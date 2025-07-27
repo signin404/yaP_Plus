@@ -17,13 +17,16 @@ jobs:
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Compile C++ code
-      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp /Fe:launcher.exe /link Shlwapi.lib User32.lib
-      # 我们假设输出文件就在根目录
+    # 新增步骤：编译资源脚本
+    # rc.exe 是 Windows 资源编译器，它会将 launcher.rc 编译成 launcher.res
+    - name: Compile resource script
+      run: rc.exe launcher.rc
 
-    # 新增步骤 1: 查找构建产物
-    # 这个步骤会递归搜索整个工作目录，找到 launcher.exe 并将其路径输出到一个名为 'exe-path' 的变量中
-    # 即使 cl.exe 把文件生成到了某个子目录，这个步骤也能找到它
+    # 修改步骤：将编译好的资源文件与C++代码一起链接
+    # 我们在 cl.exe 命令中加入了 launcher.res
+    - name: Compile C++ code and link resources
+      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib
+
     - name: Find executable
       id: find_exe
       run: |
@@ -32,11 +35,8 @@ jobs:
         echo "exe-path=$filePath" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
-    # 修正步骤 2: 上传构建产物
-    # 我们不再假设 launcher.exe 在根目录，而是直接使用上一步找到的完整路径
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: launcher-executable
-        # 使用 'find_exe' 步骤输出的路径 (steps.find_exe.outputs.exe-path)
         path: ${{ steps.find_exe.outputs.exe-path }}
