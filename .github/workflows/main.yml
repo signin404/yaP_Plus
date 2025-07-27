@@ -1,0 +1,40 @@
+name: Build C++ Launcher for Windows
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    # 使用最新的Windows环境
+    runs-on: windows-latest
+
+    steps:
+    # 第一步：签出代码
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 第二步：设置MSVC开发人员命令提示符环境
+    # 这样后续步骤就可以直接使用cl.exe编译器
+    - name: Setup MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    # 第三步：编译C++代码
+    # cl.exe是MSVC的编译器
+    # /EHsc: 启用C++异常处理
+    # /O2: 优化代码以提高速度
+    # /D "UNICODE" /D "_UNICODE": 定义宏以启用Unicode支持
+    # /Fe:launcher.exe: 指定输出文件名为launcher.exe
+    # /link Shlwapi.lib: 链接路径处理所需的库
+    - name: Compile C++ code
+      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp /Fe:launcher.exe /link Shlwapi.lib
+
+    # 第四步：上传构建产物
+    # 将编译好的launcher.exe打包，方便从Actions页面下载
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: launcher-executable
+        path: launcher.exe```
