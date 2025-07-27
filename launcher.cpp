@@ -6,6 +6,7 @@
 #include <iostream>
 
 #pragma comment(lib, "Shlwapi.lib") // Link against Shlwapi.lib for path functions
+#pragma comment(lib, "User32.lib")  // Link against User32.lib for MessageBoxW
 
 // Function to check if any of the specified processes are running
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
