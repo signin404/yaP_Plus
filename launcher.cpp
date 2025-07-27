@@ -90,24 +90,8 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // --- CORRECTED: Single-instance check with non-inheritable handle ---
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = FALSE; // This is the crucial fix!
-
-    HANDLE hMutex = CreateMutexW(&sa, TRUE, L"Global\\MyCustomLauncher_Mutex_ABC123");
-
-    if (hMutex == NULL) {
-        return 1;
-    }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(hMutex);
-        return 0;
-    }
-
-    // --- The rest of the program remains unchanged ---
-
+    // --- RESTRUCTURED LOGIC ---
+    // STEP 1: Read INI file FIRST to determine the mode of operation.
     wchar_t launcherPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherPath, MAX_PATH);
     std::wstring iniPath = launcherPath;
@@ -117,26 +101,42 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     std::wstring iniContent;
-    if (!ReadFileToWString(iniPath, iniContent)) {
-        MessageBoxW(NULL, (L"无法读取INI文件: " + iniPath).c_str(), L"文件错误", MB_ICONERROR);
-        CloseHandle(hMutex);
-        return 1;
-    }
+    // If INI doesn't exist, we assume default (single-instance) behavior.
+    ReadFileToWString(iniPath, iniContent); 
 
     std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
     bool multipleInstancesEnabled = (multipleValue == L"1");
 
+    // STEP 2: Perform single-instance check ONLY if multiple instances are DISABLED.
+    HANDLE hMutex = NULL; // Initialize mutex handle to NULL.
+    if (!multipleInstancesEnabled) {
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.lpSecurityDescriptor = NULL;
+        sa.bInheritHandle = FALSE;
+
+        hMutex = CreateMutexW(&sa, TRUE, L"Global\\MyCustomLauncher_Mutex_ABC123");
+        if (hMutex == NULL) {
+            return 1; // Critical error
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(hMutex);
+            return 0; // Another instance is running, exit silently.
+        }
+    }
+
+    // STEP 3: Proceed with the rest of the application logic.
     std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
     if (appPathRaw.empty()) {
         MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
-        CloseHandle(hMutex);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
     wchar_t absoluteAppPath[MAX_PATH];
     if (GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL) == 0) {
         MessageBoxW(NULL, L"转换应用程序路径为绝对路径失败。", L"路径错误", MB_ICONERROR);
-        CloseHandle(hMutex);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
@@ -168,7 +168,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
         std::wstring errorMsg = L"启动程序失败: \n" + std::wstring(absoluteAppPath);
         MessageBoxW(NULL, errorMsg.c_str(), L"启动错误", MB_ICONERROR);
-        CloseHandle(hMutex);
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
@@ -202,6 +202,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
-    CloseHandle(hMutex);
+    // Release the mutex only if it was created.
+    if (hMutex) {
+        CloseHandle(hMutex);
+    }
     return 0;
 }
