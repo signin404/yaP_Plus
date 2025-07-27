@@ -10,7 +10,7 @@
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 
-// --- Custom INI Reader (No changes needed here) ---
+// --- Custom INI Reader (No changes) ---
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -90,21 +90,23 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // --- NEW: Single-instance check using a Mutex ---
-    // Create a named mutex. The name should be unique to your application.
-    // The "Global\\" prefix makes it visible across all user sessions.
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Global\\MyCustomLauncher_Mutex_ABC123");
+    // --- CORRECTED: Single-instance check with non-inheritable handle ---
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = FALSE; // This is the crucial fix!
+
+    HANDLE hMutex = CreateMutexW(&sa, TRUE, L"Global\\MyCustomLauncher_Mutex_ABC123");
+
     if (hMutex == NULL) {
-        // Failed to create mutex for some reason, better to exit.
         return 1;
     }
-    // If the mutex already exists, another instance is running.
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(hMutex); // Clean up the handle we received.
-        return 0; // Silently exit.
+        CloseHandle(hMutex);
+        return 0;
     }
 
-    // --- The rest of the program continues as normal ---
+    // --- The rest of the program remains unchanged ---
 
     wchar_t launcherPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherPath, MAX_PATH);
@@ -117,29 +119,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::wstring iniContent;
     if (!ReadFileToWString(iniPath, iniContent)) {
         MessageBoxW(NULL, (L"无法读取INI文件: " + iniPath).c_str(), L"文件错误", MB_ICONERROR);
-        CloseHandle(hMutex); // Release mutex on exit
+        CloseHandle(hMutex);
         return 1;
     }
 
-    // --- NEW: Read 'multiple' setting ---
     std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
     bool multipleInstancesEnabled = (multipleValue == L"1");
 
     std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
     if (appPathRaw.empty()) {
         MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
-        CloseHandle(hMutex); // Release mutex on exit
+        CloseHandle(hMutex);
         return 1;
     }
 
     wchar_t absoluteAppPath[MAX_PATH];
     if (GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL) == 0) {
         MessageBoxW(NULL, L"转换应用程序路径为绝对路径失败。", L"路径错误", MB_ICONERROR);
-        CloseHandle(hMutex); // Release mutex on exit
+        CloseHandle(hMutex);
         return 1;
     }
 
-    // ... (Path and process creation logic remains the same)
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
@@ -168,7 +168,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
         std::wstring errorMsg = L"启动程序失败: \n" + std::wstring(absoluteAppPath);
         MessageBoxW(NULL, errorMsg.c_str(), L"启动错误", MB_ICONERROR);
-        CloseHandle(hMutex); // Release mutex on exit
+        CloseHandle(hMutex);
         return 1;
     }
 
@@ -176,9 +176,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    // --- MODIFIED: Wait process handling ---
     std::vector<std::wstring> waitProcesses;
-    // Read all configured wait processes
     for (int i = 1; ; ++i) {
         std::wstring key = L"waitprocess" + std::to_wstring(i);
         std::wstring process = GetValueFromIniContent(iniContent, L"Settings", key);
@@ -186,7 +184,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         waitProcesses.push_back(process);
     }
 
-    // NEW: If multiple instances are enabled, add the main application itself to the wait list.
     if (multipleInstancesEnabled) {
         const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
         if (appFilename && wcslen(appFilename) > 0) {
@@ -205,7 +202,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
-    // --- NEW: Release the mutex before exiting ---
     CloseHandle(hMutex);
     return 0;
 }
