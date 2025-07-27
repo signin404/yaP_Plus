@@ -8,33 +8,35 @@ on:
 
 jobs:
   build:
-    # 使用最新的Windows环境
     runs-on: windows-latest
 
     steps:
-    # 第一步：签出代码
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 第二步：设置MSVC开发人员命令提示符环境
-    # 这样后续步骤就可以直接使用cl.exe编译器
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
 
-    # 第三步：编译C++代码
-    # cl.exe是MSVC的编译器
-    # /EHsc: 启用C++异常处理
-    # /O2: 优化代码以提高速度
-    # /D "UNICODE" /D "_UNICODE": 定义宏以启用Unicode支持
-    # /Fe:launcher.exe: 指定输出文件名为launcher.exe
-    # /link Shlwapi.lib: 链接路径处理所需的库
     - name: Compile C++ code
-      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp /Fe:launcher.exe /link Shlwapi.lib
+      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp /Fe:launcher.exe /link Shlwapi.lib User32.lib
+      # 我们假设输出文件就在根目录
 
-    # 第四步：上传构建产物
-    # 将编译好的launcher.exe打包，方便从Actions页面下载
+    # 新增步骤 1: 查找构建产物
+    # 这个步骤会递归搜索整个工作目录，找到 launcher.exe 并将其路径输出到一个名为 'exe-path' 的变量中
+    # 即使 cl.exe 把文件生成到了某个子目录，这个步骤也能找到它
+    - name: Find executable
+      id: find_exe
+      run: |
+        $filePath = (Get-ChildItem -Recurse -Filter launcher.exe).FullName
+        echo "Found executable at: $filePath"
+        echo "exe-path=$filePath" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+
+    # 修正步骤 2: 上传构建产物
+    # 我们不再假设 launcher.exe 在根目录，而是直接使用上一步找到的完整路径
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: launcher-executable
-        path: launcher.exe```
+        # 使用 'find_exe' 步骤输出的路径 (steps.find_exe.outputs.exe-path)
+        path: ${{ steps.find_exe.outputs.exe-path }}
