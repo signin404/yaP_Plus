@@ -124,7 +124,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     ZeroMemory(&pi, sizeof(pi));
 
     if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
-        // We are a fire-and-forget launcher, so close handles immediately.
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
@@ -132,19 +131,11 @@ void LaunchApplication(const std::wstring& iniContent) {
 
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // --- STEP 1: Always check for the single launcher instance mutex ---
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = FALSE;
-
-    HANDLE hMutex = CreateMutexW(&sa, TRUE, L"Global\\MyCustomLauncher_Singleton_Mutex_XYZ789");
-    bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
-
-    // --- STEP 2: Read INI file regardless of instance type ---
-    wchar_t launcherPath[MAX_PATH];
-    GetModuleFileNameW(NULL, launcherPath, MAX_PATH);
-    std::wstring iniPath = launcherPath;
+    // --- STEP 1: Read INI file and get necessary info for mutex name ---
+    wchar_t launcherFullPath[MAX_PATH];
+    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
+    
+    std::wstring iniPath = launcherFullPath;
     size_t pos = iniPath.find_last_of(L".");
     if (pos != std::wstring::npos) {
         iniPath.replace(pos, std::wstring::npos, L".ini");
@@ -152,13 +143,35 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::wstring iniContent;
     ReadFileToWString(iniPath, iniContent);
 
-    // --- STEP 3: Define behavior based on whether this is the first instance ---
-    if (isFirstInstance) {
-        // --- THIS IS THE MASTER INSTANCE ---
-        // Its job is to launch a process AND wait.
+    // --- STEP 2: Dynamically construct the mutex name ---
+    // Get launcher's base name (e.g., "launcher")
+    wchar_t launcherBaseName[MAX_PATH];
+    wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
+    PathRemoveExtensionW(launcherBaseName);
 
-        // Launch the first application instance
-        std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
+    // Get application's base name from INI (e.g., "test")
+    std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
+    wchar_t appBaseName[MAX_PATH] = L""; // Default to empty if not found
+    if (!appPathRaw.empty()) {
+        wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
+        PathRemoveExtensionW(appBaseName);
+    }
+
+    // Combine them into the final mutex name
+    std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
+
+    // --- STEP 3: Create the mutex and determine instance type ---
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = FALSE;
+
+    HANDLE hMutex = CreateMutexW(&sa, TRUE, mutexName.c_str());
+    bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
+
+    // --- STEP 4: Define behavior based on instance type ---
+    if (isFirstInstance) {
+        // --- MASTER INSTANCE LOGIC ---
         if (appPathRaw.empty()) {
             MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
             CloseHandle(hMutex);
@@ -200,12 +213,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
 
-        // Wait for THIS specific instance to close.
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        // Now, begin the final wait logic for other processes.
         std::vector<std::wstring> waitProcesses;
         for (int i = 1; ; ++i) {
             std::wstring key = L"waitprocess" + std::to_wstring(i);
@@ -233,20 +244,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
         }
 
-        // Master instance's job is done, release the lock and exit.
         CloseHandle(hMutex);
 
     } else {
-        // --- THIS IS A SUBSEQUENT INSTANCE ---
-        // Its only job is to launch a new app instance if allowed, then exit.
-        CloseHandle(hMutex); // Close the handle to the existing mutex.
+        // --- SUBSEQUENT INSTANCE LOGIC ---
+        CloseHandle(hMutex);
 
         std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
         if (multipleValue == L"1") {
-            // Multi-instance is enabled, so launch a new application and exit immediately.
             LaunchApplication(iniContent);
         }
-        // If multi-instance is not enabled, do nothing and exit.
     }
 
     return 0;
