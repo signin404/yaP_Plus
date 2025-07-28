@@ -10,7 +10,8 @@
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 
-// --- Custom INI Reader (No changes) ---
+// --- Custom INI Reader ---
+
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -19,6 +20,7 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
+// Gets a single value (the first one found)
 std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
     std::wstringstream stream(content);
     std::wstring line;
@@ -44,6 +46,38 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     }
     return L"";
 }
+
+// --- NEW FUNCTION ---
+// Gets multiple values for the same key.
+std::vector<std::wstring> GetMultiValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
+    std::vector<std::wstring> values;
+    std::wstringstream stream(content);
+    std::wstring line;
+    std::wstring currentSection;
+    std::wstring searchKey = trim(key);
+    std::wstring searchSection = L"[" + trim(section) + L"]";
+
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[' && line.back() == L']') {
+            currentSection = line;
+            continue;
+        }
+        if (_wcsicmp(currentSection.c_str(), searchSection.c_str()) == 0) {
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring currentKey = trim(line.substr(0, delimiterPos));
+                if (_wcsicmp(currentKey.c_str(), searchKey.c_str()) == 0) {
+                    // Add the value to our list instead of returning immediately.
+                    values.push_back(trim(line.substr(delimiterPos + 1)));
+                }
+            }
+        }
+    }
+    return values;
+}
+
 
 bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
@@ -131,7 +165,6 @@ void LaunchApplication(const std::wstring& iniContent) {
 
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // --- STEP 1: Read INI file and get necessary info for mutex name ---
     wchar_t launcherFullPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
     
@@ -143,24 +176,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::wstring iniContent;
     ReadFileToWString(iniPath, iniContent);
 
-    // --- STEP 2: Dynamically construct the mutex name ---
-    // Get launcher's base name (e.g., "launcher")
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
 
-    // Get application's base name from INI (e.g., "test")
     std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
-    wchar_t appBaseName[MAX_PATH] = L""; // Default to empty if not found
+    wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
         PathRemoveExtensionW(appBaseName);
     }
 
-    // Combine them into the final mutex name
     std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
 
-    // --- STEP 3: Create the mutex and determine instance type ---
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.lpSecurityDescriptor = NULL;
@@ -169,7 +197,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     HANDLE hMutex = CreateMutexW(&sa, TRUE, mutexName.c_str());
     bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
 
-    // --- STEP 4: Define behavior based on instance type ---
     if (isFirstInstance) {
         // --- MASTER INSTANCE LOGIC ---
         if (appPathRaw.empty()) {
@@ -217,13 +244,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        std::vector<std::wstring> waitProcesses;
-        for (int i = 1; ; ++i) {
-            std::wstring key = L"waitprocess" + std::to_wstring(i);
-            std::wstring process = GetValueFromIniContent(iniContent, L"Settings", key);
-            if (process.empty()) break;
-            waitProcesses.push_back(process);
-        }
+        // --- MODIFIED: Simplified wait process reading ---
+        std::vector<std::wstring> waitProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"waitprocess");
 
         std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
         if (multipleValue == L"1") {
