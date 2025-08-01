@@ -9,7 +9,7 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // For SHFileOperationW
+#include <shellapi.h> // Header for SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -26,7 +26,7 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 
-// --- NEW: Privilege Elevation Functions ---
+// --- Privilege Elevation Functions ---
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -61,7 +61,7 @@ void EnableAllPrivileges() {
         L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
-        EnablePrivilege(priv); // Attempt to enable, ignore success/failure
+        EnablePrivilege(priv);
     }
 }
 
@@ -400,7 +400,6 @@ void LaunchApplication(const std::wstring& iniContent) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // Attempt to gain all possible privileges at the very start.
     EnableAllPrivileges();
 
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
