@@ -9,12 +9,13 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // Header for SHFileOperationW
+#include <shellapi.h> // For SHFileOperationW
+#include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
-#pragma comment(lib, "Shell32.lib") // <-- The crucial fix is here
+#pragma comment(lib, "Shell32.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -23,7 +24,7 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 
-// --- Custom INI Reader (No changes) ---
+// --- Path and INI Parsing Utilities ---
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -31,6 +32,42 @@ std::wstring trim(const std::wstring& s) {
     size_t last = s.find_last_not_of(WHITESPACE);
     return s.substr(first, (last - first + 1));
 }
+
+// --- NEW: Path Variable Expansion ---
+std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
+    PWSTR pszPath = nullptr;
+    HRESULT hr = SHGetKnownFolderPath(rfid, 0, NULL, &pszPath);
+    if (SUCCEEDED(hr)) {
+        std::wstring path = pszPath;
+        CoTaskMemFree(pszPath);
+        return path;
+    }
+    return L"";
+}
+
+std::wstring ExpandPathVariables(std::wstring path) {
+    static const std::vector<std::pair<std::wstring, KNOWNFOLDERID>> replacements = {
+        {L"{Local}", FOLDERID_LocalAppData},
+        {L"{LocalLow}", FOLDERID_LocalAppDataLow},
+        {L"{Roaming}", FOLDERID_RoamingAppData},
+        {L"{Documents}", FOLDERID_Documents},
+        {L"{ProgramData}", FOLDERID_ProgramData},
+        {L"{SavedGames}", FOLDERID_SavedGames},
+        {L"{PublicDocuments}", FOLDERID_PublicDocuments}
+    };
+
+    for (const auto& rep : replacements) {
+        size_t start_pos = path.find(rep.first);
+        if (start_pos != std::wstring::npos) {
+            std::wstring expanded = GetKnownFolderPath(rep.second);
+            if (!expanded.empty()) {
+                path.replace(start_pos, rep.first.length(), expanded);
+            }
+        }
+    }
+    return path;
+}
+
 
 std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
     std::wstringstream stream(content);
@@ -107,7 +144,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     }
     return true;
 }
-// --- End of Custom INI Reader ---
 
 
 // --- Process Management Functions ---
@@ -211,8 +247,9 @@ std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry
     if (separatorPos == std::wstring::npos) {
         return {};
     }
-    std::wstring dest = trim(entry.substr(0, separatorPos));
-    std::wstring src = trim(entry.substr(separatorPos + 2));
+    // Expand variables on both sides of the separator
+    std::wstring dest = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+    std::wstring src = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
     if (dest.empty() || src.empty()) {
         return {};
     }
@@ -231,11 +268,11 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
 
     wchar_t srcPath[MAX_PATH * 2] = {0};
     wcscpy_s(srcPath, src.c_str());
-    srcPath[src.length() + 1] = L'\0'; // Double-null terminate
+    srcPath[src.length() + 1] = L'\0';
 
     wchar_t destPath[MAX_PATH * 2] = {0};
     wcscpy_s(destPath, dest.c_str());
-    destPath[dest.length() + 1] = L'\0'; // Double-null terminate
+    destPath[dest.length() + 1] = L'\0';
 
     SHFILEOPSTRUCTW sfos = {0};
     sfos.wFunc = FO_COPY;
@@ -245,7 +282,6 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
 
     int result = SHFileOperationW(&sfos);
     if (result == 0 && oldVersionExists) {
-        // Success, now delete the old backup
         wchar_t backupPath[MAX_PATH * 2] = {0};
         wcscpy_s(backupPath, backupDest.c_str());
         backupPath[backupDest.length() + 1] = L'\0';
@@ -305,14 +341,16 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
-    std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
+    std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     if (appPathRaw.empty()) return;
+
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
-    std::wstring workDirRaw = GetValueFromIniContent(iniContent, L"Settings", L"workdir");
+    
+    std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
         wchar_t absoluteWorkDir[MAX_PATH];
@@ -322,6 +360,7 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
+
     std::wstring commandLine = GetValueFromIniContent(iniContent, L"Settings", L"commandline");
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -355,7 +394,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
-    std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
+    
+    std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
@@ -407,7 +447,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (backupTime > 0) {
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
-            backupData.backupInterval = backupTime * 60 * 1000; // minutes to ms
+            backupData.backupInterval = backupTime * 60 * 1000;
             
             auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupdir");
             for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
@@ -426,9 +466,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + GetValueFromIniContent(iniContent, L"Settings", L"commandline");
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        // ... (path logic)
+        
+        std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
         wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
-        std::wstring workDirRaw = GetValueFromIniContent(iniContent, L"Settings", L"workdir");
         std::wstring finalWorkDir;
         if (!workDirRaw.empty()) {
             wchar_t absoluteWorkDir[MAX_PATH]; GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
@@ -437,7 +477,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-            // Emergency shutdown of threads if launch fails
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
             CloseHandle(hMutex);
@@ -470,7 +509,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         if (hBackupThread) {
             stopBackup = true;
-            while (isBackupWorking) Sleep(100); // Wait for current job to finish
+            while (isBackupWorking) Sleep(100);
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
