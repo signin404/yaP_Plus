@@ -17,7 +17,7 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
-#pragma comment(lib, "Advapi32.lib") // For privilege elevation functions
+#pragma comment(lib, "Advapi32.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -29,9 +29,7 @@ pfnNtResumeProcess g_NtResumeProcess = nullptr;
 // --- Privilege Elevation Functions ---
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        return false;
-    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
     TOKEN_PRIVILEGES tp;
     LUID luid;
     if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
@@ -51,14 +49,13 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 
 void EnableAllPrivileges() {
     const LPCWSTR privileges[] = {
-        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
-        L"SeRestorePrivilege", L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", 
-        L"SeSecurityPrivilege", L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege",
-        L"SeSystemProfilePrivilege", L"SeSystemtimePrivilege", L"SeProfileSingleProcessPrivilege", 
-        L"SeIncreaseBasePriorityPrivilege", L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege",
-        L"SeRemoteShutdownPrivilege", L"SeUndockPrivilege", L"SeManageVolumePrivilege", 
-        L"SeIncreaseWorkingSetPrivilege", L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege",
-        L"SeDelegateSessionUserImpersonatePrivilege"
+        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
+        L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
+        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege", L"SeSystemProfilePrivilege",
+        L"SeSystemtimePrivilege", L"SeProfileSingleProcessPrivilege", L"SeIncreaseBasePriorityPrivilege",
+        L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege", L"SeRemoteShutdownPrivilege",
+        L"SeUndockPrivilege", L"SeManageVolumePrivilege", L"SeIncreaseWorkingSetPrivilege",
+        L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
         EnablePrivilege(priv);
@@ -284,14 +281,10 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 // --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
     size_t separatorPos = entry.find(L"::");
-    if (separatorPos == std::wstring::npos) {
-        return {};
-    }
+    if (separatorPos == std::wstring::npos) return {};
     std::wstring dest = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
     std::wstring src = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
-    if (dest.empty() || src.empty()) {
-        return {};
-    }
+    if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
 
@@ -369,11 +362,13 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
 void LaunchApplication(const std::wstring& iniContent) {
     std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     if (appPathRaw.empty()) return;
+
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
+    
     std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -384,7 +379,9 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
-    std::wstring commandLine = GetValueFromIniContent(iniContent, L"Settings", L"commandline");
+
+    // *** CORRECTED: Expand variables in command line ***
+    std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
@@ -486,8 +483,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wchar_t absoluteAppPath[MAX_PATH];
         GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
-        std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + GetValueFromIniContent(iniContent, L"Settings", L"commandline");
+        
+        // *** CORRECTED: Expand variables in command line ***
+        std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
+        std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        
         std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
         wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
         std::wstring finalWorkDir;
