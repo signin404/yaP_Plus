@@ -9,10 +9,12 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
+#include <shellapi.h> // Header for SHFileOperationW
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "Shell32.lib") // <-- The crucial fix is here
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -21,7 +23,7 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 
-// --- Custom INI Reader ---
+// --- Custom INI Reader (No changes) ---
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -227,11 +229,11 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
         MoveFileW(dest.c_str(), backupDest.c_str());
     }
 
-    wchar_t srcPath[MAX_PATH * 2];
+    wchar_t srcPath[MAX_PATH * 2] = {0};
     wcscpy_s(srcPath, src.c_str());
     srcPath[src.length() + 1] = L'\0'; // Double-null terminate
 
-    wchar_t destPath[MAX_PATH];
+    wchar_t destPath[MAX_PATH * 2] = {0};
     wcscpy_s(destPath, dest.c_str());
     destPath[dest.length() + 1] = L'\0'; // Double-null terminate
 
@@ -239,12 +241,12 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
     sfos.wFunc = FO_COPY;
     sfos.pFrom = srcPath;
     sfos.pTo = destPath;
-    sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_NOCONFIRMMKDIR;
 
     int result = SHFileOperationW(&sfos);
     if (result == 0 && oldVersionExists) {
         // Success, now delete the old backup
-        wchar_t backupPath[MAX_PATH * 2];
+        wchar_t backupPath[MAX_PATH * 2] = {0};
         wcscpy_s(backupPath, backupDest.c_str());
         backupPath[backupDest.length() + 1] = L'\0';
 
