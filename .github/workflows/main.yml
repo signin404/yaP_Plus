@@ -17,15 +17,12 @@ jobs:
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
 
-    # 新增步骤：编译资源脚本
-    # rc.exe 是 Windows 资源编译器，它会将 launcher.rc 编译成 launcher.res
     - name: Compile resource script
       run: rc.exe launcher.rc
 
-    # 修改步骤：将编译好的资源文件与C++代码一起链接
-    # 我们在 cl.exe 命令中加入了 launcher.res
+    # Corrected command: Added /utf-8 flag
     - name: Compile C++ code and link resources
-      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib
+      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib
 
     - name: Find executable
       id: find_exe
