@@ -402,17 +402,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         // Backup Thread Setup
-        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"autosavetime");
+        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
         int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
         if (backupTime > 0) {
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000; // minutes to ms
             
-            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavedir");
+            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupdir");
             for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
             
-            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavefile");
+            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupfile");
             for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry));
 
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
