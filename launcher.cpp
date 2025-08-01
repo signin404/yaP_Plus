@@ -16,7 +16,7 @@
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "Shell32.lib")
-#pragma comment(lib, "Ole32.lib") // <-- The final, definitive fix is here
+#pragma comment(lib, "Ole32.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -34,7 +34,7 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
-// --- NEW: Path Variable Expansion ---
+// --- CORRECTED: Path Variable Expansion ---
 std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     PWSTR pszPath = nullptr;
     HRESULT hr = SHGetKnownFolderPath(rfid, 0, NULL, &pszPath);
@@ -47,6 +47,7 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
 }
 
 std::wstring ExpandPathVariables(std::wstring path) {
+    // Stage 1: Expand custom {KnownFolder} variables
     static const std::vector<std::pair<std::wstring, KNOWNFOLDERID>> replacements = {
         {L"{Local}", FOLDERID_LocalAppData},
         {L"{LocalLow}", FOLDERID_LocalAppDataLow},
@@ -66,7 +67,19 @@ std::wstring ExpandPathVariables(std::wstring path) {
             }
         }
     }
-    return path;
+
+    // Stage 2: Expand standard %System% environment variables
+    DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
+    if (requiredSize == 0) {
+        return path; // No variables to expand or an error occurred
+    }
+
+    std::vector<wchar_t> buffer(requiredSize);
+    if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) == 0) {
+        return path; // Error during expansion, return original
+    }
+
+    return std::wstring(buffer.data());
 }
 
 
