@@ -6,23 +6,22 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
-#pragma comment(lib, "ntdll.lib") // For NtResumeProcess/NtSuspendProcess
+#pragma comment(lib, "ntdll.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
-
-// --- Global function pointers ---
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 
-// --- Custom INI Reader (No changes) ---
+// --- Custom INI Reader ---
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -110,7 +109,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 
 // --- Process Management Functions ---
-
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -131,14 +129,11 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     return false;
 }
 
-// Gets the process name for a given Process ID (PID).
 std::wstring GetProcessNameByPid(DWORD pid) {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
-
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
-
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
             if (pe32.th32ProcessID == pid) {
@@ -151,27 +146,20 @@ std::wstring GetProcessNameByPid(DWORD pid) {
     return L"";
 }
 
-// Suspends or resumes all running instances of the specified processes.
 void SetAllProcessesState(const std::vector<std::wstring>& processList, bool suspend) {
     if (processList.empty() || !g_NtSuspendProcess || !g_NtResumeProcess) return;
-
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
-
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
-
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
             for (const auto& processName : processList) {
                 if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
                     HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe32.th32ProcessID);
                     if (hProcess) {
-                        if (suspend) {
-                            g_NtSuspendProcess(hProcess);
-                        } else {
-                            g_NtResumeProcess(hProcess);
-                        }
+                        if (suspend) g_NtSuspendProcess(hProcess);
+                        else g_NtResumeProcess(hProcess);
                         CloseHandle(hProcess);
                     }
                 }
@@ -192,24 +180,20 @@ struct MonitorThreadData {
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
     bool areProcessesSuspended = false;
-
     while (!*(data->shouldStop)) {
         HWND hForegroundWnd = GetForegroundWindow();
         if (hForegroundWnd) {
             DWORD foregroundPid = 0;
             GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
             std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
-
             if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
-                // Target process is in the foreground
                 if (!areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, true); // Suspend
+                    SetAllProcessesState(data->suspendProcesses, true);
                     areProcessesSuspended = true;
                 }
             } else {
-                // Target process is NOT in the foreground
                 if (areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, false); // Resume
+                    SetAllProcessesState(data->suspendProcesses, false);
                     areProcessesSuspended = false;
                 }
             }
@@ -219,19 +203,113 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
+// --- Backup Functionality ---
+std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
+    size_t separatorPos = entry.find(L"::");
+    if (separatorPos == std::wstring::npos) {
+        return {};
+    }
+    std::wstring dest = trim(entry.substr(0, separatorPos));
+    std::wstring src = trim(entry.substr(separatorPos + 2));
+    if (dest.empty() || src.empty()) {
+        return {};
+    }
+    return {dest, src};
+}
 
-// Helper function to launch the main application.
+void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+
+    std::wstring backupDest = dest + L"_Backup";
+    bool oldVersionExists = PathFileExistsW(dest.c_str());
+
+    if (oldVersionExists) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+
+    wchar_t srcPath[MAX_PATH * 2];
+    wcscpy_s(srcPath, src.c_str());
+    srcPath[src.length() + 1] = L'\0'; // Double-null terminate
+
+    wchar_t destPath[MAX_PATH];
+    wcscpy_s(destPath, dest.c_str());
+    destPath[dest.length() + 1] = L'\0'; // Double-null terminate
+
+    SHFILEOPSTRUCTW sfos = {0};
+    sfos.wFunc = FO_COPY;
+    sfos.pFrom = srcPath;
+    sfos.pTo = destPath;
+    sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+
+    int result = SHFileOperationW(&sfos);
+    if (result == 0 && oldVersionExists) {
+        // Success, now delete the old backup
+        wchar_t backupPath[MAX_PATH * 2];
+        wcscpy_s(backupPath, backupDest.c_str());
+        backupPath[backupDest.length() + 1] = L'\0';
+
+        SHFILEOPSTRUCTW delSfos = {0};
+        delSfos.wFunc = FO_DELETE;
+        delSfos.pFrom = backupPath;
+        delSfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        SHFileOperationW(&delSfos);
+    }
+}
+
+void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+
+    std::wstring backupDest = dest + L"_Backup";
+    bool oldVersionExists = PathFileExistsW(dest.c_str());
+
+    if (oldVersionExists) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+
+    if (CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
+        if (oldVersionExists) {
+            DeleteFileW(backupDest.c_str());
+        }
+    }
+}
+
+struct BackupThreadData {
+    std::atomic<bool>* shouldStop;
+    std::atomic<bool>* isWorking;
+    int backupInterval;
+    std::vector<std::pair<std::wstring, std::wstring>> backupDirs;
+    std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
+};
+
+DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
+    BackupThreadData* data = static_cast<BackupThreadData*>(lpParam);
+    while (!*(data->shouldStop)) {
+        Sleep(data->backupInterval);
+        if (*(data->shouldStop)) break;
+
+        *(data->isWorking) = true;
+
+        for (const auto& pair : data->backupDirs) {
+            PerformDirectoryBackup(pair.first, pair.second);
+        }
+        for (const auto& pair : data->backupFiles) {
+            PerformFileBackup(pair.first, pair.second);
+        }
+
+        *(data->isWorking) = false;
+    }
+    return 0;
+}
+
+// --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
     std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
     if (appPathRaw.empty()) return;
-
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
-
     std::wstring workDirRaw = GetValueFromIniContent(iniContent, L"Settings", L"workdir");
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -242,27 +320,22 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
-
     std::wstring commandLine = GetValueFromIniContent(iniContent, L"Settings", L"commandline");
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
-
     if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
 }
 
-
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    // --- Load NTDLL functions dynamically ---
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
@@ -271,33 +344,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     wchar_t launcherFullPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
-    
     std::wstring iniPath = launcherFullPath;
     size_t pos = iniPath.find_last_of(L".");
-    if (pos != std::wstring::npos) {
-        iniPath.replace(pos, std::wstring::npos, L".ini");
-    }
+    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
     std::wstring iniContent;
     ReadFileToWString(iniPath, iniContent);
 
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
-
     std::wstring appPathRaw = GetValueFromIniContent(iniContent, L"Settings", L"application");
     wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
         PathRemoveExtensionW(appBaseName);
     }
-
     std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.lpSecurityDescriptor = NULL;
     sa.bInheritHandle = FALSE;
-
     HANDLE hMutex = CreateMutexW(&sa, TRUE, mutexName.c_str());
     bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
 
@@ -309,112 +376,110 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        // --- Foreground Monitoring Setup ---
+        // --- Setup Threads ---
         HANDLE hMonitorThread = NULL;
-        MonitorThreadData threadData;
+        MonitorThreadData monitorData;
         std::atomic<bool> stopMonitor(false);
-        
+        HANDLE hBackupThread = NULL;
+        BackupThreadData backupData;
+        std::atomic<bool> stopBackup(false);
+        std::atomic<bool> isBackupWorking(false);
+
+        // Foreground Monitor Setup
         std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
         if (!foregroundAppName.empty()) {
-            threadData.shouldStop = &stopMonitor;
-            threadData.foregroundAppName = foregroundAppName;
-            threadData.suspendProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"suspend");
-            
+            monitorData.shouldStop = &stopMonitor;
+            monitorData.foregroundAppName = foregroundAppName;
+            monitorData.suspendProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"suspend");
             std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
-            threadData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
-            if (threadData.checkInterval <= 0) threadData.checkInterval = 1;
+            monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
+            if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
+            if (!monitorData.suspendProcesses.empty()) {
+                hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+            }
+        }
 
-            if (!threadData.suspendProcesses.empty()) {
-                hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &threadData, 0, NULL);
+        // Backup Thread Setup
+        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"autosavetime");
+        int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
+        if (backupTime > 0) {
+            backupData.shouldStop = &stopBackup;
+            backupData.isWorking = &isBackupWorking;
+            backupData.backupInterval = backupTime * 60 * 1000; // minutes to ms
+            
+            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavedir");
+            for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
+            
+            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavefile");
+            for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry));
+
+            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
+                hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
             }
         }
 
         // --- Main Application Launch ---
         wchar_t absoluteAppPath[MAX_PATH];
         GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-        
-        wchar_t appDir[MAX_PATH];
-        wcscpy_s(appDir, absoluteAppPath);
-        PathRemoveFileSpecW(appDir);
-        
+        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+        std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + GetValueFromIniContent(iniContent, L"Settings", L"commandline");
+        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        // ... (path logic)
+        wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
         std::wstring workDirRaw = GetValueFromIniContent(iniContent, L"Settings", L"workdir");
         std::wstring finalWorkDir;
         if (!workDirRaw.empty()) {
-            wchar_t absoluteWorkDir[MAX_PATH];
-            GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
-            if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-            else finalWorkDir = appDir;
-        } else {
-            finalWorkDir = appDir;
-        }
-
-        std::wstring commandLine = GetValueFromIniContent(iniContent, L"Settings", L"commandline");
-        std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096];
-        wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        ZeroMemory(&pi, sizeof(pi));
+            wchar_t absoluteWorkDir[MAX_PATH]; GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
+            if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir; else finalWorkDir = appDir;
+        } else { finalWorkDir = appDir; }
 
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-            if (hMonitorThread) {
-                stopMonitor = true;
-                WaitForSingleObject(hMonitorThread, 2000);
-                CloseHandle(hMonitorThread);
-            }
+            // Emergency shutdown of threads if launch fails
+            if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
+            if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
             CloseHandle(hMutex);
             return 1;
         }
-
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
         // --- Wait Process Logic ---
         std::vector<std::wstring> waitProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"waitprocess");
-        std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
-        if (multipleValue == L"1") {
+        if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
             const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
-            if (appFilename && wcslen(appFilename) > 0) {
-                waitProcesses.push_back(appFilename);
-            }
+            if (appFilename && wcslen(appFilename) > 0) waitProcesses.push_back(appFilename);
         }
-        
         if (!waitProcesses.empty()) {
             std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"waitcheck");
             int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
             if (waitCheck <= 0) waitCheck = 10;
-            
             Sleep(3000);
-            while (AreWaitProcessesRunning(waitProcesses)) {
-                Sleep(waitCheck * 1000);
-            }
+            while (AreWaitProcessesRunning(waitProcesses)) Sleep(waitCheck * 1000);
         }
 
         // --- CRITICAL CLEANUP ---
         if (hMonitorThread) {
-            stopMonitor = true; // Signal thread to stop
-            WaitForSingleObject(hMonitorThread, 2000); // Wait for it to exit
+            stopMonitor = true;
+            WaitForSingleObject(hMonitorThread, 1500);
             CloseHandle(hMonitorThread);
-            // Ensure all processes are resumed before we exit
-            SetAllProcessesState(threadData.suspendProcesses, false);
+            SetAllProcessesState(monitorData.suspendProcesses, false);
         }
-
+        if (hBackupThread) {
+            stopBackup = true;
+            while (isBackupWorking) Sleep(100); // Wait for current job to finish
+            WaitForSingleObject(hBackupThread, 1500);
+            CloseHandle(hBackupThread);
+        }
         CloseHandle(hMutex);
 
     } else {
         // --- SUBSEQUENT INSTANCE LOGIC ---
         CloseHandle(hMutex);
-
-        std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
-        if (multipleValue == L"1") {
+        if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
             LaunchApplication(iniContent);
         }
     }
-
     return 0;
 }
