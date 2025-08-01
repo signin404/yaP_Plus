@@ -9,7 +9,7 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // Header for SHFileOperationW
+#include <shellapi.h> // For SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -17,12 +17,53 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "Advapi32.lib") // For privilege elevation functions
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
+
+
+// --- NEW: Privilege Elevation Functions ---
+bool EnablePrivilege(LPCWSTR privilegeName) {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+    return GetLastError() == ERROR_SUCCESS;
+}
+
+void EnableAllPrivileges() {
+    const LPCWSTR privileges[] = {
+        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
+        L"SeRestorePrivilege", L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", 
+        L"SeSecurityPrivilege", L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege",
+        L"SeSystemProfilePrivilege", L"SeSystemtimePrivilege", L"SeProfileSingleProcessPrivilege", 
+        L"SeIncreaseBasePriorityPrivilege", L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege",
+        L"SeRemoteShutdownPrivilege", L"SeUndockPrivilege", L"SeManageVolumePrivilege", 
+        L"SeIncreaseWorkingSetPrivilege", L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege",
+        L"SeDelegateSessionUserImpersonatePrivilege"
+    };
+    for (const auto& priv : privileges) {
+        EnablePrivilege(priv); // Attempt to enable, ignore success/failure
+    }
+}
 
 
 // --- Path and INI Parsing Utilities ---
@@ -34,7 +75,6 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
-// --- CORRECTED: Path Variable Expansion ---
 std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     PWSTR pszPath = nullptr;
     HRESULT hr = SHGetKnownFolderPath(rfid, 0, NULL, &pszPath);
@@ -47,17 +87,12 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
 }
 
 std::wstring ExpandPathVariables(std::wstring path) {
-    // Stage 1: Expand custom {KnownFolder} variables
     static const std::vector<std::pair<std::wstring, KNOWNFOLDERID>> replacements = {
-        {L"{Local}", FOLDERID_LocalAppData},
-        {L"{LocalLow}", FOLDERID_LocalAppDataLow},
-        {L"{Roaming}", FOLDERID_RoamingAppData},
-        {L"{Documents}", FOLDERID_Documents},
-        {L"{ProgramData}", FOLDERID_ProgramData},
-        {L"{SavedGames}", FOLDERID_SavedGames},
+        {L"{Local}", FOLDERID_LocalAppData}, {L"{LocalLow}", FOLDERID_LocalAppDataLow},
+        {L"{Roaming}", FOLDERID_RoamingAppData}, {L"{Documents}", FOLDERID_Documents},
+        {L"{ProgramData}", FOLDERID_ProgramData}, {L"{SavedGames}", FOLDERID_SavedGames},
         {L"{PublicDocuments}", FOLDERID_PublicDocuments}
     };
-
     for (const auto& rep : replacements) {
         size_t start_pos = path.find(rep.first);
         if (start_pos != std::wstring::npos) {
@@ -67,21 +102,12 @@ std::wstring ExpandPathVariables(std::wstring path) {
             }
         }
     }
-
-    // Stage 2: Expand standard %System% environment variables
     DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
-    if (requiredSize == 0) {
-        return path; // No variables to expand or an error occurred
-    }
-
+    if (requiredSize == 0) return path;
     std::vector<wchar_t> buffer(requiredSize);
-    if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) == 0) {
-        return path; // Error during expansion, return original
-    }
-
+    if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) == 0) return path;
     return std::wstring(buffer.data());
 }
-
 
 std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
     std::wstringstream stream(content);
@@ -271,34 +297,27 @@ std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry
 
 void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
     if (!PathFileExistsW(src.c_str())) return;
-
     std::wstring backupDest = dest + L"_Backup";
     bool oldVersionExists = PathFileExistsW(dest.c_str());
-
     if (oldVersionExists) {
         MoveFileW(dest.c_str(), backupDest.c_str());
     }
-
     wchar_t srcPath[MAX_PATH * 2] = {0};
     wcscpy_s(srcPath, src.c_str());
     srcPath[src.length() + 1] = L'\0';
-
     wchar_t destPath[MAX_PATH * 2] = {0};
     wcscpy_s(destPath, dest.c_str());
     destPath[dest.length() + 1] = L'\0';
-
     SHFILEOPSTRUCTW sfos = {0};
     sfos.wFunc = FO_COPY;
     sfos.pFrom = srcPath;
     sfos.pTo = destPath;
     sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_NOCONFIRMMKDIR;
-
     int result = SHFileOperationW(&sfos);
     if (result == 0 && oldVersionExists) {
         wchar_t backupPath[MAX_PATH * 2] = {0};
         wcscpy_s(backupPath, backupDest.c_str());
         backupPath[backupDest.length() + 1] = L'\0';
-
         SHFILEOPSTRUCTW delSfos = {0};
         delSfos.wFunc = FO_DELETE;
         delSfos.pFrom = backupPath;
@@ -309,14 +328,11 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
 
 void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
     if (!PathFileExistsW(src.c_str())) return;
-
     std::wstring backupDest = dest + L"_Backup";
     bool oldVersionExists = PathFileExistsW(dest.c_str());
-
     if (oldVersionExists) {
         MoveFileW(dest.c_str(), backupDest.c_str());
     }
-
     if (CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
         if (oldVersionExists) {
             DeleteFileW(backupDest.c_str());
@@ -337,16 +353,13 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     while (!*(data->shouldStop)) {
         Sleep(data->backupInterval);
         if (*(data->shouldStop)) break;
-
         *(data->isWorking) = true;
-
         for (const auto& pair : data->backupDirs) {
             PerformDirectoryBackup(pair.first, pair.second);
         }
         for (const auto& pair : data->backupFiles) {
             PerformFileBackup(pair.first, pair.second);
         }
-
         *(data->isWorking) = false;
     }
     return 0;
@@ -356,13 +369,11 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
 void LaunchApplication(const std::wstring& iniContent) {
     std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     if (appPathRaw.empty()) return;
-
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
-    
     std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -373,7 +384,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
-
     std::wstring commandLine = GetValueFromIniContent(iniContent, L"Settings", L"commandline");
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -390,6 +400,9 @@ void LaunchApplication(const std::wstring& iniContent) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    // Attempt to gain all possible privileges at the very start.
+    EnableAllPrivileges();
+
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
@@ -461,13 +474,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-            
             auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupdir");
             for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
-            
             auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupfile");
             for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry));
-
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
                 hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
             }
@@ -479,7 +489,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + GetValueFromIniContent(iniContent, L"Settings", L"commandline");
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        
         std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
         wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
         std::wstring finalWorkDir;
