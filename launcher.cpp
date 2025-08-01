@@ -4,14 +4,25 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
+#pragma comment(lib, "ntdll.lib") // For NtResumeProcess/NtSuspendProcess
 
-// --- Custom INI Reader ---
+// --- Function pointer types for NTDLL functions ---
+typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
+typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 
+// --- Global function pointers ---
+pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
+pfnNtResumeProcess g_NtResumeProcess = nullptr;
+
+
+// --- Custom INI Reader (No changes) ---
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -20,7 +31,6 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
-// Gets a single value (the first one found)
 std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
     std::wstringstream stream(content);
     std::wstring line;
@@ -47,8 +57,6 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
-// --- NEW FUNCTION ---
-// Gets multiple values for the same key.
 std::vector<std::wstring> GetMultiValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
     std::vector<std::wstring> values;
     std::wstringstream stream(content);
@@ -56,7 +64,6 @@ std::vector<std::wstring> GetMultiValueFromIniContent(const std::wstring& conten
     std::wstring currentSection;
     std::wstring searchKey = trim(key);
     std::wstring searchSection = L"[" + trim(section) + L"]";
-
     while (std::getline(stream, line)) {
         line = trim(line);
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
@@ -69,7 +76,6 @@ std::vector<std::wstring> GetMultiValueFromIniContent(const std::wstring& conten
             if (delimiterPos != std::wstring::npos) {
                 std::wstring currentKey = trim(line.substr(0, delimiterPos));
                 if (_wcsicmp(currentKey.c_str(), searchKey.c_str()) == 0) {
-                    // Add the value to our list instead of returning immediately.
                     values.push_back(trim(line.substr(delimiterPos + 1)));
                 }
             }
@@ -77,7 +83,6 @@ std::vector<std::wstring> GetMultiValueFromIniContent(const std::wstring& conten
     }
     return values;
 }
-
 
 bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
@@ -103,6 +108,9 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 }
 // --- End of Custom INI Reader ---
 
+
+// --- Process Management Functions ---
+
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -122,6 +130,95 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     CloseHandle(hSnapshot);
     return false;
 }
+
+// Gets the process name for a given Process ID (PID).
+std::wstring GetProcessNameByPid(DWORD pid) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == pid) {
+                CloseHandle(hSnapshot);
+                return pe32.szExeFile;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return L"";
+}
+
+// Suspends or resumes all running instances of the specified processes.
+void SetAllProcessesState(const std::vector<std::wstring>& processList, bool suspend) {
+    if (processList.empty() || !g_NtSuspendProcess || !g_NtResumeProcess) return;
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            for (const auto& processName : processList) {
+                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                    HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        if (suspend) {
+                            g_NtSuspendProcess(hProcess);
+                        } else {
+                            g_NtResumeProcess(hProcess);
+                        }
+                        CloseHandle(hProcess);
+                    }
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+}
+
+// --- Foreground Monitoring Thread ---
+struct MonitorThreadData {
+    std::atomic<bool>* shouldStop;
+    int checkInterval;
+    std::wstring foregroundAppName;
+    std::vector<std::wstring> suspendProcesses;
+};
+
+DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
+    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
+    bool areProcessesSuspended = false;
+
+    while (!*(data->shouldStop)) {
+        HWND hForegroundWnd = GetForegroundWindow();
+        if (hForegroundWnd) {
+            DWORD foregroundPid = 0;
+            GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
+            std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
+
+            if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
+                // Target process is in the foreground
+                if (!areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, true); // Suspend
+                    areProcessesSuspended = true;
+                }
+            } else {
+                // Target process is NOT in the foreground
+                if (areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, false); // Resume
+                    areProcessesSuspended = false;
+                }
+            }
+        }
+        Sleep(data->checkInterval * 1000);
+    }
+    return 0;
+}
+
 
 // Helper function to launch the main application.
 void LaunchApplication(const std::wstring& iniContent) {
@@ -165,6 +262,13 @@ void LaunchApplication(const std::wstring& iniContent) {
 
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    // --- Load NTDLL functions dynamically ---
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
+        g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
+
     wchar_t launcherFullPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
     
@@ -205,6 +309,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
+        // --- Foreground Monitoring Setup ---
+        HANDLE hMonitorThread = NULL;
+        MonitorThreadData threadData;
+        std::atomic<bool> stopMonitor(false);
+        
+        std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
+        if (!foregroundAppName.empty()) {
+            threadData.shouldStop = &stopMonitor;
+            threadData.foregroundAppName = foregroundAppName;
+            threadData.suspendProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"suspend");
+            
+            std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
+            threadData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
+            if (threadData.checkInterval <= 0) threadData.checkInterval = 1;
+
+            if (!threadData.suspendProcesses.empty()) {
+                hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &threadData, 0, NULL);
+            }
+        }
+
+        // --- Main Application Launch ---
         wchar_t absoluteAppPath[MAX_PATH];
         GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
         
@@ -236,6 +361,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
+            if (hMonitorThread) {
+                stopMonitor = true;
+                WaitForSingleObject(hMonitorThread, 2000);
+                CloseHandle(hMonitorThread);
+            }
             CloseHandle(hMutex);
             return 1;
         }
@@ -244,9 +374,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        // --- MODIFIED: Simplified wait process reading ---
+        // --- Wait Process Logic ---
         std::vector<std::wstring> waitProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"waitprocess");
-
         std::wstring multipleValue = GetValueFromIniContent(iniContent, L"Settings", L"multiple");
         if (multipleValue == L"1") {
             const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
@@ -256,14 +385,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         
         if (!waitProcesses.empty()) {
-            std::wstring checkTimeString = GetValueFromIniContent(iniContent, L"Settings", L"checktime");
-            int checkTime = checkTimeString.empty() ? 10 : _wtoi(checkTimeString.c_str());
-            if (checkTime <= 0) checkTime = 10;
+            std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"waitcheck");
+            int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
+            if (waitCheck <= 0) waitCheck = 10;
             
             Sleep(3000);
             while (AreWaitProcessesRunning(waitProcesses)) {
-                Sleep(checkTime * 1000);
+                Sleep(waitCheck * 1000);
             }
+        }
+
+        // --- CRITICAL CLEANUP ---
+        if (hMonitorThread) {
+            stopMonitor = true; // Signal thread to stop
+            WaitForSingleObject(hMonitorThread, 2000); // Wait for it to exit
+            CloseHandle(hMonitorThread);
+            // Ensure all processes are resumed before we exit
+            SetAllProcessesState(threadData.suspendProcesses, false);
         }
 
         CloseHandle(hMutex);
