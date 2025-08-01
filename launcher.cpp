@@ -282,8 +282,8 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
     size_t separatorPos = entry.find(L"::");
     if (separatorPos == std::wstring::npos) return {};
-    std::wstring dest = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-    std::wstring src = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+    std::wstring src = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+    std::wstring dest = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
