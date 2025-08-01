@@ -9,13 +9,14 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // For SHFileOperationW
+#include <shellapi.h> // Header for SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Ole32.lib") // <-- The final, definitive fix is here
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -247,7 +248,6 @@ std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry
     if (separatorPos == std::wstring::npos) {
         return {};
     }
-    // Expand variables on both sides of the separator
     std::wstring dest = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
     std::wstring src = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
     if (dest.empty() || src.empty()) {
