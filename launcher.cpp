@@ -84,30 +84,26 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-// --- NEW: Advanced Variable Expansion Engine ---
+// --- CORRECTED: Advanced Variable Expansion Engine ---
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
-    if (path.find(L'{') == std::wstring::npos) { // Quick exit if no variables
-        return path;
-    }
-
-    int safety_counter = 0; // Prevents infinite loops
+    // Stage 1: Expand custom {UserVar} variables recursively
+    int safety_counter = 0;
     while (path.find(L'{') != std::wstring::npos && safety_counter < 100) {
         size_t start_pos = path.find(L'{');
         size_t end_pos = path.find(L'}', start_pos);
-        if (end_pos == std::wstring::npos) break; // No closing brace
+        if (end_pos == std::wstring::npos) break;
 
         std::wstring varName = path.substr(start_pos + 1, end_pos - start_pos - 1);
         auto it = variables.find(varName);
         if (it != variables.end()) {
             path.replace(start_pos, end_pos - start_pos + 1, it->second);
         } else {
-            // If variable not found, just remove the placeholder to avoid loops
             path.replace(start_pos, end_pos - start_pos + 1, L"");
         }
         safety_counter++;
     }
 
-    // Final pass for system %...% variables
+    // Stage 2: Expand standard %System% environment variables
     DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
     if (requiredSize > 0) {
         std::vector<wchar_t> buffer(requiredSize);
@@ -498,9 +494,7 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
-    // Replicate variable setup for subsequent instances
     std::map<std::wstring, std::wstring> variables;
-    // Populate built-ins... (abbreviated for clarity, full logic is here)
     variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
     variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
     variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
@@ -508,7 +502,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
     variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
     variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
-    
     wchar_t launcherFullPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
     wchar_t drive[_MAX_DRIVE];
@@ -516,7 +509,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     variables[L"DRIVE"] = drive;
     PathRemoveFileSpecW(launcherFullPath);
     variables[L"YAPROOT"] = launcherFullPath;
-
     auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
     for (const auto& entry : userVars) {
         size_t separatorPos = entry.find(L"::");
@@ -526,10 +518,8 @@ void LaunchApplication(const std::wstring& iniContent) {
             variables[name] = value;
         }
     }
-
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
-
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
     variables[L"APPEXE"] = absoluteAppPath;
@@ -537,7 +527,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
     variables[L"EXEPATH"] = appDir;
-
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -549,7 +538,6 @@ void LaunchApplication(const std::wstring& iniContent) {
         finalWorkDir = appDir;
     }
     variables[L"WORKDIR"] = finalWorkDir;
-
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -591,7 +579,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
     variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
     variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
-    
     wchar_t drive[_MAX_DRIVE];
     _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
     variables[L"DRIVE"] = drive;
@@ -599,7 +586,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(launcherDir, launcherFullPath);
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
-
     auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
     for (const auto& entry : userVars) {
         size_t separatorPos = entry.find(L"::");
@@ -609,7 +595,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             variables[name] = value;
         }
     }
-
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
@@ -618,7 +603,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
     variables[L"EXEPATH"] = appDir;
-
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -662,11 +646,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<LinkRecord> hardlinkRecords, symlinkRecords;
 
         // Foreground Monitor Setup
-        std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
+        std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
             monitorData.shouldStop = &stopMonitor;
             monitorData.foregroundAppName = foregroundAppName;
-            monitorData.suspendProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"suspend");
+            auto suspendEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"suspend");
+            for(const auto& entry : suspendEntries) monitorData.suspendProcesses.push_back(ExpandVariables(entry, variables));
             std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
             monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
             if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
@@ -711,7 +696,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(pi.hThread);
 
         // --- Wait Process Logic ---
-        std::vector<std::wstring> waitProcesses = GetMultiValueFromIniContent(iniContent, L"Settings", L"waitprocess");
+        auto waitEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"waitprocess");
+        std::vector<std::wstring> waitProcesses;
+        for(const auto& entry : waitEntries) waitProcesses.push_back(ExpandVariables(entry, variables));
         if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
             const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
             if (appFilename && wcslen(appFilename) > 0) waitProcesses.push_back(appFilename);
