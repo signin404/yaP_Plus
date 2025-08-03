@@ -358,27 +358,23 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- Hardlink Management ---
-struct HardlinkRecord {
+// --- Link Management ---
+struct LinkRecord {
     std::wstring linkPath;
     std::wstring backupPath;
     bool wasDirectory;
 };
 
-void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<HardlinkRecord>& records) {
+void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<LinkRecord>& records) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
     HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-
     if (hFind == INVALID_HANDLE_VALUE) return;
-
     do {
         std::wstring fileName = findData.cFileName;
         if (fileName == L"." || fileName == L"..") continue;
-
         std::wstring srcPath = srcDir + L"\\" + fileName;
         std::wstring destPath = destDir + L"\\" + fileName;
-
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             CreateDirectoryW(destPath.c_str(), NULL);
             CreateHardLinksRecursive(srcPath, destPath, records);
@@ -393,22 +389,20 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
             if (CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL)) {
                 records.push_back({destPath, backupCreated ? backupLinkPath : L"", false});
             } else if (backupCreated) {
-                MoveFileW(backupLinkPath.c_str(), destPath.c_str()); // Restore on failure
+                MoveFileW(backupLinkPath.c_str(), destPath.c_str());
             }
         }
     } while (FindNextFileW(hFind, &findData));
-
     FindClose(hFind);
 }
 
-void ProcessHardlinks(const std::wstring& iniContent, std::vector<HardlinkRecord>& records) {
-    auto hardlinkEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"hardlink");
-    for (const auto& entry : hardlinkEntries) {
+void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
+    auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"hardlink");
+    for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-
-        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring destPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
         if (destPath.empty() || srcPath.empty()) continue;
 
         bool isDestDir = destPath.back() == L'\\';
@@ -444,21 +438,41 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<HardlinkRecord
     }
 }
 
-void CleanupHardlinks(const std::vector<HardlinkRecord>& records) {
+void ProcessSymbolicLinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
+    auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"symlink");
+    for (const auto& entry : entries) {
+        size_t separatorPos = entry.find(L"::");
+        if (separatorPos == std::wstring::npos) continue;
+        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring destPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        if (destPath.empty() || srcPath.empty()) continue;
+
+        bool isSrcDir = srcPath.back() == L'\\';
+        std::wstring backupDestPath = destPath + L"_Backup";
+        bool backupCreated = false;
+
+        if (PathFileExistsW(destPath.c_str())) {
+            if (MoveFileW(destPath.c_str(), backupDestPath.c_str())) {
+                backupCreated = true;
+            }
+        }
+
+        DWORD flags = isSrcDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+        if (CreateSymbolicLinkW(destPath.c_str(), srcPath.c_str(), flags)) {
+            records.push_back({destPath, backupCreated ? backupDestPath : L"", isSrcDir});
+        } else if (backupCreated) {
+            MoveFileW(backupDestPath.c_str(), destPath.c_str());
+        }
+    }
+}
+
+void CleanupLinks(const std::vector<LinkRecord>& records) {
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
         if (it->wasDirectory) {
-            wchar_t path[MAX_PATH * 2] = {0};
-            wcscpy_s(path, it->linkPath.c_str());
-            path[it->linkPath.length() + 1] = L'\0';
-            SHFILEOPSTRUCTW delSfos = {0};
-            delSfos.wFunc = FO_DELETE;
-            delSfos.pFrom = path;
-            delSfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-            SHFileOperationW(&delSfos);
+            RemoveDirectoryW(it->linkPath.c_str());
         } else {
             DeleteFileW(it->linkPath.c_str());
         }
-
         if (!it->backupPath.empty()) {
             MoveFileW(it->backupPath.c_str(), it->linkPath.c_str());
         }
@@ -552,7 +566,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         BackupThreadData backupData;
         std::atomic<bool> stopBackup(false);
         std::atomic<bool> isBackupWorking(false);
-        std::vector<HardlinkRecord> hardlinkRecords;
+        std::vector<LinkRecord> linkRecords;
 
         // Foreground Monitor Setup
         std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
@@ -584,8 +598,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
         }
 
-        // Hardlink Processing
-        ProcessHardlinks(iniContent, hardlinkRecords);
+        // Link Processing
+        ProcessHardlinks(iniContent, linkRecords);
+        ProcessSymbolicLinks(iniContent, linkRecords);
 
         // --- Main Application Launch ---
         wchar_t absoluteAppPath[MAX_PATH];
@@ -606,7 +621,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-            CleanupHardlinks(hardlinkRecords); // Cleanup on failure
+            CleanupLinks(linkRecords); // Cleanup on failure
             CloseHandle(hMutex);
             return 1;
         }
@@ -641,7 +656,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
-        CleanupHardlinks(hardlinkRecords); // Final cleanup
+        CleanupLinks(linkRecords); // Final cleanup
         CloseHandle(hMutex);
 
     } else {
