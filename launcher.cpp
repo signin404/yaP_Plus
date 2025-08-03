@@ -9,8 +9,9 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // For SHFileOperationW
+#include <shellapi.h> // Header for SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
+#include <filesystem> // For recursive directory iteration (C++17)
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -281,15 +282,11 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 // --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
     size_t separatorPos = entry.find(L"::");
-    if (separatorPos == std::wstring::npos) {
-        return {};
-    }
+    if (separatorPos == std::wstring::npos) return {};
     std::wstring src = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
     std::wstring dest = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
-    if (dest.empty() || src.empty()) {
-        return {};
-    }
-    return {dest, src}; // Return {destination, source}
+    if (dest.empty() || src.empty()) return {};
+    return {dest, src};
 }
 
 void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
@@ -362,71 +359,69 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- Hard Link Creation ---
-bool CreateHardLink(const std::wstring& dest, const std::wstring& src) {
-    if (!PathFileExistsW(src.c_str())) {
-        // Source does not exist, cannot create link.
-        return false;
-    }
+// --- NEW: Hardlink Functionality ---
 
+// Recursive function to create hard links for files and replicate directory structure
+void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir) {
     // Ensure destination directory exists
-    std::wstring destDir = dest;
-    PathRemoveFileSpecW(&destDir[0]); // Remove filename to get directory
-    if (!destDir.empty() && !PathFileExistsW(destDir.c_str())) {
-        if (!CreateDirectoryW(destDir.c_str(), NULL)) {
-            return false; // Failed to create destination directory
-        }
-    }
+    CreateDirectoryW(destDir.c_str(), NULL);
 
-    // If destination exists, delete it first (as per backup logic, overwrite)
-    if (PathFileExistsW(dest.c_str())) {
-        if (!DeleteFileW(dest.c_str())) {
-            return false; // Failed to delete existing destination file
-        }
-    }
-
-    // Create the hard link
-    if (!CreateHardLinkW(dest.c_str(), src.c_str(), NULL)) {
-        return false;
-    }
-    return true;
-}
-
-// Recursive function to create directory structure and hard links
-void CreateDirectoryStructureAndLinks(const std::wstring& srcBase, const std::wstring& destBase, const std::wstring& currentSrcDir, const std::wstring& currentDestDir) {
     WIN32_FIND_DATAW findData;
-    HANDLE hFind;
-
-    std::wstring searchPath = currentSrcDir + L"\\*";
-    hFind = FindFirstFileW(searchPath.c_str(), &findData);
+    std::wstring searchPath = srcDir + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
 
     if (hFind == INVALID_HANDLE_VALUE) {
-        return; // Error or empty directory
+        return;
     }
 
     do {
-        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+        std::wstring fileName = findData.cFileName;
+        if (fileName == L"." || fileName == L"..") {
             continue;
         }
 
-        std::wstring fullSrcPath = currentSrcDir + L"\\" + findData.cFileName;
-        std::wstring fullDestPath = currentDestDir + L"\\" + findData.cFileName;
+        std::wstring srcPath = srcDir + L"\\" + fileName;
+        std::wstring destPath = destDir + L"\\" + fileName;
 
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            // It's a directory
-            if (!CreateDirectoryW(fullDestPath.c_str(), NULL)) {
-                // Log error or handle if necessary, but continue for other items
-                continue;
-            }
-            // Recurse into the subdirectory
-            CreateDirectoryStructureAndLinks(srcBase, destBase, fullSrcPath, fullDestPath);
+            // It's a directory, recurse
+            CreateHardLinksRecursive(srcPath, destPath);
         } else {
             // It's a file, create a hard link
-            CreateHardLink(fullDestPath, fullSrcPath);
+            CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL);
         }
-    } while (FindNextFileW(hFind, &findData) != 0);
+    } while (FindNextFileW(hFind, &findData));
 
     FindClose(hFind);
+}
+
+// Main function to handle hardlink entries
+void ProcessHardlinks(const std::wstring& iniContent) {
+    auto hardlinkEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"hardlink");
+
+    for (const auto& entry : hardlinkEntries) {
+        size_t separatorPos = entry.find(L"::");
+        if (separatorPos == std::wstring::npos) continue;
+
+        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+
+        if (destPath.empty() || srcPath.empty()) continue;
+
+        // Check if source path is a directory (ends with a backslash)
+        bool isSourceDir = srcPath.back() == L'\\';
+        
+        if (isSourceDir) {
+            // Remove trailing backslash for consistent path handling
+            std::wstring srcDir = srcPath.substr(0, srcPath.length() - 1);
+            std::wstring destDir = destPath.substr(0, destPath.length() - 1);
+            
+            CreateHardLinksRecursive(srcDir, destDir);
+        } else {
+            // Create a single hard link for a file
+            CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL);
+        }
+    }
 }
 
 
@@ -434,13 +429,11 @@ void CreateDirectoryStructureAndLinks(const std::wstring& srcBase, const std::ws
 void LaunchApplication(const std::wstring& iniContent) {
     std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     if (appPathRaw.empty()) return;
-
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
-    
     std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -451,7 +444,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
-
     std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -549,6 +541,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
             }
         }
+
+        // --- Hardlink Processing ---
+        ProcessHardlinks(iniContent);
 
         // --- Main Application Launch ---
         wchar_t absoluteAppPath[MAX_PATH];
