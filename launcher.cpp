@@ -401,13 +401,11 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring destPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
         if (destPath.empty() || srcPath.empty()) continue;
-
         bool isDestDir = destPath.back() == L'\\';
         bool isSrcDir = srcPath.back() == L'\\';
-
         if (isDestDir && isSrcDir) {
             std::wstring destDir = destPath.substr(0, destPath.length() - 1);
             std::wstring srcDir = srcPath.substr(0, srcPath.length() - 1);
@@ -438,30 +436,28 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
     }
 }
 
-void ProcessSymbolicLinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
+void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"symlink");
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring destPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
         if (destPath.empty() || srcPath.empty()) continue;
-
-        bool isSrcDir = srcPath.back() == L'\\';
-        std::wstring backupDestPath = destPath + L"_Backup";
+        
+        std::wstring backupPath = destPath + L"_Backup";
         bool backupCreated = false;
-
         if (PathFileExistsW(destPath.c_str())) {
-            if (MoveFileW(destPath.c_str(), backupDestPath.c_str())) {
+            if (MoveFileW(destPath.c_str(), backupPath.c_str())) {
                 backupCreated = true;
             }
         }
 
-        DWORD flags = isSrcDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+        DWORD flags = PathIsDirectoryW(srcPath.c_str()) ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
         if (CreateSymbolicLinkW(destPath.c_str(), srcPath.c_str(), flags)) {
-            records.push_back({destPath, backupCreated ? backupDestPath : L"", isSrcDir});
+            records.push_back({destPath, backupCreated ? backupPath : L"", (flags & SYMBOLIC_LINK_FLAG_DIRECTORY) != 0});
         } else if (backupCreated) {
-            MoveFileW(backupDestPath.c_str(), destPath.c_str());
+            MoveFileW(backupPath.c_str(), destPath.c_str());
         }
     }
 }
@@ -566,7 +562,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         BackupThreadData backupData;
         std::atomic<bool> stopBackup(false);
         std::atomic<bool> isBackupWorking(false);
-        std::vector<LinkRecord> linkRecords;
+        std::vector<LinkRecord> hardlinkRecords;
+        std::vector<LinkRecord> symlinkRecords;
 
         // Foreground Monitor Setup
         std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
@@ -599,8 +596,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         // Link Processing
-        ProcessHardlinks(iniContent, linkRecords);
-        ProcessSymbolicLinks(iniContent, linkRecords);
+        ProcessHardlinks(iniContent, hardlinkRecords);
+        ProcessSymlinks(iniContent, symlinkRecords);
 
         // --- Main Application Launch ---
         wchar_t absoluteAppPath[MAX_PATH];
@@ -621,7 +618,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-            CleanupLinks(linkRecords); // Cleanup on failure
+            CleanupLinks(symlinkRecords);
+            CleanupLinks(hardlinkRecords);
             CloseHandle(hMutex);
             return 1;
         }
@@ -656,7 +654,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
-        CleanupLinks(linkRecords); // Final cleanup
+        CleanupLinks(symlinkRecords);
+        CleanupLinks(hardlinkRecords);
         CloseHandle(hMutex);
 
     } else {
