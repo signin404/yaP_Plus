@@ -401,14 +401,14 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
-        if (destPath.empty() || srcPath.empty()) continue;
-        bool isDestDir = destPath.back() == L'\\';
-        bool isSrcDir = srcPath.back() == L'\\';
+        std::wstring destPathRaw = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring srcPathRaw = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        if (destPathRaw.empty() || srcPathRaw.empty()) continue;
+        bool isDestDir = destPathRaw.back() == L'\\';
+        bool isSrcDir = srcPathRaw.back() == L'\\';
         if (isDestDir && isSrcDir) {
-            std::wstring destDir = destPath.substr(0, destPath.length() - 1);
-            std::wstring srcDir = srcPath.substr(0, srcPath.length() - 1);
+            std::wstring destDir = destPathRaw.substr(0, destPathRaw.length() - 1);
+            std::wstring srcDir = srcPathRaw.substr(0, srcPathRaw.length() - 1);
             std::wstring backupDestDir = destDir + L"_Backup";
             bool backupCreated = false;
             if (PathFileExistsW(destDir.c_str())) {
@@ -420,31 +420,38 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
             CreateHardLinksRecursive(srcDir, destDir, records);
             records.push_back({destDir, backupCreated ? backupDestDir : L"", true});
         } else if (!isDestDir && !isSrcDir) {
-            std::wstring backupDestPath = destPath + L"_Backup";
+            std::wstring backupDestPath = destPathRaw + L"_Backup";
             bool backupCreated = false;
-            if (PathFileExistsW(destPath.c_str())) {
-                if (MoveFileW(destPath.c_str(), backupDestPath.c_str())) {
+            if (PathFileExistsW(destPathRaw.c_str())) {
+                if (MoveFileW(destPathRaw.c_str(), backupDestPath.c_str())) {
                     backupCreated = true;
                 }
             }
-            if (CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL)) {
-                records.push_back({destPath, backupCreated ? backupDestPath : L"", false});
+            if (CreateHardLinkW(destPathRaw.c_str(), srcPathRaw.c_str(), NULL)) {
+                records.push_back({destPathRaw, backupCreated ? backupDestPath : L"", false});
             } else if (backupCreated) {
-                MoveFileW(backupDestPath.c_str(), destPath.c_str());
+                MoveFileW(backupDestPath.c_str(), destPathRaw.c_str());
             }
         }
     }
 }
 
+// *** CORRECTED: Symlink processing with robust path handling ***
 void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"symlink");
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
-        if (destPath.empty() || srcPath.empty()) continue;
-        bool isDir = destPath.back() == L'\\' || srcPath.back() == L'\\';
+        
+        std::wstring destPathRaw = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
+        std::wstring srcPathRaw = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        if (destPathRaw.empty() || srcPathRaw.empty()) continue;
+
+        bool isDir = (destPathRaw.back() == L'\\' || srcPathRaw.back() == L'\\');
+        
+        std::wstring destPath = destPathRaw;
+        if (destPath.back() == L'\\') destPath.pop_back();
+
         std::wstring backupPath = destPath + L"_Backup";
         bool backupCreated = false;
         if (PathFileExistsW(destPath.c_str())) {
@@ -452,8 +459,9 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
                 backupCreated = true;
             }
         }
+        
         DWORD flags = isDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-        if (CreateSymbolicLinkW(destPath.c_str(), srcPath.c_str(), flags)) {
+        if (CreateSymbolicLinkW(destPath.c_str(), srcPathRaw.c_str(), flags)) {
             records.push_back({destPath, backupCreated ? backupPath : L"", isDir});
         } else if (backupCreated) {
             MoveFileW(backupPath.c_str(), destPath.c_str());
@@ -461,13 +469,23 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
     }
 }
 
+// *** CORRECTED: Cleanup logic for directories ***
 void CleanupLinks(const std::vector<LinkRecord>& records) {
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
         if (it->wasDirectory) {
-            RemoveDirectoryW(it->linkPath.c_str());
+            // Use SHFileOperation for recursive directory deletion
+            wchar_t path[MAX_PATH * 2] = {0};
+            wcscpy_s(path, it->linkPath.c_str());
+            path[it->linkPath.length() + 1] = L'\0'; // Double-null terminate
+            SHFILEOPSTRUCTW delSfos = {0};
+            delSfos.wFunc = FO_DELETE;
+            delSfos.pFrom = path;
+            delSfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            SHFileOperationW(&delSfos);
         } else {
             DeleteFileW(it->linkPath.c_str());
         }
+
         if (!it->backupPath.empty()) {
             MoveFileW(it->backupPath.c_str(), it->linkPath.c_str());
         }
