@@ -7,6 +7,7 @@
 #include <atomic>
 #include <thread>
 #include <utility> // For std::pair
+#include <map>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h> // For SHFileOperationW
@@ -83,27 +84,38 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-std::wstring ExpandPathVariables(std::wstring path) {
-    static const std::vector<std::pair<std::wstring, KNOWNFOLDERID>> replacements = {
-        {L"{Local}", FOLDERID_LocalAppData}, {L"{LocalLow}", FOLDERID_LocalAppDataLow},
-        {L"{Roaming}", FOLDERID_RoamingAppData}, {L"{Documents}", FOLDERID_Documents},
-        {L"{ProgramData}", FOLDERID_ProgramData}, {L"{SavedGames}", FOLDERID_SavedGames},
-        {L"{PublicDocuments}", FOLDERID_PublicDocuments}
-    };
-    for (const auto& rep : replacements) {
-        size_t start_pos = path.find(rep.first);
-        if (start_pos != std::wstring::npos) {
-            std::wstring expanded = GetKnownFolderPath(rep.second);
-            if (!expanded.empty()) {
-                path.replace(start_pos, rep.first.length(), expanded);
-            }
+// --- NEW: Advanced Variable Expansion Engine ---
+std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
+    if (path.find(L'{') == std::wstring::npos) { // Quick exit if no variables
+        return path;
+    }
+
+    int safety_counter = 0; // Prevents infinite loops
+    while (path.find(L'{') != std::wstring::npos && safety_counter < 100) {
+        size_t start_pos = path.find(L'{');
+        size_t end_pos = path.find(L'}', start_pos);
+        if (end_pos == std::wstring::npos) break; // No closing brace
+
+        std::wstring varName = path.substr(start_pos + 1, end_pos - start_pos - 1);
+        auto it = variables.find(varName);
+        if (it != variables.end()) {
+            path.replace(start_pos, end_pos - start_pos + 1, it->second);
+        } else {
+            // If variable not found, just remove the placeholder to avoid loops
+            path.replace(start_pos, end_pos - start_pos + 1, L"");
+        }
+        safety_counter++;
+    }
+
+    // Final pass for system %...% variables
+    DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
+    if (requiredSize > 0) {
+        std::vector<wchar_t> buffer(requiredSize);
+        if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) > 0) {
+            return std::wstring(buffer.data());
         }
     }
-    DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
-    if (requiredSize == 0) return path;
-    std::vector<wchar_t> buffer(requiredSize);
-    if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) == 0) return path;
-    return std::wstring(buffer.data());
+    return path;
 }
 
 std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstring& section, const std::wstring& key) {
@@ -279,11 +291,11 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 }
 
 // --- Backup Functionality ---
-std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
+std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     size_t separatorPos = entry.find(L"::");
     if (separatorPos == std::wstring::npos) return {};
-    std::wstring src = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-    std::wstring dest = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+    std::wstring src = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
+    std::wstring dest = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
@@ -396,13 +408,13 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
     FindClose(hFind);
 }
 
-void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
+void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"hardlink");
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring destPathRaw = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring srcPathRaw = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        std::wstring destPathRaw = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
+        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
         if (destPathRaw.empty() || srcPathRaw.empty()) continue;
         bool isDestDir = destPathRaw.back() == L'\\';
         bool isSrcDir = srcPathRaw.back() == L'\\';
@@ -436,22 +448,17 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
     }
 }
 
-// *** CORRECTED: Symlink processing with robust path handling ***
-void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records) {
+void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"symlink");
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L"::");
         if (separatorPos == std::wstring::npos) continue;
-        
-        std::wstring destPathRaw = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
-        std::wstring srcPathRaw = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
+        std::wstring destPathRaw = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
+        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
         if (destPathRaw.empty() || srcPathRaw.empty()) continue;
-
         bool isDir = (destPathRaw.back() == L'\\' || srcPathRaw.back() == L'\\');
-        
         std::wstring destPath = destPathRaw;
-        if (destPath.back() == L'\\') destPath.pop_back();
-
+        if (isDir && destPath.back() == L'\\') destPath.pop_back();
         std::wstring backupPath = destPath + L"_Backup";
         bool backupCreated = false;
         if (PathFileExistsW(destPath.c_str())) {
@@ -459,7 +466,6 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
                 backupCreated = true;
             }
         }
-        
         DWORD flags = isDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
         if (CreateSymbolicLinkW(destPath.c_str(), srcPathRaw.c_str(), flags)) {
             records.push_back({destPath, backupCreated ? backupPath : L"", isDir});
@@ -469,14 +475,12 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
     }
 }
 
-// *** CORRECTED: Cleanup logic for directories ***
 void CleanupLinks(const std::vector<LinkRecord>& records) {
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
         if (it->wasDirectory) {
-            // Use SHFileOperation for recursive directory deletion
             wchar_t path[MAX_PATH * 2] = {0};
             wcscpy_s(path, it->linkPath.c_str());
-            path[it->linkPath.length() + 1] = L'\0'; // Double-null terminate
+            path[it->linkPath.length() + 1] = L'\0';
             SHFILEOPSTRUCTW delSfos = {0};
             delSfos.wFunc = FO_DELETE;
             delSfos.pFrom = path;
@@ -485,7 +489,6 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
         } else {
             DeleteFileW(it->linkPath.c_str());
         }
-
         if (!it->backupPath.empty()) {
             MoveFileW(it->backupPath.c_str(), it->linkPath.c_str());
         }
@@ -495,14 +498,47 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
-    std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
+    // Replicate variable setup for subsequent instances
+    std::map<std::wstring, std::wstring> variables;
+    // Populate built-ins... (abbreviated for clarity, full logic is here)
+    variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
+    variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
+    variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
+    variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
+    variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
+    variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
+    variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
+    
+    wchar_t launcherFullPath[MAX_PATH];
+    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
+    wchar_t drive[_MAX_DRIVE];
+    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
+    variables[L"DRIVE"] = drive;
+    PathRemoveFileSpecW(launcherFullPath);
+    variables[L"YAPROOT"] = launcherFullPath;
+
+    auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
+    for (const auto& entry : userVars) {
+        size_t separatorPos = entry.find(L"::");
+        if (separatorPos != std::wstring::npos) {
+            std::wstring name = trim(entry.substr(0, separatorPos));
+            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+            variables[name] = value;
+        }
+    }
+
+    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
+
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
+    variables[L"APPEXE"] = absoluteAppPath;
     wchar_t appDir[MAX_PATH];
     wcscpy_s(appDir, absoluteAppPath);
     PathRemoveFileSpecW(appDir);
-    std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
+    variables[L"EXEPATH"] = appDir;
+
+    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
         wchar_t absoluteWorkDir[MAX_PATH];
@@ -512,7 +548,9 @@ void LaunchApplication(const std::wstring& iniContent) {
     } else {
         finalWorkDir = appDir;
     }
-    std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
+    variables[L"WORKDIR"] = finalWorkDir;
+
+    std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
@@ -544,11 +582,59 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::wstring iniContent;
     ReadFileToWString(iniPath, iniContent);
 
+    // --- Variable Map Construction ---
+    std::map<std::wstring, std::wstring> variables;
+    variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
+    variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
+    variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
+    variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
+    variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
+    variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
+    variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
+    
+    wchar_t drive[_MAX_DRIVE];
+    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
+    variables[L"DRIVE"] = drive;
+    wchar_t launcherDir[MAX_PATH];
+    wcscpy_s(launcherDir, launcherFullPath);
+    PathRemoveFileSpecW(launcherDir);
+    variables[L"YAPROOT"] = launcherDir;
+
+    auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
+    for (const auto& entry : userVars) {
+        size_t separatorPos = entry.find(L"::");
+        if (separatorPos != std::wstring::npos) {
+            std::wstring name = trim(entry.substr(0, separatorPos));
+            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+            variables[name] = value;
+        }
+    }
+
+    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
+    wchar_t absoluteAppPath[MAX_PATH];
+    GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
+    variables[L"APPEXE"] = absoluteAppPath;
+    wchar_t appDir[MAX_PATH];
+    wcscpy_s(appDir, absoluteAppPath);
+    PathRemoveFileSpecW(appDir);
+    variables[L"EXEPATH"] = appDir;
+
+    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
+    std::wstring finalWorkDir;
+    if (!workDirRaw.empty()) {
+        wchar_t absoluteWorkDir[MAX_PATH];
+        GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
+        if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
+        else finalWorkDir = appDir;
+    } else {
+        finalWorkDir = appDir;
+    }
+    variables[L"WORKDIR"] = finalWorkDir;
+
+    // --- Mutex Creation ---
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
-    
-    std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
     wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
@@ -571,16 +657,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        // --- Setup Threads & State ---
-        HANDLE hMonitorThread = NULL;
-        MonitorThreadData monitorData;
-        std::atomic<bool> stopMonitor(false);
-        HANDLE hBackupThread = NULL;
-        BackupThreadData backupData;
-        std::atomic<bool> stopBackup(false);
-        std::atomic<bool> isBackupWorking(false);
-        std::vector<LinkRecord> hardlinkRecords;
-        std::vector<LinkRecord> symlinkRecords;
+        HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
+        HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
+        std::vector<LinkRecord> hardlinkRecords, symlinkRecords;
 
         // Foreground Monitor Setup
         std::wstring foregroundAppName = GetValueFromIniContent(iniContent, L"Settings", L"foreground");
@@ -591,9 +670,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
             monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
             if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
-            if (!monitorData.suspendProcesses.empty()) {
-                hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
-            }
+            if (!monitorData.suspendProcesses.empty()) hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
         }
 
         // Backup Thread Setup
@@ -604,33 +681,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
             auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavedir");
-            for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
+            for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry, variables));
             auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavefile");
-            for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry));
-            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
-                hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
-            }
+            for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry, variables));
+            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
         // Link Processing
-        ProcessHardlinks(iniContent, hardlinkRecords);
-        ProcessSymlinks(iniContent, symlinkRecords);
+        ProcessHardlinks(iniContent, hardlinkRecords, variables);
+        ProcessSymlinks(iniContent, symlinkRecords, variables);
 
         // --- Main Application Launch ---
-        wchar_t absoluteAppPath[MAX_PATH];
-        GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
-        std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
+        std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
-        wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
-        std::wstring finalWorkDir;
-        if (!workDirRaw.empty()) {
-            wchar_t absoluteWorkDir[MAX_PATH]; GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
-            if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir; else finalWorkDir = appDir;
-        } else { finalWorkDir = appDir; }
-
+        
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
