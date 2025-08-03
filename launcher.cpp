@@ -444,7 +444,7 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
         std::wstring destPath = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
         std::wstring srcPath = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
         if (destPath.empty() || srcPath.empty()) continue;
-        
+        bool isDir = destPath.back() == L'\\' || srcPath.back() == L'\\';
         std::wstring backupPath = destPath + L"_Backup";
         bool backupCreated = false;
         if (PathFileExistsW(destPath.c_str())) {
@@ -452,10 +452,9 @@ void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& re
                 backupCreated = true;
             }
         }
-
-        DWORD flags = PathIsDirectoryW(srcPath.c_str()) ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+        DWORD flags = isDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
         if (CreateSymbolicLinkW(destPath.c_str(), srcPath.c_str(), flags)) {
-            records.push_back({destPath, backupCreated ? backupPath : L"", (flags & SYMBOLIC_LINK_FLAG_DIRECTORY) != 0});
+            records.push_back({destPath, backupCreated ? backupPath : L"", isDir});
         } else if (backupCreated) {
             MoveFileW(backupPath.c_str(), destPath.c_str());
         }
