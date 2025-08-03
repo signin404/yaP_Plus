@@ -9,7 +9,7 @@
 #include <utility> // For std::pair
 #include <shlwapi.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // Header for SHFileOperationW
+#include <shellapi.h> // For SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -281,11 +281,15 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 // --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry) {
     size_t separatorPos = entry.find(L"::");
-    if (separatorPos == std::wstring::npos) return {};
+    if (separatorPos == std::wstring::npos) {
+        return {};
+    }
     std::wstring src = ExpandPathVariables(trim(entry.substr(0, separatorPos)));
     std::wstring dest = ExpandPathVariables(trim(entry.substr(separatorPos + 2)));
-    if (dest.empty() || src.empty()) return {};
-    return {dest, src};
+    if (dest.empty() || src.empty()) {
+        return {};
+    }
+    return {dest, src}; // Return {destination, source}
 }
 
 void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
@@ -358,6 +362,74 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
+// --- Hard Link Creation ---
+bool CreateHardLink(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) {
+        // Source does not exist, cannot create link.
+        return false;
+    }
+
+    // Ensure destination directory exists
+    std::wstring destDir = dest;
+    PathRemoveFileSpecW(&destDir[0]); // Remove filename to get directory
+    if (!destDir.empty() && !PathFileExistsW(destDir.c_str())) {
+        if (!CreateDirectoryW(destDir.c_str(), NULL)) {
+            return false; // Failed to create destination directory
+        }
+    }
+
+    // If destination exists, delete it first (as per backup logic, overwrite)
+    if (PathFileExistsW(dest.c_str())) {
+        if (!DeleteFileW(dest.c_str())) {
+            return false; // Failed to delete existing destination file
+        }
+    }
+
+    // Create the hard link
+    if (!CreateHardLinkW(dest.c_str(), src.c_str(), NULL)) {
+        return false;
+    }
+    return true;
+}
+
+// Recursive function to create directory structure and hard links
+void CreateDirectoryStructureAndLinks(const std::wstring& srcBase, const std::wstring& destBase, const std::wstring& currentSrcDir, const std::wstring& currentDestDir) {
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind;
+
+    std::wstring searchPath = currentSrcDir + L"\\*";
+    hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return; // Error or empty directory
+    }
+
+    do {
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        std::wstring fullSrcPath = currentSrcDir + L"\\" + findData.cFileName;
+        std::wstring fullDestPath = currentDestDir + L"\\" + findData.cFileName;
+
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // It's a directory
+            if (!CreateDirectoryW(fullDestPath.c_str(), NULL)) {
+                // Log error or handle if necessary, but continue for other items
+                continue;
+            }
+            // Recurse into the subdirectory
+            CreateDirectoryStructureAndLinks(srcBase, destBase, fullSrcPath, fullDestPath);
+        } else {
+            // It's a file, create a hard link
+            CreateHardLink(fullDestPath, fullSrcPath);
+        }
+    } while (FindNextFileW(hFind, &findData) != 0);
+
+    FindClose(hFind);
+}
+
+
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
     std::wstring appPathRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"));
@@ -380,7 +452,6 @@ void LaunchApplication(const std::wstring& iniContent) {
         finalWorkDir = appDir;
     }
 
-    // *** CORRECTED: Expand variables in command line ***
     std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -464,15 +535,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         // Backup Thread Setup
-        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
+        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"autosavetime");
         int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
         if (backupTime > 0) {
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupdir");
+            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavedir");
             for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry));
-            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupfile");
+            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavefile");
             for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry));
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
                 hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
@@ -483,12 +554,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wchar_t absoluteAppPath[MAX_PATH];
         GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
-        
-        // *** CORRECTED: Expand variables in command line ***
         std::wstring commandLine = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"));
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        
         std::wstring workDirRaw = ExpandPathVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"));
         wchar_t appDir[MAX_PATH]; wcscpy_s(appDir, absoluteAppPath); PathRemoveFileSpecW(appDir);
         std::wstring finalWorkDir;
