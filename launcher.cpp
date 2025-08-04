@@ -571,19 +571,65 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
 }
 
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
-    if (ruleNames.empty()) return;
+    if (ruleNames.empty()) {
+        return;
+    }
 
     INetFwPolicy2* pFwPolicy = NULL;
-    INetFwRules* pFwRules = NULL;
-
+    // 初始化COM环境应在主函数中完成，这里直接使用
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        // 在实际应用中，这里应该记录错误日志
+        return;
+    }
 
+    INetFwRules* pFwRules = NULL;
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
+
+    // 遍历所有需要被删除的规则名称
+    for (const auto& ruleName : ruleNames) {
+        if (ruleName.empty()) {
+            continue; // 名称不能为空，否则Remove会返回E_INVALIDARG
+        }
+
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        if (!bstrRuleName) {
+            // 内存不足，跳过
+            continue;
+        }
+
+        // 循环删除同名规则。
+        // INetFwRules::Remove 每次调用只删除一个规则实例。
+        // 成功删除返回 S_OK。
+        // 找不到规则返回 S_FALSE。
+        // 任何其他值都是错误。
+        // 循环必须且只能在返回值为 S_OK 时继续。
+        while (true) {
+            HRESULT hrRemove = pFwRules->Remove(bstrRuleName);
+
+            // 只有在严格等于 S_OK 时，才认为有规则被删除了，需要继续循环。
+            // 如果返回值是 S_FALSE (找不到) 或任何错误代码，都必须终止循环。
+            if (hrRemove != S_OK) {
+                break;
+            }
+            // 如果代码执行到这里，说明 hrRemove == S_OK，一个规则被成功删除。
+            // 循环将继续，以检查是否还有其他同名规则。
+        }
+
+        SysFreeString(bstrRuleName);
+    }
+
+    if (pFwRules) {
+        pFwRules->Release();
+    }
+    if (pFwPolicy) {
+        pFwPolicy->Release();
+    }
+}
 
     for (const auto& ruleName : ruleNames) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
