@@ -29,7 +29,7 @@ typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
-// --- Data Structures for File/Dir Operations ---
+// --- Data Structures ---
 struct SaveRestoreEntry {
     std::wstring sourcePath;
     std::wstring destPath;
@@ -38,12 +38,12 @@ struct SaveRestoreEntry {
     bool destBackupCreated = false;
 };
 
-// NEW: Structure for restore-only functionality
+// NEW: Structure for Restore-Only functionality
 struct RestoreOnlyEntry {
-    std::wstring originalPath;
+    std::wstring targetPath;
     std::wstring backupPath;
     bool isDirectory;
-    bool backupWasCreated = false;
+    bool backupCreated = false;
 };
 
 
@@ -610,7 +610,7 @@ void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
     if (pFwPolicy) pFwPolicy->Release();
 }
 
-// --- Save/Restore & Restore-Only Logic ---
+// --- Save/Restore Logic ---
 void ProcessSaveRestoreEntries(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<SaveRestoreEntry>& entries) {
     auto process = [&](const std::wstring& key, bool isDir) {
         auto values = GetMultiValueFromIniContent(iniContent, L"Settings", key);
@@ -630,10 +630,10 @@ void ProcessSaveRestoreEntries(const std::wstring& iniContent, const std::map<st
             if (isDir) {
                 entry.sourcePath = expandedSource;
             } else {
-                if (sourceRaw.back() == L'\\') {
+                if (sourceRaw.back() == L'\\') { // Source is a directory
                     const wchar_t* filename = PathFindFileNameW(entry.destPath.c_str());
                     entry.sourcePath = expandedSource + filename;
-                } else {
+                } else { // Source is a full file path
                     entry.sourcePath = expandedSource;
                 }
             }
@@ -649,7 +649,7 @@ void ProcessSaveRestoreEntries(const std::wstring& iniContent, const std::map<st
     process(L"file", false);
 }
 
-void PerformStartupSaveRestore(std::vector<SaveRestoreEntry>& entries) {
+void PerformStartupOperations(std::vector<SaveRestoreEntry>& entries) {
     for (auto& entry : entries) {
         if (PathFileExistsW(entry.destPath.c_str())) {
             MoveFileW(entry.destPath.c_str(), entry.destBackupPath.c_str());
@@ -666,7 +666,7 @@ void PerformStartupSaveRestore(std::vector<SaveRestoreEntry>& entries) {
     }
 }
 
-void PerformShutdownSaveRestore(std::vector<SaveRestoreEntry>& entries) {
+void PerformShutdownOperations(std::vector<SaveRestoreEntry>& entries) {
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         auto& entry = *it;
 
@@ -679,11 +679,6 @@ void PerformShutdownSaveRestore(std::vector<SaveRestoreEntry>& entries) {
             if (entry.isDirectory) {
                 PerformFileSystemOperation(FO_COPY, entry.destPath, entry.sourcePath);
             } else {
-                // Ensure parent directory of source exists for file copy
-                wchar_t sourceDir[MAX_PATH];
-                wcscpy_s(sourceDir, entry.sourcePath.c_str());
-                PathRemoveFileSpecW(sourceDir);
-                SHCreateDirectoryExW(NULL, sourceDir, NULL);
                 CopyFileW(entry.destPath.c_str(), entry.sourcePath.c_str(), FALSE);
             }
 
@@ -708,17 +703,17 @@ void PerformShutdownSaveRestore(std::vector<SaveRestoreEntry>& entries) {
     }
 }
 
-// NEW: Functions for Restore-Only
+// --- NEW Restore-Only Logic ---
 void ProcessRestoreOnlyEntries(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<RestoreOnlyEntry>& entries) {
     auto process = [&](const std::wstring& key, bool isDir) {
         auto values = GetMultiValueFromIniContent(iniContent, L"Settings", key);
         for (const auto& value : values) {
             RestoreOnlyEntry entry;
             entry.isDirectory = isDir;
-            entry.originalPath = ResolveToAbsolutePath(ExpandVariables(value, variables));
-            if (entry.originalPath.empty()) continue;
+            entry.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables));
+            if (entry.targetPath.empty()) continue;
 
-            entry.backupPath = entry.originalPath + L"_Backup";
+            entry.backupPath = entry.targetPath + L"_Backup";
             entries.push_back(entry);
         }
     };
@@ -727,29 +722,32 @@ void ProcessRestoreOnlyEntries(const std::wstring& iniContent, const std::map<st
     process(L"(file)", false);
 }
 
-void PerformStartupRestoreOnly(std::vector<RestoreOnlyEntry>& entries) {
+void PerformStartupRestoreOnlyOperations(std::vector<RestoreOnlyEntry>& entries) {
     for (auto& entry : entries) {
-        if (PathFileExistsW(entry.originalPath.c_str())) {
-            if (MoveFileW(entry.originalPath.c_str(), entry.backupPath.c_str())) {
-                entry.backupWasCreated = true;
+        if (PathFileExistsW(entry.targetPath.c_str())) {
+            if (MoveFileW(entry.targetPath.c_str(), entry.backupPath.c_str())) {
+                entry.backupCreated = true;
             }
         }
     }
 }
 
-void PerformShutdownRestoreOnly(std::vector<RestoreOnlyEntry>& entries) {
+void PerformShutdownRestoreOnlyOperations(std::vector<RestoreOnlyEntry>& entries) {
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         auto& entry = *it;
-        if (entry.backupWasCreated && PathFileExistsW(entry.backupPath.c_str())) {
-            // If the app created a new item at the original path, remove it first
-            if (PathFileExistsW(entry.originalPath.c_str())) {
-                if (entry.isDirectory) {
-                    PerformFileSystemOperation(FO_DELETE, entry.originalPath);
-                } else {
-                    DeleteFileW(entry.originalPath.c_str());
-                }
+
+        // Delete the new item created by the application
+        if (PathFileExistsW(entry.targetPath.c_str())) {
+            if (entry.isDirectory) {
+                PerformFileSystemOperation(FO_DELETE, entry.targetPath);
+            } else {
+                DeleteFileW(entry.targetPath.c_str());
             }
-            MoveFileW(entry.backupPath.c_str(), entry.originalPath.c_str());
+        }
+
+        // Restore the original
+        if (entry.backupCreated && PathFileExistsW(entry.backupPath.c_str())) {
+            MoveFileW(entry.backupPath.c_str(), entry.targetPath.c_str());
         }
     }
 }
@@ -915,10 +913,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<RestoreOnlyEntry> restoreOnlyEntries; // NEW
 
         // Process startup operations
+        ProcessRestoreOnlyEntries(iniContent, variables, restoreOnlyEntries);
+        PerformStartupRestoreOnlyOperations(restoreOnlyEntries);
         ProcessSaveRestoreEntries(iniContent, variables, saveRestoreEntries);
-        ProcessRestoreOnlyEntries(iniContent, variables, restoreOnlyEntries); // NEW
-        PerformStartupRestoreOnly(restoreOnlyEntries); // NEW
-        PerformStartupSaveRestore(saveRestoreEntries);
+        PerformStartupOperations(saveRestoreEntries);
+        ProcessHardlinks(iniContent, hardlinkRecords, variables);
+        ProcessSymlinks(iniContent, symlinkRecords, variables);
+        ProcessFirewallRules(iniContent, firewallRuleNames, variables);
 
         // Foreground Monitor Setup
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
@@ -947,11 +948,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
-        // Link & Firewall Processing
-        ProcessHardlinks(iniContent, hardlinkRecords, variables);
-        ProcessSymlinks(iniContent, symlinkRecords, variables);
-        ProcessFirewallRules(iniContent, firewallRuleNames, variables);
-
         // --- Main Application Launch ---
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
@@ -960,14 +956,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-            // Full cleanup on launch failure
+            // Cleanup on launch failure
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-            PerformShutdownSaveRestore(saveRestoreEntries);
-            PerformShutdownRestoreOnly(restoreOnlyEntries); // NEW
             CleanupFirewallRules(firewallRuleNames);
             CleanupLinks(symlinkRecords);
             CleanupLinks(hardlinkRecords);
+            PerformShutdownOperations(saveRestoreEntries);
+            PerformShutdownRestoreOnlyOperations(restoreOnlyEntries); // NEW
             CloseHandle(hMutex);
             CoUninitialize();
             return 1;
@@ -1006,11 +1002,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hBackupThread);
         }
         
-        PerformShutdownSaveRestore(saveRestoreEntries);
-        PerformShutdownRestoreOnly(restoreOnlyEntries); // NEW
+        // Perform shutdown operations in reverse order of setup
         CleanupFirewallRules(firewallRuleNames);
         CleanupLinks(symlinkRecords);
         CleanupLinks(hardlinkRecords);
+        PerformShutdownOperations(saveRestoreEntries);
+        PerformShutdownRestoreOnlyOperations(restoreOnlyEntries); // NEW
+        
         CloseHandle(hMutex);
         CoUninitialize();
 
