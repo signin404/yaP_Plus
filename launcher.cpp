@@ -1037,21 +1037,14 @@ DWORD WINAPI WorkerThread(LPVOID lpParam) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
-            WorkerThreadData* data = new WorkerThreadData();
-            if (!data) { PostQuitMessage(1); return -1; }
-
             CREATESTRUCT* pCreate = reinterpret_cast<CREATESTRUCT*>(lParam);
             WorkerThreadData* pInitialData = reinterpret_cast<WorkerThreadData*>(pCreate->lpCreateParams);
             
-            data->hMessageWnd = hwnd;
-            data->iniContent = pInitialData->iniContent;
-            data->variables = pInitialData->variables;
-            
-            HANDLE hThread = CreateThread(NULL, 0, WorkerThread, data, 0, NULL);
+            HANDLE hThread = CreateThread(NULL, 0, WorkerThread, pInitialData, 0, NULL);
             if (hThread) {
                 CloseHandle(hThread);
             } else {
-                delete data;
+                delete pInitialData; // Clean up if thread creation fails
                 PostQuitMessage(1);
             }
             return 0;
@@ -1155,13 +1148,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wc.lpszClassName = CLASS_NAME;
         RegisterClassW(&wc);
 
-        WorkerThreadData initialData;
-        initialData.iniContent = iniContent;
-        initialData.variables = variables;
+        WorkerThreadData* pInitialData = new WorkerThreadData();
+        if (!pInitialData) { CloseHandle(hMutex); return 1; }
+        pInitialData->iniContent = iniContent;
+        pInitialData->variables = variables;
 
-        HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"YAP Launcher", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, &initialData);
+        HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"YAP Launcher", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, pInitialData);
 
         if (hwnd == NULL) {
+            delete pInitialData;
             CloseHandle(hMutex);
             return 0;
         }
