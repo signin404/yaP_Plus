@@ -528,10 +528,12 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
 
         if (parts.size() != 4) continue;
 
+        // MODIFICATION: Swapped order of part assignment to match new format.
+        // New format: Rule Name :: Direction :: Action :: Path
         std::wstring ruleName = parts[0];
-        std::wstring appPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
-        std::wstring direction = parts[2];
-        std::wstring action = parts[3];
+        std::wstring direction = parts[1];
+        std::wstring action = parts[2];
+        std::wstring appPath = ResolveToAbsolutePath(ExpandVariables(parts[3], variables));
 
         if (appPath.length() > 1 && appPath.front() == L'"' && appPath.back() == L'"') {
             appPath = appPath.substr(1, appPath.length() - 2);
