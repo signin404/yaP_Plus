@@ -81,13 +81,13 @@ struct RegistryOp {
 };
 
 struct LinkOp {
-    std::wstring linkPath; 
-    std::wstring targetPath; 
-    std::wstring backupPath; 
+    std::wstring linkPath;
+    std::wstring targetPath;
+    std::wstring backupPath;
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks; 
+    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
 };
 
 struct FirewallOp {
@@ -306,86 +306,64 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     std::wstring exeDir;
     if (!workDir.empty() && PathIsDirectoryW(workDir.c_str())) {
         finalWorkDir = workDir.c_str();
-    } else {
+    }
+    else {
         exeDir = path;
         PathRemoveFileSpecW(&exeDir[0]);
         finalWorkDir = exeDir.c_str();
     }
 
+    STARTUPINFOEXW siEx;
+    ZeroMemory(&siEx, sizeof(siEx));
+    siEx.StartupInfo.cb = sizeof(siEx);
+
     if (hide) {
-        HDESK hOriginalDesktop = GetThreadDesktop(GetCurrentThreadId());
-        HDESK hNewDesktop = NULL;
-        HANDLE hToken = NULL;
-        HANDLE hNewToken = NULL;
-        LPVOID lpEnvironment = NULL;
-        bool success = false;
-
-        wchar_t newDesktopName[64];
-        swprintf_s(newDesktopName, L"YAP_HiddenDesktop_%lu", GetCurrentProcessId());
-
-        hNewDesktop = CreateDesktopW(
-            newDesktopName, NULL, NULL, 0,
-            DESKTOP_CREATEWINDOW | DESKTOP_SWITCHDESKTOP | GENERIC_ALL, NULL);
-        if (!hNewDesktop) goto cleanup;
-
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) goto cleanup;
-        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) goto cleanup;
-        
-        if (!CreateEnvironmentBlock(&lpEnvironment, hNewToken, FALSE)) {
-            lpEnvironment = NULL;
-        }
-
-        STARTUPINFOEXW siEx;
-        ZeroMemory(&siEx, sizeof(siEx));
-        siEx.StartupInfo.cb = sizeof(siEx);
-        siEx.StartupInfo.lpDesktop = newDesktopName;
-
         SIZE_T attributeListSize = 0;
         InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
         siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
         if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
             delete[] (char*)siEx.lpAttributeList;
-            siEx.lpAttributeList = NULL;
-            goto cleanup;
+            return false;
         }
 
         DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
-        UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_WINDOW_POLICY, &policy, sizeof(policy), NULL, NULL);
-
-        if (!SetThreadDesktop(hNewDesktop)) goto cleanup;
-
-        if (CreateProcessAsUserW(
-            hNewToken, NULL, cmdBuffer.data(), NULL, NULL, FALSE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            lpEnvironment,
-            finalWorkDir, &siEx.StartupInfo, &pi)) {
-            success = true;
+        if (!UpdateProcThreadAttribute(
+            siEx.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_WINDOW_POLICY,
+            &policy,
+            sizeof(policy),
+            NULL,
+            NULL)) {
+            DeleteProcThreadAttributeList(siEx.lpAttributeList);
+            delete[] (char*)siEx.lpAttributeList;
+            return false;
         }
+    }
 
-    cleanup:
-        if (hOriginalDesktop) {
-            SetThreadDesktop(hOriginalDesktop);
-        }
-        if (lpEnvironment) {
-            DestroyEnvironmentBlock(lpEnvironment);
-        }
+    DWORD creationFlags = hide ? EXTENDED_STARTUPINFO_PRESENT : 0;
+
+    if (!CreateProcessW(
+        NULL,
+        cmdBuffer.data(),
+        NULL,
+        NULL,
+        FALSE,
+        creationFlags,
+        NULL,
+        finalWorkDir,
+        &siEx.StartupInfo,
+        &pi)) {
         if (siEx.lpAttributeList) {
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
             delete[] (char*)siEx.lpAttributeList;
         }
-        if (hNewDesktop) CloseDesktop(hNewDesktop);
-        if (hNewToken) CloseHandle(hNewToken);
-        if (hToken) CloseHandle(hToken);
+        return false;
+    }
 
-        if (!success) return false;
-
-    } else {
-        STARTUPINFOW si;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, 0, NULL, finalWorkDir, &si, &pi)) {
-            return false;
-        }
+    if (siEx.lpAttributeList) {
+        DeleteProcThreadAttributeList(siEx.lpAttributeList);
+        delete[] (char*)siEx.lpAttributeList;
     }
 
     if (wait) {
@@ -456,7 +434,7 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
 bool RenameRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
     std::wstring fullSourcePath = rootKeyStr + L"\\" + subKey;
     std::wstring fullDestPath = rootKeyStr + L"\\" + newSubKey;
-    
+
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return false;
@@ -528,7 +506,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
 
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
-    
+
     std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
     write_wstring(displayName + L"=");
 
@@ -559,7 +537,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         else if (type == REG_MULTI_SZ) wss << L"(7)";
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
-        
+
         for (DWORD i = 0; i < size; ++i) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
             if (i < size - 1) {
@@ -814,7 +792,7 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
 
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
-    
+
     BSTR bstrRuleName = SysAllocString(ruleName.c_str());
     if (bstrRuleName) {
         pFwRules->Remove(bstrRuleName);
@@ -992,7 +970,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
             ro_op.backupPath = ro_op.targetPath + L"_Backup";
             op.data = ro_op;
             op_created = true;
-        } else if (_wcsicmp(key.c_str(), L"regkey") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 || 
+        } else if (_wcsicmp(key.c_str(), L"regkey") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 ||
                    _wcsicmp(key.c_str(), L"(regkey)") == 0 || _wcsicmp(key.c_str(), L"(regvalue)") == 0) {
             RegistryOp r_op;
             r_op.isKey = (key.find(L"key") != std::wstring::npos);
@@ -1019,7 +997,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
                 std::wstring srcPathRaw = trim(value.substr(sep + 4));
                 l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(destPathRaw, variables));
                 l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(srcPathRaw, variables));
-                
+
                 l_op.isDirectory = (destPathRaw.back() == L'\\' || srcPathRaw.back() == L'\\');
                 if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
 
@@ -1164,10 +1142,10 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     std::map<std::wstring, std::wstring> variables = base_variables;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
-    
+
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-    
+
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
@@ -1175,7 +1153,7 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
         GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
         if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
     }
-    
+
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false);
 }
@@ -1216,7 +1194,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(launcherDir, launcherFullPath);
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
-    
+
     std::wstringstream userVarStream(iniContent);
     std::wstring userVarLine;
     std::wstring userVarCurrentSection;
@@ -1292,7 +1270,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CoUninitialize();
             return 1;
         }
-        
+
         // Execute Pre-Launch Operations
         std::vector<PreLaunchOperation> preLaunchOps;
         ProcessPreLaunchOperations(iniContent, variables, preLaunchOps);
@@ -1301,10 +1279,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
         HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
-        
+
         std::vector<Operation> operations;
         ProcessAllOperations(iniContent, variables, operations);
-        
+
         for (auto& op : operations) {
             PerformStartupOperation(op);
         }
@@ -1314,7 +1292,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!foregroundAppName.empty()) {
             monitorData.shouldStop = &stopMonitor;
             monitorData.foregroundAppName = foregroundAppName;
-            
+
             std::wstringstream stream(iniContent);
             std::wstring line;
             std::wstring currentSection;
@@ -1350,7 +1328,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-            
+
             std::wstringstream stream(iniContent);
             std::wstring line;
             std::wstring currentSection;
@@ -1377,25 +1355,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
-        
+
         // --- Main Application Launch and Wait ---
         PROCESS_INFORMATION pi;
         ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
-        
+
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
-        
+
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096]; 
+        wchar_t commandLineBuffer[4096];
         wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        
+
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-            
+
             for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
                 PerformShutdownOperation(*it);
             }
@@ -1421,7 +1399,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 break; // Wait failed
             }
         }
-        
+
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
@@ -1473,11 +1451,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
-        
+
         for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
             PerformShutdownOperation(*it);
         }
-        
+
         CloseHandle(hMutex);
         CoUninitialize();
 
