@@ -90,7 +90,7 @@ std::wstring ResolveToAbsolutePath(const std::wstring& path) {
     if (path.empty()) return L"";
     wchar_t absolutePath[MAX_PATH];
     if (GetFullPathNameW(path.c_str(), MAX_PATH, absolutePath, NULL) == 0) {
-        return path;
+        return path; // Return original on failure
     }
     return absolutePath;
 }
@@ -570,72 +570,35 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
     if (pFwPolicy) pFwPolicy->Release();
 }
 
+// *** CORRECTED AND ROBUST CleanupFirewallRules FUNCTION ***
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
     if (ruleNames.empty()) return;
 
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
-    IUnknown* pEnumerator = NULL;
-    IEnumVARIANT* pVariant = NULL;
 
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        return; // Cannot create firewall policy instance, exit.
+    }
 
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
-        return;
+        return; // Cannot get rules collection, exit.
     }
 
-    // 枚举所有规则，收集要删除的规则，然后批量删除
-    hr = pFwRules->get__NewEnum(&pEnumerator);
-    if (SUCCEEDED(hr)) {
-        hr = pEnumerator->QueryInterface(__uuidof(IEnumVARIANT), (void**)&pVariant);
-        if (SUCCEEDED(hr)) {
-            std::vector<std::wstring> rulesToDelete;
-            
-            VARIANT var;
-            VariantInit(&var);
-            ULONG fetched = 0;
-            
-            // 遍历所有防火墙规则
-            while (SUCCEEDED(pVariant->Next(1, &var, &fetched)) && fetched) {
-                if (var.vt == VT_DISPATCH && var.pdispVal) {
-                    INetFwRule* pRule = NULL;
-                    hr = var.pdispVal->QueryInterface(__uuidof(INetFwRule), (void**)&pRule);
-                    if (SUCCEEDED(hr)) {
-                        BSTR ruleName = NULL;
-                        hr = pRule->get_Name(&ruleName);
-                        if (SUCCEEDED(hr) && ruleName) {
-                            std::wstring currentRuleName(ruleName);
-                            
-                            // 检查是否在要删除的列表中
-                            for (const auto& targetName : ruleNames) {
-                                if (_wcsicmp(currentRuleName.c_str(), targetName.c_str()) == 0) {
-                                    rulesToDelete.push_back(currentRuleName);
-                                    break;
-                                }
-                            }
-                            
-                            SysFreeString(ruleName);
-                        }
-                        pRule->Release();
-                    }
-                }
-                VariantClear(&var);
-                fetched = 0;
-            }
-            
-            // 现在删除收集到的所有规则
-            for (const auto& ruleToDelete : rulesToDelete) {
-                BSTR bstrRuleName = SysAllocString(ruleToDelete.c_str());
-                pFwRules->Remove(bstrRuleName); // 只尝试一次，因为我们知道规则存在
-                SysFreeString(bstrRuleName);
-            }
-            
-            pVariant->Release();
+    for (const auto& ruleName : ruleNames) {
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        if (!bstrRuleName) continue; // Memory allocation failed.
+
+        // Loop to remove all rules with the same name until the API returns "not found" or an error.
+        HRESULT hrRemove = S_OK; // Initialize to a success code to enter the loop.
+        while (SUCCEEDED(hrRemove) && hrRemove != S_FALSE) {
+            hrRemove = pFwRules->Remove(bstrRuleName);
         }
-        pEnumerator->Release();
+        
+        SysFreeString(bstrRuleName);
     }
 
     if (pFwRules) pFwRules->Release();
@@ -896,3 +859,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
     return 0;
+}
