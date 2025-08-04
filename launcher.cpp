@@ -19,7 +19,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
-#include <Userenv.h> // [新增] 为 CreateProcessAsUserW
+#include <Userenv.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -28,7 +28,7 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
-#pragma comment(lib, "Userenv.lib") // [新增] 为 CreateProcessAsUserW
+#pragma comment(lib, "Userenv.lib")
 
 // --- 手动定义缺失的 Windows SDK 常量和类型 ---
 #ifndef PROC_THREAD_ATTRIBUTE_LIST
@@ -290,7 +290,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// [最终修复] 完整实现 NSudo 的核心逻辑
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -314,72 +313,73 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
-        // 完整复现 NSudo 逻辑: 获取并复制令牌，然后使用 CreateProcessAsUserW
+        // --- NSudo's Full Hide Implementation ---
+        HDESK hOriginalDesktop = GetThreadDesktop(GetCurrentThreadId());
+        HDESK hNewDesktop = NULL;
         HANDLE hToken = NULL;
         HANDLE hNewToken = NULL;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
-            return false;
-        }
-        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) {
-            CloseHandle(hToken);
-            return false;
-        }
+        bool success = false;
 
+        // Step 1: Create a unique name for the new desktop
+        wchar_t newDesktopName[64];
+        swprintf_s(newDesktopName, L"YAP_HiddenDesktop_%lu", GetCurrentProcessId());
+
+        // Step 2: Create the new, invisible desktop
+        hNewDesktop = CreateDesktopW(
+            newDesktopName, NULL, NULL, 0,
+            DESKTOP_CREATEWINDOW | DESKTOP_SWITCHDESKTOP | GENERIC_ALL, NULL);
+        if (!hNewDesktop) goto cleanup;
+
+        // Step 3: Get and duplicate the current process token
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) goto cleanup;
+        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) goto cleanup;
+
+        // Step 4: Prepare STARTUPINFOEX with the new desktop and window policy
         STARTUPINFOEXW siEx;
         ZeroMemory(&siEx, sizeof(siEx));
         siEx.StartupInfo.cb = sizeof(siEx);
+        siEx.StartupInfo.lpDesktop = newDesktopName;
 
         SIZE_T attributeListSize = 0;
         InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
-        
         siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
-        ZeroMemory(siEx.lpAttributeList, attributeListSize);
+        if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
+            delete[] (char*)siEx.lpAttributeList;
+            siEx.lpAttributeList = NULL;
+            goto cleanup;
+        }
 
-        if (InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
-            DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
-            UpdateProcThreadAttribute(
-                siEx.lpAttributeList,
-                0,
-                PROC_THREAD_ATTRIBUTE_WINDOW_POLICY,
-                &policy,
-                sizeof(policy),
-                NULL,
-                NULL);
+        DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
+        UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_WINDOW_POLICY, &policy, sizeof(policy), NULL, NULL);
 
-            // 使用 CreateProcessAsUserW 和复制的令牌
-            if (!CreateProcessAsUserW(
-                hNewToken,
-                NULL,
-                cmdBuffer.data(),
-                NULL,
-                NULL,
-                FALSE,
-                EXTENDED_STARTUPINFO_PRESENT,
-                NULL,
-                finalWorkDir,
-                &siEx.StartupInfo,
-                &pi)) {
-                // 清理
-                DeleteProcThreadAttributeList(siEx.lpAttributeList);
-                delete[] (char*)siEx.lpAttributeList;
-                CloseHandle(hNewToken);
-                CloseHandle(hToken);
-                return false;
-            }
+        // Step 5: Switch this thread to the new desktop before creating the process
+        if (!SetThreadDesktop(hNewDesktop)) goto cleanup;
+
+        // Step 6: Create the process on the new desktop
+        if (CreateProcessAsUserW(
+            hNewToken, NULL, cmdBuffer.data(), NULL, NULL, FALSE,
+            EXTENDED_STARTUPINFO_PRESENT, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
+            success = true;
+        }
+
+    cleanup:
+        // Step 7: CRITICAL - Always switch back to the original desktop
+        if (hOriginalDesktop) {
+            SetThreadDesktop(hOriginalDesktop);
+        }
+        // Step 8: Clean up all resources
+        if (siEx.lpAttributeList) {
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
             delete[] (char*)siEx.lpAttributeList;
-        } else {
-            // 如果属性列表初始化失败，则无法使用此方法
-            delete[] (char*)siEx.lpAttributeList;
-            CloseHandle(hNewToken);
-            CloseHandle(hToken);
-            return false; 
         }
-        CloseHandle(hNewToken);
-        CloseHandle(hToken);
+        if (hNewDesktop) CloseDesktop(hNewDesktop);
+        if (hNewToken) CloseHandle(hNewToken);
+        if (hToken) CloseHandle(hToken);
+
+        if (!success) return false;
 
     } else {
-        // 不隐藏，正常启动
+        // Standard process creation
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
