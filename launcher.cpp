@@ -86,6 +86,16 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
+// *** CORRECTED: Helper to ensure all paths become absolute ***
+std::wstring ResolveToAbsolutePath(const std::wstring& path) {
+    if (path.empty()) return L"";
+    wchar_t absolutePath[MAX_PATH];
+    if (GetFullPathNameW(path.c_str(), MAX_PATH, absolutePath, NULL) == 0) {
+        return path; // Return original on failure
+    }
+    return absolutePath;
+}
+
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
     int safety_counter = 0;
     while (path.find(L'{') != std::wstring::npos && safety_counter < 100) {
@@ -105,7 +115,7 @@ std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std
     if (requiredSize > 0) {
         std::vector<wchar_t> buffer(requiredSize);
         if (ExpandEnvironmentStringsW(path.c_str(), buffer.data(), requiredSize) > 0) {
-            return std::wstring(buffer.data());
+            path = std::wstring(buffer.data());
         }
     }
     return path;
@@ -287,8 +297,8 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     size_t separatorPos = entry.find(L" :: ");
     if (separatorPos == std::wstring::npos) return {};
-    std::wstring src = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
-    std::wstring dest = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
+    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables));
+    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + 4)), variables));
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
@@ -406,8 +416,8 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
     for (const auto& entry : entries) {
         size_t separatorPos = entry.find(L" :: ");
         if (separatorPos == std::wstring::npos) continue;
-        std::wstring destPathRaw = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
-        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
+        std::wstring destPathRaw = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables));
+        std::wstring srcPathRaw = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + 4)), variables));
         if (destPathRaw.empty() || srcPathRaw.empty()) continue;
         bool isDestDir = destPathRaw.back() == L'\\';
         bool isSrcDir = srcPathRaw.back() == L'\\';
@@ -519,11 +529,10 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
         if (parts.size() != 4) continue;
 
         std::wstring ruleName = parts[0];
-        std::wstring appPath = ExpandVariables(parts[1], variables);
+        std::wstring appPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
         std::wstring direction = parts[2];
         std::wstring action = parts[3];
 
-        // *** CORRECTED: Remove quotes from path if present ***
         if (appPath.length() > 1 && appPath.front() == L'"' && appPath.back() == L'"') {
             appPath = appPath.substr(1, appPath.length() - 2);
         }
@@ -579,7 +588,10 @@ void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
 
     for (const auto& ruleName : ruleNames) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {}
+        // *** CORRECTED: Loop until failure to remove all rules with the same name ***
+        while (SUCCEEDED(pFwRules->Remove(bstrRuleName)) && hr != S_FALSE) {
+            // Keep removing until it fails (HRESULT is negative) or S_FALSE (not found)
+        }
         SysFreeString(bstrRuleName);
     }
 
