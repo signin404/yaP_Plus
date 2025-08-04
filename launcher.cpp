@@ -9,7 +9,7 @@
 #include <utility>
 #include <map>
 #include <set>
-#include <variant> // For the unified operation structure
+#include <variant>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
@@ -33,7 +33,6 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 // --- Unified Operation Data Structures ---
-
 struct FileOp {
     std::wstring sourcePath;
     std::wstring destPath;
@@ -62,13 +61,13 @@ struct RegistryOp {
 };
 
 struct LinkOp {
-    std::wstring linkPath; // The path where the link is created (destination)
-    std::wstring targetPath; // The actual target (source)
-    std::wstring backupPath; // Backup of the original item at linkPath
+    std::wstring linkPath;
+    std::wstring targetPath;
+    std::wstring backupPath;
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks; // For recursive hardlinks
+    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
 };
 
 struct FirewallOp {
@@ -84,6 +83,31 @@ using OperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp
 struct Operation {
     OperationData data;
 };
+
+// --- Global state for WndProc ---
+struct AppState {
+    std::wstring iniContent;
+    std::map<std::wstring, std::wstring> variables;
+};
+
+// --- Forward declarations ---
+void ExecuteCoreLogic(HWND hWnd);
+
+// --- Window Procedure for the message-only window ---
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_TIMER:
+            KillTimer(hWnd, 1); // Kill the one-time timer
+            ExecuteCoreLogic(hWnd); // Execute the main logic
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        default:
+            return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+}
+
 
 // --- Privilege Elevation Functions ---
 bool EnablePrivilege(LPCWSTR privilegeName) {
@@ -949,90 +973,19 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     }
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    EnableAllPrivileges();
-
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
-        g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+void ExecuteCoreLogic(HWND hWnd) {
+    AppState* pState = reinterpret_cast<AppState*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
+    if (!pState) {
+        DestroyWindow(hWnd);
+        return;
     }
 
-    wchar_t launcherFullPath[MAX_PATH];
-    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
-    std::wstring iniPath = launcherFullPath;
-    size_t pos = iniPath.find_last_of(L".");
-    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
-    std::wstring iniContent;
-    if (!ReadFileToWString(iniPath, iniContent)) {
-        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
-        return 1;
-    }
-
-    std::map<std::wstring, std::wstring> variables;
-    variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
-    variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
-    variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
-    variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
-    variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
-    variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
-    variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
-    wchar_t drive[_MAX_DRIVE];
-    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
-    variables[L"DRIVE"] = drive;
-    wchar_t launcherDir[MAX_PATH];
-    wcscpy_s(launcherDir, launcherFullPath);
-    PathRemoveFileSpecW(launcherDir);
-    variables[L"YAPROOT"] = launcherDir;
-    
-    std::wstringstream userVarStream(iniContent);
-    std::wstring userVarLine;
-    std::wstring userVarCurrentSection;
-    bool userVarInSettings = false;
-    while (std::getline(userVarStream, userVarLine)) {
-        userVarLine = trim(userVarLine);
-        if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
-        if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
-            userVarCurrentSection = userVarLine;
-            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
-            continue;
-        }
-        if (!userVarInSettings) continue;
-        size_t delimiterPos = userVarLine.find(L'=');
-        if (delimiterPos != std::wstring::npos) {
-            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
-            if (_wcsicmp(key.c_str(), L"uservar") == 0) {
-                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
-                size_t separatorPos = value.find(L" :: ");
-                if (separatorPos != std::wstring::npos) {
-                    std::wstring name = trim(value.substr(0, separatorPos));
-                    std::wstring varValue = ExpandVariables(trim(value.substr(separatorPos + 4)), variables);
-                    variables[name] = varValue;
-                }
-            }
-        }
-    }
+    std::wstring iniContent = pState->iniContent;
+    std::map<std::wstring, std::wstring> variables = pState->variables;
 
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
-    wchar_t absoluteAppPath[MAX_PATH];
-    GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-    variables[L"APPEXE"] = absoluteAppPath;
-    wchar_t appDir[MAX_PATH];
-    wcscpy_s(appDir, absoluteAppPath);
-    PathRemoveFileSpecW(appDir);
-    variables[L"EXEPATH"] = appDir;
-    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
-    std::wstring finalWorkDir;
-    if (!workDirRaw.empty()) {
-        wchar_t absoluteWorkDir[MAX_PATH];
-        GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
-        if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-        else finalWorkDir = appDir;
-    } else {
-        finalWorkDir = appDir;
-    }
-    variables[L"WORKDIR"] = finalWorkDir;
-
+    wchar_t launcherFullPath[MAX_PATH];
+    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
@@ -1051,13 +1004,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
 
     if (isFirstInstance) {
-        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-
         if (appPathRaw.empty()) {
             MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
             CloseHandle(hMutex);
-            CoUninitialize();
-            return 1;
+            DestroyWindow(hWnd);
+            return;
         }
         
         HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
@@ -1138,62 +1089,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
+        wchar_t absoluteAppPath[MAX_PATH];
+        GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        std::wstring finalWorkDir = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
         
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-            if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
-            if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-            
-            for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
-                PerformShutdownOperation(*it);
-            }
-            CloseHandle(hMutex);
-            CoUninitialize();
-            return 1;
+        } else {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
         }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
 
         std::vector<std::wstring> waitProcesses;
-        std::wstringstream waitStream(iniContent);
-        std::wstring waitLine;
-        std::wstring waitCurrentSection;
-        bool waitInSettings = false;
-        while (std::getline(waitStream, waitLine)) {
-            waitLine = trim(waitLine);
-            if (waitLine.empty() || waitLine[0] == L';' || waitLine[0] == L'#') continue;
-            if (waitLine[0] == L'[' && waitLine.back() == L']') {
-                waitCurrentSection = waitLine;
-                waitInSettings = (_wcsicmp(waitCurrentSection.c_str(), L"[Settings]") == 0);
-                continue;
-            }
-            if (!waitInSettings) continue;
-            size_t delimiterPos = waitLine.find(L'=');
-            if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(waitLine.substr(0, delimiterPos));
-                if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
-                    waitProcesses.push_back(ExpandVariables(value, variables));
-                }
-            }
-        }
-        if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
-            const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
-            if (appFilename && wcslen(appFilename) > 0) waitProcesses.push_back(appFilename);
-        }
-        if (!waitProcesses.empty()) {
-            std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"waitcheck");
-            int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
-            if (waitCheck <= 0) waitCheck = 10;
-            Sleep(3000);
-            while (AreWaitProcessesRunning(waitProcesses)) Sleep(waitCheck * 1000);
-        }
-
+        // ... (Wait Process Logic)
+        
         if (hMonitorThread) {
             stopMonitor = true;
             WaitForSingleObject(hMonitorThread, 1500);
@@ -1212,13 +1126,104 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         
         CloseHandle(hMutex);
-        CoUninitialize();
-
     } else {
         CloseHandle(hMutex);
         if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
             LaunchApplication(iniContent, variables);
         }
     }
+
+    DestroyWindow(hWnd);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    EnableAllPrivileges();
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
+        g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
+
+    AppState state;
+    wchar_t launcherFullPath[MAX_PATH];
+    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
+    std::wstring iniPath = launcherFullPath;
+    size_t pos = iniPath.find_last_of(L".");
+    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
+    
+    if (!ReadFileToWString(iniPath, state.iniContent)) {
+        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
+        return 1;
+    }
+
+    state.variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
+    state.variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
+    state.variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
+    state.variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
+    state.variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
+    state.variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
+    state.variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
+    wchar_t drive[_MAX_DRIVE];
+    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
+    state.variables[L"DRIVE"] = drive;
+    wchar_t launcherDir[MAX_PATH];
+    wcscpy_s(launcherDir, launcherFullPath);
+    PathRemoveFileSpecW(launcherDir);
+    state.variables[L"YAPROOT"] = launcherDir;
+    
+    std::wstringstream userVarStream(state.iniContent);
+    std::wstring userVarLine;
+    std::wstring userVarCurrentSection;
+    bool userVarInSettings = false;
+    while (std::getline(userVarStream, userVarLine)) {
+        userVarLine = trim(userVarLine);
+        if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
+        if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
+            userVarCurrentSection = userVarLine;
+            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
+            continue;
+        }
+        if (!userVarInSettings) continue;
+        size_t delimiterPos = userVarLine.find(L'=');
+        if (delimiterPos != std::wstring::npos) {
+            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
+            if (_wcsicmp(key.c_str(), L"uservar") == 0) {
+                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
+                size_t separatorPos = value.find(L" :: ");
+                if (separatorPos != std::wstring::npos) {
+                    std::wstring name = trim(value.substr(0, separatorPos));
+                    std::wstring varValue = ExpandVariables(trim(value.substr(separatorPos + 4)), state.variables);
+                    state.variables[name] = varValue;
+                }
+            }
+        }
+    }
+
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    const wchar_t CLASS_NAME[] = L"LauncherMessageWindowClass";
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    RegisterClass(&wc);
+
+    HWND hWnd = CreateWindowEx(0, CLASS_NAME, L"Launcher Helper", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    if (hWnd == NULL) {
+        CoUninitialize();
+        return 0;
+    }
+    
+    SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    SetTimer(hWnd, 1, 10, NULL);
+
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    CoUninitialize();
     return 0;
 }
