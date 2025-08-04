@@ -28,10 +28,13 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
 
-// --- [已修复] 手动定义缺失的 Windows SDK 常量 ---
-// 解决在旧版 Windows SDK 中编译时 "undeclared identifier" 的问题
+// --- [最终修复] 手动定义缺失的 Windows SDK 常量和类型 ---
+// 解决在旧版 Windows SDK 中编译时 "undeclared identifier" 和 "redefinition" 的问题
+
 #ifndef PROC_THREAD_ATTRIBUTE_LIST
-typedef PVOID LPPROC_THREAD_ATTRIBUTE_LIST;
+// 与官方头文件保持一致，定义为指向不透明结构体的指针
+struct _PROC_THREAD_ATTRIBUTE_LIST;
+typedef struct _PROC_THREAD_ATTRIBUTE_LIST *LPPROC_THREAD_ATTRIBUTE_LIST;
 #endif
 
 #ifndef PROC_THREAD_ATTRIBUTE_WINDOW_POLICY
