@@ -313,28 +313,29 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
-        // --- NSudo's Full Hide Implementation ---
         HDESK hOriginalDesktop = GetThreadDesktop(GetCurrentThreadId());
         HDESK hNewDesktop = NULL;
         HANDLE hToken = NULL;
         HANDLE hNewToken = NULL;
+        LPVOID lpEnvironment = NULL;
         bool success = false;
 
-        // Step 1: Create a unique name for the new desktop
         wchar_t newDesktopName[64];
         swprintf_s(newDesktopName, L"YAP_HiddenDesktop_%lu", GetCurrentProcessId());
 
-        // Step 2: Create the new, invisible desktop
         hNewDesktop = CreateDesktopW(
             newDesktopName, NULL, NULL, 0,
             DESKTOP_CREATEWINDOW | DESKTOP_SWITCHDESKTOP | GENERIC_ALL, NULL);
         if (!hNewDesktop) goto cleanup;
 
-        // Step 3: Get and duplicate the current process token
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) goto cleanup;
         if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) goto cleanup;
+        
+        // [新增] 创建环境块
+        if (!CreateEnvironmentBlock(&lpEnvironment, hNewToken, FALSE)) {
+            lpEnvironment = NULL;
+        }
 
-        // Step 4: Prepare STARTUPINFOEX with the new desktop and window policy
         STARTUPINFOEXW siEx;
         ZeroMemory(&siEx, sizeof(siEx));
         siEx.StartupInfo.cb = sizeof(siEx);
@@ -352,22 +353,23 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
         UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_WINDOW_POLICY, &policy, sizeof(policy), NULL, NULL);
 
-        // Step 5: Switch this thread to the new desktop before creating the process
         if (!SetThreadDesktop(hNewDesktop)) goto cleanup;
 
-        // Step 6: Create the process on the new desktop
         if (CreateProcessAsUserW(
             hNewToken, NULL, cmdBuffer.data(), NULL, NULL, FALSE,
-            EXTENDED_STARTUPINFO_PRESENT, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, // [新增] 添加 UNICODE 标志
+            lpEnvironment, // [新增] 传入环境块
+            finalWorkDir, &siEx.StartupInfo, &pi)) {
             success = true;
         }
 
     cleanup:
-        // Step 7: CRITICAL - Always switch back to the original desktop
         if (hOriginalDesktop) {
             SetThreadDesktop(hOriginalDesktop);
         }
-        // Step 8: Clean up all resources
+        if (lpEnvironment) { // [新增] 销毁环境块
+            DestroyEnvironmentBlock(lpEnvironment);
+        }
         if (siEx.lpAttributeList) {
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
             delete[] (char*)siEx.lpAttributeList;
@@ -379,7 +381,6 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         if (!success) return false;
 
     } else {
-        // Standard process creation
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
@@ -1232,9 +1233,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!userVarInSettings) continue;
         size_t delimiterPos = userVarLine.find(L'=');
         if (delimiterPos != std::wstring::npos) {
-            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
+            std::wstring key = trim(line.substr(0, delimiterPos));
             if (_wcsicmp(key.c_str(), L"uservar") == 0) {
-                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
+                std::wstring value = trim(line.substr(delimiterPos + 1));
                 size_t separatorPos = value.find(L" :: ");
                 if (separatorPos != std::wstring::npos) {
                     std::wstring name = trim(value.substr(0, separatorPos));
@@ -1442,9 +1443,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!waitInSettings) continue;
             size_t delimiterPos = waitLine.find(L'=');
             if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(waitLine.substr(0, delimiterPos));
+                std::wstring key = trim(line.substr(0, delimiterPos));
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
+                    std::wstring value = trim(line.substr(delimiterPos + 1));
                     waitProcesses.push_back(ExpandVariables(value, variables));
                 }
             }
