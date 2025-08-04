@@ -2,9 +2,9 @@ name: Build C++ Launcher for Windows
 
 on:
   push:
-    branches: [ "main", "signin404-patch-2" ]
+    branches: [ "main", "signin404-patch-3" ]
   pull_request:
-    branches: [ "main", "signin404-patch-2" ]
+    branches: [ "main", "signin404-patch-3" ]
 
 jobs:
   build:
@@ -20,9 +20,9 @@ jobs:
     - name: Compile resource script
       run: rc.exe launcher.rc
 
-    # Corrected command: Added /utf-8 flag
+    # Corrected command: Added OleAut32.lib
     - name: Compile C++ code and link resources
-      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib
+      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib
 
     - name: Find executable
       id: find_exe
