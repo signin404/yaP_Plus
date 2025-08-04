@@ -313,76 +313,56 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
-        // NSudo 隐藏方式: 使用 CreateProcessAsUserW 和窗口策略属性
-        HANDLE hToken = NULL;
-        HANDLE hNewToken = NULL;
-        LPVOID lpEnvironment = NULL;
-        STARTUPINFOEXW siEx;
-        ZeroMemory(&siEx, sizeof(siEx));
-        siEx.StartupInfo.cb = sizeof(siEx);
+        // --- 可靠的“隐藏桌面”方法 ---
+        // 这种方法不依赖于难以捉摸的窗口策略属性，而是通过在一个不可见的虚拟桌面中创建进程来确保其完全隐藏。
+        
+        HDESK hOriginalDesktop = GetThreadDesktop(GetCurrentThreadId());
+        HDESK hNewDesktop = NULL;
         bool success = false;
 
-        // 1. 获取并复制当前进程的令牌
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
-            goto cleanup;
-        }
-        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) {
-            goto cleanup;
-        }
-        
-        // 2. 为新令牌创建环境块
-        if (!CreateEnvironmentBlock(&lpEnvironment, hNewToken, FALSE)) {
-            lpEnvironment = NULL; // 即使失败也可以继续，但最好有
+        // 1. 创建一个独一无二的、不可见的桌面
+        wchar_t newDesktopName[64];
+        swprintf_s(newDesktopName, L"GoInterruptPolicy_HiddenDesktop_%lu", GetCurrentProcessId());
+        hNewDesktop = CreateDesktopW(
+            newDesktopName, 
+            NULL, NULL, 0,
+            DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP, 
+            NULL);
+
+        if (!hNewDesktop) {
+            // 如果创建桌面失败，则退回到标准方式创建，至少保证程序能运行
+             return ExecuteProcess(path, args, workDir, wait, false);
         }
 
-        // 3. 设置进程启动属性，以隐藏窗口
-        SIZE_T attributeListSize = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
-        siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
-        if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
-            delete[] (char*)siEx.lpAttributeList;
-            siEx.lpAttributeList = NULL;
-            goto cleanup;
-        }
+        // 2. 准备启动信息，指定新进程在那个不可见的桌面上启动
+        STARTUPINFOW si;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        si.lpDesktop = newDesktopName; // 关键！
 
-        DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
-        if (!UpdateProcThreadAttribute(
-            siEx.lpAttributeList,
-            0,
-            PROC_THREAD_ATTRIBUTE_WINDOW_POLICY,
-            &policy,
-            sizeof(policy),
-            NULL,
-            NULL)) {
-            goto cleanup;
-        }
-
-        // 4. 使用复制的令牌和扩展启动信息来创建进程
-        if (CreateProcessAsUserW(
-            hNewToken,
+        // 3. 在新桌面上创建进程
+        if (CreateProcessW(
             NULL,
             cmdBuffer.data(),
             NULL,
             NULL,
             FALSE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            lpEnvironment,
+            0, // 不需要特殊标志
+            NULL,
             finalWorkDir,
-            &siEx.StartupInfo,
+            &si, // 传入指定了新桌面的启动信息
             &pi)) {
             success = true;
         }
 
-    cleanup: // 清理资源
-        if (lpEnvironment) {
-            DestroyEnvironmentBlock(lpEnvironment);
+        // 4. 清理资源
+        if (hNewDesktop) {
+            CloseDesktop(hNewDesktop);
         }
-        if (siEx.lpAttributeList) {
-            DeleteProcThreadAttributeList(siEx.lpAttributeList);
-            delete[] (char*)siEx.lpAttributeList;
+        // 恢复原始桌面（虽然对于非UI线程可能不是必须的，但这是个好习惯）
+        if(hOriginalDesktop) {
+            SetThreadDesktop(hOriginalDesktop);
         }
-        if (hNewToken) CloseHandle(hNewToken);
-        if (hToken) CloseHandle(hToken);
 
         if (!success) return false;
 
