@@ -22,7 +22,7 @@ jobs:
 
     # MODIFIED: Added /std:c++17 to enable modern C++ features like std::variant
     - name: Compile C++ code and link resources
-      Run cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
+      run: cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
 
     - name: Find executable
       id: find_exe
