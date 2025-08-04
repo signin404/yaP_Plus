@@ -1,3 +1,5 @@
+#define _WIN32_WINNT 0x0A00 // 必须放在所有 include 之前，以启用新版 Windows API
+
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -345,7 +347,7 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
             }
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
         }
-        delete[] siEx.lpAttributeList;
+        delete[] (char*)siEx.lpAttributeList;
 
         if (!success) {
             // --- Classic Fallback Method (for older Windows or if modern method fails) ---
