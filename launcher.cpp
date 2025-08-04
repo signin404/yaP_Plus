@@ -33,14 +33,18 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 // --- FORWARD DECLARATIONS for helper functions ---
-bool RunCommand(const std::wstring& command, bool showWindow = false);
-void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"");
+bool RunCommand(const std::wstring& command, bool showWindow);
+void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to);
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName);
 bool RenameRegistryKey(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& newSubKey);
 bool RenameRegistryValue(HKEY hRoot, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName);
 bool ExportRegistryKey(const std::wstring& fullKeyPath, const std::wstring& filePath);
 bool ExportRegistryValue(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& filePath);
 bool ImportRegistryFile(const std::wstring& filePath);
+void CleanupFirewallRules(); // CORRECTED: Added forward declaration
+class Operation; // Forward declare base class for ProcessAllSettings
+void ProcessAllSettings(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<std::unique_ptr<Operation>>& operations);
+void LaunchApplication(const std::wstring& iniContent);
 
 // --- Polymorphic Base Class for all Operations ---
 class Operation {
@@ -493,7 +497,47 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
-// --- Registry Helpers (definitions) ---
+// --- Helper Function Definitions ---
+bool RunCommand(const std::wstring& command, bool showWindow) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = showWindow ? SW_SHOW : SW_HIDE;
+    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
+    cmdBuffer.push_back(0);
+    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, showWindow ? 0 : CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return exitCode == 0;
+}
+
+void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to) {
+    wchar_t fromPath[MAX_PATH * 2] = {0};
+    wcscpy_s(fromPath, from.c_str());
+    fromPath[from.length() + 1] = L'\0';
+    wchar_t toPath[MAX_PATH * 2] = {0};
+    if (!to.empty()) {
+        wcscpy_s(toPath, to.c_str());
+        toPath[to.length() + 1] = L'\0';
+    }
+    SHFILEOPSTRUCTW sfos = {0};
+    sfos.wFunc = func;
+    sfos.pFrom = fromPath;
+    sfos.pTo = to.empty() ? NULL : toPath;
+    sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    if (func == FO_COPY) {
+        sfos.fFlags |= FOF_NOCONFIRMMKDIR;
+    }
+    SHFileOperationW(&sfos);
+}
+
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     size_t firstSlash = fullPath.find(L'\\');
     if (firstSlash == std::wstring::npos) return false;
@@ -514,6 +558,125 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
         valueName = restOfPath.substr(lastSlash + 1);
     }
     return true;
+}
+
+bool RenameRegistryKey(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& newSubKey) {
+    std::wstring fullSourcePath = rootStr + L"\\" + subKey;
+    std::wstring fullDestPath = rootStr + L"\\" + newSubKey;
+    HKEY hKey;
+    if (RegOpenKeyExW(hRoot, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+    RegCloseKey(hKey);
+    if (!RunCommand(L"reg copy \"" + fullSourcePath + L"\" \"" + fullDestPath + L"\" /s /f")) return false;
+    return SHDeleteKeyW(hRoot, subKey.c_str()) == ERROR_SUCCESS;
+}
+
+bool RenameRegistryValue(HKEY hRoot, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName) {
+    HKEY hKey;
+    if (RegOpenKeyExW(hRoot, subKey.c_str(), 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) return false;
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey); return false;
+    }
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey); return false;
+    }
+    if (RegSetValueExW(hKey, newValueName.c_str(), 0, type, data.data(), size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey); return false;
+    }
+    RegDeleteValueW(hKey, valueName.c_str());
+    RegCloseKey(hKey);
+    return true;
+}
+
+bool ExportRegistryKey(const std::wstring& fullKeyPath, const std::wstring& filePath) {
+    return RunCommand(L"reg export \"" + fullKeyPath + L"\" \"" + filePath + L"\" /y");
+}
+
+bool ExportRegistryValue(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& filePath) {
+    HKEY hKey;
+    if (RegOpenKeyExW(hRoot, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey); return false;
+    }
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey); return false;
+    }
+    RegCloseKey(hKey);
+
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    if (!regFile.is_open()) return false;
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+    regFile.put((char)0xFF); regFile.put((char)0xFE);
+    write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
+    write_wstring(L"[" + rootStr + L"\\" + subKey + L"]\r\n");
+    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
+    write_wstring(displayName + L"=");
+    std::wstringstream wss;
+    if (type == REG_SZ) {
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
+        std::wstring escapedStr;
+        for (wchar_t c : strValue) {
+            if (c == L'\\') escapedStr += L"\\\\"; else if (c == L'"') escapedStr += L"\\\""; else escapedStr += c;
+        }
+        wss << L"\"" << escapedStr << L"\"";
+    } else if (type == REG_DWORD) {
+        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
+        wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
+    } else if (type == REG_QWORD) {
+        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
+        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
+        wss << L"hex(b):";
+        for (int i = 0; i < 8; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
+            if (i < 7) wss << L",";
+        }
+    } else {
+        wss << L"hex";
+        if (type == REG_EXPAND_SZ) wss << L"(2)";
+        else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type != REG_BINARY) wss << L"(" << type << L")";
+        wss << L":";
+        for (DWORD i = 0; i < size; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            if (i < size - 1) {
+                wss << L",";
+                if ((i + 1) % 38 == 0) wss << L"\\\r\n  ";
+            }
+        }
+    }
+    write_wstring(wss.str());
+    write_wstring(L"\r\n");
+    regFile.close();
+    return true;
+}
+
+bool ImportRegistryFile(const std::wstring& filePath) {
+    if (!PathFileExistsW(filePath.c_str())) return true;
+    return RunCommand(L"reg import \"" + filePath + L"\"", false);
+}
+
+void CleanupFirewallRules() {
+    if (g_createdFirewallRuleNames.empty()) return;
+    INetFwPolicy2* pFwPolicy = NULL;
+    INetFwRules* pFwRules = NULL;
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) return;
+    hr = pFwPolicy->get_Rules(&pFwRules);
+    if (FAILED(hr)) { pFwPolicy->Release(); return; }
+    for (const auto& ruleName : g_createdFirewallRuleNames) {
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        if (bstrRuleName) {
+            pFwRules->Remove(bstrRuleName);
+            SysFreeString(bstrRuleName);
+        }
+    }
+    if (pFwRules) pFwRules->Release();
+    if (pFwPolicy) pFwPolicy->Release();
 }
 
 // --- Master Parser ---
@@ -588,8 +751,6 @@ void ProcessAllSettings(const std::wstring& iniContent, const std::map<std::wstr
             }
             else if (_wcsicmp(key.c_str(), L"firewall") == 0) {
                 std::vector<std::wstring> parts;
-                std::wstringstream valStream(value);
-                std::wstring part;
                 std::wstring temp_value = value;
                 size_t pos = 0;
                 while ((pos = temp_value.find(L" :: ")) != std::wstring::npos) {
@@ -609,15 +770,40 @@ void ProcessAllSettings(const std::wstring& iniContent, const std::map<std::wstr
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
-    // This function is for subsequent instances when multiple=1
-    // It doesn't need the full setup/teardown logic
     std::map<std::wstring, std::wstring> variables;
-    // ... (variable map construction as in wWinMain) ...
+    wchar_t launcherFullPath[MAX_PATH];
+    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
+    variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
+    variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
+    variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
+    variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
+    variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
+    variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
+    variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
+    wchar_t drive[_MAX_DRIVE];
+    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
+    variables[L"DRIVE"] = drive;
+    wchar_t launcherDir[MAX_PATH];
+    wcscpy_s(launcherDir, launcherFullPath);
+    PathRemoveFileSpecW(launcherDir);
+    variables[L"YAPROOT"] = launcherDir;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-    // ... (rest of path/command line setup as in wWinMain) ...
+    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
+    std::wstring finalWorkDir;
+    wchar_t appDir[MAX_PATH];
+    wcscpy_s(appDir, absoluteAppPath);
+    PathRemoveFileSpecW(appDir);
+    if (!workDirRaw.empty()) {
+        wchar_t absoluteWorkDir[MAX_PATH];
+        GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
+        if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
+        else finalWorkDir = appDir;
+    } else {
+        finalWorkDir = appDir;
+    }
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
@@ -627,8 +813,6 @@ void LaunchApplication(const std::wstring& iniContent) {
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
-    // ... (get workdir as in wWinMain) ...
-    std::wstring finalWorkDir; // You need to calculate this
     if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -657,7 +841,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         iniContent = wss.str();
     }
 
-    // --- Variable Map Construction ---
     std::map<std::wstring, std::wstring> variables;
     variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
     variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
@@ -673,7 +856,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(launcherDir, launcherFullPath);
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
-    // ... (uservar parsing) ...
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
@@ -694,7 +876,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     variables[L"WORKDIR"] = finalWorkDir;
 
-    // --- Mutex Creation ---
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
