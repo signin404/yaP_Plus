@@ -492,16 +492,20 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
 void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstring>& createdRuleNames, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"firewall");
     if (entries.empty()) return;
+
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
     INetFwRule* pFwRule = NULL;
+
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
     if (FAILED(hr)) return;
+
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
+
     for (const auto& entry : entries) {
         std::vector<std::wstring> parts;
         std::wstring current = entry;
@@ -511,57 +515,74 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
             current.erase(0, pos + 4);
         }
         parts.push_back(trim(current));
+
         if (parts.size() != 4) continue;
+
         std::wstring ruleName = parts[0];
         std::wstring appPath = ExpandVariables(parts[1], variables);
         std::wstring direction = parts[2];
         std::wstring action = parts[3];
+
+        // *** CORRECTED: Remove quotes from path if present ***
+        if (appPath.length() > 1 && appPath.front() == L'"' && appPath.back() == L'"') {
+            appPath = appPath.substr(1, appPath.length() - 2);
+        }
+
         hr = CoCreateInstance(__uuidof(NetFwRule), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule), (void**)&pFwRule);
         if (FAILED(hr)) continue;
+
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
         BSTR bstrAppPath = SysAllocString(appPath.c_str());
+
         pFwRule->put_Name(bstrRuleName);
         pFwRule->put_ApplicationName(bstrAppPath);
+        
         if (_wcsicmp(direction.c_str(), L"in") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_IN);
         else if (_wcsicmp(direction.c_str(), L"out") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+
         if (_wcsicmp(action.c_str(), L"allow") == 0) pFwRule->put_Action(NET_FW_ACTION_ALLOW);
         else if (_wcsicmp(action.c_str(), L"block") == 0) pFwRule->put_Action(NET_FW_ACTION_BLOCK);
+
         pFwRule->put_Enabled(VARIANT_TRUE);
         pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
         pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+
         hr = pFwRules->Add(pFwRule);
         if (SUCCEEDED(hr)) {
             createdRuleNames.push_back(ruleName);
         }
+
         SysFreeString(bstrRuleName);
         SysFreeString(bstrAppPath);
         pFwRule->Release();
         pFwRule = NULL;
     }
+
     if (pFwRules) pFwRules->Release();
     if (pFwPolicy) pFwPolicy->Release();
 }
 
-// *** CORRECTED: Aggressive Firewall Rule Cleanup ***
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
     if (ruleNames.empty()) return;
+
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
+
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
     if (FAILED(hr)) return;
+
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
+
     for (const auto& ruleName : ruleNames) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        // Loop to remove all rules with this name
-        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {
-            // Keep removing until none are left
-        }
+        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {}
         SysFreeString(bstrRuleName);
     }
+
     if (pFwRules) pFwRules->Release();
     if (pFwPolicy) pFwPolicy->Release();
 }
