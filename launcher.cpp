@@ -1,5 +1,3 @@
-#define _WIN32_WINNT 0x0A00
-
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -11,7 +9,7 @@
 #include <utility>
 #include <map>
 #include <set>
-#include <variant>
+#include <variant> // For the unified operation structure
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
@@ -19,7 +17,6 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
-#include <Userenv.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -28,47 +25,6 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
-#pragma comment(lib, "Userenv.lib")
-
-// --- 手动定义缺失的 Windows SDK 常量和类型 ---
-#ifndef PROC_THREAD_ATTRIBUTE_LIST
-struct _PROC_THREAD_ATTRIBUTE_LIST;
-typedef struct _PROC_THREAD_ATTRIBUTE_LIST *LPPROC_THREAD_ATTRIBUTE_LIST;
-#endif
-
-#ifndef PROC_THREAD_ATTRIBUTE_WINDOW_POLICY
-#define PROC_THREAD_ATTRIBUTE_WINDOW_POLICY 0x00020014
-#endif
-
-#ifndef PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW
-#define PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW 0x1
-#endif
-
-// --- 新增：错误诊断弹窗函数 ---
-void ShowError(const std::wstring& functionName, DWORD errorCode) {
-    wchar_t* messageBuffer = nullptr;
-    size_t size = FormatMessageW(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL,
-        errorCode,
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        (LPWSTR)&messageBuffer,
-        0,
-        NULL);
-
-    std::wstring errorMessage = L"No specific error message found.";
-    if (messageBuffer) {
-        errorMessage = messageBuffer;
-        LocalFree(messageBuffer);
-    }
-
-    std::wstring finalMessage = L"A critical error occurred during the hide operation.\n\n";
-    finalMessage += L"Function Failed:\n" + functionName + L"\n\n";
-    finalMessage += L"Error Code:\n" + std::to_wstring(errorCode) + L"\n\n";
-    finalMessage += L"System Message:\n" + errorMessage;
-
-    MessageBoxW(NULL, finalMessage.c_str(), L"GoInterruptPolicy - Hide Launch Diagnosis", MB_OK | MB_ICONERROR);
-}
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -106,13 +62,13 @@ struct RegistryOp {
 };
 
 struct LinkOp {
-    std::wstring linkPath;
-    std::wstring targetPath;
-    std::wstring backupPath;
+    std::wstring linkPath; 
+    std::wstring targetPath; 
+    std::wstring backupPath; 
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
+    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks; 
 };
 
 struct FirewallOp {
@@ -132,12 +88,12 @@ struct Operation {
 
 // --- Pre-Launch Operation Data Structures ---
 
+// [已修改] 从 RunOp 结构体中移除 hide 成员
 struct RunOp {
     std::wstring programPath;
     std::wstring commandLine;
     std::wstring workDir;
     bool wait;
-    bool hide;
 };
 
 struct BatchOp {
@@ -206,6 +162,7 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
+// Helper to split string by a delimiter
 std::vector<std::wstring> split_string(const std::wstring& s, const std::wstring& delimiter) {
     std::vector<std::wstring> parts;
     std::wstring str = s;
@@ -250,7 +207,7 @@ std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std
         if (it != variables.end()) {
             path.replace(start_pos, end_pos - start_pos + 1, it->second);
         } else {
-            path.replace(start_pos, 1, L"");
+            path.replace(start_pos, 1, L""); // Replace only '{' to avoid infinite loops on unknown vars
         }
         safety_counter++;
     }
@@ -315,16 +272,29 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// --- 诊断版 ExecuteProcess (带有完整的错误检查和弹窗) ---
+// A powerful and flexible process execution function
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
-        ShowError(L"PathFileExistsW (Check before launch)", 0);
         return false;
     }
 
     std::wstring commandLine = L"\"" + path + L"\" " + args;
     std::vector<wchar_t> cmdBuffer(commandLine.begin(), commandLine.end());
     cmdBuffer.push_back(0);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    DWORD creationFlags = 0;
+
+    if (hide) {
+        si.dwFlags |= STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        creationFlags |= CREATE_NO_WINDOW;
+    }
 
     const wchar_t* finalWorkDir = NULL;
     std::wstring exeDir;
@@ -336,146 +306,17 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         finalWorkDir = exeDir.c_str();
     }
 
-    if (hide) {
-        // --- NSudo 终极方案的诊断流程 ---
-        
-        // 1. 找到 winlogon.exe PID
-        PROCESSENTRY32W pe32;
-        pe32.dwSize = sizeof(PROCESSENTRY32W);
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
-            ShowError(L"CreateToolhelp32Snapshot", GetLastError());
-            return false;
-        }
-
-        DWORD winlogonPid = 0;
-        if (Process32FirstW(hSnapshot, &pe32)) {
-            do {
-                if (_wcsicmp(pe32.szExeFile, L"winlogon.exe") == 0) {
-                    winlogonPid = pe32.th32ProcessID;
-                    break;
-                }
-            } while (Process32NextW(hSnapshot, &pe32));
-        }
-        CloseHandle(hSnapshot);
-        if (winlogonPid == 0) {
-            ShowError(L"Finding winlogon.exe PID (not found)", 0);
-            return false;
-        }
-
-        // 2. 打开 winlogon.exe 进程
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, winlogonPid);
-        if (!hProcess) {
-            ShowError(L"OpenProcess (for winlogon.exe)", GetLastError());
-            return false;
-        }
-
-        // 3. 打开其令牌
-        HANDLE hProcessToken = NULL;
-        if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE, &hProcessToken)) {
-            ShowError(L"OpenProcessToken", GetLastError());
-            CloseHandle(hProcess);
-            return false;
-        }
-        CloseHandle(hProcess);
-
-        // 4. 复制令牌
-        HANDLE hSystemToken = NULL;
-        if (!DuplicateTokenEx(hProcessToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hSystemToken)) {
-            ShowError(L"DuplicateTokenEx", GetLastError());
-            CloseHandle(hProcessToken);
-            return false;
-        }
-        CloseHandle(hProcessToken);
-
-        // 5. 修改令牌的会话ID
-        DWORD dwSessionId = 0;
-        if (ProcessIdToSessionId(GetCurrentProcessId(), &dwSessionId)) {
-            if (!SetTokenInformation(hSystemToken, TokenSessionId, &dwSessionId, sizeof(DWORD))) {
-                ShowError(L"SetTokenInformation (TokenSessionId)", GetLastError());
-                CloseHandle(hSystemToken);
-                return false;
-            }
-        } else {
-            ShowError(L"ProcessIdToSessionId", GetLastError());
-            CloseHandle(hSystemToken);
-            return false;
-        }
-
-        // 6. 准备启动信息和隐藏属性
-        STARTUPINFOEXW siEx;
-        ZeroMemory(&siEx, sizeof(siEx));
-        siEx.StartupInfo.cb = sizeof(siEx);
-        siEx.StartupInfo.lpDesktop = const_cast<wchar_t*>(L"WinSta0\\Default");
-
-        SIZE_T attributeListSize = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
-        siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
-        if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
-            ShowError(L"InitializeProcThreadAttributeList (1st call)", GetLastError());
-            delete[] (char*)siEx.lpAttributeList;
-            CloseHandle(hSystemToken);
-            return false;
-        }
-
-        DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
-        if (!UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_WINDOW_POLICY, &policy, sizeof(policy), NULL, NULL)) {
-            ShowError(L"UpdateProcThreadAttribute", GetLastError());
-            DeleteProcThreadAttributeList(siEx.lpAttributeList);
-            delete[] (char*)siEx.lpAttributeList;
-            CloseHandle(hSystemToken);
-            return false;
-        }
-
-        // 7. 创建环境块
-        LPVOID lpEnvironment = NULL;
-        if (!CreateEnvironmentBlock(&lpEnvironment, hSystemToken, FALSE)) {
-            ShowError(L"CreateEnvironmentBlock", GetLastError());
-            // 即使此步失败也尝试继续，但这是一个可能的失败点
-        }
-
-        // 8. 创建进程
-        PROCESS_INFORMATION pi;
-        ZeroMemory(&pi, sizeof(pi));
-        bool success = false;
-        if (CreateProcessAsUserW(
-            hSystemToken, NULL, &cmdBuffer[0], NULL, NULL, FALSE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            lpEnvironment, finalWorkDir, &siEx.StartupInfo, &pi)) {
-            success = true;
-            if (wait) {
-                WaitForSingleObject(pi.hProcess, INFINITE);
-            }
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        } else {
-            ShowError(L"CreateProcessAsUserW", GetLastError());
-        }
-
-        // 9. 清理
-        if (lpEnvironment) DestroyEnvironmentBlock(lpEnvironment);
-        DeleteProcThreadAttributeList(siEx.lpAttributeList);
-        delete[] (char*)siEx.lpAttributeList;
-        CloseHandle(hSystemToken);
-        return success;
-
-    } else {
-        // 标准非隐藏模式
-        STARTUPINFOW si;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi;
-        if (!CreateProcessW(NULL, &cmdBuffer[0], NULL, NULL, FALSE, 0, NULL, finalWorkDir, &si, &pi)) {
-            ShowError(L"CreateProcessW (standard mode)", GetLastError());
-            return false;
-        }
-        if (wait) {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-        }
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return true;
+    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, creationFlags, NULL, finalWorkDir, &si, &pi)) {
+        return false;
     }
+
+    if (wait) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
 }
 
 
@@ -504,9 +345,28 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 // --- Registry Helpers ---
 
 bool RunSimpleCommand(const std::wstring& command) {
-    wchar_t systemPath[MAX_PATH];
-    GetSystemDirectoryW(systemPath, MAX_PATH);
-    return ExecuteProcess(std::wstring(systemPath) + L"\\cmd.exe", L"/c " + command, L"", true, true);
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
+    cmdBuffer.push_back(0);
+
+    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return exitCode == 0;
 }
 
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
@@ -537,7 +397,7 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
 bool RenameRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
     std::wstring fullSourcePath = rootKeyStr + L"\\" + subKey;
     std::wstring fullDestPath = rootKeyStr + L"\\" + newSubKey;
-
+    
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return false;
@@ -609,7 +469,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
 
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
-
+    
     std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
     write_wstring(displayName + L"=");
 
@@ -640,7 +500,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         else if (type == REG_MULTI_SZ) wss << L"(7)";
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
-
+        
         for (DWORD i = 0; i < size; ++i) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
             if (i < size - 1) {
@@ -895,7 +755,7 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
 
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
-
+    
     BSTR bstrRuleName = SysAllocString(ruleName.c_str());
     if (bstrRuleName) {
         pFwRules->Remove(bstrRuleName);
@@ -1073,7 +933,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
             ro_op.backupPath = ro_op.targetPath + L"_Backup";
             op.data = ro_op;
             op_created = true;
-        } else if (_wcsicmp(key.c_str(), L"regkey") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 ||
+        } else if (_wcsicmp(key.c_str(), L"regkey") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 || 
                    _wcsicmp(key.c_str(), L"(regkey)") == 0 || _wcsicmp(key.c_str(), L"(regvalue)") == 0) {
             RegistryOp r_op;
             r_op.isKey = (key.find(L"key") != std::wstring::npos);
@@ -1100,7 +960,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
                 std::wstring srcPathRaw = trim(value.substr(sep + 4));
                 l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(destPathRaw, variables));
                 l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(srcPathRaw, variables));
-
+                
                 l_op.isDirectory = (destPathRaw.back() == L'\\' || srcPathRaw.back() == L'\\');
                 if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
 
@@ -1144,7 +1004,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
 }
 
 
-// --- Pre-Launch Operation Parser and Executor (no changes) ---
+// --- Pre-Launch Operation Parser and Executor ---
 
 void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<PreLaunchOperation>& operations) {
     std::wstringstream stream(iniContent);
@@ -1172,15 +1032,15 @@ void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<s
         PreLaunchOperation op;
         bool op_created = false;
 
+        // [已修改] 更新 run 命令的解析逻辑，移除 hide 参数
         if (_wcsicmp(key.c_str(), L"run") == 0) {
             std::vector<std::wstring> parts = split_string(value, L"::");
             if (!parts.empty() && !parts[0].empty()) {
                 RunOp r_op;
                 r_op.programPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
                 r_op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                r_op.hide = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"hide") == 0);
-                r_op.commandLine = (parts.size() > 3 && _wcsicmp(parts[3].c_str(), L"null") != 0) ? parts[3] : L"";
-                r_op.workDir = (parts.size() > 4 && !parts[4].empty()) ? ResolveToAbsolutePath(ExpandVariables(parts[4], variables)) : L"";
+                r_op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
+                r_op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ResolveToAbsolutePath(ExpandVariables(parts[3], variables)) : L"";
                 op.data = r_op;
                 op_created = true;
             }
@@ -1215,25 +1075,27 @@ void ExecutePreLaunchOperations(const std::vector<PreLaunchOperation>& operation
     for (const auto& op : operations) {
         std::visit([&](const auto& arg) {
             using T = std::decay_t<decltype(arg)>;
+            
+            // [已修改] 对于 run 命令，hide 参数硬编码为 false
             if constexpr (std::is_same_v<T, RunOp>) {
-                ExecuteProcess(arg.programPath, arg.commandLine, arg.workDir, arg.wait, arg.hide);
+                ExecuteProcess(arg.programPath, arg.commandLine, arg.workDir, arg.wait, false);
             } else if constexpr (std::is_same_v<T, BatchOp>) {
                 wchar_t systemPath[MAX_PATH];
                 GetSystemDirectoryW(systemPath, MAX_PATH);
                 std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
                 std::wstring args = L"/c \"" + arg.batchPath + L"\"";
-                ExecuteProcess(cmdPath, args, L"", true, true);
+                ExecuteProcess(cmdPath, args, L"", true, true); // 总是等待并隐藏
             } else if constexpr (std::is_same_v<T, RegImportOp>) {
                 ImportRegistryFile(arg.regPath);
             } else if constexpr (std::is_same_v<T, RegDllOp>) {
                 wchar_t systemPath[MAX_PATH];
                 GetSystemDirectoryW(systemPath, MAX_PATH);
                 std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
-                std::wstring args = L"/s \"" + arg.dllPath + L"\"";
+                std::wstring args = L"/s \"" + arg.dllPath + L"\""; // /s for silent
                 if (arg.unregister) {
-                    args = L"/u " + args;
+                    args = L"/u " + args; // /u for unregister
                 }
-                ExecuteProcess(regsvrPath, args, L"", true, true);
+                ExecuteProcess(regsvrPath, args, L"", true, true); // 总是等待并静默
             }
         }, op.data);
     }
@@ -1245,18 +1107,24 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     std::map<std::wstring, std::wstring> variables = base_variables;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
-
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-
+    variables[L"APPEXE"] = absoluteAppPath;
+    wchar_t appDir[MAX_PATH];
+    wcscpy_s(appDir, absoluteAppPath);
+    PathRemoveFileSpecW(appDir);
+    variables[L"EXEPATH"] = appDir;
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
         wchar_t absoluteWorkDir[MAX_PATH];
         GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
         if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
+        else finalWorkDir = appDir;
+    } else {
+        finalWorkDir = appDir;
     }
-
+    variables[L"WORKDIR"] = finalWorkDir;
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false);
 }
@@ -1281,7 +1149,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
 
-    // --- Variable Parsing ---
+    // --- Variable Parsing (no changes) ---
     std::map<std::wstring, std::wstring> variables;
     variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
     variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
@@ -1297,7 +1165,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(launcherDir, launcherFullPath);
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
-
+    
     std::wstringstream userVarStream(iniContent);
     std::wstring userVarLine;
     std::wstring userVarCurrentSection;
@@ -1313,9 +1181,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!userVarInSettings) continue;
         size_t delimiterPos = userVarLine.find(L'=');
         if (delimiterPos != std::wstring::npos) {
-            std::wstring key = trim(userVarLine.substr(0, delimiterPos)); // [已修复]
+            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
             if (_wcsicmp(key.c_str(), L"uservar") == 0) {
-                std::wstring value = trim(userVarLine.substr(delimiterPos + 1)); // [已修复]
+                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
                 size_t separatorPos = value.find(L" :: ");
                 if (separatorPos != std::wstring::npos) {
                     std::wstring name = trim(value.substr(0, separatorPos));
@@ -1346,7 +1214,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     variables[L"WORKDIR"] = finalWorkDir;
 
-    // --- Mutex Creation ---
+    // --- Mutex Creation (no changes) ---
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
@@ -1373,7 +1241,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CoUninitialize();
             return 1;
         }
-
+        
         // Execute Pre-Launch Operations
         std::vector<PreLaunchOperation> preLaunchOps;
         ProcessPreLaunchOperations(iniContent, variables, preLaunchOps);
@@ -1382,20 +1250,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
         HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
-
+        
         std::vector<Operation> operations;
         ProcessAllOperations(iniContent, variables, operations);
-
+        
         for (auto& op : operations) {
             PerformStartupOperation(op);
         }
 
-        // --- Foreground/Suspend/Backup Thread Creation ---
+        // --- Foreground/Suspend/Backup Thread Creation (no changes) ---
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
             monitorData.shouldStop = &stopMonitor;
             monitorData.foregroundAppName = foregroundAppName;
-
+            
             std::wstringstream stream(iniContent);
             std::wstring line;
             std::wstring currentSection;
@@ -1431,7 +1299,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-
+            
             std::wstringstream stream(iniContent);
             std::wstring line;
             std::wstring currentSection;
@@ -1458,25 +1326,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
-
+        
         // --- Main Application Launch and Wait ---
-        PROCESS_INFORMATION pi;
-        ZeroMemory(&pi, sizeof(pi));
+        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
-
-        STARTUPINFOW si;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096];
-        wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-
+        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
-
+            
             for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
                 PerformShutdownOperation(*it);
             }
@@ -1502,11 +1363,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 break; // Wait failed
             }
         }
-
+        
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        // --- Post-Application Cleanup ---
+        // --- Post-Application Cleanup (no changes) ---
         std::vector<std::wstring> waitProcesses;
         std::wstringstream waitStream(iniContent);
         std::wstring waitLine;
@@ -1523,9 +1384,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!waitInSettings) continue;
             size_t delimiterPos = waitLine.find(L'=');
             if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(waitLine.substr(0, delimiterPos)); // [已修复]
+                std::wstring key = trim(waitLine.substr(0, delimiterPos));
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(waitLine.substr(delimiterPos + 1)); // [已修复]
+                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
                     waitProcesses.push_back(ExpandVariables(value, variables));
                 }
             }
@@ -1554,11 +1415,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
-
+        
         for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
             PerformShutdownOperation(*it);
         }
-
+        
         CloseHandle(hMutex);
         CoUninitialize();
 
