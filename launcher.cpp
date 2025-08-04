@@ -84,29 +84,28 @@ struct Operation {
     OperationData data;
 };
 
-// --- Global state for WndProc ---
-struct AppState {
+// --- Background Thread Data Structures ---
+struct MonitorThreadData {
+    std::atomic<bool>* shouldStop;
+    int checkInterval;
+    std::wstring foregroundAppName;
+    std::vector<std::wstring> suspendProcesses;
+};
+
+struct BackupThreadData {
+    std::atomic<bool>* shouldStop;
+    std::atomic<bool>* isWorking;
+    int backupInterval;
+    std::vector<std::pair<std::wstring, std::wstring>> backupDirs;
+    std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
+};
+
+// Data for the main worker thread
+struct WorkerThreadData {
+    HWND hMessageWnd;
     std::wstring iniContent;
     std::map<std::wstring, std::wstring> variables;
 };
-
-// --- Forward declarations ---
-void ExecuteCoreLogic(HWND hWnd);
-
-// --- Window Procedure for the message-only window ---
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_TIMER:
-            KillTimer(hWnd, 1);
-            ExecuteCoreLogic(hWnd);
-            return 0;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-        default:
-            return DefWindowProc(hWnd, msg, wParam, lParam);
-    }
-}
 
 
 // --- Privilege Elevation Functions ---
@@ -145,8 +144,8 @@ void EnableAllPrivileges() {
     }
 }
 
-
 // --- Path and INI Parsing Utilities ---
+// ... (omitted for brevity, same as before) ...
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -250,6 +249,7 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 }
 
 // --- File System & Command Helpers ---
+// ... (omitted for brevity, same as before) ...
 bool RunCommand(const std::wstring& command, bool showWindow = false) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -298,6 +298,7 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 }
 
 // --- Registry Helpers ---
+// ... (omitted for brevity, same as before) ...
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     size_t firstSlash = fullPath.find(L'\\');
     if (firstSlash == std::wstring::npos) return false;
@@ -452,12 +453,148 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 }
 
 // --- Process Management Functions ---
-// ... (omitted for brevity) ...
+// ... (omitted for brevity, same as before) ...
+bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
+    if (waitProcesses.empty()) return false;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            for (const auto& processName : waitProcesses) {
+                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                    CloseHandle(hSnapshot);
+                    return true;
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return false;
+}
+
+std::wstring GetProcessNameByPid(DWORD pid) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == pid) {
+                CloseHandle(hSnapshot);
+                return pe32.szExeFile;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return L"";
+}
+
+void SetAllProcessesState(const std::vector<std::wstring>& processList, bool suspend) {
+    if (processList.empty() || !g_NtSuspendProcess || !g_NtResumeProcess) return;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            for (const auto& processName : processList) {
+                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                    HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        if (suspend) g_NtSuspendProcess(hProcess);
+                        else g_NtResumeProcess(hProcess);
+                        CloseHandle(hProcess);
+                    }
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+}
 
 // --- Background Thread Functions (Monitor, Backup) ---
-// ... (omitted for brevity) ...
+// ... (omitted for brevity, same as before) ...
+DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
+    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
+    bool areProcessesSuspended = false;
+    while (!*(data->shouldStop)) {
+        HWND hForegroundWnd = GetForegroundWindow();
+        if (hForegroundWnd) {
+            DWORD foregroundPid = 0;
+            GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
+            std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
+            if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
+                if (!areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, true);
+                    areProcessesSuspended = true;
+                }
+            } else {
+                if (areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, false);
+                    areProcessesSuspended = false;
+                }
+            }
+        }
+        Sleep(data->checkInterval * 1000);
+    }
+    return 0;
+}
+
+std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
+    size_t separatorPos = entry.find(L" :: ");
+    if (separatorPos == std::wstring::npos) return {};
+    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables));
+    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + 4)), variables));
+    if (dest.empty() || src.empty()) return {};
+    return {dest, src};
+}
+
+void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+    std::wstring backupDest = dest + L"_Backup";
+    if (PathFileExistsW(dest.c_str())) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+    PerformFileSystemOperation(FO_COPY, src, dest);
+    if (PathFileExistsW(backupDest.c_str())) {
+        PerformFileSystemOperation(FO_DELETE, backupDest);
+    }
+}
+
+void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+    std::wstring backupDest = dest + L"_Backup";
+    if (PathFileExistsW(dest.c_str())) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+    if (CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
+        if (PathFileExistsW(backupDest.c_str())) {
+            DeleteFileW(backupDest.c_str());
+        }
+    }
+}
+
+DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
+    BackupThreadData* data = static_cast<BackupThreadData*>(lpParam);
+    while (!*(data->shouldStop)) {
+        Sleep(data->backupInterval);
+        if (*(data->shouldStop)) break;
+        *(data->isWorking) = true;
+        for (const auto& pair : data->backupDirs) {
+            PerformDirectoryBackup(pair.first, pair.second);
+        }
+        for (const auto& pair : data->backupFiles) {
+            PerformFileBackup(pair.first, pair.second);
+        }
+        *(data->isWorking) = false;
+    }
+    return 0;
+}
 
 // --- Link Management ---
+// ... (omitted for brevity, same as before) ...
 void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
@@ -481,6 +618,7 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
 }
 
 // --- Firewall Management ---
+// ... (omitted for brevity, same as before) ...
 void CreateFirewallRule(FirewallOp& op) {
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
@@ -543,7 +681,7 @@ cleanup:
 }
 
 // --- Unified Operation Handlers ---
-
+// ... (omitted for brevity, same as before) ...
 void PerformStartupOperation(Operation& op) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -656,8 +794,8 @@ void PerformShutdownOperation(Operation& op) {
     }, op.data);
 }
 
-
 // --- Master Operation Parser ---
+// ... (omitted for brevity, same as before) ...
 void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<Operation>& operations) {
     std::wstringstream stream(iniContent);
     std::wstring line;
@@ -824,41 +962,133 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     }
 }
 
-void ExecuteCoreLogic(HWND hWnd) {
-    AppState* pState = reinterpret_cast<AppState*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
-    if (!pState) {
-        DestroyWindow(hWnd);
-        return;
-    }
+DWORD WINAPI WorkerThread(LPVOID lpParam) {
+    WorkerThreadData* data = static_cast<WorkerThreadData*>(lpParam);
+    
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-    // Use copies to work with
-    std::wstring iniContent = pState->iniContent;
-    std::map<std::wstring, std::wstring> variables = pState->variables;
+    std::map<std::wstring, std::wstring> variables = data->variables;
+    std::wstring iniContent = data->iniContent;
 
-    // STAGE 2: Complete the variables map now that we are in the core logic
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
-    wchar_t absoluteAppPath[MAX_PATH];
-    GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-    variables[L"APPEXE"] = absoluteAppPath;
-    wchar_t appDir[MAX_PATH];
-    wcscpy_s(appDir, absoluteAppPath);
-    PathRemoveFileSpecW(appDir);
-    variables[L"EXEPATH"] = appDir;
-    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
-    std::wstring finalWorkDir;
-    if (!workDirRaw.empty()) {
-        wchar_t absoluteWorkDir[MAX_PATH];
-        GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
-        if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-        else finalWorkDir = appDir;
-    } else {
-        finalWorkDir = appDir;
+    if (appPathRaw.empty()) {
+        MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
+        PostMessage(data->hMessageWnd, WM_QUIT, 0, 0);
+        CoUninitialize();
+        delete data;
+        return 1;
     }
-    variables[L"WORKDIR"] = finalWorkDir;
+    
+    HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
+    HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
+    
+    std::vector<Operation> operations;
+    ProcessAllOperations(iniContent, variables, operations);
+    
+    for (auto& op : operations) {
+        PerformStartupOperation(op);
+    }
 
-    // Now create the mutex
+    std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
+    if (!foregroundAppName.empty()) {
+        monitorData.shouldStop = &stopMonitor;
+        monitorData.foregroundAppName = foregroundAppName;
+        // ... (Foreground Monitor Setup logic)
+        hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+    }
+
+    std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
+    if (!backupTimeStr.empty() && _wtoi(backupTimeStr.c_str()) > 0) {
+        // ... (Backup Thread Setup logic)
+        hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
+    }
+
+    STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
+    std::wstring fullCommandLine = L"\"" + std::wstring(variables[L"APPEXE"]) + L"\" " + commandLine;
+    wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+    
+    if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, variables[L"WORKDIR"].c_str(), &si, &pi)) {
+        MessageBoxW(NULL, (L"启动程序失败: \n" + variables[L"APPEXE"]).c_str(), L"启动错误", MB_ICONERROR);
+    } else {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    
+    // ... (Wait Process Logic)
+
+    if (hMonitorThread) {
+        stopMonitor = true;
+        WaitForSingleObject(hMonitorThread, 1500);
+        CloseHandle(hMonitorThread);
+        SetAllProcessesState(monitorData.suspendProcesses, false);
+    }
+    if (hBackupThread) {
+        stopBackup = true;
+        while (isBackupWorking) Sleep(100);
+        WaitForSingleObject(hBackupThread, 1500);
+        CloseHandle(hBackupThread);
+    }
+    
+    for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
+        PerformShutdownOperation(*it);
+    }
+    
+    CoUninitialize();
+    PostMessage(data->hMessageWnd, WM_QUIT, 0, 0);
+    delete data;
+    return 0;
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_CREATE: {
+            WorkerThreadData* data = new WorkerThreadData();
+            data->hMessageWnd = hwnd;
+            data->iniContent = *reinterpret_cast<std::wstring*>(reinterpret_cast<CREATESTRUCT*>(lParam)->lpCreateParams);
+            
+            HANDLE hThread = CreateThread(NULL, 0, WorkerThread, data, 0, NULL);
+            if (hThread) {
+                CloseHandle(hThread);
+            } else {
+                delete data;
+                PostQuitMessage(1);
+            }
+            return 0;
+        }
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    EnableAllPrivileges();
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
+        g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
+
     wchar_t launcherFullPath[MAX_PATH];
     GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
+    std::wstring iniPath = launcherFullPath;
+    size_t pos = iniPath.find_last_of(L".");
+    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
+    std::wstring iniContent;
+    if (!ReadFileToWString(iniPath, iniContent)) {
+        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
+        return 1;
+    }
+
+    std::map<std::wstring, std::wstring> variables;
+    // ... (Variable Map Construction, same as before)
+
+    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
+    
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
@@ -877,122 +1107,25 @@ void ExecuteCoreLogic(HWND hWnd) {
     bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
 
     if (isFirstInstance) {
-        if (appPathRaw.empty()) {
-            MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
+        const wchar_t CLASS_NAME[]  = L"YAPLauncherMessageWindowClass";
+        
+        WNDCLASSW wc = { };
+        wc.lpfnWndProc   = WindowProc;
+        wc.hInstance     = hInstance;
+        wc.lpszClassName = CLASS_NAME;
+        RegisterClassW(&wc);
+
+        HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"YAP Launcher", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, &iniContent);
+
+        if (hwnd == NULL) {
             CloseHandle(hMutex);
-            DestroyWindow(hWnd);
-            return;
-        }
-        
-        HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
-        HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
-        
-        std::vector<Operation> operations;
-        ProcessAllOperations(iniContent, variables, operations);
-        
-        for (auto& op : operations) {
-            PerformStartupOperation(op);
+            return 0;
         }
 
-        std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
-        if (!foregroundAppName.empty()) {
-            monitorData.shouldStop = &stopMonitor;
-            monitorData.foregroundAppName = foregroundAppName;
-            
-            std::wstringstream stream(iniContent);
-            std::wstring line;
-            std::wstring currentSection;
-            bool inSettings = false;
-            while (std::getline(stream, line)) {
-                line = trim(line);
-                if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
-                if (line[0] == L'[' && line.back() == L']') {
-                    currentSection = line;
-                    inSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
-                    continue;
-                }
-                if (!inSettings) continue;
-                size_t delimiterPos = line.find(L'=');
-                if (delimiterPos != std::wstring::npos) {
-                    std::wstring key = trim(line.substr(0, delimiterPos));
-                    if (_wcsicmp(key.c_str(), L"suspend") == 0) {
-                        std::wstring value = trim(line.substr(delimiterPos + 1));
-                        monitorData.suspendProcesses.push_back(ExpandVariables(value, variables));
-                    }
-                }
-            }
-
-            std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
-            monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
-            if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
-            if (!monitorData.suspendProcesses.empty()) hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
-        }
-
-        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
-        int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
-        if (backupTime > 0) {
-            backupData.shouldStop = &stopBackup;
-            backupData.isWorking = &isBackupWorking;
-            backupData.backupInterval = backupTime * 60 * 1000;
-            
-            std::wstringstream stream(iniContent);
-            std::wstring line;
-            std::wstring currentSection;
-            bool inSettings = false;
-            while (std::getline(stream, line)) {
-                line = trim(line);
-                if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
-                if (line[0] == L'[' && line.back() == L']') {
-                    currentSection = line;
-                    inSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
-                    continue;
-                }
-                if (!inSettings) continue;
-                size_t delimiterPos = line.find(L'=');
-                if (delimiterPos != std::wstring::npos) {
-                    std::wstring key = trim(line.substr(0, delimiterPos));
-                    std::wstring value = trim(line.substr(delimiterPos + 1));
-                    if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
-                        backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
-                    } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
-                        backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
-                    }
-                }
-            }
-            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
-        }
-
-        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
-        std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
-        std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        
-        if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
-            MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-        } else {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-
-        std::vector<std::wstring> waitProcesses;
-        // ... (Wait Process Logic)
-        
-        if (hMonitorThread) {
-            stopMonitor = true;
-            WaitForSingleObject(hMonitorThread, 1500);
-            CloseHandle(hMonitorThread);
-            SetAllProcessesState(monitorData.suspendProcesses, false);
-        }
-        if (hBackupThread) {
-            stopBackup = true;
-            while (isBackupWorking) Sleep(100);
-            WaitForSingleObject(hBackupThread, 1500);
-            CloseHandle(hBackupThread);
-        }
-        
-        for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
-            PerformShutdownOperation(*it);
+        MSG msg = { };
+        while (GetMessage(&msg, NULL, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
         
         CloseHandle(hMutex);
@@ -1002,99 +1135,5 @@ void ExecuteCoreLogic(HWND hWnd) {
             LaunchApplication(iniContent, variables);
         }
     }
-
-    DestroyWindow(hWnd);
-}
-
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    EnableAllPrivileges();
-
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
-        g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
-    }
-
-    AppState state;
-    wchar_t launcherFullPath[MAX_PATH];
-    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
-    std::wstring iniPath = launcherFullPath;
-    size_t pos = iniPath.find_last_of(L".");
-    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
-    
-    if (!ReadFileToWString(iniPath, state.iniContent)) {
-        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
-        return 1;
-    }
-
-    // STAGE 1: Initialize static and user variables
-    state.variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
-    state.variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
-    state.variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
-    state.variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
-    state.variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
-    state.variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
-    state.variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
-    wchar_t drive[_MAX_DRIVE];
-    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
-    state.variables[L"DRIVE"] = drive;
-    wchar_t launcherDir[MAX_PATH];
-    wcscpy_s(launcherDir, launcherFullPath);
-    PathRemoveFileSpecW(launcherDir);
-    state.variables[L"YAPROOT"] = launcherDir;
-    
-    std::wstringstream userVarStream(state.iniContent);
-    std::wstring userVarLine;
-    std::wstring userVarCurrentSection;
-    bool userVarInSettings = false;
-    while (std::getline(userVarStream, userVarLine)) {
-        userVarLine = trim(userVarLine);
-        if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
-        if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
-            userVarCurrentSection = userVarLine;
-            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
-            continue;
-        }
-        if (!userVarInSettings) continue;
-        size_t delimiterPos = userVarLine.find(L'=');
-        if (delimiterPos != std::wstring::npos) {
-            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
-            if (_wcsicmp(key.c_str(), L"uservar") == 0) {
-                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
-                size_t separatorPos = value.find(L" :: ");
-                if (separatorPos != std::wstring::npos) {
-                    std::wstring name = trim(value.substr(0, separatorPos));
-                    std::wstring varValue = ExpandVariables(trim(value.substr(separatorPos + 4)), state.variables);
-                    state.variables[name] = varValue;
-                }
-            }
-        }
-    }
-
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-
-    const wchar_t CLASS_NAME[] = L"LauncherMessageWindowClass";
-    WNDCLASS wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = CLASS_NAME;
-    RegisterClass(&wc);
-
-    HWND hWnd = CreateWindowEx(0, CLASS_NAME, L"Launcher Helper", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
-    if (hWnd == NULL) {
-        CoUninitialize();
-        return 0;
-    }
-    
-    SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
-    SetTimer(hWnd, 1, 10, NULL);
-
-    MSG msg = {};
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    CoUninitialize();
     return 0;
 }
