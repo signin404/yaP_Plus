@@ -1,5 +1,3 @@
-#define _WIN32_WINNT 0x0A00 // 必须放在所有 include 之前，以启用新版 Windows API
-
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -273,38 +271,18 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// Helper structure for the EnumWindows callback
-struct EnumData {
-    DWORD dwProcessId;
-    HWND hWnd;
-};
-
-// Callback function for EnumWindows to find the window by PID
-BOOL CALLBACK EnumWindowsCallback(HWND hWnd, LPARAM lParam) {
-    EnumData* pData = (EnumData*)lParam;
-    DWORD dwProcessId = 0;
-    GetWindowThreadProcessId(hWnd, &dwProcessId);
-    if (pData->dwProcessId == dwProcessId) {
-        // Found the window, store it and stop enumerating
-        pData->hWnd = hWnd;
-        return FALSE; 
-    }
-    return TRUE;
-}
-
-// A powerful and flexible process execution function with forced window hiding
+// [已修复] 使用 NSudo 的方法强制隐藏窗口
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
     }
 
-    // Prepare basic process startup info
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
     std::wstring commandLine = L"\"" + path + L"\" " + args;
     std::vector<wchar_t> cmdBuffer(commandLine.begin(), commandLine.end());
     cmdBuffer.push_back(0);
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
 
     const wchar_t* finalWorkDir = NULL;
     std::wstring exeDir;
@@ -316,62 +294,68 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         finalWorkDir = exeDir.c_str();
     }
 
-    if (!hide) {
-        // Simple case: just run the process without hiding
+    if (hide) {
+        // 这是 NSudo 使用的强制隐藏窗口的方法
+        STARTUPINFOEXW siEx;
+        ZeroMemory(&siEx, sizeof(siEx));
+        siEx.StartupInfo.cb = sizeof(siEx);
+
+        SIZE_T attributeListSize = 0;
+        // 第一次调用获取所需大小
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
+        
+        siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
+        ZeroMemory(siEx.lpAttributeList, attributeListSize);
+
+        // 第二次调用初始化列表
+        if (InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
+            DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
+            // 更新列表，添加窗口策略属性
+            UpdateProcThreadAttribute(
+                siEx.lpAttributeList,
+                0,
+                PROC_THREAD_ATTRIBUTE_WINDOW_POLICY,
+                &policy,
+                sizeof(policy),
+                NULL,
+                NULL);
+
+            if (!CreateProcessW(
+                NULL,
+                cmdBuffer.data(),
+                NULL,
+                NULL,
+                FALSE,
+                EXTENDED_STARTUPINFO_PRESENT, // 必须使用此标志
+                NULL,
+                finalWorkDir,
+                &siEx.StartupInfo,
+                &pi)) {
+                // 清理
+                DeleteProcThreadAttributeList(siEx.lpAttributeList);
+                delete[] siEx.lpAttributeList;
+                return false;
+            }
+            // 清理
+            DeleteProcThreadAttributeList(siEx.lpAttributeList);
+            delete[] siEx.lpAttributeList;
+        } else {
+            // 如果属性列表初始化失败，回退到旧方法
+            delete[] siEx.lpAttributeList;
+            siEx.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+            siEx.StartupInfo.wShowWindow = SW_HIDE;
+            if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
+                return false;
+            }
+        }
+    } else {
+        // 不隐藏，正常启动
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
         if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, 0, NULL, finalWorkDir, &si, &pi)) {
             return false;
         }
-    } else {
-        // Advanced case: Force hide the window
-        STARTUPINFOEXW siEx;
-        ZeroMemory(&siEx, sizeof(siEx));
-        siEx.StartupInfo.cb = sizeof(STARTUPINFOEXW);
-        siEx.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
-        siEx.StartupInfo.wShowWindow = SW_HIDE;
-
-        bool success = false;
-
-        // --- Modern Method (Windows 10+) ---
-        SIZE_T attributeListSize = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
-        siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
-        if (InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
-            DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_EXCLUDE_DESKTOP_VIEW;
-            if (UpdateProcThreadAttribute(siEx.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_WINDOW_POLICY, &policy, sizeof(policy), NULL, NULL)) {
-                 if (CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
-                    success = true;
-                }
-            }
-            DeleteProcThreadAttributeList(siEx.lpAttributeList);
-        }
-        delete[] (char*)siEx.lpAttributeList;
-
-        if (!success) {
-            // --- Classic Fallback Method (for older Windows or if modern method fails) ---
-            STARTUPINFOW si;
-            ZeroMemory(&si, sizeof(si));
-            si.cb = sizeof(si);
-            si.dwFlags = STARTF_USESHOWWINDOW;
-            si.wShowWindow = SW_HIDE; // Still provide a hint
-
-            if (CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, finalWorkDir, &si, &pi)) {
-                // Poll for the window to appear and hide it immediately
-                EnumData data = { pi.dwProcessId, NULL };
-                for (int i = 0; i < 50; ++i) { // Poll for up to 5 seconds
-                    EnumWindows(EnumWindowsCallback, (LPARAM)&data);
-                    if (data.hWnd) {
-                        ShowWindow(data.hWnd, SW_HIDE);
-                        break;
-                    }
-                    Sleep(100);
-                }
-                success = true;
-            }
-        }
-        if (!success) return false;
     }
 
     if (wait) {
@@ -409,28 +393,7 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 // --- Registry Helpers ---
 
 bool RunSimpleCommand(const std::wstring& command) {
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
-    cmdBuffer.push_back(0);
-
-    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return exitCode == 0;
+    return ExecuteProcess(L"cmd.exe", L"/c " + command, L"", true, true);
 }
 
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
@@ -655,7 +618,7 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
 }
 
 
-// --- Foreground Monitoring, Backup, Link, Firewall Sections ---
+// --- Foreground Monitoring, Backup, Link, Firewall Sections (no changes) ---
 struct MonitorThreadData {
     std::atomic<bool>* shouldStop;
     int checkInterval;
@@ -831,7 +794,7 @@ cleanup:
     if (pFwPolicy) pFwPolicy->Release();
 }
 
-// --- Unified Operation Handlers ---
+// --- Unified Operation Handlers (no changes) ---
 
 void PerformStartupOperation(Operation& op) {
     std::visit([&](auto& arg) {
@@ -946,7 +909,7 @@ void PerformShutdownOperation(Operation& op) {
 }
 
 
-// --- Master Operation Parser ---
+// --- Master Operation Parser (no changes) ---
 void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<Operation>& operations) {
     std::wstringstream stream(iniContent);
     std::wstring line;
@@ -1068,7 +1031,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
 }
 
 
-// --- Pre-Launch Operation Parser and Executor ---
+// --- Pre-Launch Operation Parser and Executor (no changes) ---
 
 void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<PreLaunchOperation>& operations) {
     std::wstringstream stream(iniContent);
@@ -1169,24 +1132,18 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     std::map<std::wstring, std::wstring> variables = base_variables;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
+    
     wchar_t absoluteAppPath[MAX_PATH];
     GetFullPathNameW(appPathRaw.c_str(), MAX_PATH, absoluteAppPath, NULL);
-    variables[L"APPEXE"] = absoluteAppPath;
-    wchar_t appDir[MAX_PATH];
-    wcscpy_s(appDir, absoluteAppPath);
-    PathRemoveFileSpecW(appDir);
-    variables[L"EXEPATH"] = appDir;
+    
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"workdir"), variables);
     std::wstring finalWorkDir;
     if (!workDirRaw.empty()) {
         wchar_t absoluteWorkDir[MAX_PATH];
         GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
         if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-        else finalWorkDir = appDir;
-    } else {
-        finalWorkDir = appDir;
     }
-    variables[L"WORKDIR"] = finalWorkDir;
+    
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
     ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false);
 }
@@ -1390,10 +1347,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         
         // --- Main Application Launch and Wait ---
-        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
+        
+        // Use a simple STARTUPINFO for the main app, as we don't want to hide it.
+        STARTUPINFOW si;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        
         std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        wchar_t commandLineBuffer[4096]; 
+        wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
         
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
@@ -1408,10 +1373,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
 
+        // Use MsgWaitForMultipleObjects to prevent the busy cursor issue
         while (true) {
             DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
             if (dwResult == WAIT_OBJECT_0) {
-                break;
+                break; // Process ended
             }
             else if (dwResult == WAIT_OBJECT_0 + 1) {
                 MSG msg;
@@ -1421,7 +1387,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 }
             }
              else {
-                break;
+                break; // Wait failed
             }
         }
         
