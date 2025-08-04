@@ -1,4 +1,4 @@
-#define _WIN32_WINNT 0x0A00
+#define _WIN32_WINNT 0x0A00 // 保持这个定义
 
 #include <windows.h>
 #include <string>
@@ -28,20 +28,20 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
 
-// --- [新增] 手动定义缺失的 Windows SDK 常量 ---
+// --- [已修复] 手动定义缺失的 Windows SDK 常量 ---
 // 解决在旧版 Windows SDK 中编译时 "undeclared identifier" 的问题
-
 #ifndef PROC_THREAD_ATTRIBUTE_LIST
 typedef PVOID LPPROC_THREAD_ATTRIBUTE_LIST;
 #endif
 
 #ifndef PROC_THREAD_ATTRIBUTE_WINDOW_POLICY
-#define PROC_THREAD_ATTRIBUTE_WINDOW_POLICY 0x20014
+#define PROC_THREAD_ATTRIBUTE_WINDOW_POLICY 0x00020014
 #endif
 
 #ifndef PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW
 #define PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW 0x1
 #endif
+
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -288,7 +288,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// [已修复] 使用 NSudo 的方法强制隐藏窗口
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -312,22 +311,18 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
-        // 这是 NSudo 使用的强制隐藏窗口的方法
         STARTUPINFOEXW siEx;
         ZeroMemory(&siEx, sizeof(siEx));
         siEx.StartupInfo.cb = sizeof(siEx);
 
         SIZE_T attributeListSize = 0;
-        // 第一次调用获取所需大小
         InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
         
         siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
         ZeroMemory(siEx.lpAttributeList, attributeListSize);
 
-        // 第二次调用初始化列表
         if (InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
             DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
-            // 更新列表，添加窗口策略属性
             UpdateProcThreadAttribute(
                 siEx.lpAttributeList,
                 0,
@@ -343,22 +338,19 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
                 NULL,
                 NULL,
                 FALSE,
-                EXTENDED_STARTUPINFO_PRESENT, // 必须使用此标志
+                EXTENDED_STARTUPINFO_PRESENT,
                 NULL,
                 finalWorkDir,
                 &siEx.StartupInfo,
                 &pi)) {
-                // 清理
                 DeleteProcThreadAttributeList(siEx.lpAttributeList);
-                delete[] siEx.lpAttributeList;
+                delete[] (char*)siEx.lpAttributeList;
                 return false;
             }
-            // 清理
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
-            delete[] siEx.lpAttributeList;
+            delete[] (char*)siEx.lpAttributeList;
         } else {
-            // 如果属性列表初始化失败，回退到旧方法
-            delete[] siEx.lpAttributeList;
+            delete[] (char*)siEx.lpAttributeList;
             siEx.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
             siEx.StartupInfo.wShowWindow = SW_HIDE;
             if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
@@ -366,7 +358,6 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
             }
         }
     } else {
-        // 不隐藏，正常启动
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
@@ -410,7 +401,9 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 // --- Registry Helpers ---
 
 bool RunSimpleCommand(const std::wstring& command) {
-    return ExecuteProcess(L"cmd.exe", L"/c " + command, L"", true, true);
+    wchar_t systemPath[MAX_PATH];
+    GetSystemDirectoryW(systemPath, MAX_PATH);
+    return ExecuteProcess(std::wstring(systemPath) + L"\\cmd.exe", L"/c " + command, L"", true, true);
 }
 
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
@@ -1368,7 +1361,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
         
-        // Use a simple STARTUPINFO for the main app, as we don't want to hide it.
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
