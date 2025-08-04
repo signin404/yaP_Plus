@@ -32,17 +32,17 @@ typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
-// --- FORWARD DECLARATIONS for helper functions ---
-bool RunCommand(const std::wstring& command, bool showWindow);
-void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to);
+// --- FORWARD DECLARATIONS with CORRECTED signatures ---
+bool RunCommand(const std::wstring& command, bool showWindow = false);
+void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"");
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName);
 bool RenameRegistryKey(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& newSubKey);
 bool RenameRegistryValue(HKEY hRoot, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName);
 bool ExportRegistryKey(const std::wstring& fullKeyPath, const std::wstring& filePath);
 bool ExportRegistryValue(HKEY hRoot, const std::wstring& rootStr, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& filePath);
 bool ImportRegistryFile(const std::wstring& filePath);
-void CleanupFirewallRules(); // CORRECTED: Added forward declaration
-class Operation; // Forward declare base class for ProcessAllSettings
+void CleanupFirewallRules();
+class Operation;
 void ProcessAllSettings(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<std::unique_ptr<Operation>>& operations);
 void LaunchApplication(const std::wstring& iniContent);
 
@@ -657,7 +657,7 @@ bool ExportRegistryValue(HKEY hRoot, const std::wstring& rootStr, const std::wst
 
 bool ImportRegistryFile(const std::wstring& filePath) {
     if (!PathFileExistsW(filePath.c_str())) return true;
-    return RunCommand(L"reg import \"" + filePath + L"\"", false);
+    return RunCommand(L"reg import \"" + filePath + L"\"");
 }
 
 void CleanupFirewallRules() {
