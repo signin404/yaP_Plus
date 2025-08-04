@@ -14,6 +14,8 @@
 #include <shellapi.h> // For SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
 #include <netfw.h>    // For Firewall COM API
+#include <winreg.h>   // For Registry functions
+#include <iomanip>    // For std::hex formatting
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -21,7 +23,7 @@
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
-#pragma comment(lib, "OleAut32.lib") // For Firewall BSTR functions
+#pragma comment(lib, "OleAut32.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -38,12 +40,29 @@ struct SaveRestoreEntry {
     bool destBackupCreated = false;
 };
 
-// NEW: Structure for Restore-Only functionality
 struct RestoreOnlyEntry {
     std::wstring targetPath;
     std::wstring backupPath;
     bool isDirectory;
     bool backupCreated = false;
+};
+
+struct RegistryEntry {
+    bool isSaveRestore; // true for save/restore, false for restore-only
+    bool isKey;         // true for key, false for value
+    HKEY hRootKey;
+    std::wstring rootKeyStr; // For command line usage
+    std::wstring subKey;
+    std::wstring valueName; // Empty if it's a key operation
+    std::wstring backupName;
+    std::wstring filePath; // Only for save/restore
+    bool backupCreated = false;
+};
+
+struct LinkRecord {
+    std::wstring linkPath;
+    std::wstring backupPath;
+    bool wasDirectory;
 };
 
 
@@ -214,16 +233,41 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     return true;
 }
 
-// --- File System Helpers ---
+// --- File System & Command Helpers ---
+bool RunCommand(const std::wstring& command, bool showWindow = false) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = showWindow ? SW_SHOW : SW_HIDE;
+
+    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
+    cmdBuffer.push_back(0);
+
+    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, showWindow ? 0 : CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return exitCode == 0;
+}
+
 void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"") {
     wchar_t fromPath[MAX_PATH * 2] = {0};
     wcscpy_s(fromPath, from.c_str());
-    fromPath[from.length() + 1] = L'\0'; // Double null-terminate
+    fromPath[from.length() + 1] = L'\0';
 
     wchar_t toPath[MAX_PATH * 2] = {0};
     if (!to.empty()) {
         wcscpy_s(toPath, to.c_str());
-        toPath[to.length() + 1] = L'\0'; // Double null-terminate
+        toPath[to.length() + 1] = L'\0';
     }
 
     SHFILEOPSTRUCTW sfos = {0};
@@ -235,6 +279,134 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
         sfos.fFlags |= FOF_NOCONFIRMMKDIR;
     }
     SHFileOperationW(&sfos);
+}
+
+// --- Registry Helpers ---
+bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
+    size_t firstSlash = fullPath.find(L'\\');
+    if (firstSlash == std::wstring::npos) return false;
+
+    std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
+    std::wstring restOfPath = fullPath.substr(firstSlash + 1);
+
+    if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKU") == 0) { hRootKey = HKEY_USERS; rootKeyStr = L"HKEY_USERS"; }
+    else return false;
+
+    if (isKey) {
+        subKey = restOfPath;
+        valueName = L"";
+    } else {
+        size_t lastSlash = restOfPath.find_last_of(L'\\');
+        if (lastSlash == std::wstring::npos) return false; // Value must be in a key
+        subKey = restOfPath.substr(0, lastSlash);
+        valueName = restOfPath.substr(lastSlash + 1);
+    }
+    return true;
+}
+
+bool RenameRegistryKey(const RegistryEntry& entry, const std::wstring& newSubKey) {
+    std::wstring fullSourcePath = entry.rootKeyStr + L"\\" + entry.subKey;
+    std::wstring fullDestPath = entry.rootKeyStr + L"\\" + newSubKey;
+    
+    HKEY hKey;
+    if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return false; // Source doesn't exist, nothing to rename.
+    }
+    RegCloseKey(hKey);
+
+    if (!RunCommand(L"reg copy \"" + fullSourcePath + L"\" \"" + fullDestPath + L"\" /s /f")) {
+        return false;
+    }
+    return SHDeleteKeyW(entry.hRootKey, entry.subKey.c_str()) == ERROR_SUCCESS;
+}
+
+bool RenameRegistryValue(const RegistryEntry& entry, const std::wstring& newValueName) {
+    HKEY hKey;
+    if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) return false;
+
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, entry.valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false; // Source value doesn't exist
+    }
+
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, entry.valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    if (RegSetValueExW(hKey, newValueName.c_str(), 0, type, data.data(), size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    RegDeleteValueW(hKey, entry.valueName.c_str());
+    RegCloseKey(hKey);
+    return true;
+}
+
+bool ExportRegistryKey(const RegistryEntry& entry) {
+    std::wstring fullKeyPath = entry.rootKeyStr + L"\\" + entry.subKey;
+    return RunCommand(L"reg export \"" + fullKeyPath + L"\" \"" + entry.filePath + L"\" /y");
+}
+
+bool ExportRegistryValue(const RegistryEntry& entry) {
+    HKEY hKey;
+    if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, entry.valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, entry.valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+    RegCloseKey(hKey);
+
+    std::wofstream regFile(entry.filePath);
+    if (!regFile.is_open()) return false;
+
+    regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
+    regFile << L"[" << entry.rootKeyStr << L"\\" << entry.subKey << L"]\r\n";
+    regFile << L"\"" << entry.valueName << L"\"=";
+
+    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+        std::wstring strValue(reinterpret_cast<wchar_t*>(data.data()));
+        std::wstring escapedStr;
+        for (wchar_t c : strValue) {
+            if (c == L'\\') escapedStr += L"\\\\";
+            else if (c == L'"') escapedStr += L"\\\"";
+            else escapedStr += c;
+        }
+        regFile << L"\"" << escapedStr << L"\"";
+    } else if (type == REG_DWORD) {
+        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
+        regFile << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
+    } else if (type == REG_QWORD) {
+        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
+        regFile << L"hex(b):" << std::hex << std::setw(16) << std::setfill(L'0') << qwordValue;
+    } else if (type == REG_BINARY || type == REG_MULTI_SZ || type == REG_NONE) {
+        regFile << L"hex" << (type == REG_MULTI_SZ ? L"(7)" : L"") << L":";
+        for (DWORD i = 0; i < size; ++i) {
+            regFile << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            if (i < size - 1) regFile << L",";
+        }
+    }
+    regFile << L"\r\n";
+    regFile.close();
+    return true;
+}
+
+bool ImportRegistryFile(const std::wstring& filePath) {
+    if (!PathFileExistsW(filePath.c_str())) return true; // Nothing to import, not an error
+    return RunCommand(L"reg import \"" + filePath + L"\"");
 }
 
 // --- Process Management Functions ---
@@ -393,12 +565,6 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
 }
 
 // --- Link Management ---
-struct LinkRecord {
-    std::wstring linkPath;
-    std::wstring backupPath;
-    bool wasDirectory;
-};
-
 void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<LinkRecord>& records) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
@@ -703,7 +869,7 @@ void PerformShutdownOperations(std::vector<SaveRestoreEntry>& entries) {
     }
 }
 
-// --- NEW Restore-Only Logic ---
+// --- Restore-Only Logic ---
 void ProcessRestoreOnlyEntries(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<RestoreOnlyEntry>& entries) {
     auto process = [&](const std::wstring& key, bool isDir) {
         auto values = GetMultiValueFromIniContent(iniContent, L"Settings", key);
@@ -736,7 +902,6 @@ void PerformShutdownRestoreOnlyOperations(std::vector<RestoreOnlyEntry>& entries
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         auto& entry = *it;
 
-        // Delete the new item created by the application
         if (PathFileExistsW(entry.targetPath.c_str())) {
             if (entry.isDirectory) {
                 PerformFileSystemOperation(FO_DELETE, entry.targetPath);
@@ -745,13 +910,97 @@ void PerformShutdownRestoreOnlyOperations(std::vector<RestoreOnlyEntry>& entries
             }
         }
 
-        // Restore the original
         if (entry.backupCreated && PathFileExistsW(entry.backupPath.c_str())) {
             MoveFileW(entry.backupPath.c_str(), entry.targetPath.c_str());
         }
     }
 }
 
+// --- Registry Processing Logic ---
+void ProcessRegistryEntries(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<RegistryEntry>& entries) {
+    auto process = [&](const std::wstring& iniKey, bool isSaveRestore, bool isKey) {
+        auto values = GetMultiValueFromIniContent(iniContent, L"Settings", iniKey);
+        for (const auto& value : values) {
+            RegistryEntry entry;
+            entry.isSaveRestore = isSaveRestore;
+            entry.isKey = isKey;
+            
+            std::wstring regPathRaw;
+            if (isSaveRestore) {
+                size_t separatorPos = value.find(L" :: ");
+                if (separatorPos == std::wstring::npos) continue;
+                regPathRaw = trim(value.substr(0, separatorPos));
+                entry.filePath = ResolveToAbsolutePath(ExpandVariables(trim(value.substr(separatorPos + 4)), variables));
+            } else {
+                regPathRaw = value;
+            }
+
+            if (!ParseRegistryPath(regPathRaw, isKey, entry.hRootKey, entry.rootKeyStr, entry.subKey, entry.valueName)) continue;
+
+            if (isKey) {
+                entry.backupName = entry.subKey + L"_Backup";
+            } else {
+                entry.backupName = entry.valueName + L"_Backup";
+            }
+            entries.push_back(entry);
+        }
+    };
+
+    process(L"regkey", true, true);
+    process(L"regvalue", true, false);
+    process(L"(regkey)", false, true);
+    process(L"(regvalue)", false, false);
+}
+
+void PerformStartupRegistryOperations(std::vector<RegistryEntry>& entries) {
+    for (auto& entry : entries) {
+        bool renamed = false;
+        if (entry.isKey) {
+            renamed = RenameRegistryKey(entry, entry.backupName);
+        } else {
+            renamed = RenameRegistryValue(entry, entry.backupName);
+        }
+        if (renamed) {
+            entry.backupCreated = true;
+        }
+
+        if (entry.isSaveRestore) {
+            ImportRegistryFile(entry.filePath);
+        }
+    }
+}
+
+void PerformShutdownRegistryOperations(std::vector<RegistryEntry>& entries) {
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+        auto& entry = *it;
+        
+        if (entry.isSaveRestore) {
+            if (entry.isKey) {
+                ExportRegistryKey(entry);
+            } else {
+                ExportRegistryValue(entry);
+            }
+        }
+
+        if (entry.isKey) {
+            SHDeleteKeyW(entry.hRootKey, entry.subKey.c_str());
+        } else {
+            HKEY hKey;
+            if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+                RegDeleteValueW(hKey, entry.valueName.c_str());
+                RegCloseKey(hKey);
+            }
+        }
+
+        if (entry.backupCreated) {
+            if (entry.isKey) {
+                RenameRegistryKey({true, true, entry.hRootKey, entry.rootKeyStr, entry.backupName}, entry.subKey);
+            } else {
+                RenameRegistryValue({true, false, entry.hRootKey, entry.rootKeyStr, entry.subKey, entry.backupName}, entry.valueName);
+            }
+        }
+    }
+}
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
@@ -910,12 +1159,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<LinkRecord> hardlinkRecords, symlinkRecords;
         std::vector<std::wstring> firewallRuleNames;
         std::vector<SaveRestoreEntry> saveRestoreEntries;
-        std::vector<RestoreOnlyEntry> restoreOnlyEntries; // NEW
+        std::vector<RestoreOnlyEntry> restoreOnlyEntries;
+        std::vector<RegistryEntry> registryEntries;
 
-        // Process startup operations
+        // --- Startup Operations ---
+        ProcessRegistryEntries(iniContent, variables, registryEntries);
         ProcessRestoreOnlyEntries(iniContent, variables, restoreOnlyEntries);
-        PerformStartupRestoreOnlyOperations(restoreOnlyEntries);
         ProcessSaveRestoreEntries(iniContent, variables, saveRestoreEntries);
+        
+        PerformStartupRegistryOperations(registryEntries);
+        PerformStartupRestoreOnlyOperations(restoreOnlyEntries);
         PerformStartupOperations(saveRestoreEntries);
         ProcessHardlinks(iniContent, hardlinkRecords, variables);
         ProcessSymlinks(iniContent, symlinkRecords, variables);
@@ -956,14 +1209,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
-            // Cleanup on launch failure
+            // --- Cleanup on launch failure ---
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
             CleanupFirewallRules(firewallRuleNames);
             CleanupLinks(symlinkRecords);
             CleanupLinks(hardlinkRecords);
             PerformShutdownOperations(saveRestoreEntries);
-            PerformShutdownRestoreOnlyOperations(restoreOnlyEntries); // NEW
+            PerformShutdownRestoreOnlyOperations(restoreOnlyEntries);
+            PerformShutdownRegistryOperations(registryEntries);
             CloseHandle(hMutex);
             CoUninitialize();
             return 1;
@@ -1007,7 +1261,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CleanupLinks(symlinkRecords);
         CleanupLinks(hardlinkRecords);
         PerformShutdownOperations(saveRestoreEntries);
-        PerformShutdownRestoreOnlyOperations(restoreOnlyEntries); // NEW
+        PerformShutdownRestoreOnlyOperations(restoreOnlyEntries);
+        PerformShutdownRegistryOperations(registryEntries);
         
         CloseHandle(hMutex);
         CoUninitialize();
