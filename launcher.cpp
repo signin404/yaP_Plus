@@ -100,7 +100,6 @@ struct BackupThreadData {
     std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
 };
 
-// Data for the main worker thread
 struct WorkerThreadData {
     HWND hMessageWnd;
     std::wstring iniContent;
@@ -144,8 +143,8 @@ void EnableAllPrivileges() {
     }
 }
 
+
 // --- Path and INI Parsing Utilities ---
-// ... (omitted for brevity, same as before) ...
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -249,7 +248,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 }
 
 // --- File System & Command Helpers ---
-// ... (omitted for brevity, same as before) ...
 bool RunCommand(const std::wstring& command, bool showWindow = false) {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -298,7 +296,6 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 }
 
 // --- Registry Helpers ---
-// ... (omitted for brevity, same as before) ...
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     size_t firstSlash = fullPath.find(L'\\');
     if (firstSlash == std::wstring::npos) return false;
@@ -453,7 +450,6 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 }
 
 // --- Process Management Functions ---
-// ... (omitted for brevity, same as before) ...
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -514,8 +510,7 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
     CloseHandle(hSnapshot);
 }
 
-// --- Background Thread Functions (Monitor, Backup) ---
-// ... (omitted for brevity, same as before) ...
+// --- Foreground Monitoring Thread ---
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
     bool areProcessesSuspended = false;
@@ -542,6 +537,7 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
+// --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     size_t separatorPos = entry.find(L" :: ");
     if (separatorPos == std::wstring::npos) return {};
@@ -594,7 +590,6 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
 }
 
 // --- Link Management ---
-// ... (omitted for brevity, same as before) ...
 void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
@@ -618,7 +613,6 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
 }
 
 // --- Firewall Management ---
-// ... (omitted for brevity, same as before) ...
 void CreateFirewallRule(FirewallOp& op) {
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
@@ -681,7 +675,6 @@ cleanup:
 }
 
 // --- Unified Operation Handlers ---
-// ... (omitted for brevity, same as before) ...
 void PerformStartupOperation(Operation& op) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -794,8 +787,8 @@ void PerformShutdownOperation(Operation& op) {
     }, op.data);
 }
 
+
 // --- Master Operation Parser ---
-// ... (omitted for brevity, same as before) ...
 void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<Operation>& operations) {
     std::wstringstream stream(iniContent);
     std::wstring line;
@@ -1005,7 +998,7 @@ DWORD WINAPI WorkerThread(LPVOID lpParam) {
 
     STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
-    std::wstring fullCommandLine = L"\"" + std::wstring(variables[L"APPEXE"]) + L"\" " + commandLine;
+    std::wstring fullCommandLine = L"\"" + variables[L"APPEXE"] + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
     
     if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, variables[L"WORKDIR"].c_str(), &si, &pi)) {
@@ -1045,8 +1038,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     switch (uMsg) {
         case WM_CREATE: {
             WorkerThreadData* data = new WorkerThreadData();
+            if (!data) { PostQuitMessage(1); return -1; }
+
+            CREATESTRUCT* pCreate = reinterpret_cast<CREATESTRUCT*>(lParam);
+            WorkerThreadData* pInitialData = reinterpret_cast<WorkerThreadData*>(pCreate->lpCreateParams);
+            
             data->hMessageWnd = hwnd;
-            data->iniContent = *reinterpret_cast<std::wstring*>(reinterpret_cast<CREATESTRUCT*>(lParam)->lpCreateParams);
+            data->iniContent = pInitialData->iniContent;
+            data->variables = pInitialData->variables;
             
             HANDLE hThread = CreateThread(NULL, 0, WorkerThread, data, 0, NULL);
             if (hThread) {
@@ -1085,7 +1084,48 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     std::map<std::wstring, std::wstring> variables;
-    // ... (Variable Map Construction, same as before)
+    variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
+    variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
+    variables[L"Roaming"] = GetKnownFolderPath(FOLDERID_RoamingAppData);
+    variables[L"Documents"] = GetKnownFolderPath(FOLDERID_Documents);
+    variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
+    variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
+    variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
+    wchar_t drive[_MAX_DRIVE];
+    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
+    variables[L"DRIVE"] = drive;
+    wchar_t launcherDir[MAX_PATH];
+    wcscpy_s(launcherDir, launcherFullPath);
+    PathRemoveFileSpecW(launcherDir);
+    variables[L"YAPROOT"] = launcherDir;
+    
+    std::wstringstream userVarStream(iniContent);
+    std::wstring userVarLine;
+    std::wstring userVarCurrentSection;
+    bool userVarInSettings = false;
+    while (std::getline(userVarStream, userVarLine)) {
+        userVarLine = trim(userVarLine);
+        if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
+        if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
+            userVarCurrentSection = userVarLine;
+            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
+            continue;
+        }
+        if (!userVarInSettings) continue;
+        size_t delimiterPos = userVarLine.find(L'=');
+        if (delimiterPos != std::wstring::npos) {
+            std::wstring key = trim(userVarLine.substr(0, delimiterPos));
+            if (_wcsicmp(key.c_str(), L"uservar") == 0) {
+                std::wstring value = trim(userVarLine.substr(delimiterPos + 1));
+                size_t separatorPos = value.find(L" :: ");
+                if (separatorPos != std::wstring::npos) {
+                    std::wstring name = trim(value.substr(0, separatorPos));
+                    std::wstring varValue = ExpandVariables(trim(value.substr(separatorPos + 4)), variables);
+                    variables[name] = varValue;
+                }
+            }
+        }
+    }
 
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     
@@ -1115,7 +1155,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wc.lpszClassName = CLASS_NAME;
         RegisterClassW(&wc);
 
-        HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"YAP Launcher", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, &iniContent);
+        WorkerThreadData initialData;
+        initialData.iniContent = iniContent;
+        initialData.variables = variables;
+
+        HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"YAP Launcher", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, &initialData);
 
         if (hwnd == NULL) {
             CloseHandle(hMutex);
