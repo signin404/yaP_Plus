@@ -2,9 +2,9 @@ name: Build C++ Launcher for Windows
 
 on:
   push:
-    branches: [ "main", "顺序执行" ]
+    branches: [ "main", "signin404-patch-5" ]
   pull_request:
-    branches: [ "main", "顺序执行" ]
+    branches: [ "main", "signin404-patch-5" ]
 
 jobs:
   build:
