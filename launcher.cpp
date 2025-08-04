@@ -162,7 +162,7 @@ std::wstring trim(const std::wstring& s) {
     return s.substr(first, (last - first + 1));
 }
 
-// [新增] Helper to split string by a delimiter
+// Helper to split string by a delimiter
 std::vector<std::wstring> split_string(const std::wstring& s, const std::wstring& delimiter) {
     std::vector<std::wstring> parts;
     std::wstring str = s;
@@ -272,34 +272,7 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// [修改] 旧的 RunCommand 被新的 ExecuteProcess 替代，但保留一个简化版用于简单命令
-bool RunSimpleCommand(const std::wstring& command) {
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // Always hide for simple commands
-
-    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
-    cmdBuffer.push_back(0);
-
-    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return exitCode == 0;
-}
-
-
-// [新增] A more powerful and flexible process execution function
+// A powerful and flexible process execution function
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -313,12 +286,17 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
 
     DWORD creationFlags = 0;
+
     if (hide) {
-        si.dwFlags = STARTF_USESHOWWINDOW;
+        // This combination provides the best chance of hiding the window for both GUI and Console apps.
+        // STARTF_USESHOWWINDOW/SW_HIDE is a request for GUI apps to hide their main window.
+        // CREATE_NO_WINDOW prevents a new console window from being created for console apps.
+        si.dwFlags |= STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
-        creationFlags = CREATE_NO_WINDOW;
+        creationFlags |= CREATE_NO_WINDOW;
     }
 
     // Use workDir if provided and valid, otherwise use the exe's directory
@@ -347,7 +325,6 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
 
 
 void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"") {
-    // ... (no changes in this function)
     wchar_t fromPath[MAX_PATH * 2] = {0};
     wcscpy_s(fromPath, from.c_str());
     fromPath[from.length() + 1] = L'\0';
@@ -370,7 +347,32 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 }
 
 // --- Registry Helpers ---
-// ... (no changes in any registry helper functions: ParseRegistryPath, RenameRegistryKey, etc.)
+
+bool RunSimpleCommand(const std::wstring& command) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
+    cmdBuffer.push_back(0);
+
+    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return exitCode == 0;
+}
+
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     size_t firstSlash = fullPath.find(L'\\');
     if (firstSlash == std::wstring::npos) return false;
@@ -519,15 +521,22 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
+// [已修复] 使用 regedit.exe /s 提高可靠性
 bool ImportRegistryFile(const std::wstring& filePath) {
     if (!PathFileExistsW(filePath.c_str())) return true;
-    // [修改] 使用新的 ExecuteProcess 函数
-    return ExecuteProcess(L"reg.exe", L"import \"" + filePath + L"\"", L"", true, true);
+
+    // 使用 "regedit.exe /s" 是进行静默导入最可靠的标准方法
+    wchar_t windir[MAX_PATH];
+    GetWindowsDirectoryW(windir, MAX_PATH);
+    std::wstring regeditPath = std::wstring(windir) + L"\\regedit.exe";
+    std::wstring args = L"/s \"" + filePath + L"\"";
+
+    // ExecuteProcess 会等待其完成，并且不会显示任何窗口
+    return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
 
 // --- Process Management Functions ---
-// ... (no changes in AreWaitProcessesRunning, GetProcessNameByPid, SetAllProcessesState, etc.)
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -589,9 +598,7 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
 }
 
 
-// --- Foreground Monitoring, Backup, Link, Firewall Sections ---
-// ... (no changes in these sections: MonitorThreadData, ForegroundMonitorThread, BackupThreadData, etc.)
-// --- Foreground Monitoring Thread ---
+// --- Foreground Monitoring, Backup, Link, Firewall Sections (no changes) ---
 struct MonitorThreadData {
     std::atomic<bool>* shouldStop;
     int checkInterval;
@@ -625,7 +632,6 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     size_t separatorPos = entry.find(L" :: ");
     if (separatorPos == std::wstring::npos) return {};
@@ -685,7 +691,6 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- Link Management ---
 void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
@@ -708,7 +713,6 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
     FindClose(hFind);
 }
 
-// --- Firewall Management ---
 void CreateFirewallRule(FirewallOp& op) {
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
@@ -770,10 +774,9 @@ cleanup:
     if (pFwPolicy) pFwPolicy->Release();
 }
 
-// --- Unified Operation Handlers ---
+// --- Unified Operation Handlers (no changes) ---
 
 void PerformStartupOperation(Operation& op) {
-    // ... (no changes in this function)
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
@@ -821,7 +824,6 @@ void PerformStartupOperation(Operation& op) {
 }
 
 void PerformShutdownOperation(Operation& op) {
-    // ... (no changes in this function)
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
@@ -887,9 +889,8 @@ void PerformShutdownOperation(Operation& op) {
 }
 
 
-// --- Master Operation Parser ---
+// --- Master Operation Parser (no changes) ---
 void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<Operation>& operations) {
-    // ... (no changes in this function)
     std::wstringstream stream(iniContent);
     std::wstring line;
     std::wstring currentSection;
@@ -1010,7 +1011,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
 }
 
 
-// --- [新增] Pre-Launch Operation Parser and Executor ---
+// --- Pre-Launch Operation Parser and Executor (no changes) ---
 
 void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& variables, std::vector<PreLaunchOperation>& operations) {
     std::wstringstream stream(iniContent);
@@ -1084,21 +1085,20 @@ void ExecutePreLaunchOperations(const std::vector<PreLaunchOperation>& operation
             if constexpr (std::is_same_v<T, RunOp>) {
                 ExecuteProcess(arg.programPath, arg.commandLine, arg.workDir, arg.wait, arg.hide);
             } else if constexpr (std::is_same_v<T, BatchOp>) {
-                std::wstring cmdPath = L"C:\\Windows\\System32\\cmd.exe";
+                wchar_t systemPath[MAX_PATH];
+                GetSystemDirectoryW(systemPath, MAX_PATH);
+                std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
                 std::wstring args = L"/c \"" + arg.batchPath + L"\"";
                 ExecuteProcess(cmdPath, args, L"", true, true); // Always wait and hide
             } else if constexpr (std::is_same_v<T, RegImportOp>) {
-                ImportRegistryFile(arg.regPath); // Already waits and hides
+                ImportRegistryFile(arg.regPath);
             } else if constexpr (std::is_same_v<T, RegDllOp>) {
-                std::wstring system32Path;
-                wchar_t buf[MAX_PATH];
-                GetSystemDirectoryW(buf, MAX_PATH);
-                system32Path = buf;
-                
-                std::wstring regsvrPath = system32Path + L"\\regsvr32.exe";
-                std::wstring args = L"/s \"" + arg.dllPath + L"\"";
+                wchar_t systemPath[MAX_PATH];
+                GetSystemDirectoryW(systemPath, MAX_PATH);
+                std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
+                std::wstring args = L"/s \"" + arg.dllPath + L"\""; // /s for silent
                 if (arg.unregister) {
-                    args = L"/u " + args;
+                    args = L"/u " + args; // /u for unregister
                 }
                 ExecuteProcess(regsvrPath, args, L"", true, true); // Always wait and be silent
             }
@@ -1132,18 +1132,7 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     }
     variables[L"WORKDIR"] = finalWorkDir;
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"commandline"), variables);
-    std::wstring fullCommandLine = L"\"" + std::wstring(absoluteAppPath) + L"\" " + commandLine;
-    wchar_t commandLineBuffer[4096];
-    wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-    if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
+    ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
@@ -1259,7 +1248,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        // --- [新增] Execute Pre-Launch Operations ---
+        // Execute Pre-Launch Operations
         std::vector<PreLaunchOperation> preLaunchOps;
         ProcessPreLaunchOperations(iniContent, variables, preLaunchOps);
         ExecutePreLaunchOperations(preLaunchOps);
@@ -1363,7 +1352,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
 
-        // [修改] 使用 MsgWaitForMultipleObjects 修复光标转圈问题
+        // Use MsgWaitForMultipleObjects to prevent the busy cursor issue
         while (true) {
             DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
             if (dwResult == WAIT_OBJECT_0) {
