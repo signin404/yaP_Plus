@@ -354,6 +354,7 @@ bool ExportRegistryKey(const RegistryEntry& entry) {
     return RunCommand(L"reg export \"" + fullKeyPath + L"\" \"" + entry.filePath + L"\" /y");
 }
 
+// MODIFIED: This function now correctly writes a UTF-16 LE BOM for Unicode support.
 bool ExportRegistryValue(const RegistryEntry& entry) {
     HKEY hKey;
     if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -370,15 +371,25 @@ bool ExportRegistryValue(const RegistryEntry& entry) {
     }
     RegCloseKey(hKey);
 
-    std::wofstream regFile(entry.filePath);
+    // Open file in binary mode to write a BOM for UTF-16 LE
+    std::wofstream regFile(entry.filePath, std::ios::binary);
     if (!regFile.is_open()) return false;
+
+    // Write the UTF-16 LE Byte Order Mark
+    regFile.put(wchar_t(0xFEFF));
 
     regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
     regFile << L"[" << entry.rootKeyStr << L"\\" << entry.subKey << L"]\r\n";
-    regFile << L"\"" << entry.valueName << L"\"=";
+    
+    // Handle default value name
+    std::wstring displayName = entry.valueName.empty() ? L"@" : L"\"" + entry.valueName + L"\"";
+    regFile << displayName << L"=";
 
     if (type == REG_SZ || type == REG_EXPAND_SZ) {
-        std::wstring strValue(reinterpret_cast<wchar_t*>(data.data()));
+        // Data from registry for REG_SZ includes the null terminator, so we adjust size.
+        size_t strLen = wcsnlen_s(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), strLen);
+        
         std::wstring escapedStr;
         for (wchar_t c : strValue) {
             if (c == L'\\') escapedStr += L"\\\\";
@@ -391,12 +402,23 @@ bool ExportRegistryValue(const RegistryEntry& entry) {
         regFile << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
     } else if (type == REG_QWORD) {
         ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
-        regFile << L"hex(b):" << std::hex << std::setw(16) << std::setfill(L'0') << qwordValue;
+        regFile << L"hex(b):";
+        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
+        for (int i = 0; i < 8; ++i) {
+            regFile << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
+            if (i < 7) regFile << L",";
+        }
     } else if (type == REG_BINARY || type == REG_MULTI_SZ || type == REG_NONE) {
-        regFile << L"hex" << (type == REG_MULTI_SZ ? L"(7)" : L"") << L":";
+        regFile << L"hex" << (type == REG_MULTI_SZ ? L"(7)" : (type == REG_EXPAND_SZ ? L"(2)" : L"")) << L":";
         for (DWORD i = 0; i < size; ++i) {
             regFile << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
-            if (i < size - 1) regFile << L",";
+            if (i < size - 1) {
+                regFile << L",";
+                // Add line breaks for readability in large binary values
+                if ((i + 1) % 38 == 0) {
+                    regFile << L"\\\r\n  ";
+                }
+            }
         }
     }
     regFile << L"\r\n";
@@ -994,9 +1016,15 @@ void PerformShutdownRegistryOperations(std::vector<RegistryEntry>& entries) {
 
         if (entry.backupCreated) {
             if (entry.isKey) {
-                RenameRegistryKey({true, true, entry.hRootKey, entry.rootKeyStr, entry.backupName}, entry.subKey);
+                // The source for rename is now the backup name
+                RegistryEntry backupEntry = entry;
+                backupEntry.subKey = entry.backupName;
+                RenameRegistryKey(backupEntry, entry.subKey);
             } else {
-                RenameRegistryValue({true, false, entry.hRootKey, entry.rootKeyStr, entry.subKey, entry.backupName}, entry.valueName);
+                // The source for rename is now the backup name
+                RegistryEntry backupEntry = entry;
+                backupEntry.valueName = entry.backupName;
+                RenameRegistryValue(backupEntry, entry.valueName);
             }
         }
     }
