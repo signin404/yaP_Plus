@@ -202,7 +202,6 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
-// RESTORED: This function was accidentally deleted.
 bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
@@ -914,7 +913,7 @@ void ProcessAllOperations(const std::wstring& iniContent, const std::map<std::ws
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& base_variables) {
-    std::map<std::wstring, std::wstring> variables = base_variables; // Create a copy for this instance
+    std::map<std::wstring, std::wstring> variables = base_variables;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"application"), variables);
     if (appPathRaw.empty()) return;
     wchar_t absoluteAppPath[MAX_PATH];
@@ -970,7 +969,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
 
-    // --- Variable Map Construction ---
     std::map<std::wstring, std::wstring> variables;
     variables[L"Local"] = GetKnownFolderPath(FOLDERID_LocalAppData);
     variables[L"LocalLow"] = GetKnownFolderPath(FOLDERID_LocalAppDataLow);
@@ -1035,7 +1033,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     variables[L"WORKDIR"] = finalWorkDir;
 
-    // --- Mutex Creation ---
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
@@ -1075,12 +1072,70 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
-            // ... (Foreground Monitor Setup)
+            monitorData.shouldStop = &stopMonitor;
+            monitorData.foregroundAppName = foregroundAppName;
+            
+            std::wstringstream stream(iniContent);
+            std::wstring line;
+            std::wstring currentSection;
+            bool inSettings = false;
+            while (std::getline(stream, line)) {
+                line = trim(line);
+                if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+                if (line[0] == L'[' && line.back() == L']') {
+                    currentSection = line;
+                    inSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
+                    continue;
+                }
+                if (!inSettings) continue;
+                size_t delimiterPos = line.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, delimiterPos));
+                    if (_wcsicmp(key.c_str(), L"suspend") == 0) {
+                        std::wstring value = trim(line.substr(delimiterPos + 1));
+                        monitorData.suspendProcesses.push_back(ExpandVariables(value, variables));
+                    }
+                }
+            }
+
+            std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"foregroundcheck");
+            monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
+            if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
+            if (!monitorData.suspendProcesses.empty()) hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
         }
 
         std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
-        if (!backupTimeStr.empty() && _wtoi(backupTimeStr.c_str()) > 0) {
-            // ... (Backup Thread Setup)
+        int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
+        if (backupTime > 0) {
+            backupData.shouldStop = &stopBackup;
+            backupData.isWorking = &isBackupWorking;
+            backupData.backupInterval = backupTime * 60 * 1000;
+            
+            std::wstringstream stream(iniContent);
+            std::wstring line;
+            std::wstring currentSection;
+            bool inSettings = false;
+            while (std::getline(stream, line)) {
+                line = trim(line);
+                if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+                if (line[0] == L'[' && line.back() == L']') {
+                    currentSection = line;
+                    inSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
+                    continue;
+                }
+                if (!inSettings) continue;
+                size_t delimiterPos = line.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, delimiterPos));
+                    std::wstring value = trim(line.substr(delimiterPos + 1));
+                    if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
+                        backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
+                    } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
+                        backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
+                    }
+                }
+            }
+            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
@@ -1104,8 +1159,41 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        // ... (Wait Process Logic)
-        
+        std::vector<std::wstring> waitProcesses;
+        std::wstringstream waitStream(iniContent);
+        std::wstring waitLine;
+        std::wstring waitCurrentSection;
+        bool waitInSettings = false;
+        while (std::getline(waitStream, waitLine)) {
+            waitLine = trim(waitLine);
+            if (waitLine.empty() || waitLine[0] == L';' || waitLine[0] == L'#') continue;
+            if (waitLine[0] == L'[' && waitLine.back() == L']') {
+                waitCurrentSection = waitLine;
+                waitInSettings = (_wcsicmp(waitCurrentSection.c_str(), L"[Settings]") == 0);
+                continue;
+            }
+            if (!waitInSettings) continue;
+            size_t delimiterPos = waitLine.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(waitLine.substr(0, delimiterPos));
+                if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
+                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
+                    waitProcesses.push_back(ExpandVariables(value, variables));
+                }
+            }
+        }
+        if (GetValueFromIniContent(iniContent, L"Settings", L"multiple") == L"1") {
+            const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath);
+            if (appFilename && wcslen(appFilename) > 0) waitProcesses.push_back(appFilename);
+        }
+        if (!waitProcesses.empty()) {
+            std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"Settings", L"waitcheck");
+            int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
+            if (waitCheck <= 0) waitCheck = 10;
+            Sleep(3000);
+            while (AreWaitProcessesRunning(waitProcesses)) Sleep(waitCheck * 1000);
+        }
+
         if (hMonitorThread) {
             stopMonitor = true;
             WaitForSingleObject(hMonitorThread, 1500);
