@@ -285,10 +285,10 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
 
 // --- Backup Functionality ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
-    size_t separatorPos = entry.find(L"::");
+    size_t separatorPos = entry.find(L" :: ");
     if (separatorPos == std::wstring::npos) return {};
     std::wstring src = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
-    std::wstring dest = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+    std::wstring dest = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
@@ -404,10 +404,10 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
 void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"hardlink");
     for (const auto& entry : entries) {
-        size_t separatorPos = entry.find(L"::");
+        size_t separatorPos = entry.find(L" :: ");
         if (separatorPos == std::wstring::npos) continue;
         std::wstring destPathRaw = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
-        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
         if (destPathRaw.empty() || srcPathRaw.empty()) continue;
         bool isDestDir = destPathRaw.back() == L'\\';
         bool isSrcDir = srcPathRaw.back() == L'\\';
@@ -444,10 +444,10 @@ void ProcessHardlinks(const std::wstring& iniContent, std::vector<LinkRecord>& r
 void ProcessSymlinks(const std::wstring& iniContent, std::vector<LinkRecord>& records, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"symlink");
     for (const auto& entry : entries) {
-        size_t separatorPos = entry.find(L"::");
+        size_t separatorPos = entry.find(L" :: ");
         if (separatorPos == std::wstring::npos) continue;
         std::wstring destPathRaw = ExpandVariables(trim(entry.substr(0, separatorPos)), variables);
-        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+        std::wstring srcPathRaw = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
         if (destPathRaw.empty() || srcPathRaw.empty()) continue;
         bool isDir = (destPathRaw.back() == L'\\' || srcPathRaw.back() == L'\\');
         std::wstring destPath = destPathRaw;
@@ -489,24 +489,19 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
 }
 
 // --- Firewall Management ---
-// *** CORRECTED: Robust Firewall Rule Parsing ***
 void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstring>& createdRuleNames, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"firewall");
     if (entries.empty()) return;
-
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
     INetFwRule* pFwRule = NULL;
-
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
     if (FAILED(hr)) return;
-
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
-
     for (const auto& entry : entries) {
         std::vector<std::wstring> parts;
         std::wstring current = entry;
@@ -516,69 +511,57 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
             current.erase(0, pos + 4);
         }
         parts.push_back(trim(current));
-
         if (parts.size() != 4) continue;
-
         std::wstring ruleName = parts[0];
         std::wstring appPath = ExpandVariables(parts[1], variables);
         std::wstring direction = parts[2];
         std::wstring action = parts[3];
-
         hr = CoCreateInstance(__uuidof(NetFwRule), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule), (void**)&pFwRule);
         if (FAILED(hr)) continue;
-
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
         BSTR bstrAppPath = SysAllocString(appPath.c_str());
-
         pFwRule->put_Name(bstrRuleName);
         pFwRule->put_ApplicationName(bstrAppPath);
-        
         if (_wcsicmp(direction.c_str(), L"in") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_IN);
         else if (_wcsicmp(direction.c_str(), L"out") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
-
         if (_wcsicmp(action.c_str(), L"allow") == 0) pFwRule->put_Action(NET_FW_ACTION_ALLOW);
         else if (_wcsicmp(action.c_str(), L"block") == 0) pFwRule->put_Action(NET_FW_ACTION_BLOCK);
-
         pFwRule->put_Enabled(VARIANT_TRUE);
         pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
         pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
-
         hr = pFwRules->Add(pFwRule);
         if (SUCCEEDED(hr)) {
             createdRuleNames.push_back(ruleName);
         }
-
         SysFreeString(bstrRuleName);
         SysFreeString(bstrAppPath);
         pFwRule->Release();
         pFwRule = NULL;
     }
-
     if (pFwRules) pFwRules->Release();
     if (pFwPolicy) pFwPolicy->Release();
 }
 
+// *** CORRECTED: Aggressive Firewall Rule Cleanup ***
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
     if (ruleNames.empty()) return;
-
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
-
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
     if (FAILED(hr)) return;
-
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
-
     for (const auto& ruleName : ruleNames) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        pFwRules->Remove(bstrRuleName);
+        // Loop to remove all rules with this name
+        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {
+            // Keep removing until none are left
+        }
         SysFreeString(bstrRuleName);
     }
-
     if (pFwRules) pFwRules->Release();
     if (pFwPolicy) pFwPolicy->Release();
 }
@@ -755,15 +738,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         // Backup Thread Setup
-        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"autosavetime");
+        std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"Settings", L"backuptime");
         int backupTime = backupTimeStr.empty() ? 0 : _wtoi(backupTimeStr.c_str());
         if (backupTime > 0) {
             backupData.shouldStop = &stopBackup;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavedir");
+            auto dirEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupdir");
             for(const auto& entry : dirEntries) backupData.backupDirs.push_back(ParseBackupEntry(entry, variables));
-            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"autosavefile");
+            auto fileEntries = GetMultiValueFromIniContent(iniContent, L"Settings", L"backupfile");
             for(const auto& entry : fileEntries) backupData.backupFiles.push_back(ParseBackupEntry(entry, variables));
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
