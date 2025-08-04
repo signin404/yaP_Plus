@@ -1,4 +1,4 @@
-#define _WIN32_WINNT 0x0A00 // 保持这个定义
+#define _WIN32_WINNT 0x0A00
 
 #include <windows.h>
 #include <string>
@@ -11,7 +11,7 @@
 #include <utility>
 #include <map>
 #include <set>
-#include <variant> // For the unified operation structure
+#include <variant>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
@@ -19,6 +19,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
+#include <Userenv.h> // [新增] 为 CreateProcessAsUserW
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -27,12 +28,10 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
+#pragma comment(lib, "Userenv.lib") // [新增] 为 CreateProcessAsUserW
 
-// --- [最终修复] 手动定义缺失的 Windows SDK 常量和类型 ---
-// 解决在旧版 Windows SDK 中编译时 "undeclared identifier" 和 "redefinition" 的问题
-
+// --- 手动定义缺失的 Windows SDK 常量和类型 ---
 #ifndef PROC_THREAD_ATTRIBUTE_LIST
-// 与官方头文件保持一致，定义为指向不透明结构体的指针
 struct _PROC_THREAD_ATTRIBUTE_LIST;
 typedef struct _PROC_THREAD_ATTRIBUTE_LIST *LPPROC_THREAD_ATTRIBUTE_LIST;
 #endif
@@ -291,6 +290,7 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
+// [最终修复] 完整实现 NSudo 的核心逻辑
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -314,6 +314,17 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
+        // 完整复现 NSudo 逻辑: 获取并复制令牌，然后使用 CreateProcessAsUserW
+        HANDLE hToken = NULL;
+        HANDLE hNewToken = NULL;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
+            return false;
+        }
+        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) {
+            CloseHandle(hToken);
+            return false;
+        }
+
         STARTUPINFOEXW siEx;
         ZeroMemory(&siEx, sizeof(siEx));
         siEx.StartupInfo.cb = sizeof(siEx);
@@ -335,7 +346,9 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
                 NULL,
                 NULL);
 
-            if (!CreateProcessW(
+            // 使用 CreateProcessAsUserW 和复制的令牌
+            if (!CreateProcessAsUserW(
+                hNewToken,
                 NULL,
                 cmdBuffer.data(),
                 NULL,
@@ -346,21 +359,27 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
                 finalWorkDir,
                 &siEx.StartupInfo,
                 &pi)) {
+                // 清理
                 DeleteProcThreadAttributeList(siEx.lpAttributeList);
                 delete[] (char*)siEx.lpAttributeList;
+                CloseHandle(hNewToken);
+                CloseHandle(hToken);
                 return false;
             }
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
             delete[] (char*)siEx.lpAttributeList;
         } else {
+            // 如果属性列表初始化失败，则无法使用此方法
             delete[] (char*)siEx.lpAttributeList;
-            siEx.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
-            siEx.StartupInfo.wShowWindow = SW_HIDE;
-            if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, finalWorkDir, &siEx.StartupInfo, &pi)) {
-                return false;
-            }
+            CloseHandle(hNewToken);
+            CloseHandle(hToken);
+            return false; 
         }
+        CloseHandle(hNewToken);
+        CloseHandle(hToken);
+
     } else {
+        // 不隐藏，正常启动
         STARTUPINFOW si;
         ZeroMemory(&si, sizeof(si));
         si.cb = sizeof(si);
@@ -1200,14 +1219,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     
     std::wstringstream userVarStream(iniContent);
     std::wstring userVarLine;
-    std::wstring userVarCurrentSection;
+    std::wstring currentSection;
     bool userVarInSettings = false;
     while (std::getline(userVarStream, userVarLine)) {
         userVarLine = trim(userVarLine);
         if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
         if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
-            userVarCurrentSection = userVarLine;
-            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
+            currentSection = userVarLine;
+            userVarInSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
             continue;
         }
         if (!userVarInSettings) continue;
