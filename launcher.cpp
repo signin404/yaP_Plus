@@ -86,12 +86,11 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-// *** CORRECTED: Helper to ensure all paths become absolute ***
 std::wstring ResolveToAbsolutePath(const std::wstring& path) {
     if (path.empty()) return L"";
     wchar_t absolutePath[MAX_PATH];
     if (GetFullPathNameW(path.c_str(), MAX_PATH, absolutePath, NULL) == 0) {
-        return path; // Return original on failure
+        return path;
     }
     return absolutePath;
 }
@@ -588,9 +587,9 @@ void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
 
     for (const auto& ruleName : ruleNames) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        // *** CORRECTED: Loop until failure to remove all rules with the same name ***
-        while (SUCCEEDED(pFwRules->Remove(bstrRuleName)) && hr != S_FALSE) {
-            // Keep removing until it fails (HRESULT is negative) or S_FALSE (not found)
+        // *** CORRECTED: Loop only while the result is exactly S_OK ***
+        while (pFwRules->Remove(bstrRuleName) == S_OK) {
+            // Keep removing as long as we successfully find and remove a rule.
         }
         SysFreeString(bstrRuleName);
     }
