@@ -290,6 +290,61 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
+// +++ 新增辅助函数 1: 按名称获取进程ID +++
+// 这个函数用于找到 winlogon.exe 的PID。
+DWORD GetProcessIdByName(const std::wstring& processName) {
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                CloseHandle(hSnapshot);
+                return pe32.th32ProcessID;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return 0;
+}
+
+// +++ 新增辅助函数 2: 获取SYSTEM令牌 +++
+// 这是NSudo的核心技术：从winlogon.exe窃取SYSTEM主令牌。
+HANDLE GetSystemToken() {
+    // SeDebugPrivilege 必须已启用!
+    DWORD pid = GetProcessIdByName(L"winlogon.exe");
+    if (pid == 0) return NULL;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) return NULL;
+
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE, &hToken)) {
+        CloseHandle(hProcess);
+        return NULL;
+    }
+
+    HANDLE hSystemToken = NULL;
+    if (!DuplicateTokenEx(
+        hToken,
+        TOKEN_ALL_ACCESS,
+        NULL,
+        SecurityImpersonation,
+        TokenPrimary,
+        &hSystemToken)) {
+        CloseHandle(hToken);
+        CloseHandle(hProcess);
+        return NULL;
+    }
+
+    CloseHandle(hToken);
+    CloseHandle(hProcess);
+    return hSystemToken;
+}
+
+// +++ 最终版的 ExecuteProcess 函数 +++
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -313,56 +368,73 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     }
 
     if (hide) {
-        // --- 可靠的“隐藏桌面”方法 ---
-        // 这种方法不依赖于难以捉摸的窗口策略属性，而是通过在一个不可见的虚拟桌面中创建进程来确保其完全隐藏。
-        
-        HDESK hOriginalDesktop = GetThreadDesktop(GetCurrentThreadId());
-        HDESK hNewDesktop = NULL;
-        bool success = false;
-
-        // 1. 创建一个独一无二的、不可见的桌面
-        wchar_t newDesktopName[64];
-        swprintf_s(newDesktopName, L"GoInterruptPolicy_HiddenDesktop_%lu", GetCurrentProcessId());
-        hNewDesktop = CreateDesktopW(
-            newDesktopName, 
-            NULL, NULL, 0,
-            DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP, 
-            NULL);
-
-        if (!hNewDesktop) {
-            // 如果创建桌面失败，则退回到标准方式创建，至少保证程序能运行
-             return ExecuteProcess(path, args, workDir, wait, false);
+        // --- NSudo终极方案：窃取SYSTEM令牌并用其创建隐藏进程 ---
+        HANDLE hSystemToken = GetSystemToken();
+        if (!hSystemToken) {
+            // 如果无法获取SYSTEM令牌（例如SeDebugPrivilege无效或winlogon未运行），则启动失败。
+            // 这是预期的，因为用户要求的是终极隐藏方案。
+            return false;
         }
 
-        // 2. 准备启动信息，指定新进程在那个不可见的桌面上启动
-        STARTUPINFOW si;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        si.lpDesktop = newDesktopName; // 关键！
+        LPVOID lpEnvironment = NULL;
+        STARTUPINFOEXW siEx;
+        ZeroMemory(&siEx, sizeof(siEx));
+        siEx.StartupInfo.cb = sizeof(siEx);
+        siEx.StartupInfo.lpDesktop = const_cast<wchar_t*>(L"WinSta0\\Default"); // 必须指定桌面
+        bool success = false;
 
-        // 3. 在新桌面上创建进程
-        if (CreateProcessW(
+        // 为SYSTEM令牌创建环境块
+        if (!CreateEnvironmentBlock(&lpEnvironment, hSystemToken, FALSE)) {
+            lpEnvironment = NULL;
+        }
+
+        // 设置进程启动属性，以隐藏窗口
+        SIZE_T attributeListSize = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
+        siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
+        if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
+            delete[] (char*)siEx.lpAttributeList;
+            siEx.lpAttributeList = NULL;
+            goto cleanup;
+        }
+
+        DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
+        if (!UpdateProcThreadAttribute(
+            siEx.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_WINDOW_POLICY,
+            &policy,
+            sizeof(policy),
+            NULL,
+            NULL)) {
+            goto cleanup;
+        }
+
+        // 使用窃取来的SYSTEM令牌和扩展启动信息来创建进程
+        if (CreateProcessAsUserW(
+            hSystemToken,
             NULL,
             cmdBuffer.data(),
             NULL,
             NULL,
             FALSE,
-            0, // 不需要特殊标志
-            NULL,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            lpEnvironment,
             finalWorkDir,
-            &si, // 传入指定了新桌面的启动信息
+            &siEx.StartupInfo,
             &pi)) {
             success = true;
         }
 
-        // 4. 清理资源
-        if (hNewDesktop) {
-            CloseDesktop(hNewDesktop);
+    cleanup: // 清理所有资源
+        if (lpEnvironment) {
+            DestroyEnvironmentBlock(lpEnvironment);
         }
-        // 恢复原始桌面（虽然对于非UI线程可能不是必须的，但这是个好习惯）
-        if(hOriginalDesktop) {
-            SetThreadDesktop(hOriginalDesktop);
+        if (siEx.lpAttributeList) {
+            DeleteProcThreadAttributeList(siEx.lpAttributeList);
+            delete[] (char*)siEx.lpAttributeList;
         }
+        if (hSystemToken) CloseHandle(hSystemToken);
 
         if (!success) return false;
 
