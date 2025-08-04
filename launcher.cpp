@@ -331,7 +331,6 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) goto cleanup;
         if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) goto cleanup;
         
-        // [新增] 创建环境块
         if (!CreateEnvironmentBlock(&lpEnvironment, hNewToken, FALSE)) {
             lpEnvironment = NULL;
         }
@@ -357,8 +356,8 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
 
         if (CreateProcessAsUserW(
             hNewToken, NULL, cmdBuffer.data(), NULL, NULL, FALSE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, // [新增] 添加 UNICODE 标志
-            lpEnvironment, // [新增] 传入环境块
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            lpEnvironment,
             finalWorkDir, &siEx.StartupInfo, &pi)) {
             success = true;
         }
@@ -367,7 +366,7 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         if (hOriginalDesktop) {
             SetThreadDesktop(hOriginalDesktop);
         }
-        if (lpEnvironment) { // [新增] 销毁环境块
+        if (lpEnvironment) {
             DestroyEnvironmentBlock(lpEnvironment);
         }
         if (siEx.lpAttributeList) {
@@ -1220,22 +1219,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     
     std::wstringstream userVarStream(iniContent);
     std::wstring userVarLine;
-    std::wstring currentSection;
+    std::wstring userVarCurrentSection;
     bool userVarInSettings = false;
     while (std::getline(userVarStream, userVarLine)) {
         userVarLine = trim(userVarLine);
         if (userVarLine.empty() || userVarLine[0] == L';' || userVarLine[0] == L'#') continue;
         if (userVarLine[0] == L'[' && userVarLine.back() == L']') {
-            currentSection = userVarLine;
-            userVarInSettings = (_wcsicmp(currentSection.c_str(), L"[Settings]") == 0);
+            userVarCurrentSection = userVarLine;
+            userVarInSettings = (_wcsicmp(userVarCurrentSection.c_str(), L"[Settings]") == 0);
             continue;
         }
         if (!userVarInSettings) continue;
         size_t delimiterPos = userVarLine.find(L'=');
         if (delimiterPos != std::wstring::npos) {
-            std::wstring key = trim(line.substr(0, delimiterPos));
+            std::wstring key = trim(userVarLine.substr(0, delimiterPos)); // [已修复]
             if (_wcsicmp(key.c_str(), L"uservar") == 0) {
-                std::wstring value = trim(line.substr(delimiterPos + 1));
+                std::wstring value = trim(userVarLine.substr(delimiterPos + 1)); // [已修复]
                 size_t separatorPos = value.find(L" :: ");
                 if (separatorPos != std::wstring::npos) {
                     std::wstring name = trim(value.substr(0, separatorPos));
@@ -1443,9 +1442,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!waitInSettings) continue;
             size_t delimiterPos = waitLine.find(L'=');
             if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(line.substr(0, delimiterPos));
+                std::wstring key = trim(waitLine.substr(0, delimiterPos)); // [已修复]
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(line.substr(delimiterPos + 1));
+                    std::wstring value = trim(waitLine.substr(delimiterPos + 1)); // [已修复]
                     waitProcesses.push_back(ExpandVariables(value, variables));
                 }
             }
