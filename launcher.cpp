@@ -489,6 +489,7 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
 }
 
 // --- Firewall Management ---
+// *** CORRECTED: Robust Firewall Rule Parsing ***
 void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstring>& createdRuleNames, const std::map<std::wstring, std::wstring>& variables) {
     auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"firewall");
     if (entries.empty()) return;
@@ -507,13 +508,14 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
     }
 
     for (const auto& entry : entries) {
-        std::wstringstream ss(entry);
-        std::wstring segment;
         std::vector<std::wstring> parts;
-        while(std::getline(ss, segment, L':')) {
-            if (segment.front() == L':') segment.erase(0, 1);
-            parts.push_back(trim(segment));
+        std::wstring current = entry;
+        size_t pos = 0;
+        while ((pos = current.find(L" :: ")) != std::wstring::npos) {
+            parts.push_back(trim(current.substr(0, pos)));
+            current.erase(0, pos + 4);
         }
+        parts.push_back(trim(current));
 
         if (parts.size() != 4) continue;
 
@@ -601,10 +603,10 @@ void LaunchApplication(const std::wstring& iniContent) {
     variables[L"YAPROOT"] = launcherFullPath;
     auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
     for (const auto& entry : userVars) {
-        size_t separatorPos = entry.find(L"::");
+        size_t separatorPos = entry.find(L" :: ");
         if (separatorPos != std::wstring::npos) {
             std::wstring name = trim(entry.substr(0, separatorPos));
-            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
             variables[name] = value;
         }
     }
@@ -678,10 +680,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     variables[L"YAPROOT"] = launcherDir;
     auto userVars = GetMultiValueFromIniContent(iniContent, L"Settings", L"uservar");
     for (const auto& entry : userVars) {
-        size_t separatorPos = entry.find(L"::");
+        size_t separatorPos = entry.find(L" :: ");
         if (separatorPos != std::wstring::npos) {
             std::wstring name = trim(entry.substr(0, separatorPos));
-            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 2)), variables);
+            std::wstring value = ExpandVariables(trim(entry.substr(separatorPos + 4)), variables);
             variables[name] = value;
         }
     }
