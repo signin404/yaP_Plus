@@ -760,7 +760,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wchar_t absoluteWorkDir[MAX_PATH];
         GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
         if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-        else finalWorkDir = finalWorkDir = appDir;
+        else finalWorkDir = appDir;
     } else {
         finalWorkDir = appDir;
     }
