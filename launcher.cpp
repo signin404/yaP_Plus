@@ -571,73 +571,71 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
 }
 
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
-    if (ruleNames.empty()) {
-        return;
-    }
+    if (ruleNames.empty()) return;
 
     INetFwPolicy2* pFwPolicy = NULL;
-    // 初始化COM环境应在主函数中完成，这里直接使用
-    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
-    if (FAILED(hr)) {
-        // 在实际应用中，这里应该记录错误日志
-        return;
-    }
-
     INetFwRules* pFwRules = NULL;
+    IUnknown* pEnumerator = NULL;
+    IEnumVARIANT* pVariant = NULL;
+
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) return;
+
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
         return;
     }
 
-    // 遍历所有需要被删除的规则名称
-    for (const auto& ruleName : ruleNames) {
-        if (ruleName.empty()) {
-            continue; // 名称不能为空，否则Remove会返回E_INVALIDARG
-        }
-
-        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        if (!bstrRuleName) {
-            // 内存不足，跳过
-            continue;
-        }
-
-        // 循环删除同名规则。
-        // INetFwRules::Remove 每次调用只删除一个规则实例。
-        // 成功删除返回 S_OK。
-        // 找不到规则返回 S_FALSE。
-        // 任何其他值都是错误。
-        // 循环必须且只能在返回值为 S_OK 时继续。
-        while (true) {
-            HRESULT hrRemove = pFwRules->Remove(bstrRuleName);
-
-            // 只有在严格等于 S_OK 时，才认为有规则被删除了，需要继续循环。
-            // 如果返回值是 S_FALSE (找不到) 或任何错误代码，都必须终止循环。
-            if (hrRemove != S_OK) {
-                break;
+    // 枚举所有规则，收集要删除的规则，然后批量删除
+    hr = pFwRules->get__NewEnum(&pEnumerator);
+    if (SUCCEEDED(hr)) {
+        hr = pEnumerator->QueryInterface(__uuidof(IEnumVARIANT), (void**)&pVariant);
+        if (SUCCEEDED(hr)) {
+            std::vector<std::wstring> rulesToDelete;
+            
+            VARIANT var;
+            VariantInit(&var);
+            ULONG fetched = 0;
+            
+            // 遍历所有防火墙规则
+            while (SUCCEEDED(pVariant->Next(1, &var, &fetched)) && fetched) {
+                if (var.vt == VT_DISPATCH && var.pdispVal) {
+                    INetFwRule* pRule = NULL;
+                    hr = var.pdispVal->QueryInterface(__uuidof(INetFwRule), (void**)&pRule);
+                    if (SUCCEEDED(hr)) {
+                        BSTR ruleName = NULL;
+                        hr = pRule->get_Name(&ruleName);
+                        if (SUCCEEDED(hr) && ruleName) {
+                            std::wstring currentRuleName(ruleName);
+                            
+                            // 检查是否在要删除的列表中
+                            for (const auto& targetName : ruleNames) {
+                                if (_wcsicmp(currentRuleName.c_str(), targetName.c_str()) == 0) {
+                                    rulesToDelete.push_back(currentRuleName);
+                                    break;
+                                }
+                            }
+                            
+                            SysFreeString(ruleName);
+                        }
+                        pRule->Release();
+                    }
+                }
+                VariantClear(&var);
+                fetched = 0;
             }
-            // 如果代码执行到这里，说明 hrRemove == S_OK，一个规则被成功删除。
-            // 循环将继续，以检查是否还有其他同名规则。
+            
+            // 现在删除收集到的所有规则
+            for (const auto& ruleToDelete : rulesToDelete) {
+                BSTR bstrRuleName = SysAllocString(ruleToDelete.c_str());
+                pFwRules->Remove(bstrRuleName); // 只尝试一次，因为我们知道规则存在
+                SysFreeString(bstrRuleName);
+            }
+            
+            pVariant->Release();
         }
-
-        SysFreeString(bstrRuleName);
-    }
-
-    if (pFwRules) {
-        pFwRules->Release();
-    }
-    if (pFwPolicy) {
-        pFwPolicy->Release();
-    }
-}
-
-    for (const auto& ruleName : ruleNames) {
-        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        // *** CORRECTED: Loop only while the result is exactly S_OK ***
-        while (pFwRules->Remove(bstrRuleName) == S_OK) {
-            // Keep removing as long as we successfully find and remove a rule.
-        }
-        SysFreeString(bstrRuleName);
+        pEnumerator->Release();
     }
 
     if (pFwRules) pFwRules->Release();
@@ -762,7 +760,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wchar_t absoluteWorkDir[MAX_PATH];
         GetFullPathNameW(workDirRaw.c_str(), MAX_PATH, absoluteWorkDir, NULL);
         if (PathFileExistsW(absoluteWorkDir)) finalWorkDir = absoluteWorkDir;
-        else finalWorkDir = appDir;
+        else finalWorkDir = finalWorkDir = appDir;
     } else {
         finalWorkDir = appDir;
     }
@@ -898,4 +896,3 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
     return 0;
-}
