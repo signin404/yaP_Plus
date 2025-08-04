@@ -306,24 +306,43 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     std::wstring exeDir;
     if (!workDir.empty() && PathIsDirectoryW(workDir.c_str())) {
         finalWorkDir = workDir.c_str();
-    }
-    else {
+    } else {
         exeDir = path;
         PathRemoveFileSpecW(&exeDir[0]);
         finalWorkDir = exeDir.c_str();
     }
 
-    STARTUPINFOEXW siEx;
-    ZeroMemory(&siEx, sizeof(siEx));
-    siEx.StartupInfo.cb = sizeof(siEx);
-
     if (hide) {
+        // NSudo 隐藏方式: 使用 CreateProcessAsUserW 和窗口策略属性
+        HANDLE hToken = NULL;
+        HANDLE hNewToken = NULL;
+        LPVOID lpEnvironment = NULL;
+        STARTUPINFOEXW siEx;
+        ZeroMemory(&siEx, sizeof(siEx));
+        siEx.StartupInfo.cb = sizeof(siEx);
+        bool success = false;
+
+        // 1. 获取并复制当前进程的令牌
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &hToken)) {
+            goto cleanup;
+        }
+        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hNewToken)) {
+            goto cleanup;
+        }
+        
+        // 2. 为新令牌创建环境块
+        if (!CreateEnvironmentBlock(&lpEnvironment, hNewToken, FALSE)) {
+            lpEnvironment = NULL; // 即使失败也可以继续，但最好有
+        }
+
+        // 3. 设置进程启动属性，以隐藏窗口
         SIZE_T attributeListSize = 0;
         InitializeProcThreadAttributeList(NULL, 1, 0, &attributeListSize);
         siEx.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)new char[attributeListSize];
         if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, &attributeListSize)) {
             delete[] (char*)siEx.lpAttributeList;
-            return false;
+            siEx.lpAttributeList = NULL;
+            goto cleanup;
         }
 
         DWORD policy = PROC_THREAD_ATTRIBUTE_WINDOW_POLICY_PREVENT_SHOW;
@@ -335,35 +354,46 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
             sizeof(policy),
             NULL,
             NULL)) {
-            DeleteProcThreadAttributeList(siEx.lpAttributeList);
-            delete[] (char*)siEx.lpAttributeList;
-            return false;
+            goto cleanup;
         }
-    }
 
-    DWORD creationFlags = hide ? EXTENDED_STARTUPINFO_PRESENT : 0;
+        // 4. 使用复制的令牌和扩展启动信息来创建进程
+        if (CreateProcessAsUserW(
+            hNewToken,
+            NULL,
+            cmdBuffer.data(),
+            NULL,
+            NULL,
+            FALSE,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            lpEnvironment,
+            finalWorkDir,
+            &siEx.StartupInfo,
+            &pi)) {
+            success = true;
+        }
 
-    if (!CreateProcessW(
-        NULL,
-        cmdBuffer.data(),
-        NULL,
-        NULL,
-        FALSE,
-        creationFlags,
-        NULL,
-        finalWorkDir,
-        &siEx.StartupInfo,
-        &pi)) {
+    cleanup: // 清理资源
+        if (lpEnvironment) {
+            DestroyEnvironmentBlock(lpEnvironment);
+        }
         if (siEx.lpAttributeList) {
             DeleteProcThreadAttributeList(siEx.lpAttributeList);
             delete[] (char*)siEx.lpAttributeList;
         }
-        return false;
-    }
+        if (hNewToken) CloseHandle(hNewToken);
+        if (hToken) CloseHandle(hToken);
 
-    if (siEx.lpAttributeList) {
-        DeleteProcThreadAttributeList(siEx.lpAttributeList);
-        delete[] (char*)siEx.lpAttributeList;
+        if (!success) return false;
+
+    } else {
+        // 标准方式创建进程
+        STARTUPINFOW si;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, 0, NULL, finalWorkDir, &si, &pi)) {
+            return false;
+        }
     }
 
     if (wait) {
