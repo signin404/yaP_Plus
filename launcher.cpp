@@ -8,6 +8,7 @@
 #include <thread>
 #include <utility> // For std::pair
 #include <map>
+#include <set> // For the new firewall logic
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h> // For SHFileOperationW
@@ -570,35 +571,69 @@ void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstri
     if (pFwPolicy) pFwPolicy->Release();
 }
 
-// *** CORRECTED AND ROBUST CleanupFirewallRules FUNCTION ***
+// *** NEW, MORE ROBUST CleanupFirewallRules FUNCTION BASED ON USER FEEDBACK ***
 void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
     if (ruleNames.empty()) return;
 
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
+    IEnumVARIANT* pEnumerator = NULL;
+    INetFwRule* pFwRule = NULL;
 
     HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
-    if (FAILED(hr)) {
-        return; // Cannot create firewall policy instance, exit.
-    }
+    if (FAILED(hr)) return;
 
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) {
         pFwPolicy->Release();
-        return; // Cannot get rules collection, exit.
+        return;
     }
 
-    for (const auto& ruleName : ruleNames) {
-        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-        if (!bstrRuleName) continue; // Memory allocation failed.
+    // For efficient lookup of target rule names
+    std::set<std::wstring> targetRuleNames(ruleNames.begin(), ruleNames.end());
+    std::vector<std::wstring> actualRulesToDelete;
 
-        // Loop to remove all rules with the same name until the API returns "not found" or an error.
-        HRESULT hrRemove = S_OK; // Initialize to a success code to enter the loop.
-        while (SUCCEEDED(hrRemove) && hrRemove != S_FALSE) {
-            hrRemove = pFwRules->Remove(bstrRuleName);
+    // --- Step 1: Enumerate ALL firewall rules to find which ones we need to delete ---
+    IUnknown* pUnknown = NULL;
+    hr = pFwRules->get__NewEnum(&pUnknown);
+    if (SUCCEEDED(hr) && pUnknown) {
+        hr = pUnknown->QueryInterface(__uuidof(IEnumVARIANT), (void**)&pEnumerator);
+        pUnknown->Release();
+    }
+
+    if (SUCCEEDED(hr) && pEnumerator) {
+        VARIANT var;
+        VariantInit(&var);
+        while (pEnumerator->Next(1, &var, NULL) == S_OK) {
+            if (var.vt == VT_DISPATCH) {
+                hr = var.pdispVal->QueryInterface(__uuidof(INetFwRule), (void**)&pFwRule);
+                if (SUCCEEDED(hr)) {
+                    BSTR bstrName = NULL;
+                    if (SUCCEEDED(pFwRule->get_Name(&bstrName))) {
+                        // Check if the rule's name is in our set of targets
+                        if (targetRuleNames.count(bstrName) > 0) {
+                            actualRulesToDelete.push_back(bstrName);
+                        }
+                        SysFreeString(bstrName);
+                    }
+                    pFwRule->Release();
+                    pFwRule = NULL;
+                }
+            }
+            VariantClear(&var);
         }
-        
-        SysFreeString(bstrRuleName);
+        pEnumerator->Release();
+    }
+
+    // --- Step 2: Delete the rules found in the enumeration step ---
+    // This avoids a while-loop by iterating over a pre-compiled list.
+    // The number of Remove calls is now fixed and finite.
+    for (const auto& ruleNameToDelete : actualRulesToDelete) {
+        BSTR bstrRuleNameToDelete = SysAllocString(ruleNameToDelete.c_str());
+        if (bstrRuleNameToDelete) {
+            pFwRules->Remove(bstrRuleNameToDelete); // We call Remove but don't loop on its result
+            SysFreeString(bstrRuleNameToDelete);
+        }
     }
 
     if (pFwRules) pFwRules->Release();
