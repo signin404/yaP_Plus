@@ -12,6 +12,7 @@
 #include <tlhelp32.h>
 #include <shellapi.h> // For SHFileOperationW
 #include <shlobj.h>   // For SHGetKnownFolderPath and KNOWNFOLDERID
+#include <netfw.h>    // For Firewall COM API
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -19,6 +20,7 @@
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "OleAut32.lib") // For Firewall BSTR functions
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -84,15 +86,12 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-// --- CORRECTED: Advanced Variable Expansion Engine ---
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
-    // Stage 1: Expand custom {UserVar} variables recursively
     int safety_counter = 0;
     while (path.find(L'{') != std::wstring::npos && safety_counter < 100) {
         size_t start_pos = path.find(L'{');
         size_t end_pos = path.find(L'}', start_pos);
         if (end_pos == std::wstring::npos) break;
-
         std::wstring varName = path.substr(start_pos + 1, end_pos - start_pos - 1);
         auto it = variables.find(varName);
         if (it != variables.end()) {
@@ -102,8 +101,6 @@ std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std
         }
         safety_counter++;
     }
-
-    // Stage 2: Expand standard %System% environment variables
     DWORD requiredSize = ExpandEnvironmentStringsW(path.c_str(), NULL, 0);
     if (requiredSize > 0) {
         std::vector<wchar_t> buffer(requiredSize);
@@ -491,6 +488,99 @@ void CleanupLinks(const std::vector<LinkRecord>& records) {
     }
 }
 
+// --- Firewall Management ---
+void ProcessFirewallRules(const std::wstring& iniContent, std::vector<std::wstring>& createdRuleNames, const std::map<std::wstring, std::wstring>& variables) {
+    auto entries = GetMultiValueFromIniContent(iniContent, L"Settings", L"firewall");
+    if (entries.empty()) return;
+
+    INetFwPolicy2* pFwPolicy = NULL;
+    INetFwRules* pFwRules = NULL;
+    INetFwRule* pFwRule = NULL;
+
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) return;
+
+    hr = pFwPolicy->get_Rules(&pFwRules);
+    if (FAILED(hr)) {
+        pFwPolicy->Release();
+        return;
+    }
+
+    for (const auto& entry : entries) {
+        std::wstringstream ss(entry);
+        std::wstring segment;
+        std::vector<std::wstring> parts;
+        while(std::getline(ss, segment, L':')) {
+            if (segment.front() == L':') segment.erase(0, 1);
+            parts.push_back(trim(segment));
+        }
+
+        if (parts.size() != 4) continue;
+
+        std::wstring ruleName = parts[0];
+        std::wstring appPath = ExpandVariables(parts[1], variables);
+        std::wstring direction = parts[2];
+        std::wstring action = parts[3];
+
+        hr = CoCreateInstance(__uuidof(NetFwRule), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule), (void**)&pFwRule);
+        if (FAILED(hr)) continue;
+
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        BSTR bstrAppPath = SysAllocString(appPath.c_str());
+
+        pFwRule->put_Name(bstrRuleName);
+        pFwRule->put_ApplicationName(bstrAppPath);
+        
+        if (_wcsicmp(direction.c_str(), L"in") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_IN);
+        else if (_wcsicmp(direction.c_str(), L"out") == 0) pFwRule->put_Direction(NET_FW_RULE_DIR_OUT);
+
+        if (_wcsicmp(action.c_str(), L"allow") == 0) pFwRule->put_Action(NET_FW_ACTION_ALLOW);
+        else if (_wcsicmp(action.c_str(), L"block") == 0) pFwRule->put_Action(NET_FW_ACTION_BLOCK);
+
+        pFwRule->put_Enabled(VARIANT_TRUE);
+        pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
+        pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+
+        hr = pFwRules->Add(pFwRule);
+        if (SUCCEEDED(hr)) {
+            createdRuleNames.push_back(ruleName);
+        }
+
+        SysFreeString(bstrRuleName);
+        SysFreeString(bstrAppPath);
+        pFwRule->Release();
+        pFwRule = NULL;
+    }
+
+    if (pFwRules) pFwRules->Release();
+    if (pFwPolicy) pFwPolicy->Release();
+}
+
+void CleanupFirewallRules(const std::vector<std::wstring>& ruleNames) {
+    if (ruleNames.empty()) return;
+
+    INetFwPolicy2* pFwPolicy = NULL;
+    INetFwRules* pFwRules = NULL;
+
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) return;
+
+    hr = pFwPolicy->get_Rules(&pFwRules);
+    if (FAILED(hr)) {
+        pFwPolicy->Release();
+        return;
+    }
+
+    for (const auto& ruleName : ruleNames) {
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        pFwRules->Remove(bstrRuleName);
+        SysFreeString(bstrRuleName);
+    }
+
+    if (pFwRules) pFwRules->Release();
+    if (pFwPolicy) pFwPolicy->Release();
+}
+
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent) {
@@ -635,15 +725,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     if (isFirstInstance) {
         // --- MASTER INSTANCE LOGIC ---
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
         if (appPathRaw.empty()) {
             MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
             CloseHandle(hMutex);
+            CoUninitialize();
             return 1;
         }
         
         HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
         HANDLE hBackupThread = NULL; BackupThreadData backupData; std::atomic<bool> stopBackup(false); std::atomic<bool> isBackupWorking(false);
         std::vector<LinkRecord> hardlinkRecords, symlinkRecords;
+        std::vector<std::wstring> firewallRuleNames;
 
         // Foreground Monitor Setup
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"Settings", L"foreground"), variables);
@@ -672,9 +766,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
-        // Link Processing
+        // Link & Firewall Processing
         ProcessHardlinks(iniContent, hardlinkRecords, variables);
         ProcessSymlinks(iniContent, symlinkRecords, variables);
+        ProcessFirewallRules(iniContent, firewallRuleNames, variables);
 
         // --- Main Application Launch ---
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
@@ -686,9 +781,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             MessageBoxW(NULL, (L"启动程序失败: \n" + std::wstring(absoluteAppPath)).c_str(), L"启动错误", MB_ICONERROR);
             if (hMonitorThread) { stopMonitor = true; WaitForSingleObject(hMonitorThread, 1500); CloseHandle(hMonitorThread); }
             if (hBackupThread) { stopBackup = true; while(isBackupWorking) Sleep(100); WaitForSingleObject(hBackupThread, 1500); CloseHandle(hBackupThread); }
+            CleanupFirewallRules(firewallRuleNames);
             CleanupLinks(symlinkRecords);
             CleanupLinks(hardlinkRecords);
             CloseHandle(hMutex);
+            CoUninitialize();
             return 1;
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
@@ -724,9 +821,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
+        CleanupFirewallRules(firewallRuleNames);
         CleanupLinks(symlinkRecords);
         CleanupLinks(hardlinkRecords);
         CloseHandle(hMutex);
+        CoUninitialize();
 
     } else {
         // --- SUBSEQUENT INSTANCE LOGIC ---
