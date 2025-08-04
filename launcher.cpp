@@ -354,7 +354,7 @@ bool ExportRegistryKey(const RegistryEntry& entry) {
     return RunCommand(L"reg export \"" + fullKeyPath + L"\" \"" + entry.filePath + L"\" /y");
 }
 
-// CORRECTED: This function now correctly writes a UTF-16 LE file using std::ofstream.
+// CORRECTED: This function now correctly handles REG_EXPAND_SZ.
 bool ExportRegistryValue(const RegistryEntry& entry) {
     HKEY hKey;
     if (RegOpenKeyExW(entry.hRootKey, entry.subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -389,7 +389,7 @@ bool ExportRegistryValue(const RegistryEntry& entry) {
     write_wstring(displayName + L"=");
 
     std::wstringstream wss;
-    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+    if (type == REG_SZ) {
         std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
         std::wstring escapedStr;
         for (wchar_t c : strValue) {
@@ -409,8 +409,13 @@ bool ExportRegistryValue(const RegistryEntry& entry) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
             if (i < 7) wss << L",";
         }
-    } else if (type == REG_BINARY || type == REG_MULTI_SZ || type == REG_NONE) {
-        wss << L"hex" << (type == REG_MULTI_SZ ? L"(7)" : (type == REG_EXPAND_SZ ? L"(2)" : L"")) << L":";
+    } else { // Handles REG_EXPAND_SZ, REG_BINARY, REG_MULTI_SZ, REG_NONE
+        wss << L"hex";
+        if (type == REG_EXPAND_SZ) wss << L"(2)";
+        else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type != REG_BINARY) wss << L"(" << type << L")"; // Fallback for other types
+        wss << L":";
+        
         for (DWORD i = 0; i < size; ++i) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
             if (i < size - 1) {
