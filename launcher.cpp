@@ -1378,39 +1378,104 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
-            std::vector<std::wstring> parts;
-            std::wstring temp_value = val;
+        // 在 ParseIniSections 函数中，完全替换原来的 parseCreateFileOp lambda 函数：
+        
+        auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) -> bool {
+            // 清空结构体，确保每次都是干净的状态
+            cf_op = CreateFileOp{};
+            cf_op.format = TextFormat::Win;      // 显式设置默认值
+            cf_op.encoding = TextEncoding::UTF8; // 显式设置默认值
+            cf_op.overwrite = false;             // 显式设置默认值
+            
+            const std::wstring separator = L" :: ";
+            std::vector<std::wstring> tokens;
+            
+            // 完全重写字符串分割逻辑
+            std::wstring remaining = val;
             size_t pos = 0;
-            while (parts.size() < 4 && (pos = temp_value.find(delimiter)) != std::wstring::npos) {
-                parts.push_back(trim(temp_value.substr(0, pos)));
-                temp_value.erase(0, pos + delimiter.length());
+            
+            // 分割成最多5个部分
+            for (int i = 0; i < 4 && !remaining.empty(); i++) {
+                pos = remaining.find(separator);
+                if (pos != std::wstring::npos) {
+                    tokens.push_back(trim(remaining.substr(0, pos)));
+                    remaining = remaining.substr(pos + separator.length());
+                } else {
+                    // 没有更多分隔符，剩余全部作为最后一个token
+                    tokens.push_back(trim(remaining));
+                    remaining.clear();
+                    break;
+                }
             }
-            parts.push_back(trim(temp_value));
-        
-            if (parts.size() >= 2) {
-                cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                
-                // 修正：检查 parts.size() > 1 而不是 > 2
-                cf_op.overwrite = (parts.size() > 1) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
-                
-                // 修正：检查 parts.size() > 2 而不是 > 3
-                std::wstring formatStr = (parts.size() > 2) ? parts[2] : L"win";
-                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
-                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
-                else cf_op.format = TextFormat::Win;
-        
-                // 修正：检查 parts.size() > 3 而不是 > 4
-                std::wstring encodingStr = (parts.size() > 3) ? parts[3] : L"utf8";
-                if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
-                else cf_op.encoding = TextEncoding::UTF8;
-                
-                cf_op.content = parts.back();
-                return true;
+            
+            // 如果还有剩余内容，作为最后一个token
+            if (!remaining.empty()) {
+                tokens.push_back(trim(remaining));
             }
-            return false;
+            
+            // 调试输出 - 可以临时添加来诊断问题
+            /*
+            OutputDebugStringA("CreateFile tokens:\n");
+            for (size_t i = 0; i < tokens.size(); i++) {
+                std::string debug = "  [" + std::to_string(i) + "]: ";
+                int needed = WideCharToMultiByte(CP_UTF8, 0, tokens[i].c_str(), -1, NULL, 0, NULL, NULL);
+                std::vector<char> buffer(needed);
+                WideCharToMultiByte(CP_UTF8, 0, tokens[i].c_str(), -1, buffer.data(), needed, NULL, NULL);
+                debug += buffer.data();
+                debug += "\n";
+                OutputDebugStringA(debug.c_str());
+            }
+            */
+            
+            if (tokens.empty()) {
+                return false;
+            }
+            
+            // 解析参数
+            // Token 0: 文件路径 (必需)
+            cf_op.path = ResolveToAbsolutePath(ExpandVariables(tokens[0], variables));
+            
+            // Token 1: 覆盖标志 (可选)
+            if (tokens.size() > 1) {
+                std::wstring overwriteFlag = tokens[1];
+                std::transform(overwriteFlag.begin(), overwriteFlag.end(), overwriteFlag.begin(), ::towlower);
+                cf_op.overwrite = (overwriteFlag == L"overwrite");
+            }
+            
+            // Token 2: 格式 (可选)
+            if (tokens.size() > 2) {
+                std::wstring formatStr = tokens[2];
+                std::transform(formatStr.begin(), formatStr.end(), formatStr.begin(), ::towlower);
+                if (formatStr == L"unix") {
+                    cf_op.format = TextFormat::Unix;
+                } else if (formatStr == L"mac") {
+                    cf_op.format = TextFormat::Mac;
+                } else {
+                    cf_op.format = TextFormat::Win; // win 或其他值
+                }
+            }
+            
+            // Token 3: 编码 (可选)
+            if (tokens.size() > 3) {
+                std::wstring encodingStr = tokens[3];
+                std::transform(encodingStr.begin(), encodingStr.end(), encodingStr.begin(), ::towlower);
+                if (encodingStr == L"utf8bom") {
+                    cf_op.encoding = TextEncoding::UTF8_BOM;
+                } else if (encodingStr == L"utf16le") {
+                    cf_op.encoding = TextEncoding::UTF16_LE;
+                } else if (encodingStr == L"utf16be") {
+                    cf_op.encoding = TextEncoding::UTF16_BE;
+                } else {
+                    cf_op.encoding = TextEncoding::UTF8; // utf8 或其他值
+                }
+            }
+            
+            // Token 4: 内容 (可选)
+            if (tokens.size() > 4) {
+                cf_op.content = tokens[4];
+            }
+            
+            return true;
         };
 
         if (currentSection == Section::Before) {
