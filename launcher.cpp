@@ -10,7 +10,7 @@
 #include <map>
 #include <set>
 #include <variant>
-#include <optional> // Added missing header
+#include <optional>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
@@ -164,7 +164,6 @@ struct CreateRegValueOp {
     std::wstring typeStr;
 };
 
-// --- NEW: Structures for new operations ---
 struct CopyMoveOp {
     std::wstring sourcePath;
     std::wstring destPath;
@@ -203,7 +202,7 @@ struct ReplaceLineOp {
 using ActionOpData = std::variant<
     RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
-    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp // NEW
+    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp
 >;
 struct ActionOperation {
     ActionOpData data;
@@ -970,17 +969,13 @@ namespace ActionHelpers {
         }
     }
 
-    // --- NEW: Handlers for new operations ---
-
     void HandleCopyMove(const CopyMoveOp& op) {
         if (!op.overwrite && PathFileExistsW(op.destPath.c_str())) {
-            return; // Skip if destination exists and no overwrite flag
+            return;
         }
 
-        // Backup existing item at destination if we are overwriting
         if (op.overwrite && PathFileExistsW(op.destPath.c_str())) {
             std::wstring backupPath = op.destPath + L"_Backup";
-            // Ensure old backup is gone
             if (PathIsDirectoryW(backupPath.c_str())) {
                  PerformFileSystemOperation(FO_DELETE, backupPath);
             } else {
@@ -991,11 +986,11 @@ namespace ActionHelpers {
 
         wchar_t fromPath[MAX_PATH * 2] = {0};
         wcscpy_s(fromPath, op.sourcePath.c_str());
-        fromPath[op.sourcePath.length() + 1] = L'\0'; // Double null-terminate
+        fromPath[op.sourcePath.length() + 1] = L'\0';
 
         wchar_t toPath[MAX_PATH * 2] = {0};
         wcscpy_s(toPath, op.destPath.c_str());
-        toPath[op.destPath.length() + 1] = L'\0'; // Double null-terminate
+        toPath[op.destPath.length() + 1] = L'\0';
 
         SHFILEOPSTRUCTW sfos = {0};
         sfos.wFunc = op.isMove ? FO_MOVE : FO_COPY;
@@ -1011,7 +1006,6 @@ namespace ActionHelpers {
 
         SHFileOperationW(&sfos);
 
-        // Cleanup backup if operation was successful
         std::wstring backupPath = op.destPath + L"_Backup";
         if (PathFileExistsW(backupPath.c_str())) {
             if (op.isDirectory) {
@@ -1026,118 +1020,88 @@ namespace ActionHelpers {
         SetFileAttributesW(op.path.c_str(), op.attributes);
     }
 
-    // --- REFACTORED: Core text file handling logic for Unicode support ---
+    // --- REWRITTEN: Core text file handling logic for robust Unicode support ---
     struct FileContentInfo {
-        std::vector<char> raw_bytes;
-        TextEncoding encoding = TextEncoding::ANSI;
+        TextEncoding encoding = TextEncoding::UTF8;
         std::wstring line_ending = L"\r\n";
     };
 
-    bool ReadFileWithFormatDetection(const std::wstring& path, FileContentInfo& info) {
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) return false;
-        info.raw_bytes = std::vector<char>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        file.close();
-
-        if (info.raw_bytes.empty()) {
-            info.encoding = TextEncoding::UTF8; // Default for new files
-            info.line_ending = L"\r\n";
-            return true;
+    std::vector<std::wstring> GetLinesFromFile(const std::vector<char>& raw_bytes, FileContentInfo& out_info) {
+        if (raw_bytes.empty()) {
+            out_info.encoding = TextEncoding::UTF8;
+            out_info.line_ending = L"\r\n";
+            return {};
         }
 
-        // Detect encoding
-        if (info.raw_bytes.size() >= 3 && (BYTE)info.raw_bytes[0] == 0xEF && (BYTE)info.raw_bytes[1] == 0xBB && (BYTE)info.raw_bytes[2] == 0xBF) {
-            info.encoding = TextEncoding::UTF8_BOM;
-        } else if (info.raw_bytes.size() >= 2 && (BYTE)info.raw_bytes[0] == 0xFF && (BYTE)info.raw_bytes[1] == 0xFE) {
-            info.encoding = TextEncoding::UTF16_LE;
-        } else if (info.raw_bytes.size() >= 2 && (BYTE)info.raw_bytes[0] == 0xFE && (BYTE)info.raw_bytes[1] == 0xFF) {
-            info.encoding = TextEncoding::UTF16_BE;
+        const char* start_ptr = raw_bytes.data();
+        int byte_count = (int)raw_bytes.size();
+        std::wstring content;
+
+        // 1. Detect encoding by BOM first (most reliable)
+        if (byte_count >= 3 && (BYTE)start_ptr[0] == 0xEF && (BYTE)start_ptr[1] == 0xBB && (BYTE)start_ptr[2] == 0xBF) {
+            out_info.encoding = TextEncoding::UTF8_BOM;
+            int wsize = MultiByteToWideChar(CP_UTF8, 0, start_ptr + 3, byte_count - 3, NULL, 0);
+            content.resize(wsize);
+            MultiByteToWideChar(CP_UTF8, 0, start_ptr + 3, byte_count - 3, &content[0], wsize);
+        } else if (byte_count >= 2 && (BYTE)start_ptr[0] == 0xFF && (BYTE)start_ptr[1] == 0xFE) {
+            out_info.encoding = TextEncoding::UTF16_LE;
+            content = std::wstring(reinterpret_cast<const wchar_t*>(start_ptr + 2), (byte_count / 2) - 1);
+        } else if (byte_count >= 2 && (BYTE)start_ptr[0] == 0xFE && (BYTE)start_ptr[1] == 0xFF) {
+            out_info.encoding = TextEncoding::UTF16_BE;
+            const wchar_t* w_ptr = reinterpret_cast<const wchar_t*>(start_ptr + 2);
+            int w_len = (byte_count / 2) - 1;
+            std::vector<wchar_t> temp_buffer(w_len);
+            for(int i=0; i < w_len; ++i) { temp_buffer[i] = _byteswap_ushort(w_ptr[i]); }
+            content.assign(temp_buffer.data(), w_len);
         } else {
-            // Try to decode as UTF-8, if it fails, assume ANSI
-            if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, info.raw_bytes.data(), (int)info.raw_bytes.size(), NULL, 0) != 0) {
-                info.encoding = TextEncoding::UTF8;
+            // 2. No BOM: Try to decode as UTF-8. If it fails, assume it's legacy ANSI.
+            int wsize = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, start_ptr, byte_count, NULL, 0);
+            if (wsize > 0) {
+                out_info.encoding = TextEncoding::UTF8;
+                content.resize(wsize);
+                MultiByteToWideChar(CP_UTF8, 0, start_ptr, byte_count, &content[0], wsize);
             } else {
-                info.encoding = TextEncoding::ANSI;
+                out_info.encoding = TextEncoding::ANSI;
+                wsize = MultiByteToWideChar(CP_ACP, 0, start_ptr, byte_count, NULL, 0);
+                content.resize(wsize);
+                MultiByteToWideChar(CP_ACP, 0, start_ptr, byte_count, &content[0], wsize);
             }
         }
 
-        // Detect line endings from a sample of the file
-        std::string sample(info.raw_bytes.begin(), info.raw_bytes.begin() + min(1024, info.raw_bytes.size()));
+        // 3. Detect line endings from the raw bytes
+        std::string sample(raw_bytes.begin(), raw_bytes.begin() + min(2048, raw_bytes.size()));
         size_t cr_count = std::count(sample.begin(), sample.end(), '\r');
         size_t lf_count = std::count(sample.begin(), sample.end(), '\n');
-        size_t crlf_count = sample.find("\r\n") != std::string::npos ? 1 : 0; // Just check for presence
-
-        if (crlf_count > 0 || (cr_count > 0 && cr_count == lf_count)) {
-            info.line_ending = L"\r\n";
-        } else if (lf_count > cr_count) {
-            info.line_ending = L"\n";
+        
+        if (cr_count > 0 && lf_count > 0) {
+             out_info.line_ending = L"\r\n";
+        } else if (lf_count > 0) {
+             out_info.line_ending = L"\n";
         } else if (cr_count > 0) {
-            info.line_ending = L"\r";
+             out_info.line_ending = L"\r";
+        } else {
+             out_info.line_ending = L"\r\n"; // Default
         }
 
-        return true;
-    }
-
-    std::vector<std::wstring> GetLinesFromFile(const FileContentInfo& info) {
-        std::wstring content;
-        const char* start_ptr = info.raw_bytes.data();
-        int byte_count = (int)info.raw_bytes.size();
-
-        if (byte_count > 0) {
-            if (info.encoding == TextEncoding::UTF16_LE) {
-                content = std::wstring(reinterpret_cast<const wchar_t*>(start_ptr + 2), (byte_count / 2) - 1);
-            } else if (info.encoding == TextEncoding::UTF16_BE) {
-                std::vector<wchar_t> temp_buffer(byte_count / 2);
-                for(int i=0; i < byte_count/2; ++i) {
-                    temp_buffer[i] = _byteswap_ushort(((const wchar_t*)start_ptr)[i]);
-                }
-                content = std::wstring(temp_buffer.data() + 1, (byte_count / 2) - 1);
-            } else {
-                UINT codePage = CP_ACP;
-                if (info.encoding == TextEncoding::UTF8_BOM) {
-                    codePage = CP_UTF8;
-                    start_ptr += 3;
-                    byte_count -= 3;
-                } else if (info.encoding == TextEncoding::UTF8) {
-                    codePage = CP_UTF8;
-                }
-                int wsize = MultiByteToWideChar(codePage, 0, start_ptr, byte_count, NULL, 0);
-                content.resize(wsize);
-                MultiByteToWideChar(codePage, 0, start_ptr, byte_count, &content[0], wsize);
-            }
-        }
-
-        // Normalize line endings to \n for processing
-        std::wstring normalized_content;
-        normalized_content.reserve(content.length());
-        for (size_t i = 0; i < content.length(); ++i) {
-            if (content[i] == L'\r') {
-                if (i + 1 < content.length() && content[i+1] == L'\n') {
-                    normalized_content += L'\n'; i++;
-                } else {
-                    normalized_content += L'\n';
-                }
-            } else {
-                normalized_content += content[i];
-            }
-        }
-
+        // 4. Split the decoded content into lines
         std::vector<std::wstring> lines;
-        std::wstringstream ss(normalized_content);
+        std::wstringstream ss(content);
         std::wstring line;
-        while (std::getline(ss, line, L'\n')) {
+        wchar_t line_ending_char = (out_info.line_ending == L"\n") ? L'\n' : L'\r';
+        while (std::getline(ss, line, line_ending_char)) {
+            if (!line.empty() && line_ending_char == L'\r' && line.back() == L'\n') {
+                line.pop_back();
+            }
             lines.push_back(line);
         }
-        if (normalized_content.empty() && !info.raw_bytes.empty()) lines.clear();
+        if (content.empty() && !raw_bytes.empty()) lines.clear();
         return lines;
     }
-
 
     bool WriteFileWithFormat(const std::wstring& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
 
-        // Write BOM if needed
         if (info.encoding == TextEncoding::UTF8_BOM) {
             file.write("\xEF\xBB\xBF", 3);
         } else if (info.encoding == TextEncoding::UTF16_LE) {
@@ -1154,14 +1118,18 @@ namespace ActionHelpers {
 
             if (info.encoding == TextEncoding::UTF8 || info.encoding == TextEncoding::UTF8_BOM) {
                 int size = WideCharToMultiByte(CP_UTF8, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
-                std::string utf8_str(size - 1, 0);
-                WideCharToMultiByte(CP_UTF8, 0, line_to_write.c_str(), -1, &utf8_str[0], size, NULL, NULL);
-                file.write(utf8_str.c_str(), utf8_str.length());
+                if (size > 1) {
+                    std::string utf8_str(size - 1, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, line_to_write.c_str(), -1, &utf8_str[0], size, NULL, NULL);
+                    file.write(utf8_str.c_str(), utf8_str.length());
+                }
             } else if (info.encoding == TextEncoding::ANSI) {
                 int size = WideCharToMultiByte(CP_ACP, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
-                std::string ansi_str(size - 1, 0);
-                WideCharToMultiByte(CP_ACP, 0, line_to_write.c_str(), -1, &ansi_str[0], size, NULL, NULL);
-                file.write(ansi_str.c_str(), ansi_str.length());
+                if (size > 1) {
+                    std::string ansi_str(size - 1, 0);
+                    WideCharToMultiByte(CP_ACP, 0, line_to_write.c_str(), -1, &ansi_str[0], size, NULL, NULL);
+                    file.write(ansi_str.c_str(), ansi_str.length());
+                }
             } else if (info.encoding == TextEncoding::UTF16_LE) {
                 file.write(reinterpret_cast<const char*>(line_to_write.c_str()), line_to_write.length() * sizeof(wchar_t));
             } else if (info.encoding == TextEncoding::UTF16_BE) {
@@ -1176,17 +1144,16 @@ namespace ActionHelpers {
 
     void HandleIniWrite(const IniWriteOp& op) {
         FileContentInfo formatInfo;
-        bool file_exists = PathFileExistsW(op.path.c_str());
-        if (file_exists) {
-            if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
-        } else {
-            formatInfo.encoding = TextEncoding::UTF8;
-            formatInfo.line_ending = L"\r\n";
+        std::vector<char> raw_bytes;
+        
+        std::ifstream file_reader(op.path, std::ios::binary);
+        if (file_reader) {
+            raw_bytes.assign((std::istreambuf_iterator<char>(file_reader)), std::istreambuf_iterator<char>());
+            file_reader.close();
         }
 
-        std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
+        std::vector<std::wstring> lines = GetLinesFromFile(raw_bytes, formatInfo);
 
-        // Handle deleting a section
         if (op.deleteSection) {
             std::vector<std::wstring> new_lines;
             std::wstring section_to_delete_header = L"[" + op.section + L"]";
@@ -1214,11 +1181,7 @@ namespace ActionHelpers {
             std::wstring trimmed_line = trim(l);
 
             if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                if (is_null_section) {
-                    in_target_section = false;
-                } else {
-                    in_target_section = (_wcsicmp(trimmed_line.c_str(), search_section_header.c_str()) == 0);
-                }
+                in_target_section = is_null_section ? false : (_wcsicmp(trimmed_line.c_str(), search_section_header.c_str()) == 0);
             }
 
             if (in_target_section) {
@@ -1226,17 +1189,11 @@ namespace ActionHelpers {
                 if (eq_pos != std::wstring::npos) {
                     std::wstring current_key = trim(trimmed_line.substr(0, eq_pos));
                     if (_wcsicmp(current_key.c_str(), op.key.c_str()) == 0) {
-                        if (_wcsicmp(op.value.c_str(), L"null") != 0) { // Modify
+                        if (_wcsicmp(op.value.c_str(), L"null") != 0) {
                             size_t original_eq_pos = l.find(L'=');
-                            size_t value_start_pos = l.find_first_not_of(L" \t", original_eq_pos + 1);
-                            if (value_start_pos == std::wstring::npos) { // key=
-                                l = l.substr(0, original_eq_pos + 1) + op.value;
-                            } else {
-                                l = l.substr(0, value_start_pos) + op.value;
-                            }
-                        } else { // Delete
-                            lines.erase(lines.begin() + i);
-                            --i; // Adjust loop counter
+                            l = l.substr(0, original_eq_pos) + L"=" + op.value;
+                        } else {
+                            lines.erase(lines.begin() + i--);
                         }
                         key_found_and_handled = true;
                         if (is_null_section) break;
@@ -1245,7 +1202,6 @@ namespace ActionHelpers {
             }
         }
 
-        // If key was not found, add it
         if (!key_found_and_handled && _wcsicmp(op.value.c_str(), L"null") != 0) {
             if (is_null_section) {
                 lines.insert(lines.begin(), op.key + L"=" + op.value);
@@ -1259,10 +1215,8 @@ namespace ActionHelpers {
                 }
                 if (section_line != -1) {
                     lines.insert(lines.begin() + section_line + 1, op.key + L"=" + op.value);
-                } else { // Section not found, create it
-                    if (!lines.empty() && !trim(lines.back()).empty()) {
-                        lines.push_back(L"");
-                    }
+                } else {
+                    if (!lines.empty() && !trim(lines.back()).empty()) lines.push_back(L"");
                     lines.push_back(search_section_header);
                     lines.push_back(op.key + L"=" + op.value);
                 }
@@ -1274,47 +1228,42 @@ namespace ActionHelpers {
 
     void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
-        if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
+        std::vector<char> raw_bytes;
+        std::ifstream file_reader(op.path, std::ios::binary);
+        if (!file_reader) return;
+        raw_bytes.assign((std::istreambuf_iterator<char>(file_reader)), std::istreambuf_iterator<char>());
+        file_reader.close();
 
-        std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
-        std::wstring content;
-        for(size_t i = 0; i < lines.size(); ++i) {
-            content += lines[i];
-            if (i < lines.size() - 1) content += L"\n";
+        std::vector<std::wstring> lines = GetLinesFromFile(raw_bytes, formatInfo);
+        
+        for(auto& line : lines) {
+            size_t pos = 0;
+            while ((pos = line.find(op.findText, pos)) != std::wstring::npos) {
+                line.replace(pos, op.findText.length(), op.replaceText);
+                pos += op.replaceText.length();
+            }
         }
 
-        size_t pos = 0;
-        while ((pos = content.find(op.findText, pos)) != std::wstring::npos) {
-            content.replace(pos, op.findText.length(), op.replaceText);
-            pos += op.replaceText.length();
-        }
-
-        std::vector<std::wstring> new_lines;
-        std::wstringstream ss(content);
-        std::wstring line;
-        while (std::getline(ss, line, L'\n')) {
-            new_lines.push_back(line);
-        }
-        if (content.empty() && !lines.empty()) new_lines.clear();
-
-        WriteFileWithFormat(op.path, new_lines, formatInfo);
+        WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
         FileContentInfo formatInfo;
-        if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
+        std::vector<char> raw_bytes;
+        std::ifstream file_reader(op.path, std::ios::binary);
+        if (!file_reader) return;
+        raw_bytes.assign((std::istreambuf_iterator<char>(file_reader)), std::istreambuf_iterator<char>());
+        file_reader.close();
 
-        std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
-        std::vector<std::wstring> new_lines;
-        for (const auto& l : lines) {
+        std::vector<std::wstring> lines = GetLinesFromFile(raw_bytes, formatInfo);
+        
+        for (auto& l : lines) {
             if (l.rfind(op.lineStart, 0) == 0) {
-                new_lines.push_back(op.replaceLine);
-            } else {
-                new_lines.push_back(l);
+                l = op.replaceLine;
             }
         }
 
-        WriteFileWithFormat(op.path, new_lines, formatInfo);
+        WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
 } // namespace ActionHelpers
@@ -1806,7 +1755,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[2], parts[3]};
             }
         }
-        // --- NEW: Parse new action op types ---
         else if (_wcsicmp(key.c_str(), L"<-dir") == 0 || _wcsicmp(key.c_str(), L"->dir") == 0 || _wcsicmp(key.c_str(), L"<-file") == 0 || _wcsicmp(key.c_str(), L"->file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 2) {
@@ -1817,8 +1765,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 std::wstring path2 = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
                 op.destPath = is_reversed ? path2 : path1;
                 op.sourcePath = is_reversed ? path1 : path2;
-                op.overwrite = true; // Default
-                op.isMove = false; // Default
+                op.overwrite = true;
+                op.isMove = false;
                 for (size_t i = 2; i < parts.size(); ++i) {
                     if (_wcsicmp(parts[i].c_str(), L"no overwrite") == 0) op.overwrite = false;
                     if (_wcsicmp(parts[i].c_str(), L"overwrite") == 0) op.overwrite = true;
@@ -1831,7 +1779,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             if (!parts.empty()) {
                 AttributesOp op;
                 op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                op.attributes = FILE_ATTRIBUTE_NORMAL; // Default
+                op.attributes = FILE_ATTRIBUTE_NORMAL;
                 if (parts.size() > 1) {
                     op.attributes = 0;
                     auto attr_parts = split_string(parts[1], L",");
@@ -2074,7 +2022,6 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.valueData = ExpandVariables(arg.valueData, variables);
             ActionHelpers::HandleCreateRegValue(mutable_op);
         }
-        // --- NEW: Execute new actions with variable expansion ---
         else if constexpr (std::is_same_v<T, CopyMoveOp>) {
             ActionHelpers::HandleCopyMove(arg);
         } else if constexpr (std::is_same_v<T, AttributesOp>) {
@@ -2193,13 +2140,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         BackupThreadData backupData;
         ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
-        // Execute [Before] section
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
                     ExecuteActionOperation(arg, variables);
-                } else { // It's a startup/shutdown type
+                } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
