@@ -146,8 +146,9 @@ enum class TextEncoding { UTF8, UTF8_BOM, UTF16_LE, UTF16_BE };
 struct CreateFileOp {
     std::wstring path;
     bool overwrite;
+    TextFormat format; // [FIXED] Re-added format to handle per-file line endings
     TextEncoding encoding;
-    std::wstring content; // Content is now pre-processed with correct newlines
+    std::wstring content;
 };
 
 struct CreateRegKeyOp {
@@ -278,7 +279,9 @@ std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std
         if (it != variables.end()) {
             path.replace(start_pos, end_pos - start_pos + 1, it->second);
         } else {
-            path.replace(start_pos, 1, L"");
+            // [FIXED] Don't break placeholders like {LINEBREAK} by only replacing known variables
+            // If var not found, just move to the next brace
+            start_pos = end_pos + 1;
         }
         safety_counter++;
     }
@@ -804,6 +807,20 @@ namespace ActionHelpers {
             return;
         }
 
+        // [FIXED] Determine line break format here, during execution
+        std::wstring lineBreak;
+        if (op.format == TextFormat::Unix) lineBreak = L"\n";
+        else if (op.format == TextFormat::Mac) lineBreak = L"\r";
+        else lineBreak = L"\r\n";
+
+        std::wstring content = op.content;
+        const std::wstring toFind = L"{LINEBREAK}";
+        size_t pos = content.find(toFind);
+        while(pos != std::wstring::npos) {
+            content.replace(pos, toFind.size(), lineBreak);
+            pos = content.find(toFind, pos + lineBreak.size());
+        }
+
         std::ofstream file(op.path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return;
 
@@ -816,15 +833,15 @@ namespace ActionHelpers {
         }
 
         if (op.encoding == TextEncoding::UTF8 || op.encoding == TextEncoding::UTF8_BOM) {
-            int size_needed = WideCharToMultiByte(CP_UTF8, 0, op.content.c_str(), (int)op.content.length(), NULL, 0, NULL, NULL);
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
             std::string utf8_str(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, op.content.c_str(), (int)op.content.length(), &utf8_str[0], size_needed, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), &utf8_str[0], size_needed, NULL, NULL);
             file.write(utf8_str.c_str(), utf8_str.length());
         } else { // UTF-16
             if (op.encoding == TextEncoding::UTF16_LE) {
-                 file.write(reinterpret_cast<const char*>(op.content.c_str()), op.content.length() * sizeof(wchar_t));
+                 file.write(reinterpret_cast<const char*>(content.c_str()), content.length() * sizeof(wchar_t));
             } else { // UTF-16 BE
-                std::vector<wchar_t> swapped_content(op.content.begin(), op.content.end());
+                std::vector<wchar_t> swapped_content(content.begin(), content.end());
                 for(wchar_t& ch : swapped_content) {
                     ch = _byteswap_ushort(ch);
                 }
@@ -854,15 +871,22 @@ namespace ActionHelpers {
 
         HKEY hKey;
         if (RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            if (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0) {
-                RegSetValueExW(hKey, finalValueName, 0, REG_SZ, (const BYTE*)op.valueData.c_str(), (DWORD)(op.valueData.length() + 1) * sizeof(wchar_t));
-            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_EXPAND_SZ") == 0) {
-                RegSetValueExW(hKey, finalValueName, 0, REG_EXPAND_SZ, (const BYTE*)op.valueData.c_str(), (DWORD)(op.valueData.length() + 1) * sizeof(wchar_t));
+            if (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0 || _wcsicmp(op.typeStr.c_str(), L"REG_EXPAND_SZ") == 0) {
+                // [FIXED] Perform variable expansion first, then {LINEBREAK} replacement
+                std::wstring finalData = op.valueData; // We will modify this copy
+                const std::wstring toFind = L"{LINEBREAK}";
+                const std::wstring toReplace = L"\r\n"; // REG_SZ uses standard Windows newlines
+                size_t pos = finalData.find(toFind);
+                while(pos != std::wstring::npos) {
+                    finalData.replace(pos, toFind.size(), toReplace);
+                    pos = finalData.find(toFind, pos + toReplace.size());
+                }
+                DWORD type = (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0) ? REG_SZ : REG_EXPAND_SZ;
+                RegSetValueExW(hKey, finalValueName, 0, type, (const BYTE*)finalData.c_str(), (DWORD)(finalData.length() + 1) * sizeof(wchar_t));
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_DWORD") == 0) {
                 DWORD data = _wtol(op.valueData.c_str());
                 RegSetValueExW(hKey, finalValueName, 0, REG_DWORD, (const BYTE*)&data, sizeof(data));
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_QWORD") == 0) {
-                // [FIXED] Parse comma-separated hex bytes for REG_QWORD
                 ULONGLONG data = 0;
                 BYTE* pBytes = reinterpret_cast<BYTE*>(&data);
                 std::wstringstream ss(op.valueData);
@@ -881,7 +905,6 @@ namespace ActionHelpers {
                 }
                 RegSetValueExW(hKey, finalValueName, 0, REG_BINARY, data.data(), (DWORD)data.size());
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_MULTI_SZ") == 0) {
-                // [FIXED] Robustly handle {LINEBREAK} for REG_MULTI_SZ
                 std::vector<wchar_t> buffer;
                 std::wstring source = op.valueData;
                 std::wstring toFind = L"{LINEBREAK}";
@@ -1135,13 +1158,36 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
 
-    BSTR bstrRuleName = SysAllocString(ruleName.c_str());
-    if (bstrRuleName) {
-        // [FIXED] Loop to delete all rules with the same name
-        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {
-            // Keep removing until it fails (no more rules with this name)
+    // [FIXED] First count, then delete, to avoid infinite loops.
+    long currentCount = 0;
+    int rulesToDelete = 0;
+    hr = pFwRules->get_Count(&currentCount);
+    if(SUCCEEDED(hr)) {
+        for (long i = 0; i < currentCount; i++) {
+            INetFwRule* pFwRule = NULL;
+            hr = pFwRules->Item(CComVariant(i), &pFwRule);
+            if (SUCCEEDED(hr)) {
+                BSTR bstrName = NULL;
+                hr = pFwRule->get_Name(&bstrName);
+                if (SUCCEEDED(hr)) {
+                    if (_wcsicmp(bstrName, ruleName.c_str()) == 0) {
+                        rulesToDelete++;
+                    }
+                    SysFreeString(bstrName);
+                }
+                pFwRule->Release();
+            }
         }
-        SysFreeString(bstrRuleName);
+    }
+    
+    if (rulesToDelete > 0) {
+        BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+        if (bstrRuleName) {
+            for (int i = 0; i < rulesToDelete; i++) {
+                pFwRules->Remove(bstrRuleName);
+            }
+            SysFreeString(bstrRuleName);
+        }
     }
 
 cleanup:
@@ -1322,7 +1368,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // Helper lambda to parse +file operation to avoid code duplication
         auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
             std::vector<std::wstring> parts;
             std::wstring temp_value = val;
@@ -1336,27 +1381,19 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             if (parts.size() >= 2) {
                 cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
                 cf_op.overwrite = (parts.size() > 2) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
-
-                std::wstring formatStr = (parts.size() > 3) ? parts[2] : L"win";
-                std::wstring lineBreak;
-                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) lineBreak = L"\n";
-                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) lineBreak = L"\r";
-                else lineBreak = L"\r\n";
                 
-                std::wstring content_raw = parts.back();
-                const std::wstring toFind = L"{LINEBREAK}";
-                size_t replace_pos = content_raw.find(toFind);
-                while(replace_pos != std::wstring::npos) {
-                    content_raw.replace(replace_pos, toFind.size(), lineBreak);
-                    replace_pos = content_raw.find(toFind, replace_pos + lineBreak.size());
-                }
-                cf_op.content = ExpandVariables(content_raw, variables);
+                std::wstring formatStr = (parts.size() > 3) ? parts[2] : L"win";
+                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
+                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
+                else cf_op.format = TextFormat::Win;
 
                 std::wstring encodingStr = (parts.size() > 4) ? parts[3] : L"utf8";
                 if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
                 else cf_op.encoding = TextEncoding::UTF8;
+                
+                cf_op.content = ExpandVariables(parts.back(), variables);
                 return true;
             }
             return false;
@@ -1495,7 +1532,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     crv_op.keyPath = ExpandVariables(parts[0], variables);
                     crv_op.valueName = parts[1];
                     crv_op.typeStr = parts[2];
-                    crv_op.valueData = ExpandVariables(parts[3], variables);
+                    crv_op.valueData = parts[3]; // Do not expand variables here, handle it in execution
                     beforeOp.data = crv_op; op_created = true;
                 }
             }
@@ -1578,7 +1615,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         crv_op.keyPath = ExpandVariables(parts[0], variables);
                         crv_op.valueName = parts[1];
                         crv_op.typeStr = parts[2];
-                        crv_op.valueData = ExpandVariables(parts[3], variables);
+                        crv_op.valueData = parts[3]; // Do not expand variables here, handle it in execution
                         actionOp.data = crv_op; action_created = true;
                     }
                 }
@@ -1636,7 +1673,10 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, CreateRegKeyOp>) {
             ActionHelpers::HandleCreateRegKey(arg.keyPath);
         } else if constexpr (std::is_same_v<T, CreateRegValueOp>) {
-            ActionHelpers::HandleCreateRegValue(arg);
+            // Create a mutable copy to expand variables
+            CreateRegValueOp mutable_op = arg;
+            mutable_op.valueData = ExpandVariables(arg.valueData, variables);
+            ActionHelpers::HandleCreateRegValue(mutable_op);
         }
     }, opData);
 }
@@ -1709,7 +1749,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     bool isFirstInstance = (GetLastError() != ERROR_ALREADY_EXISTS);
 
     if (isFirstInstance) {
-        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
         if (appPathRaw.empty()) {
             MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
