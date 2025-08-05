@@ -737,10 +737,242 @@ namespace DeletionHelpers {
 
 
 // --- Process Management Functions ---
-// ... (Omitted for brevity, no changes)
+bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
+    if (waitProcesses.empty()) return false;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            for (const auto& processName : waitProcesses) {
+                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                    CloseHandle(hSnapshot);
+                    return true;
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return false;
+}
+
+std::wstring GetProcessNameByPid(DWORD pid) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == pid) {
+                CloseHandle(hSnapshot);
+                return pe32.szExeFile;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return L"";
+}
+
+void SetAllProcessesState(const std::vector<std::wstring>& processList, bool suspend) {
+    if (processList.empty() || !g_NtSuspendProcess || !g_NtResumeProcess) return;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            for (const auto& processName : processList) {
+                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                    HANDLE hProcess = OpenProcess(PROCESS_SUSPEND_RESUME, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        if (suspend) g_NtSuspendProcess(hProcess);
+                        else g_NtResumeProcess(hProcess);
+                        CloseHandle(hProcess);
+                    }
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+}
+
 
 // --- Foreground Monitoring, Backup, Link, Firewall Sections ---
-// ... (Omitted for brevity, no changes)
+struct MonitorThreadData {
+    std::atomic<bool>* shouldStop;
+    int checkInterval;
+    std::wstring foregroundAppName;
+    std::vector<std::wstring> suspendProcesses;
+};
+
+DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
+    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
+    bool areProcessesSuspended = false;
+    while (!*(data->shouldStop)) {
+        HWND hForegroundWnd = GetForegroundWindow();
+        if (hForegroundWnd) {
+            DWORD foregroundPid = 0;
+            GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
+            std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
+            if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
+                if (!areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, true);
+                    areProcessesSuspended = true;
+                }
+            } else {
+                if (areProcessesSuspended) {
+                    SetAllProcessesState(data->suspendProcesses, false);
+                    areProcessesSuspended = false;
+                }
+            }
+        }
+        Sleep(data->checkInterval * 1000);
+    }
+    return 0;
+}
+
+std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
+    size_t separatorPos = entry.find(L" :: ");
+    if (separatorPos == std::wstring::npos) return {};
+    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables));
+    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + 4)), variables));
+    if (dest.empty() || src.empty()) return {};
+    return {dest, src};
+}
+
+void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+    std::wstring backupDest = dest + L"_Backup";
+    if (PathFileExistsW(dest.c_str())) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+    PerformFileSystemOperation(FO_COPY, src, dest);
+    if (PathFileExistsW(backupDest.c_str())) {
+        PerformFileSystemOperation(FO_DELETE, backupDest);
+    }
+}
+
+void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
+    if (!PathFileExistsW(src.c_str())) return;
+    std::wstring backupDest = dest + L"_Backup";
+    if (PathFileExistsW(dest.c_str())) {
+        MoveFileW(dest.c_str(), backupDest.c_str());
+    }
+    if (CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
+        if (PathFileExistsW(backupDest.c_str())) {
+            DeleteFileW(backupDest.c_str());
+        }
+    }
+}
+
+struct BackupThreadData {
+    std::atomic<bool>* shouldStop;
+    std::atomic<bool>* isWorking;
+    int backupInterval;
+    std::vector<std::pair<std::wstring, std::wstring>> backupDirs;
+    std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
+};
+
+DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
+    BackupThreadData* data = static_cast<BackupThreadData*>(lpParam);
+    while (!*(data->shouldStop)) {
+        Sleep(data->backupInterval);
+        if (*(data->shouldStop)) break;
+        *(data->isWorking) = true;
+        for (const auto& pair : data->backupDirs) {
+            PerformDirectoryBackup(pair.first, pair.second);
+        }
+        for (const auto& pair : data->backupFiles) {
+            PerformFileBackup(pair.first, pair.second);
+        }
+        *(data->isWorking) = false;
+    }
+    return 0;
+}
+
+void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
+    WIN32_FIND_DATAW findData;
+    std::wstring searchPath = srcDir + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring fileName = findData.cFileName;
+        if (fileName == L"." || fileName == L"..") continue;
+        std::wstring srcPath = srcDir + L"\\" + fileName;
+        std::wstring destPath = destDir + L"\\" + fileName;
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CreateDirectoryW(destPath.c_str(), NULL);
+            CreateHardLinksRecursive(srcPath, destPath, createdLinks);
+        } else {
+            if (CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL)) {
+                createdLinks.push_back({destPath, srcPath});
+            }
+        }
+    } while (FindNextFileW(hFind, &findData));
+    FindClose(hFind);
+}
+
+void CreateFirewallRule(FirewallOp& op) {
+    INetFwPolicy2* pFwPolicy = NULL;
+    INetFwRules* pFwRules = NULL;
+    INetFwRule* pFwRule = NULL;
+    BSTR bstrRuleName = NULL;
+    BSTR bstrAppPath = NULL;
+
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pFwPolicy->get_Rules(&pFwRules);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = CoCreateInstance(__uuidof(NetFwRule), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwRule), (void**)&pFwRule);
+    if (FAILED(hr)) goto cleanup;
+
+    bstrRuleName = SysAllocString(op.ruleName.c_str());
+    bstrAppPath = SysAllocString(op.appPath.c_str());
+
+    pFwRule->put_Name(bstrRuleName);
+    pFwRule->put_ApplicationName(bstrAppPath);
+    pFwRule->put_Direction(op.direction);
+    pFwRule->put_Action(op.action);
+    pFwRule->put_Enabled(VARIANT_TRUE);
+    pFwRule->put_Protocol(NET_FW_IP_PROTOCOL_ANY);
+    pFwRule->put_Profiles(NET_FW_PROFILE2_ALL);
+
+    hr = pFwRules->Add(pFwRule);
+    if (SUCCEEDED(hr)) {
+        op.ruleCreated = true;
+    }
+
+cleanup:
+    if (bstrRuleName) SysFreeString(bstrRuleName);
+    if (bstrAppPath) SysFreeString(bstrAppPath);
+    if (pFwRule) pFwRule->Release();
+    if (pFwRules) pFwRules->Release();
+    if (pFwPolicy) pFwPolicy->Release();
+}
+
+void DeleteFirewallRule(const std::wstring& ruleName) {
+    INetFwPolicy2* pFwPolicy = NULL;
+    INetFwRules* pFwRules = NULL;
+
+    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pFwPolicy->get_Rules(&pFwRules);
+    if (FAILED(hr)) goto cleanup;
+    
+    BSTR bstrRuleName = SysAllocString(ruleName.c_str());
+    if (bstrRuleName) {
+        pFwRules->Remove(bstrRuleName);
+        SysFreeString(bstrRuleName);
+    }
+
+cleanup:
+    if (pFwRules) pFwRules->Release();
+    if (pFwPolicy) pFwPolicy->Release();
+}
 
 // --- Unified Operation Handlers ---
 
@@ -886,7 +1118,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         std::wstring key = trim(line.substr(0, delimiterPos));
         std::wstring value = trim(line.substr(delimiterPos + 1));
 
-        // Handle uservar dynamically
         if (_wcsicmp(key.c_str(), L"uservar") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
                 auto parts = split_string(value, L"::");
@@ -894,14 +1125,13 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     variables[parts[0]] = ExpandVariables(parts[1], variables);
                 }
             }
-            continue; // Processed, move to next line
+            continue;
         }
 
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
             bool op_created = false;
             
-            // Startup/Shutdown Ops
             if (_wcsicmp(key.c_str(), L"hardlink") == 0 || _wcsicmp(key.c_str(), L"symlink") == 0) {
                 LinkOp l_op; l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
                 auto parts = split_string(value, L"::");
@@ -915,15 +1145,15 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             } else if (_wcsicmp(key.c_str(), L"(regvalue)") == 0 || _wcsicmp(key.c_str(), L"(regkey)") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 || _wcsicmp(key.c_str(), L"regkey") == 0) {
                 RegistryOp r_op; r_op.isKey = (key.find(L"key") != std::wstring::npos); r_op.isSaveRestore = (key.front() != L'(');
-                std::wstring regPathRaw = ExpandVariables(value, variables);
+                std::wstring regPathRaw = value;
                 if (r_op.isSaveRestore) {
                     auto parts = split_string(value, L"::");
                     if (!parts.empty()) {
-                        regPathRaw = ExpandVariables(parts[0], variables);
+                        regPathRaw = parts[0];
                         if (parts.size() > 1) r_op.filePath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
                     }
                 }
-                if (ParseRegistryPath(regPathRaw, r_op.isKey, r_op.hRootKey, r_op.rootKeyStr, r_op.subKey, r_op.valueName)) {
+                if (ParseRegistryPath(ExpandVariables(regPathRaw, variables), r_op.isKey, r_op.hRootKey, r_op.rootKeyStr, r_op.subKey, r_op.valueName)) {
                     r_op.backupName = (r_op.isKey ? r_op.subKey : r_op.valueName) + L"_Backup";
                     beforeOp.data = r_op; op_created = true;
                 }
@@ -951,14 +1181,52 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
             } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
                 backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
+            } else if (_wcsicmp(key.c_str(), L"run") == 0) {
+                auto parts = split_string(value, L"::");
+                if (!parts.empty() && !parts[0].empty()) {
+                    RunOp r_op; r_op.programPath = ExpandVariables(parts[0], variables);
+                    r_op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
+                    r_op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
+                    r_op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
+                    beforeOp.data = r_op; op_created = true;
+                }
+            } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
+                BatchOp b_op; b_op.batchPath = ExpandVariables(value, variables); beforeOp.data = b_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
+                RegImportOp ri_op; ri_op.regPath = ExpandVariables(value, variables); beforeOp.data = ri_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
+                auto parts = split_string(value, L"::");
+                if (!parts.empty() && !parts[0].empty()) {
+                    RegDllOp rd_op; rd_op.dllPath = ExpandVariables(parts[0], variables);
+                    rd_op.unregister = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"unregister") == 0);
+                    beforeOp.data = rd_op; op_created = true;
+                }
+            } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
+                DeleteFileOp df_op; df_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(value, variables)); beforeOp.data = df_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
+                auto parts = split_string(value, L"::");
+                DeleteDirOp dd_op; dd_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+                dd_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
+                beforeOp.data = dd_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"-regkey") == 0) {
+                auto parts = split_string(value, L"::");
+                DeleteRegKeyOp drk_op; drk_op.keyPattern = ExpandVariables(parts[0], variables);
+                drk_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
+                beforeOp.data = drk_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"-regvalue") == 0) {
+                auto parts = split_string(value, L"::");
+                if (parts.size() == 2) {
+                    DeleteRegValueOp drv_op; drv_op.keyPattern = ExpandVariables(parts[0], variables);
+                    drv_op.valuePattern = parts[1];
+                    beforeOp.data = drv_op; op_created = true;
+                }
             }
 
             if (op_created) {
                 beforeOps.push_back(beforeOp);
             }
         }
-        
-        if (currentSection == Section::Before || currentSection == Section::After) {
+        else if (currentSection == Section::After) {
             ActionOperation actionOp;
             bool action_created = false;
             if (_wcsicmp(key.c_str(), L"run") == 0) {
@@ -1003,11 +1271,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
 
             if (action_created) {
-                if (currentSection == Section::Before) {
-                    beforeOps.push_back({actionOp.data});
-                } else if (currentSection == Section::After) {
-                    afterOps.push_back(actionOp);
-                }
+                afterOps.push_back(actionOp);
             }
         }
     }
@@ -1149,11 +1413,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
-                // Check if it's a one-shot action
                 if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp>) {
                     ActionOperation actionOp{arg};
                     ExecuteActionOperations({actionOp});
-                } else { // It's a startup/shutdown operation
+                } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
