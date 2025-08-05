@@ -143,7 +143,19 @@ struct KillProcessOp {
 };
 
 enum class TextFormat { Win, Unix, Mac };
-enum class TextEncoding { ANSI, UTF8, UTF8_BOM, UTF16_LE, UTF16_BE };
+// --- MODIFICATION START: Expanded TextEncoding enum ---
+enum class TextEncoding {
+    ANSI,       // System Default ANSI
+    UTF8,       // UTF-8 without BOM
+    UTF8_BOM,   // UTF-8 with BOM
+    UTF16_LE,   // UTF-16 Little Endian
+    UTF16_BE,   // UTF-16 Big Endian
+    SHIFT_JIS,  // Japanese, CP932
+    EUC_KR,     // Korean, CP949
+    BIG5        // Traditional Chinese, CP950
+};
+// --- MODIFICATION END ---
+
 
 struct CreateFileOp {
     std::wstring path;
@@ -362,6 +374,7 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
+// This function is now a simple wrapper around the more advanced ActionHelpers::ReadFileWithFormatDetection
 bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
@@ -1033,6 +1046,7 @@ namespace ActionHelpers {
         std::wstring line_ending = L"\r\n";
     };
 
+    // --- MODIFICATION START: Rewritten encoding detection ---
     bool ReadFileWithFormatDetection(const std::wstring& path, FileContentInfo& info) {
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return false;
@@ -1045,18 +1059,36 @@ namespace ActionHelpers {
             return true;
         }
 
-        // Detect encoding
-        if (info.raw_bytes.size() >= 3 && (BYTE)info.raw_bytes[0] == 0xEF && (BYTE)info.raw_bytes[1] == 0xBB && (BYTE)info.raw_bytes[2] == 0xBF) {
+        const char* data = info.raw_bytes.data();
+        const int size = static_cast<int>(info.raw_bytes.size());
+
+        // 1. Check for BOMs (Byte Order Marks)
+        if (size >= 3 && (BYTE)data[0] == 0xEF && (BYTE)data[1] == 0xBB && (BYTE)data[2] == 0xBF) {
             info.encoding = TextEncoding::UTF8_BOM;
-        } else if (info.raw_bytes.size() >= 2 && (BYTE)info.raw_bytes[0] == 0xFF && (BYTE)info.raw_bytes[1] == 0xFE) {
+        } else if (size >= 2 && (BYTE)data[0] == 0xFF && (BYTE)data[1] == 0xFE) {
             info.encoding = TextEncoding::UTF16_LE;
-        } else if (info.raw_bytes.size() >= 2 && (BYTE)info.raw_bytes[0] == 0xFE && (BYTE)info.raw_bytes[1] == 0xFF) {
+        } else if (size >= 2 && (BYTE)data[0] == 0xFE && (BYTE)data[1] == 0xFF) {
             info.encoding = TextEncoding::UTF16_BE;
         } else {
-            // Try to decode as UTF-8, if it fails, assume ANSI
-            if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, info.raw_bytes.data(), (int)info.raw_bytes.size(), NULL, 0) != 0) {
+            // 2. No BOM, try to validate against different encodings
+            // Helper lambda to test a codepage
+            auto is_valid_for_codepage = [&](UINT cp) -> bool {
+                if (size == 0) return true;
+                int wsize = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, data, size, NULL, 0);
+                return wsize > 0;
+            };
+
+            // The order of checks is important
+            if (is_valid_for_codepage(CP_UTF8)) {
                 info.encoding = TextEncoding::UTF8;
+            } else if (is_valid_for_codepage(932)) { // Shift-JIS
+                info.encoding = TextEncoding::SHIFT_JIS;
+            } else if (is_valid_for_codepage(949)) { // EUC-KR
+                info.encoding = TextEncoding::EUC_KR;
+            } else if (is_valid_for_codepage(950)) { // Big5
+                info.encoding = TextEncoding::BIG5;
             } else {
+                // 3. Fallback to system default ANSI
                 info.encoding = TextEncoding::ANSI;
             }
         }
@@ -1077,33 +1109,47 @@ namespace ActionHelpers {
 
         return true;
     }
+    // --- MODIFICATION END ---
 
+    // --- MODIFICATION START: Updated to handle new encodings ---
     std::vector<std::wstring> GetLinesFromFile(const FileContentInfo& info) {
         std::wstring content;
         const char* start_ptr = info.raw_bytes.data();
         int byte_count = (int)info.raw_bytes.size();
 
         if (info.encoding == TextEncoding::UTF16_LE) {
+            if (byte_count < 2) return {};
             content = std::wstring(reinterpret_cast<const wchar_t*>(start_ptr + 2), (byte_count / 2) - 1);
         } else if (info.encoding == TextEncoding::UTF16_BE) {
-            // Basic BE conversion
+            if (byte_count < 2) return {};
             std::vector<wchar_t> temp_buffer(byte_count / 2);
             for(int i=0; i < byte_count/2; ++i) {
                 temp_buffer[i] = _byteswap_ushort(((const wchar_t*)start_ptr)[i]);
             }
             content = std::wstring(temp_buffer.data() + 1, (byte_count / 2) - 1);
         } else {
-            UINT codePage = CP_ACP;
+            UINT codePage = CP_ACP; // Default to ANSI
             if (info.encoding == TextEncoding::UTF8_BOM) {
                 codePage = CP_UTF8;
-                start_ptr += 3;
-                byte_count -= 3;
+                if (byte_count >= 3) {
+                    start_ptr += 3;
+                    byte_count -= 3;
+                }
             } else if (info.encoding == TextEncoding::UTF8) {
                 codePage = CP_UTF8;
+            } else if (info.encoding == TextEncoding::SHIFT_JIS) {
+                codePage = 932;
+            } else if (info.encoding == TextEncoding::EUC_KR) {
+                codePage = 949;
+            } else if (info.encoding == TextEncoding::BIG5) {
+                codePage = 950;
             }
-            int wsize = MultiByteToWideChar(codePage, 0, start_ptr, byte_count, NULL, 0);
-            content.resize(wsize);
-            MultiByteToWideChar(codePage, 0, start_ptr, byte_count, &content[0], wsize);
+
+            if (byte_count > 0) {
+                int wsize = MultiByteToWideChar(codePage, 0, start_ptr, byte_count, NULL, 0);
+                content.resize(wsize);
+                MultiByteToWideChar(codePage, 0, start_ptr, byte_count, &content[0], wsize);
+            }
         }
 
         // Normalize line endings to \n for processing
@@ -1133,8 +1179,9 @@ namespace ActionHelpers {
         if (normalized_content.empty() && !info.raw_bytes.empty()) lines.clear();
         return lines;
     }
+    // --- MODIFICATION END ---
 
-
+    // --- MODIFICATION START: Updated to handle new encodings ---
     bool WriteFileWithFormat(const std::wstring& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
@@ -1150,31 +1197,55 @@ namespace ActionHelpers {
 
         for (size_t i = 0; i < lines.size(); ++i) {
             std::wstring line_to_write = lines[i];
-            if (i < lines.size() - 1) {
-                line_to_write += info.line_ending;
+            // Add line ending, except for the very last line if the original file didn't have one
+            if (i < lines.size() - 1 || !lines.back().empty()) {
+                 line_to_write += info.line_ending;
             }
 
-            if (info.encoding == TextEncoding::UTF8 || info.encoding == TextEncoding::UTF8_BOM) {
-                int size = WideCharToMultiByte(CP_UTF8, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
-                std::string utf8_str(size - 1, 0);
-                WideCharToMultiByte(CP_UTF8, 0, line_to_write.c_str(), -1, &utf8_str[0], size, NULL, NULL);
-                file.write(utf8_str.c_str(), utf8_str.length());
-            } else if (info.encoding == TextEncoding::ANSI) {
-                int size = WideCharToMultiByte(CP_ACP, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
-                std::string ansi_str(size - 1, 0);
-                WideCharToMultiByte(CP_ACP, 0, line_to_write.c_str(), -1, &ansi_str[0], size, NULL, NULL);
-                file.write(ansi_str.c_str(), ansi_str.length());
-            } else if (info.encoding == TextEncoding::UTF16_LE) {
-                file.write(reinterpret_cast<const char*>(line_to_write.c_str()), line_to_write.length() * sizeof(wchar_t));
-            } else if (info.encoding == TextEncoding::UTF16_BE) {
-                std::vector<wchar_t> swapped_content(line_to_write.begin(), line_to_write.end());
-                for(wchar_t& ch : swapped_content) { ch = _byteswap_ushort(ch); }
-                file.write(reinterpret_cast<const char*>(swapped_content.data()), swapped_content.size() * sizeof(wchar_t));
+            UINT codePage = 0;
+            switch(info.encoding) {
+                case TextEncoding::UTF8:
+                case TextEncoding::UTF8_BOM:
+                    codePage = CP_UTF8;
+                    break;
+                case TextEncoding::ANSI:
+                    codePage = CP_ACP;
+                    break;
+                case TextEncoding::SHIFT_JIS:
+                    codePage = 932;
+                    break;
+                case TextEncoding::EUC_KR:
+                    codePage = 949;
+                    break;
+                case TextEncoding::BIG5:
+                    codePage = 950;
+                    break;
+                case TextEncoding::UTF16_LE: {
+                    file.write(reinterpret_cast<const char*>(line_to_write.c_str()), line_to_write.length() * sizeof(wchar_t));
+                    continue; // Skip common path
+                }
+                case TextEncoding::UTF16_BE: {
+                    std::vector<wchar_t> swapped_content(line_to_write.begin(), line_to_write.end());
+                    for(wchar_t& ch : swapped_content) { ch = _byteswap_ushort(ch); }
+                    file.write(reinterpret_cast<const char*>(swapped_content.data()), swapped_content.size() * sizeof(wchar_t));
+                    continue; // Skip common path
+                }
+            }
+
+            if (codePage != 0) {
+                if (line_to_write.empty()) continue;
+                int size = WideCharToMultiByte(codePage, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
+                if (size > 1) { // size includes null terminator
+                    std::string mb_str(size - 1, 0);
+                    WideCharToMultiByte(codePage, 0, line_to_write.c_str(), -1, &mb_str[0], size, NULL, NULL);
+                    file.write(mb_str.c_str(), mb_str.length());
+                }
             }
         }
         file.close();
         return true;
     }
+    // --- MODIFICATION END ---
 
     void HandleIniWrite(const IniWriteOp& op) {
         FileContentInfo formatInfo;
