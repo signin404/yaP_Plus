@@ -1378,10 +1378,17 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // 在 ParseIniSections 函数中找到并替换这个 lambda 函数
+        // 在 ParseIniSections 函数中找到并用此版本完整替换旧的 lambda
         auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
+            // --- 诊断代码: 显示传入的原始值 ---
+             MessageBoxW(NULL, val.c_str(), L"1. 原始输入值 (val)", MB_OK);
+        
             // 步骤 1: 使用健壮的 split_string 函数进行完全分割
-            std::vector<std::wstring> parts = split_string(val, delimiter);
+            std::vector<std::wstring> parts = split_string(val, L" :: ");
+        
+            // --- 诊断代码: 显示分割后的部分数量 ---
+             std::wstring msg = L"分割后部分数量: " + std::to_wstring(parts.size());
+             MessageBoxW(NULL, msg.c_str(), L"2. 分割结果", MB_OK);
         
             // 至少需要路径和内容两个部分
             if (parts.size() < 2) {
@@ -1401,6 +1408,11 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             // 遍历所有中间参数 (从索引1到倒数第二个)
             for (size_t i = 1; i < parts.size() - 1; ++i) {
                 const std::wstring& param = parts[i];
+                
+                // --- 诊断代码: 显示正在检查的参数 ---
+                 std::wstring param_msg = L"正在检查参数[" + std::to_wstring(i) + L"]: " + param;
+                 MessageBoxW(NULL, param_msg.c_str(), L"3. 参数检查", MB_OK);
+        
                 if (_wcsicmp(param.c_str(), L"overwrite") == 0) {
                     cf_op.overwrite = true;
                 } else if (_wcsicmp(param.c_str(), L"unix") == 0) {
@@ -1419,6 +1431,16 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     cf_op.encoding = TextEncoding::UTF8;
                 }
             }
+        
+            // --- 诊断代码: 显示最终确定的格式 ---
+             std::wstring final_format_msg;
+             switch(cf_op.format) {
+                 case TextFormat::Win: final_format_msg = L"Win"; break;
+                 case TextFormat::Unix: final_format_msg = L"Unix"; break;
+                 case TextFormat::Mac: final_format_msg = L"Mac"; break;
+             }
+             final_format_msg = L"文件: " + cf_op.path + L"\n最终格式: " + final_format_msg;
+             MessageBoxW(NULL, final_format_msg.c_str(), L"4. 最终结果", MB_OK);
         
             return true;
         };
