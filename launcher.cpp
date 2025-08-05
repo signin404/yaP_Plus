@@ -17,7 +17,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
-#include <atlbase.h>
+#include <atlbase.h> // [FIXED] Added for CComVariant and other ATL types
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -147,7 +147,7 @@ enum class TextEncoding { UTF8, UTF8_BOM, UTF16_LE, UTF16_BE };
 struct CreateFileOp {
     std::wstring path;
     bool overwrite;
-    TextFormat format; // [FIXED] Re-added format to handle per-file line endings
+    TextFormat format;
     TextEncoding encoding;
     std::wstring content;
 };
@@ -271,18 +271,19 @@ std::wstring ResolveToAbsolutePath(const std::wstring& path) {
 
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
     int safety_counter = 0;
-    while (path.find(L'{') != std::wstring::npos && safety_counter < 100) {
-        size_t start_pos = path.find(L'{');
+    size_t current_pos = 0;
+    while ((current_pos = path.find(L'{', current_pos)) != std::wstring::npos && safety_counter < 100) {
+        size_t start_pos = current_pos;
         size_t end_pos = path.find(L'}', start_pos);
         if (end_pos == std::wstring::npos) break;
+
         std::wstring varName = path.substr(start_pos + 1, end_pos - start_pos - 1);
         auto it = variables.find(varName);
         if (it != variables.end()) {
             path.replace(start_pos, end_pos - start_pos + 1, it->second);
+            current_pos = start_pos + it->second.length();
         } else {
-            // [FIXED] Don't break placeholders like {LINEBREAK} by only replacing known variables
-            // If var not found, just move to the next brace
-            start_pos = end_pos + 1;
+            current_pos = end_pos + 1;
         }
         safety_counter++;
     }
@@ -808,7 +809,6 @@ namespace ActionHelpers {
             return;
         }
 
-        // [FIXED] Determine line break format here, during execution
         std::wstring lineBreak;
         if (op.format == TextFormat::Unix) lineBreak = L"\n";
         else if (op.format == TextFormat::Mac) lineBreak = L"\r";
@@ -873,10 +873,9 @@ namespace ActionHelpers {
         HKEY hKey;
         if (RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             if (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0 || _wcsicmp(op.typeStr.c_str(), L"REG_EXPAND_SZ") == 0) {
-                // [FIXED] Perform variable expansion first, then {LINEBREAK} replacement
-                std::wstring finalData = op.valueData; // We will modify this copy
+                std::wstring finalData = op.valueData;
                 const std::wstring toFind = L"{LINEBREAK}";
-                const std::wstring toReplace = L"\r\n"; // REG_SZ uses standard Windows newlines
+                const std::wstring toReplace = L"\r\n";
                 size_t pos = finalData.find(toFind);
                 while(pos != std::wstring::npos) {
                     finalData.replace(pos, toFind.size(), toReplace);
@@ -1159,18 +1158,18 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
 
-    // [FIXED] First count, then delete, to avoid infinite loops.
     long currentCount = 0;
     int rulesToDelete = 0;
     hr = pFwRules->get_Count(&currentCount);
     if(SUCCEEDED(hr)) {
-        for (long i = 0; i < currentCount; i++) {
+        for (long i = 1; i <= currentCount; i++) { // COM collections are often 1-based
             INetFwRule* pFwRule = NULL;
+            // [FIXED] Use get_Item with a long index
             hr = pFwRules->Item(CComVariant(i), &pFwRule);
             if (SUCCEEDED(hr)) {
                 BSTR bstrName = NULL;
                 hr = pFwRule->get_Name(&bstrName);
-                if (SUCCEEDED(hr)) {
+                if (SUCCEEDED(hr) && bstrName) {
                     if (_wcsicmp(bstrName, ruleName.c_str()) == 0) {
                         rulesToDelete++;
                     }
@@ -1185,7 +1184,7 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
         if (bstrRuleName) {
             for (int i = 0; i < rulesToDelete; i++) {
-                pFwRules->Remove(bstrRuleName);
+                pFwRules->Remove(bstrRuleName); // This might fail if rules change, but it's safer than a while loop
             }
             SysFreeString(bstrRuleName);
         }
@@ -1394,7 +1393,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
                 else cf_op.encoding = TextEncoding::UTF8;
                 
-                cf_op.content = ExpandVariables(parts.back(), variables);
+                cf_op.content = parts.back(); // Store raw content with {LINEBREAK}
                 return true;
             }
             return false;
@@ -1533,7 +1532,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     crv_op.keyPath = ExpandVariables(parts[0], variables);
                     crv_op.valueName = parts[1];
                     crv_op.typeStr = parts[2];
-                    crv_op.valueData = parts[3]; // Do not expand variables here, handle it in execution
+                    crv_op.valueData = parts[3];
                     beforeOp.data = crv_op; op_created = true;
                 }
             }
@@ -1616,7 +1615,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         crv_op.keyPath = ExpandVariables(parts[0], variables);
                         crv_op.valueName = parts[1];
                         crv_op.typeStr = parts[2];
-                        crv_op.valueData = parts[3]; // Do not expand variables here, handle it in execution
+                        crv_op.valueData = parts[3];
                         actionOp.data = crv_op; action_created = true;
                     }
                 }
@@ -1670,11 +1669,12 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             ActionHelpers::HandleKillProcess(arg.processPattern);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
-            ActionHelpers::HandleCreateFile(arg);
+            CreateFileOp mutable_op = arg;
+            mutable_op.content = ExpandVariables(arg.content, variables);
+            ActionHelpers::HandleCreateFile(mutable_op);
         } else if constexpr (std::is_same_v<T, CreateRegKeyOp>) {
             ActionHelpers::HandleCreateRegKey(arg.keyPath);
         } else if constexpr (std::is_same_v<T, CreateRegValueOp>) {
-            // Create a mutable copy to expand variables
             CreateRegValueOp mutable_op = arg;
             mutable_op.valueData = ExpandVariables(arg.valueData, variables);
             ActionHelpers::HandleCreateRegValue(mutable_op);
