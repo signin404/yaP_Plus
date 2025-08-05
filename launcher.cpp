@@ -127,16 +127,45 @@ struct DeleteRegValueOp {
     std::wstring valuePattern;
 };
 
+struct CreateDirOp {
+    std::wstring path;
+};
+
+struct StringReplaceOp {
+    std::wstring inputText;
+    std::wstring findText;
+    std::wstring replaceText;
+    std::wstring outputVarName;
+};
+
+struct DelayOp {
+    int milliseconds;
+};
+
+struct KillProcessOp {
+    std::wstring processPattern;
+};
+
 // A variant for one-shot actions, used by [After] section
-using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp>;
+using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, StringReplaceOp, DelayOp, KillProcessOp>;
 struct ActionOperation {
     ActionOpData data;
 };
 
+// Special marker for the [After] section to trigger cleanup
+struct RestoreMarkerOp {};
+
+// A variant for all possible operations in the [After] section
+using AfterOperationData = std::variant<ActionOperation, RestoreMarkerOp>;
+struct AfterOperation {
+    AfterOperationData data;
+};
+
+
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
     FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, // Startup/Shutdown types
-    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp // One-shot types
+    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, StringReplaceOp, DelayOp, KillProcessOp // One-shot types
 >;
 struct BeforeOperation {
     BeforeOperationData data;
@@ -559,8 +588,29 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 }
 
 
-// Deletion Helpers
-namespace DeletionHelpers {
+// Deletion and Action Helpers
+namespace ActionHelpers {
+
+    void HandleKillProcess(const std::wstring& processPattern) {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+        PROCESSENTRY32W pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(hSnapshot, &pe32)) {
+            do {
+                if (PathMatchSpecW(pe32.szExeFile, processPattern.c_str())) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                    }
+                }
+            } while (Process32NextW(hSnapshot, &pe32));
+        }
+        CloseHandle(hSnapshot);
+    }
 
     void HandleDeleteFile(const std::wstring& pathPattern) {
         wchar_t dirPath_w[MAX_PATH];
@@ -733,7 +783,7 @@ namespace DeletionHelpers {
         }
     }
 
-} // namespace DeletionHelpers
+} // namespace ActionHelpers
 
 
 // --- Process Management Functions ---
@@ -1092,7 +1142,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
 // --- Master Parser ---
 void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables,
                       std::vector<BeforeOperation>& beforeOps,
-                      std::vector<ActionOperation>& afterOps,
+                      std::vector<AfterOperation>& afterOps,
                       BackupThreadData& backupData) {
     
     std::wstringstream stream(iniContent);
@@ -1220,6 +1270,18 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     drv_op.valuePattern = parts[1];
                     beforeOp.data = drv_op; op_created = true;
                 }
+            } else if (_wcsicmp(key.c_str(), L"+dir") == 0) {
+                CreateDirOp cd_op; cd_op.path = ResolveToAbsolutePath(ExpandVariables(value, variables)); beforeOp.data = cd_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
+                auto parts = split_string(value, L"::");
+                if (parts.size() == 4) {
+                    StringReplaceOp sr_op; sr_op.inputText = ExpandVariables(parts[0], variables); sr_op.findText = parts[1]; sr_op.replaceText = parts[2]; sr_op.outputVarName = parts[3];
+                    beforeOp.data = sr_op; op_created = true;
+                }
+            } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
+                DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); beforeOp.data = d_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
+                KillProcessOp kp_op; kp_op.processPattern = value; beforeOp.data = kp_op; op_created = true;
             }
 
             if (op_created) {
@@ -1227,90 +1289,124 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
         }
         else if (currentSection == Section::After) {
-            ActionOperation actionOp;
-            bool action_created = false;
-            if (_wcsicmp(key.c_str(), L"run") == 0) {
-                auto parts = split_string(value, L"::");
-                if (!parts.empty() && !parts[0].empty()) {
-                    RunOp r_op; r_op.programPath = ExpandVariables(parts[0], variables);
-                    r_op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                    r_op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
-                    r_op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
-                    actionOp.data = r_op; action_created = true;
+            AfterOperation afterOp;
+            bool op_created = false;
+            if (_wcsicmp(key.c_str(), L"restore") == 0 && value == L"1") {
+                afterOp.data = RestoreMarkerOp{}; op_created = true;
+            } else {
+                ActionOperation actionOp;
+                bool action_created = false;
+                if (_wcsicmp(key.c_str(), L"run") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (!parts.empty() && !parts[0].empty()) {
+                        RunOp r_op; r_op.programPath = ExpandVariables(parts[0], variables);
+                        r_op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
+                        r_op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
+                        r_op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
+                        actionOp.data = r_op; action_created = true;
+                    }
+                } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
+                    BatchOp b_op; b_op.batchPath = ExpandVariables(value, variables); actionOp.data = b_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
+                    RegImportOp ri_op; ri_op.regPath = ExpandVariables(value, variables); actionOp.data = ri_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (!parts.empty() && !parts[0].empty()) {
+                        RegDllOp rd_op; rd_op.dllPath = ExpandVariables(parts[0], variables);
+                        rd_op.unregister = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"unregister") == 0);
+                        actionOp.data = rd_op; action_created = true;
+                    }
+                } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
+                    DeleteFileOp df_op; df_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(value, variables)); actionOp.data = df_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
+                    auto parts = split_string(value, L"::");
+                    DeleteDirOp dd_op; dd_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+                    dd_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
+                    actionOp.data = dd_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"-regkey") == 0) {
+                    auto parts = split_string(value, L"::");
+                    DeleteRegKeyOp drk_op; drk_op.keyPattern = ExpandVariables(parts[0], variables);
+                    drk_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
+                    actionOp.data = drk_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"-regvalue") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (parts.size() == 2) {
+                        DeleteRegValueOp drv_op; drv_op.keyPattern = ExpandVariables(parts[0], variables);
+                        drv_op.valuePattern = parts[1];
+                        actionOp.data = drv_op; action_created = true;
+                    }
+                } else if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (parts.size() == 4) {
+                        StringReplaceOp sr_op; sr_op.inputText = ExpandVariables(parts[0], variables); sr_op.findText = parts[1]; sr_op.replaceText = parts[2]; sr_op.outputVarName = parts[3];
+                        actionOp.data = sr_op; action_created = true;
+                    }
+                } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
+                    DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); actionOp.data = d_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
+                    KillProcessOp kp_op; kp_op.processPattern = value; actionOp.data = kp_op; action_created = true;
                 }
-            } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
-                BatchOp b_op; b_op.batchPath = ExpandVariables(value, variables); actionOp.data = b_op; action_created = true;
-            } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
-                RegImportOp ri_op; ri_op.regPath = ExpandVariables(value, variables); actionOp.data = ri_op; action_created = true;
-            } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
-                auto parts = split_string(value, L"::");
-                if (!parts.empty() && !parts[0].empty()) {
-                    RegDllOp rd_op; rd_op.dllPath = ExpandVariables(parts[0], variables);
-                    rd_op.unregister = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"unregister") == 0);
-                    actionOp.data = rd_op; action_created = true;
-                }
-            } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
-                DeleteFileOp df_op; df_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(value, variables)); actionOp.data = df_op; action_created = true;
-            } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
-                auto parts = split_string(value, L"::");
-                DeleteDirOp dd_op; dd_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                dd_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
-                actionOp.data = dd_op; action_created = true;
-            } else if (_wcsicmp(key.c_str(), L"-regkey") == 0) {
-                auto parts = split_string(value, L"::");
-                DeleteRegKeyOp drk_op; drk_op.keyPattern = ExpandVariables(parts[0], variables);
-                drk_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
-                actionOp.data = drk_op; action_created = true;
-            } else if (_wcsicmp(key.c_str(), L"-regvalue") == 0) {
-                auto parts = split_string(value, L"::");
-                if (parts.size() == 2) {
-                    DeleteRegValueOp drv_op; drv_op.keyPattern = ExpandVariables(parts[0], variables);
-                    drv_op.valuePattern = parts[1];
-                    actionOp.data = drv_op; action_created = true;
+
+                if (action_created) {
+                    afterOp.data = actionOp;
+                    op_created = true;
                 }
             }
-
-            if (action_created) {
-                afterOps.push_back(actionOp);
+            if (op_created) {
+                afterOps.push_back(afterOp);
             }
         }
     }
 }
 
-void ExecuteActionOperations(const std::vector<ActionOperation>& operations) {
-    for (const auto& op : operations) {
-        std::visit([&](const auto& arg) {
-            using T = std::decay_t<decltype(arg)>;
-            if constexpr (std::is_same_v<T, RunOp>) {
-                ExecuteProcess(ResolveToAbsolutePath(arg.programPath), arg.commandLine, ResolveToAbsolutePath(arg.workDir), arg.wait, false);
-            } else if constexpr (std::is_same_v<T, BatchOp>) {
-                wchar_t systemPath[MAX_PATH];
-                GetSystemDirectoryW(systemPath, MAX_PATH);
-                std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
-                std::wstring args = L"/c \"" + ResolveToAbsolutePath(arg.batchPath) + L"\"";
-                ExecuteProcess(cmdPath, args, L"", true, true);
-            } else if constexpr (std::is_same_v<T, RegImportOp>) {
-                ImportRegistryFile(ResolveToAbsolutePath(arg.regPath));
-            } else if constexpr (std::is_same_v<T, RegDllOp>) {
-                wchar_t systemPath[MAX_PATH];
-                GetSystemDirectoryW(systemPath, MAX_PATH);
-                std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
-                std::wstring args = L"/s \"" + ResolveToAbsolutePath(arg.dllPath) + L"\"";
-                if (arg.unregister) {
-                    args = L"/u " + args;
-                }
-                ExecuteProcess(regsvrPath, args, L"", true, true);
-            } else if constexpr (std::is_same_v<T, DeleteFileOp>) {
-                DeletionHelpers::HandleDeleteFile(arg.pathPattern);
-            } else if constexpr (std::is_same_v<T, DeleteDirOp>) {
-                DeletionHelpers::HandleDeleteDir(arg.pathPattern, arg.ifEmpty);
-            } else if constexpr (std::is_same_v<T, DeleteRegKeyOp>) {
-                DeletionHelpers::HandleDeleteRegKey(arg.keyPattern, arg.ifEmpty);
-            } else if constexpr (std::is_same_v<T, DeleteRegValueOp>) {
-                DeletionHelpers::HandleDeleteRegValue(arg.keyPattern, arg.valuePattern);
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables) {
+    std::visit([&](const auto& arg) {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, RunOp>) {
+            ExecuteProcess(ResolveToAbsolutePath(arg.programPath), arg.commandLine, ResolveToAbsolutePath(arg.workDir), arg.wait, false);
+        } else if constexpr (std::is_same_v<T, BatchOp>) {
+            wchar_t systemPath[MAX_PATH];
+            GetSystemDirectoryW(systemPath, MAX_PATH);
+            std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
+            std::wstring args = L"/c \"" + ResolveToAbsolutePath(arg.batchPath) + L"\"";
+            ExecuteProcess(cmdPath, args, L"", true, true);
+        } else if constexpr (std::is_same_v<T, RegImportOp>) {
+            ImportRegistryFile(ResolveToAbsolutePath(arg.regPath));
+        } else if constexpr (std::is_same_v<T, RegDllOp>) {
+            wchar_t systemPath[MAX_PATH];
+            GetSystemDirectoryW(systemPath, MAX_PATH);
+            std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
+            std::wstring args = L"/s \"" + ResolveToAbsolutePath(arg.dllPath) + L"\"";
+            if (arg.unregister) {
+                args = L"/u " + args;
             }
-        }, op.data);
-    }
+            ExecuteProcess(regsvrPath, args, L"", true, true);
+        } else if constexpr (std::is_same_v<T, DeleteFileOp>) {
+            ActionHelpers::HandleDeleteFile(arg.pathPattern);
+        } else if constexpr (std::is_same_v<T, DeleteDirOp>) {
+            ActionHelpers::HandleDeleteDir(arg.pathPattern, arg.ifEmpty);
+        } else if constexpr (std::is_same_v<T, DeleteRegKeyOp>) {
+            ActionHelpers::HandleDeleteRegKey(arg.keyPattern, arg.ifEmpty);
+        } else if constexpr (std::is_same_v<T, DeleteRegValueOp>) {
+            ActionHelpers::HandleDeleteRegValue(arg.keyPattern, arg.valuePattern);
+        } else if constexpr (std::is_same_v<T, CreateDirOp>) {
+            SHCreateDirectoryExW(NULL, arg.path.c_str(), NULL);
+        } else if constexpr (std::is_same_v<T, StringReplaceOp>) {
+            std::wstring result = arg.inputText;
+            std::wstring toFind = arg.findText;
+            std::wstring toReplace = (_wcsicmp(arg.replaceText.c_str(), L"null") == 0) ? L"" : arg.replaceText;
+            size_t pos = result.find(toFind);
+            while(pos != std::wstring::npos) {
+                result.replace(pos, toFind.size(), toReplace);
+                pos = result.find(toFind, pos + toReplace.size());
+            }
+            variables[arg.outputVarName] = result;
+        } else if constexpr (std::is_same_v<T, DelayOp>) {
+            Sleep(arg.milliseconds);
+        } else if constexpr (std::is_same_v<T, KillProcessOp>) {
+            ActionHelpers::HandleKillProcess(arg.processPattern);
+        }
+    }, opData);
 }
 
 
@@ -1404,7 +1500,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         variables[L"WORKDIR"] = finalWorkDir;
 
         std::vector<BeforeOperation> beforeOps;
-        std::vector<ActionOperation> afterOps;
+        std::vector<AfterOperation> afterOps;
         std::vector<StartupShutdownOperation> shutdownOps;
         BackupThreadData backupData;
         ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
@@ -1413,9 +1509,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp>) {
-                    ActionOperation actionOp{arg};
-                    ExecuteActionOperations({actionOp});
+                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, StringReplaceOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp>) {
+                    ExecuteActionOperation(arg, variables);
                 } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
@@ -1542,11 +1637,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hBackupThread);
         }
         
-        for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
-            PerformShutdownOperation(it->data);
+        bool restored = false;
+        for (auto& op : afterOps) {
+            if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
+                for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
+                    PerformShutdownOperation(it->data);
+                }
+                restored = true;
+            } else {
+                ActionOperation actionOp = std::get<ActionOperation>(op.data);
+                ExecuteActionOperation(actionOp.data, variables);
+            }
         }
-        
-        ExecuteActionOperations(afterOps);
+
+        if (!restored) {
+            for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
+                PerformShutdownOperation(it->data);
+            }
+        }
 
         CloseHandle(hMutex);
         CoUninitialize();
