@@ -18,6 +18,7 @@
 #include <winreg.h>
 #include <iomanip>
 #include <atlbase.h> // Required for CComVariant and other ATL/COM helpers
+#include <optional>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
