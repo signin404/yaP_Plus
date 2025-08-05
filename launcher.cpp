@@ -378,9 +378,9 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
         out_content.resize(size_needed);
         MultiByteToWideChar(CP_UTF8, 0, &buffer[3], (int)buffer.size() - 3, &out_content[0], size_needed);
     } else {
-        int size_needed = MultiByteToWideChar(CP_ACP, 0, &buffer[0], (int)buffer.size(), NULL, 0);
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, &buffer[0], (int)buffer.size(), NULL, 0);
         out_content.resize(size_needed);
-        MultiByteToWideChar(CP_ACP, 0, &buffer[0], (int)buffer.size(), &out_content[0], size_needed);
+        MultiByteToWideChar(CP_UTF8, 0, &buffer[0], (int)buffer.size(), &out_content[0], size_needed);
     }
     return true;
 }
@@ -1026,7 +1026,7 @@ namespace ActionHelpers {
         SetFileAttributesW(op.path.c_str(), op.attributes);
     }
 
-    // --- REFACTORED: Core text file handling logic for Unicode support ---
+    // --- NEW: Core text file handling logic ---
     struct FileContentInfo {
         std::vector<char> raw_bytes;
         TextEncoding encoding = TextEncoding::ANSI;
@@ -1053,7 +1053,12 @@ namespace ActionHelpers {
         } else if (info.raw_bytes.size() >= 2 && (BYTE)info.raw_bytes[0] == 0xFE && (BYTE)info.raw_bytes[1] == 0xFF) {
             info.encoding = TextEncoding::UTF16_BE;
         } else {
+            // Try to decode as UTF-8, if it fails, assume ANSI
+            if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, info.raw_bytes.data(), (int)info.raw_bytes.size(), NULL, 0) != 0) {
                 info.encoding = TextEncoding::UTF8;
+            } else {
+                info.encoding = TextEncoding::ANSI;
+            }
         }
 
         // Detect line endings from a sample of the file
@@ -1078,28 +1083,27 @@ namespace ActionHelpers {
         const char* start_ptr = info.raw_bytes.data();
         int byte_count = (int)info.raw_bytes.size();
 
-        if (byte_count > 0) {
-            if (info.encoding == TextEncoding::UTF16_LE) {
-                content = std::wstring(reinterpret_cast<const wchar_t*>(start_ptr + 2), (byte_count / 2) - 1);
-            } else if (info.encoding == TextEncoding::UTF16_BE) {
-                std::vector<wchar_t> temp_buffer(byte_count / 2);
-                for(int i=0; i < byte_count/2; ++i) {
-                    temp_buffer[i] = _byteswap_ushort(((const wchar_t*)start_ptr)[i]);
-                }
-                content = std::wstring(temp_buffer.data() + 1, (byte_count / 2) - 1);
-            } else {
-                UINT codePage = CP_ACP;
-                if (info.encoding == TextEncoding::UTF8_BOM) {
-                    codePage = CP_UTF8;
-                    start_ptr += 3;
-                    byte_count -= 3;
-                } else if (info.encoding == TextEncoding::UTF8) {
-                    codePage = CP_UTF8;
-                }
-                int wsize = MultiByteToWideChar(codePage, 0, start_ptr, byte_count, NULL, 0);
-                content.resize(wsize);
-                MultiByteToWideChar(codePage, 0, start_ptr, byte_count, &content[0], wsize);
+        if (info.encoding == TextEncoding::UTF16_LE) {
+            content = std::wstring(reinterpret_cast<const wchar_t*>(start_ptr + 2), (byte_count / 2) - 1);
+        } else if (info.encoding == TextEncoding::UTF16_BE) {
+            // Basic BE conversion
+            std::vector<wchar_t> temp_buffer(byte_count / 2);
+            for(int i=0; i < byte_count/2; ++i) {
+                temp_buffer[i] = _byteswap_ushort(((const wchar_t*)start_ptr)[i]);
             }
+            content = std::wstring(temp_buffer.data() + 1, (byte_count / 2) - 1);
+        } else {
+            UINT codePage = CP_ACP;
+            if (info.encoding == TextEncoding::UTF8_BOM) {
+                codePage = CP_UTF8;
+                start_ptr += 3;
+                byte_count -= 3;
+            } else if (info.encoding == TextEncoding::UTF8) {
+                codePage = CP_UTF8;
+            }
+            int wsize = MultiByteToWideChar(codePage, 0, start_ptr, byte_count, NULL, 0);
+            content.resize(wsize);
+            MultiByteToWideChar(codePage, 0, start_ptr, byte_count, &content[0], wsize);
         }
 
         // Normalize line endings to \n for processing
@@ -1108,8 +1112,11 @@ namespace ActionHelpers {
         for (size_t i = 0; i < content.length(); ++i) {
             if (content[i] == L'\r') {
                 if (i + 1 < content.length() && content[i+1] == L'\n') {
-                    normalized_content += L'\n'; i++;
+                    // CRLF -> LF
+                    normalized_content += L'\n';
+                    i++;
                 } else {
+                    // CR -> LF
                     normalized_content += L'\n';
                 }
             } else {
@@ -1209,7 +1216,7 @@ namespace ActionHelpers {
             std::wstring trimmed_line = trim(l);
 
             if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                if (is_null_section) {
+                if (is_null_section) { // We've hit the first section, stop searching for top-level keys
                     in_target_section = false;
                 } else {
                     in_target_section = (_wcsicmp(trimmed_line.c_str(), search_section_header.c_str()) == 0);
@@ -1234,7 +1241,7 @@ namespace ActionHelpers {
                             --i; // Adjust loop counter
                         }
                         key_found_and_handled = true;
-                        if (is_null_section) break;
+                        if (is_null_section) break; // Done with top-level
                     }
                 }
             }
@@ -1256,7 +1263,7 @@ namespace ActionHelpers {
                     lines.insert(lines.begin() + section_line + 1, op.key + L"=" + op.value);
                 } else { // Section not found, create it
                     if (!lines.empty() && !trim(lines.back()).empty()) {
-                        lines.push_back(L"");
+                        lines.push_back(L""); // Add a blank line before new section
                     }
                     lines.push_back(search_section_header);
                     lines.push_back(op.key + L"=" + op.value);
@@ -1275,7 +1282,7 @@ namespace ActionHelpers {
         std::wstring content;
         for(size_t i = 0; i < lines.size(); ++i) {
             content += lines[i];
-            if (i < lines.size() - 1) content += L"\n";
+            if (i < lines.size() - 1) content += L"\n"; // Use normalized separator
         }
 
         size_t pos = 0;
