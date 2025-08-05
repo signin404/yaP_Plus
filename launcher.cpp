@@ -131,13 +131,6 @@ struct CreateDirOp {
     std::wstring path;
 };
 
-struct StringReplaceOp {
-    std::wstring inputText;
-    std::wstring findText;
-    std::wstring replaceText;
-    std::wstring outputVarName;
-};
-
 struct DelayOp {
     int milliseconds;
 };
@@ -147,7 +140,7 @@ struct KillProcessOp {
 };
 
 // A variant for one-shot actions, used by [After] section
-using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, StringReplaceOp, DelayOp, KillProcessOp>;
+using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp>;
 struct ActionOperation {
     ActionOpData data;
 };
@@ -165,7 +158,7 @@ struct AfterOperation {
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
     FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, // Startup/Shutdown types
-    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, StringReplaceOp, DelayOp, KillProcessOp // One-shot types
+    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp // One-shot types
 >;
 struct BeforeOperation {
     BeforeOperationData data;
@@ -1177,6 +1170,24 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
             continue;
         }
+        
+        if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
+            if (currentSection == Section::Before || currentSection == Section::After) {
+                auto parts = split_string(value, L"::");
+                if (parts.size() == 4) {
+                    std::wstring result = ExpandVariables(parts[0], variables);
+                    std::wstring toFind = parts[1];
+                    std::wstring toReplace = (_wcsicmp(parts[2].c_str(), L"null") == 0) ? L"" : parts[2];
+                    size_t pos = result.find(toFind);
+                    while(pos != std::wstring::npos) {
+                        result.replace(pos, toFind.size(), toReplace);
+                        pos = result.find(toFind, pos + toReplace.size());
+                    }
+                    variables[parts[3]] = result;
+                }
+            }
+            continue;
+        }
 
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
@@ -1272,12 +1283,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             } else if (_wcsicmp(key.c_str(), L"+dir") == 0) {
                 CreateDirOp cd_op; cd_op.path = ResolveToAbsolutePath(ExpandVariables(value, variables)); beforeOp.data = cd_op; op_created = true;
-            } else if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
-                auto parts = split_string(value, L"::");
-                if (parts.size() == 4) {
-                    StringReplaceOp sr_op; sr_op.inputText = ExpandVariables(parts[0], variables); sr_op.findText = parts[1]; sr_op.replaceText = parts[2]; sr_op.outputVarName = parts[3];
-                    beforeOp.data = sr_op; op_created = true;
-                }
             } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
                 DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); beforeOp.data = d_op; op_created = true;
             } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
@@ -1335,12 +1340,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         drv_op.valuePattern = parts[1];
                         actionOp.data = drv_op; action_created = true;
                     }
-                } else if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
-                    auto parts = split_string(value, L"::");
-                    if (parts.size() == 4) {
-                        StringReplaceOp sr_op; sr_op.inputText = ExpandVariables(parts[0], variables); sr_op.findText = parts[1]; sr_op.replaceText = parts[2]; sr_op.outputVarName = parts[3];
-                        actionOp.data = sr_op; action_created = true;
-                    }
                 } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
                     DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); actionOp.data = d_op; action_created = true;
                 } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
@@ -1391,16 +1390,6 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             ActionHelpers::HandleDeleteRegValue(arg.keyPattern, arg.valuePattern);
         } else if constexpr (std::is_same_v<T, CreateDirOp>) {
             SHCreateDirectoryExW(NULL, arg.path.c_str(), NULL);
-        } else if constexpr (std::is_same_v<T, StringReplaceOp>) {
-            std::wstring result = arg.inputText;
-            std::wstring toFind = arg.findText;
-            std::wstring toReplace = (_wcsicmp(arg.replaceText.c_str(), L"null") == 0) ? L"" : arg.replaceText;
-            size_t pos = result.find(toFind);
-            while(pos != std::wstring::npos) {
-                result.replace(pos, toFind.size(), toReplace);
-                pos = result.find(toFind, pos + toReplace.size());
-            }
-            variables[arg.outputVarName] = result;
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
@@ -1509,7 +1498,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, StringReplaceOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp>) {
+                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp>) {
                     ExecuteActionOperation(arg, variables);
                 } else {
                     StartupShutdownOperation ssOp{arg};
@@ -1637,22 +1626,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hBackupThread);
         }
         
-        bool restored = false;
-        for (auto& op : afterOps) {
+        bool restoreMarkerFound = false;
+        for (const auto& op : afterOps) {
             if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
-                for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
-                    PerformShutdownOperation(it->data);
-                }
-                restored = true;
-            } else {
-                ActionOperation actionOp = std::get<ActionOperation>(op.data);
-                ExecuteActionOperation(actionOp.data, variables);
+                restoreMarkerFound = true;
+                break;
             }
         }
 
-        if (!restored) {
+        if (restoreMarkerFound) {
+            for (auto& op : afterOps) {
+                if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
+                    for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
+                        PerformShutdownOperation(it->data);
+                    }
+                } else {
+                    ActionOperation actionOp = std::get<ActionOperation>(op.data);
+                    ExecuteActionOperation(actionOp.data, variables);
+                }
+            }
+        } else {
             for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
                 PerformShutdownOperation(it->data);
+            }
+            for (auto& op : afterOps) {
+                ActionOperation actionOp = std::get<ActionOperation>(op.data);
+                ExecuteActionOperation(actionOp.data, variables);
             }
         }
 
