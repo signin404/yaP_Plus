@@ -17,6 +17,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
+#include <atlbase.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
