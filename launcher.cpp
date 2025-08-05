@@ -1378,103 +1378,48 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // 在 ParseIniSections 函数中，完全替换原来的 parseCreateFileOp lambda 函数：
+        // 在 ParseIniSections 函数中找到并替换这个 lambda 函数
+        auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
+            // 步骤 1: 使用健壮的 split_string 函数进行完全分割
+            std::vector<std::wstring> parts = split_string(val, delimiter);
         
-        auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) -> bool {
-            // 清空结构体，确保每次都是干净的状态
-            cf_op = CreateFileOp{};
-            cf_op.format = TextFormat::Win;      // 显式设置默认值
-            cf_op.encoding = TextEncoding::UTF8; // 显式设置默认值
-            cf_op.overwrite = false;             // 显式设置默认值
-            
-            const std::wstring separator = L" :: ";
-            std::vector<std::wstring> tokens;
-            
-            // 完全重写字符串分割逻辑
-            std::wstring remaining = val;
-            size_t pos = 0;
-            
-            // 分割成最多5个部分
-            for (int i = 0; i < 4 && !remaining.empty(); i++) {
-                pos = remaining.find(separator);
-                if (pos != std::wstring::npos) {
-                    tokens.push_back(trim(remaining.substr(0, pos)));
-                    remaining = remaining.substr(pos + separator.length());
-                } else {
-                    // 没有更多分隔符，剩余全部作为最后一个token
-                    tokens.push_back(trim(remaining));
-                    remaining.clear();
-                    break;
-                }
-            }
-            
-            // 如果还有剩余内容，作为最后一个token
-            if (!remaining.empty()) {
-                tokens.push_back(trim(remaining));
-            }
-            
-            // 调试输出 - 可以临时添加来诊断问题
-            /*
-            OutputDebugStringA("CreateFile tokens:\n");
-            for (size_t i = 0; i < tokens.size(); i++) {
-                std::string debug = "  [" + std::to_string(i) + "]: ";
-                int needed = WideCharToMultiByte(CP_UTF8, 0, tokens[i].c_str(), -1, NULL, 0, NULL, NULL);
-                std::vector<char> buffer(needed);
-                WideCharToMultiByte(CP_UTF8, 0, tokens[i].c_str(), -1, buffer.data(), needed, NULL, NULL);
-                debug += buffer.data();
-                debug += "\n";
-                OutputDebugStringA(debug.c_str());
-            }
-            */
-            
-            if (tokens.empty()) {
+            // 至少需要路径和内容两个部分
+            if (parts.size() < 2) {
                 return false;
             }
-            
-            // 解析参数
-            // Token 0: 文件路径 (必需)
-            cf_op.path = ResolveToAbsolutePath(ExpandVariables(tokens[0], variables));
-            
-            // Token 1: 覆盖标志 (可选)
-            if (tokens.size() > 1) {
-                std::wstring overwriteFlag = tokens[1];
-                std::transform(overwriteFlag.begin(), overwriteFlag.end(), overwriteFlag.begin(), ::towlower);
-                cf_op.overwrite = (overwriteFlag == L"overwrite");
-            }
-            
-            // Token 2: 格式 (可选)
-            if (tokens.size() > 2) {
-                std::wstring formatStr = tokens[2];
-                std::transform(formatStr.begin(), formatStr.end(), formatStr.begin(), ::towlower);
-                if (formatStr == L"unix") {
+        
+            // 职责清晰：第一个是路径，最后一个是内容
+            cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+            cf_op.content = parts.back();
+        
+            // 步骤 2: 灵活地识别参数，不再依赖固定位置
+            // 首先设置所有参数的默认值
+            cf_op.overwrite = false;
+            cf_op.format = TextFormat::Win;
+            cf_op.encoding = TextEncoding::UTF8;
+        
+            // 遍历所有中间参数 (从索引1到倒数第二个)
+            for (size_t i = 1; i < parts.size() - 1; ++i) {
+                const std::wstring& param = parts[i];
+                if (_wcsicmp(param.c_str(), L"overwrite") == 0) {
+                    cf_op.overwrite = true;
+                } else if (_wcsicmp(param.c_str(), L"unix") == 0) {
                     cf_op.format = TextFormat::Unix;
-                } else if (formatStr == L"mac") {
+                } else if (_wcsicmp(param.c_str(), L"mac") == 0) {
                     cf_op.format = TextFormat::Mac;
-                } else {
-                    cf_op.format = TextFormat::Win; // win 或其他值
-                }
-            }
-            
-            // Token 3: 编码 (可选)
-            if (tokens.size() > 3) {
-                std::wstring encodingStr = tokens[3];
-                std::transform(encodingStr.begin(), encodingStr.end(), encodingStr.begin(), ::towlower);
-                if (encodingStr == L"utf8bom") {
+                } else if (_wcsicmp(param.c_str(), L"win") == 0) {
+                    cf_op.format = TextFormat::Win;
+                } else if (_wcsicmp(param.c_str(), L"utf8bom") == 0) {
                     cf_op.encoding = TextEncoding::UTF8_BOM;
-                } else if (encodingStr == L"utf16le") {
+                } else if (_wcsicmp(param.c_str(), L"utf16le") == 0) {
                     cf_op.encoding = TextEncoding::UTF16_LE;
-                } else if (encodingStr == L"utf16be") {
+                } else if (_wcsicmp(param.c_str(), L"utf16be") == 0) {
                     cf_op.encoding = TextEncoding::UTF16_BE;
-                } else {
-                    cf_op.encoding = TextEncoding::UTF8; // utf8 或其他值
+                } else if (_wcsicmp(param.c_str(), L"utf8") == 0) {
+                    cf_op.encoding = TextEncoding::UTF8;
                 }
             }
-            
-            // Token 4: 内容 (可选)
-            if (tokens.size() > 4) {
-                cf_op.content = tokens[4];
-            }
-            
+        
             return true;
         };
 
