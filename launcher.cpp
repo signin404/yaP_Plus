@@ -97,6 +97,7 @@ struct RunOp {
 
 struct BatchOp {
     std::wstring batchPath;
+    bool wait;
 };
 
 struct RegImportOp {
@@ -139,8 +140,31 @@ struct KillProcessOp {
     std::wstring processPattern;
 };
 
+enum class TextFormat { Win, Unix, Mac };
+enum class TextEncoding { UTF8, UTF8_BOM, UTF16_LE, UTF16_BE };
+
+struct CreateFileOp {
+    std::wstring path;
+    bool overwrite;
+    TextFormat format;
+    TextEncoding encoding;
+    std::wstring content;
+};
+
+struct CreateRegKeyOp {
+    std::wstring keyPath;
+};
+
+struct CreateRegValueOp {
+    std::wstring keyPath;
+    std::wstring valueName;
+    std::wstring valueData;
+    std::wstring typeStr;
+};
+
+
 // A variant for one-shot actions, used by [After] section
-using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp>;
+using ActionOpData = std::variant<RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp>;
 struct ActionOperation {
     ActionOpData data;
 };
@@ -158,7 +182,7 @@ struct AfterOperation {
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
     FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, // Startup/Shutdown types
-    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp // One-shot types
+    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp, CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp // One-shot types
 >;
 struct BeforeOperation {
     BeforeOperationData data;
@@ -773,6 +797,109 @@ namespace ActionHelpers {
                 }
                 RegCloseKey(hKey);
             }
+        }
+    }
+
+    void HandleCreateFile(const CreateFileOp& op) {
+        if (!op.overwrite && PathFileExistsW(op.path.c_str())) {
+            return;
+        }
+
+        std::wstring content = op.content;
+        std::wstring lineBreak;
+        if (op.format == TextFormat::Win) lineBreak = L"\r\n";
+        else if (op.format == TextFormat::Unix) lineBreak = L"\n";
+        else if (op.format == TextFormat::Mac) lineBreak = L"\r";
+        
+        const std::wstring toFind = L"{LINEBREAK}";
+        size_t pos = content.find(toFind);
+        while(pos != std::wstring::npos) {
+            content.replace(pos, toFind.size(), lineBreak);
+            pos = content.find(toFind, pos + lineBreak.size());
+        }
+
+        std::ofstream file(op.path, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) return;
+
+        if (op.encoding == TextEncoding::UTF8_BOM) {
+            file.put((char)0xEF); file.put((char)0xBB); file.put((char)0xBF);
+        } else if (op.encoding == TextEncoding::UTF16_LE) {
+            file.put((char)0xFF); file.put((char)0xFE);
+        } else if (op.encoding == TextEncoding::UTF16_BE) {
+            file.put((char)0xFE); file.put((char)0xFF);
+        }
+
+        if (op.encoding == TextEncoding::UTF8 || op.encoding == TextEncoding::UTF8_BOM) {
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
+            std::string utf8_str(size_needed, 0);
+            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), &utf8_str[0], size_needed, NULL, NULL);
+            file.write(utf8_str.c_str(), utf8_str.length());
+        } else { // UTF-16
+            if (op.encoding == TextEncoding::UTF16_LE) {
+                 file.write(reinterpret_cast<const char*>(content.c_str()), content.length() * sizeof(wchar_t));
+            } else { // UTF-16 BE
+                std::vector<wchar_t> swapped_content(content.begin(), content.end());
+                for(wchar_t& ch : swapped_content) {
+                    ch = _byteswap_ushort(ch);
+                }
+                file.write(reinterpret_cast<const char*>(swapped_content.data()), swapped_content.size() * sizeof(wchar_t));
+            }
+        }
+        file.close();
+    }
+    
+    void HandleCreateRegKey(const std::wstring& keyPath) {
+        HKEY hRootKey;
+        std::wstring rootKeyStr, subKey, valueName;
+        if (!ParseRegistryPath(keyPath, true, hRootKey, rootKeyStr, subKey, valueName)) return;
+        
+        HKEY hKey;
+        RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+        RegCloseKey(hKey);
+    }
+
+    void HandleCreateRegValue(const CreateRegValueOp& op) {
+        HKEY hRootKey;
+        std::wstring rootKeyStr, subKey, valueNameParsed;
+        if (!ParseRegistryPath(op.keyPath, false, hRootKey, rootKeyStr, subKey, valueNameParsed)) return;
+
+        const wchar_t* finalValueName = (_wcsicmp(op.valueName.c_str(), L"null") == 0) ? NULL : op.valueName.c_str();
+        
+        HKEY hKey;
+        if (RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            if (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0) {
+                RegSetValueExW(hKey, finalValueName, 0, REG_SZ, (const BYTE*)op.valueData.c_str(), (DWORD)(op.valueData.length() + 1) * sizeof(wchar_t));
+            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_EXPAND_SZ") == 0) {
+                RegSetValueExW(hKey, finalValueName, 0, REG_EXPAND_SZ, (const BYTE*)op.valueData.c_str(), (DWORD)(op.valueData.length() + 1) * sizeof(wchar_t));
+            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_DWORD") == 0) {
+                DWORD data = _wtol(op.valueData.c_str());
+                RegSetValueExW(hKey, finalValueName, 0, REG_DWORD, (const BYTE*)&data, sizeof(data));
+            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_QWORD") == 0) {
+                ULONGLONG data = _wcstoui64(op.valueData.c_str(), NULL, 10);
+                RegSetValueExW(hKey, finalValueName, 0, REG_QWORD, (const BYTE*)&data, sizeof(data));
+            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_BINARY") == 0) {
+                std::vector<BYTE> data;
+                std::wstringstream ss(op.valueData);
+                std::wstring byteStr;
+                while(std::getline(ss, byteStr, L',')) {
+                    data.push_back((BYTE)wcstol(byteStr.c_str(), NULL, 16));
+                }
+                RegSetValueExW(hKey, finalValueName, 0, REG_BINARY, data.data(), (DWORD)data.size());
+            } else if (_wcsicmp(op.typeStr.c_str(), L"REG_MULTI_SZ") == 0) {
+                std::wstring data = op.valueData;
+                const std::wstring toFind = L"{LINEBREAK}";
+                const std::wstring toReplace = L"\0";
+                size_t pos = data.find(toFind);
+                while(pos != std::wstring::npos) {
+                    data.replace(pos, toFind.size(), toReplace);
+                    pos = data.find(toFind, pos + toReplace.size());
+                }
+                std::vector<wchar_t> buffer(data.begin(), data.end());
+                buffer.push_back(L'\0');
+                buffer.push_back(L'\0');
+                RegSetValueExW(hKey, finalValueName, 0, REG_MULTI_SZ, (const BYTE*)buffer.data(), (DWORD)buffer.size() * sizeof(wchar_t));
+            }
+            RegCloseKey(hKey);
         }
     }
 
