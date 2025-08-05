@@ -1381,14 +1381,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         // 在 ParseIniSections 函数中找到并用此版本完整替换旧的 lambda
         auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
             // --- 诊断代码: 显示传入的原始值 ---
-             MessageBoxW(NULL, val.c_str(), L"1. 原始输入值 (val)", MB_OK);
+            // MessageBoxW(NULL, val.c_str(), L"1. 原始输入值 (val)", MB_OK);
         
             // 步骤 1: 使用健壮的 split_string 函数进行完全分割
             std::vector<std::wstring> parts = split_string(val, L" :: ");
         
             // --- 诊断代码: 显示分割后的部分数量 ---
-             std::wstring msg = L"分割后部分数量: " + std::to_wstring(parts.size());
-             MessageBoxW(NULL, msg.c_str(), L"2. 分割结果", MB_OK);
+            // std::wstring msg = L"分割后部分数量: " + std::to_wstring(parts.size());
+            // MessageBoxW(NULL, msg.c_str(), L"2. 分割结果", MB_OK);
         
             // 至少需要路径和内容两个部分
             if (parts.size() < 2) {
@@ -1410,8 +1410,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 const std::wstring& param = parts[i];
                 
                 // --- 诊断代码: 显示正在检查的参数 ---
-                 std::wstring param_msg = L"正在检查参数[" + std::to_wstring(i) + L"]: " + param;
-                 MessageBoxW(NULL, param_msg.c_str(), L"3. 参数检查", MB_OK);
+                // std::wstring param_msg = L"正在检查参数[" + std::to_wstring(i) + L"]: " + param;
+                // MessageBoxW(NULL, param_msg.c_str(), L"3. 参数检查", MB_OK);
         
                 if (_wcsicmp(param.c_str(), L"overwrite") == 0) {
                     cf_op.overwrite = true;
@@ -1433,14 +1433,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
         
             // --- 诊断代码: 显示最终确定的格式 ---
-             std::wstring final_format_msg;
-             switch(cf_op.format) {
-                 case TextFormat::Win: final_format_msg = L"Win"; break;
-                 case TextFormat::Unix: final_format_msg = L"Unix"; break;
-                 case TextFormat::Mac: final_format_msg = L"Mac"; break;
-             }
-             final_format_msg = L"文件: " + cf_op.path + L"\n最终格式: " + final_format_msg;
-             MessageBoxW(NULL, final_format_msg.c_str(), L"4. 最终结果", MB_OK);
+            // std::wstring final_format_msg;
+            // switch(cf_op.format) {
+            //     case TextFormat::Win: final_format_msg = L"Win"; break;
+            //     case TextFormat::Unix: final_format_msg = L"Unix"; break;
+            //     case TextFormat::Mac: final_format_msg = L"Mac"; break;
+            // }
+            // final_format_msg = L"文件: " + cf_op.path + L"\n最终格式: " + final_format_msg;
+            // MessageBoxW(NULL, final_format_msg.c_str(), L"4. 最终结果", MB_OK);
         
             return true;
         };
@@ -1828,9 +1828,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp> || std::is_same_v<T, CreateFileOp> || std::is_same_v<T, CreateRegKeyOp> || std::is_same_v<T, CreateRegValueOp>) {
+        
+                // 步骤 1: 为 CreateFileOp 创建一个明确、独立的路径
+                if constexpr (std::is_same_v<T, CreateFileOp>) {
+                    // 直接调用正确的执行器，绕过所有复杂的逻辑分支
+                    CreateFileOp mutable_op = arg;
+                    mutable_op.content = ExpandVariables(arg.content, variables);
+                    ActionHelpers::HandleCreateFile(mutable_op);
+                }
+                // 步骤 2: 其他“一次性”操作也走它们的正确路径
+                else if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp> || std::is_same_v<T, CreateRegKeyOp> || std::is_same_v<T, CreateRegValueOp>) {
+                    // 这些类型仍然使用通用的 Action 执行器
                     ExecuteActionOperation(arg, variables);
-                } else {
+                }
+                // 步骤 3: 所有其他类型（启动/关闭类型）走它们原来的路径
+                else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
