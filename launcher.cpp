@@ -560,7 +560,7 @@ namespace DeletionHelpers {
         PathRemoveFileSpecW(dirOfPattern_w);
         std::wstring dirOfPattern = dirOfPattern_w;
         
-        if (dirOfPattern == pathPattern) { // No directory part in pattern
+        if (dirOfPattern == pathPattern) {
             dirOfPattern = L".";
         }
 
@@ -585,7 +585,7 @@ namespace DeletionHelpers {
         std::wstring dirPart = dirPart_w;
         std::wstring patternPart = PathFindFileNameW(pathPattern.c_str());
 
-        if (dirPart == pathPattern) { // No directory part in pattern
+        if (dirPart == pathPattern) {
             dirPart = L".";
         }
 
@@ -1253,13 +1253,13 @@ void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<s
             }
         } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
             DeleteFileOp df_op;
-            df_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(value, variables));
+            df_op.pathPattern = ExpandVariables(value, variables); // Do NOT resolve to absolute path
             op.data = df_op;
             op_created = true;
         } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
             std::vector<std::wstring> parts = split_string(value, L"::");
             DeleteDirOp dd_op;
-            dd_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+            dd_op.pathPattern = ExpandVariables(parts[0], variables); // Do NOT resolve to absolute path
             dd_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
             op.data = dd_op;
             op_created = true;
