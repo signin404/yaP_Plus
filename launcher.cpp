@@ -555,26 +555,36 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 namespace DeletionHelpers {
 
     void HandleDeleteFile(const std::wstring& pathPattern) {
-        wchar_t dirOfPattern_w[MAX_PATH];
-        wcscpy_s(dirOfPattern_w, pathPattern.c_str());
-        PathRemoveFileSpecW(dirOfPattern_w);
-        std::wstring dirOfPattern = dirOfPattern_w;
-        
-        if (dirOfPattern == pathPattern) {
-            dirOfPattern = L".";
+        wchar_t dirPath_w[MAX_PATH];
+        wcscpy_s(dirPath_w, pathPattern.c_str());
+        PathRemoveFileSpecW(dirPath_w);
+        std::wstring dirPath = dirPath_w;
+
+        const wchar_t* filePattern = PathFindFileNameW(pathPattern.c_str());
+
+        if (dirPath == pathPattern) {
+            dirPath = L".";
         }
+        
+        std::wstring searchPattern = dirPath + L"\\*";
 
         WIN32_FIND_DATAW findData;
-        HANDLE hFind = FindFirstFileW(pathPattern.c_str(), &findData);
+        HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
         if (hFind == INVALID_HANDLE_VALUE) {
             return;
         }
+
         do {
-            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                std::wstring fullFilePath = dirOfPattern + L"\\" + findData.cFileName;
-                DeleteFileW(fullFilePath.c_str());
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                continue;
+            }
+
+            if (PathMatchSpecW(findData.cFileName, filePattern)) {
+                std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
+                DeleteFileW(fullPathToDelete.c_str());
             }
         } while (FindNextFileW(hFind, &findData));
+
         FindClose(hFind);
     }
 
@@ -1253,13 +1263,13 @@ void ProcessPreLaunchOperations(const std::wstring& iniContent, const std::map<s
             }
         } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
             DeleteFileOp df_op;
-            df_op.pathPattern = ExpandVariables(value, variables); // Do NOT resolve to absolute path
+            df_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(value, variables));
             op.data = df_op;
             op_created = true;
         } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
             std::vector<std::wstring> parts = split_string(value, L"::");
             DeleteDirOp dd_op;
-            dd_op.pathPattern = ExpandVariables(parts[0], variables); // Do NOT resolve to absolute path
+            dd_op.pathPattern = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
             dd_op.ifEmpty = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ifempty") == 0);
             op.data = dd_op;
             op_created = true;
