@@ -63,13 +63,13 @@ struct RegistryOp {
 };
 
 struct LinkOp {
-    std::wstring linkPath; 
-    std::wstring targetPath; 
-    std::wstring backupPath; 
+    std::wstring linkPath;
+    std::wstring targetPath;
+    std::wstring backupPath;
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks; 
+    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
 };
 
 struct FirewallOp {
@@ -459,7 +459,7 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
         valueName = L"";
     } else {
         size_t lastSlash = restOfPath.find_last_of(L'\\');
-        if (lastSlash == std::wstring::npos) { 
+        if (lastSlash == std::wstring::npos) {
             subKey = L"";
             valueName = restOfPath;
         } else {
@@ -473,7 +473,7 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
 bool RenameRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
     std::wstring fullSourcePath = rootKeyStr + L"\\" + subKey;
     std::wstring fullDestPath = rootKeyStr + L"\\" + newSubKey;
-    
+
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return false;
@@ -545,7 +545,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
 
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
-    
+
     std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
     write_wstring(displayName + L"=");
 
@@ -576,7 +576,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         else if (type == REG_MULTI_SZ) wss << L"(7)";
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
-        
+
         for (DWORD i = 0; i < size; ++i) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
             if (i < size - 1) {
@@ -640,7 +640,7 @@ namespace ActionHelpers {
         if (dirPath == pathPattern) {
             dirPath = L".";
         }
-        
+
         std::wstring searchPattern = dirPath + L"\\*";
 
         WIN32_FIND_DATAW findData;
@@ -810,7 +810,7 @@ namespace ActionHelpers {
         if (op.format == TextFormat::Win) lineBreak = L"\r\n";
         else if (op.format == TextFormat::Unix) lineBreak = L"\n";
         else if (op.format == TextFormat::Mac) lineBreak = L"\r";
-        
+
         const std::wstring toFind = L"{LINEBREAK}";
         size_t pos = content.find(toFind);
         while(pos != std::wstring::npos) {
@@ -847,12 +847,12 @@ namespace ActionHelpers {
         }
         file.close();
     }
-    
+
     void HandleCreateRegKey(const std::wstring& keyPath) {
         HKEY hRootKey;
         std::wstring rootKeyStr, subKey, valueName;
         if (!ParseRegistryPath(keyPath, true, hRootKey, rootKeyStr, subKey, valueName)) return;
-        
+
         HKEY hKey;
         RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
         RegCloseKey(hKey);
@@ -864,7 +864,7 @@ namespace ActionHelpers {
         if (!ParseRegistryPath(op.keyPath, false, hRootKey, rootKeyStr, subKey, valueNameParsed)) return;
 
         const wchar_t* finalValueName = (_wcsicmp(op.valueName.c_str(), L"null") == 0) ? NULL : op.valueName.c_str();
-        
+
         HKEY hKey;
         if (RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             if (_wcsicmp(op.typeStr.c_str(), L"REG_SZ") == 0) {
@@ -1132,7 +1132,7 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
 
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
-    
+
     BSTR bstrRuleName = SysAllocString(ruleName.c_str());
     if (bstrRuleName) {
         pFwRules->Remove(bstrRuleName);
@@ -1264,7 +1264,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                       std::vector<BeforeOperation>& beforeOps,
                       std::vector<AfterOperation>& afterOps,
                       BackupThreadData& backupData) {
-    
+
     std::wstringstream stream(iniContent);
     std::wstring line;
     enum class Section { None, General, Before, After };
@@ -1297,7 +1297,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
             continue;
         }
-        
+
         if (_wcsicmp(key.c_str(), L"stringreplace") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
                 auto parts = split_string(value, L"::");
@@ -1319,7 +1319,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
             bool op_created = false;
-            
+
             if (_wcsicmp(key.c_str(), L"hardlink") == 0 || _wcsicmp(key.c_str(), L"symlink") == 0) {
                 LinkOp l_op; l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
                 auto parts = split_string(value, L"::");
@@ -1379,7 +1379,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     beforeOp.data = r_op; op_created = true;
                 }
             } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
-                BatchOp b_op; b_op.batchPath = ExpandVariables(value, variables); beforeOp.data = b_op; op_created = true;
+                auto parts = split_string(value, L"::");
+                BatchOp b_op;
+                b_op.batchPath = ExpandVariables(parts[0], variables);
+                b_op.wait = true; // Wait is implicit and mandatory for before-section batch files
+                beforeOp.data = b_op;
+                op_created = true;
             } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
                 RegImportOp ri_op; ri_op.regPath = ExpandVariables(value, variables); beforeOp.data = ri_op; op_created = true;
             } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
@@ -1414,6 +1419,36 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); beforeOp.data = d_op; op_created = true;
             } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
                 KillProcessOp kp_op; kp_op.processPattern = value; beforeOp.data = kp_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"+file") == 0) {
+                auto parts = split_string(value, L"::");
+                if (parts.size() >= 2) {
+                    CreateFileOp cf_op;
+                    cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+                    cf_op.content = ExpandVariables(parts[1], variables);
+                    cf_op.overwrite = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"overwrite") == 0);
+                    std::wstring formatStr = (parts.size() > 3) ? parts[3] : L"win";
+                    if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
+                    else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
+                    else cf_op.format = TextFormat::Win;
+                    std::wstring encodingStr = (parts.size() > 4) ? parts[4] : L"utf8";
+                    if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
+                    else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
+                    else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
+                    else cf_op.encoding = TextEncoding::UTF8;
+                    beforeOp.data = cf_op; op_created = true;
+                }
+            } else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
+                CreateRegKeyOp crk_op; crk_op.keyPath = ExpandVariables(value, variables); beforeOp.data = crk_op; op_created = true;
+            } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
+                auto parts = split_string(value, L"::");
+                if (parts.size() == 4) {
+                    CreateRegValueOp crv_op;
+                    crv_op.keyPath = ExpandVariables(parts[0], variables);
+                    crv_op.valueName = parts[1];
+                    crv_op.typeStr = parts[2];
+                    crv_op.valueData = ExpandVariables(parts[3], variables);
+                    beforeOp.data = crv_op; op_created = true;
+                }
             }
 
             if (op_created) {
@@ -1438,7 +1473,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         actionOp.data = r_op; action_created = true;
                     }
                 } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
-                    BatchOp b_op; b_op.batchPath = ExpandVariables(value, variables); actionOp.data = b_op; action_created = true;
+                    auto parts = split_string(value, L"::");
+                    if (!parts.empty()) {
+                        BatchOp b_op;
+                        b_op.batchPath = ExpandVariables(parts[0], variables);
+                        b_op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
+                        actionOp.data = b_op;
+                        action_created = true;
+                    }
                 } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
                     RegImportOp ri_op; ri_op.regPath = ExpandVariables(value, variables); actionOp.data = ri_op; action_created = true;
                 } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
@@ -1471,7 +1513,40 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     DelayOp d_op; d_op.milliseconds = _wtoi(value.c_str()); actionOp.data = d_op; action_created = true;
                 } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
                     KillProcessOp kp_op; kp_op.processPattern = value; actionOp.data = kp_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"+dir") == 0) {
+                    CreateDirOp cd_op; cd_op.path = ResolveToAbsolutePath(ExpandVariables(value, variables)); actionOp.data = cd_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"+file") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (parts.size() >= 2) {
+                        CreateFileOp cf_op;
+                        cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+                        cf_op.content = ExpandVariables(parts[1], variables);
+                        cf_op.overwrite = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"overwrite") == 0);
+                        std::wstring formatStr = (parts.size() > 3) ? parts[3] : L"win";
+                        if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
+                        else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
+                        else cf_op.format = TextFormat::Win;
+                        std::wstring encodingStr = (parts.size() > 4) ? parts[4] : L"utf8";
+                        if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
+                        else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
+                        else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
+                        else cf_op.encoding = TextEncoding::UTF8;
+                        actionOp.data = cf_op; action_created = true;
+                    }
+                } else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
+                    CreateRegKeyOp crk_op; crk_op.keyPath = ExpandVariables(value, variables); actionOp.data = crk_op; action_created = true;
+                } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
+                    auto parts = split_string(value, L"::");
+                    if (parts.size() == 4) {
+                        CreateRegValueOp crv_op;
+                        crv_op.keyPath = ExpandVariables(parts[0], variables);
+                        crv_op.valueName = parts[1];
+                        crv_op.typeStr = parts[2];
+                        crv_op.valueData = ExpandVariables(parts[3], variables);
+                        actionOp.data = crv_op; action_created = true;
+                    }
                 }
+
 
                 if (action_created) {
                     afterOp.data = actionOp;
@@ -1495,7 +1570,7 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             GetSystemDirectoryW(systemPath, MAX_PATH);
             std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
             std::wstring args = L"/c \"" + ResolveToAbsolutePath(arg.batchPath) + L"\"";
-            ExecuteProcess(cmdPath, args, L"", true, true);
+            ExecuteProcess(cmdPath, args, L"", arg.wait, true);
         } else if constexpr (std::is_same_v<T, RegImportOp>) {
             ImportRegistryFile(ResolveToAbsolutePath(arg.regPath));
         } else if constexpr (std::is_same_v<T, RegDllOp>) {
@@ -1521,6 +1596,12 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             ActionHelpers::HandleKillProcess(arg.processPattern);
+        } else if constexpr (std::is_same_v<T, CreateFileOp>) {
+            ActionHelpers::HandleCreateFile(arg);
+        } else if constexpr (std::is_same_v<T, CreateRegKeyOp>) {
+            ActionHelpers::HandleCreateRegKey(arg.keyPath);
+        } else if constexpr (std::is_same_v<T, CreateRegValueOp>) {
+            ActionHelpers::HandleCreateRegValue(arg);
         }
     }, opData);
 }
@@ -1531,7 +1612,7 @@ void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstri
     std::map<std::wstring, std::wstring> variables = base_variables;
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
     if (appPathRaw.empty()) return;
-    
+
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw), commandLine, ResolveToAbsolutePath(workDirRaw), false, false);
@@ -1572,9 +1653,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wcscpy_s(launcherDir, launcherFullPath);
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
-    
+
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
-    
+
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
@@ -1601,7 +1682,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CoUninitialize();
             return 1;
         }
-        
+
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw);
         variables[L"APPEXE"] = absoluteAppPath;
         wchar_t appDir[MAX_PATH];
@@ -1625,7 +1706,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp>) {
+                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp> || std::is_same_v<T, CreateFileOp> || std::is_same_v<T, CreateRegKeyOp> || std::is_same_v<T, CreateRegValueOp>) {
                     ExecuteActionOperation(arg, variables);
                 } else {
                     StartupShutdownOperation ssOp{arg};
@@ -1637,12 +1718,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
         HANDLE hBackupThread = NULL; std::atomic<bool> isBackupWorking(false);
-        
+
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
             monitorData.shouldStop = &stopMonitor;
             monitorData.foregroundAppName = foregroundAppName;
-            
+
             std::wstringstream stream(iniContent);
             std::wstring line;
             std::wstring currentSection_fg;
@@ -1685,13 +1766,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
         std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
         wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-        
+
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
         } else {
             while (true) {
                 DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
-                if (dwResult == WAIT_OBJECT_0) break; 
+                if (dwResult == WAIT_OBJECT_0) break;
                 else if (dwResult == WAIT_OBJECT_0 + 1) {
                     MSG msg;
                     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1752,7 +1833,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             WaitForSingleObject(hBackupThread, 1500);
             CloseHandle(hBackupThread);
         }
-        
+
         bool restoreMarkerFound = false;
         for (const auto& op : afterOps) {
             if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
