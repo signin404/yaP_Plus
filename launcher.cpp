@@ -1829,20 +1829,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
         
-                // 步骤 1: 为 CreateFileOp 创建一个明确、独立的路径
-                if constexpr (std::is_same_v<T, CreateFileOp>) {
-                    // 直接调用正确的执行器，绕过所有复杂的逻辑分支
-                    CreateFileOp mutable_op = arg;
-                    mutable_op.content = ExpandVariables(arg.content, variables);
-                    ActionHelpers::HandleCreateFile(mutable_op);
-                }
-                // 步骤 2: 其他“一次性”操作也走它们的正确路径
-                else if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || std::is_same_v<T, KillProcessOp> || std::is_same_v<T, CreateRegKeyOp> || std::is_same_v<T, CreateRegValueOp>) {
-                    // 这些类型仍然使用通用的 Action 执行器
-                    ExecuteActionOperation(arg, variables);
-                }
-                // 步骤 3: 所有其他类型（启动/关闭类型）走它们原来的路径
-                else {
+                // This `if constexpr` block is the fix.
+                // It checks if the operation is a "one-shot" action type.
+                if constexpr (std::is_same_v<T, RunOp> || std::is_same_v<T, BatchOp> || 
+                              std::is_same_v<T, RegImportOp> || std::is_same_v<T, RegDllOp> || 
+                              std::is_same_v<T, DeleteFileOp> || std::is_same_v<T, DeleteDirOp> || 
+                              std::is_same_v<T, DeleteRegKeyOp> || std::is_same_v<T, DeleteRegValueOp> || 
+                              std::is_same_v<T, CreateDirOp> || std::is_same_v<T, DelayOp> || 
+                              std::is_same_v<T, KillProcessOp> || std::is_same_v<T, CreateFileOp> || 
+                              std::is_same_v<T, CreateRegKeyOp> || std::is_same_v<T, CreateRegValueOp>) 
+                {
+                    // Instead of calling the destructive function, we now execute directly.
+                    // This uses 'arg' (the original, correct data) without any conversion.
+                    // We are essentially moving the logic from ExecuteActionOperation here.
+                    
+                    // We must re-implement the visit for the inner types here.
+                    // This is safe because 'arg' is already the correct, final type.
+                    if constexpr (std::is_same_v<T, CreateFileOp>) {
+                        CreateFileOp mutable_op = arg;
+                        mutable_op.content = ExpandVariables(arg.content, variables);
+                        ActionHelpers::HandleCreateFile(mutable_op);
+                    } else {
+                        // For all other action types, we can still use the generic helper,
+                        // but we must construct the ActionOpData variant explicitly to be safe.
+                        ActionOpData actionData = arg;
+                        ExecuteActionOperation(actionData, variables);
+                    }
+                } 
+                else // This handles FileOp, RegistryOp, LinkOp, etc.
+                {
+                    // This part of the logic was already correct.
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
