@@ -1378,66 +1378,36 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // 在 ParseIniSections 函数中，将原来的 parseCreateFileOp lambda 替换为以下代码：
-        
         auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
             std::vector<std::wstring> parts;
             std::wstring temp_value = val;
             size_t pos = 0;
-            
-            // 解析前4个参数：路径、覆盖标志、格式、编码
             while (parts.size() < 4 && (pos = temp_value.find(delimiter)) != std::wstring::npos) {
                 parts.push_back(trim(temp_value.substr(0, pos)));
                 temp_value.erase(0, pos + delimiter.length());
             }
-            // 剩余的全部内容作为文件内容
-            if (!temp_value.empty()) {
-                parts.push_back(trim(temp_value));
-            } else if (parts.size() == 4) {
-                // 如果正好有4个分隔符，但最后没有内容，添加空字符串
-                parts.push_back(L"");
-            }
+            parts.push_back(trim(temp_value));
         
-            if (parts.size() >= 1) {
-                // 参数1：文件路径（必需）
+            if (parts.size() >= 2) {
                 cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
                 
-                // 参数2：覆盖标志（可选，默认false）
-                cf_op.overwrite = false;
-                if (parts.size() > 1) {
-                    cf_op.overwrite = (_wcsicmp(parts[1].c_str(), L"overwrite") == 0);
-                }
+                // 修正：检查 parts.size() > 1 而不是 > 2
+                cf_op.overwrite = (parts.size() > 1) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
                 
-                // 参数3：文本格式（可选，默认win）
-                cf_op.format = TextFormat::Win;
-                if (parts.size() > 2) {
-                    if (_wcsicmp(parts[2].c_str(), L"unix") == 0) {
-                        cf_op.format = TextFormat::Unix;
-                    } else if (_wcsicmp(parts[2].c_str(), L"mac") == 0) {
-                        cf_op.format = TextFormat::Mac;
-                    }
-                    // 其他情况保持默认的 Win 格式
-                }
+                // 修正：检查 parts.size() > 2 而不是 > 3
+                std::wstring formatStr = (parts.size() > 2) ? parts[2] : L"win";
+                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
+                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
+                else cf_op.format = TextFormat::Win;
         
-                // 参数4：编码格式（可选，默认utf8）
-                cf_op.encoding = TextEncoding::UTF8;
-                if (parts.size() > 3) {
-                    if (_wcsicmp(parts[3].c_str(), L"utf8bom") == 0) {
-                        cf_op.encoding = TextEncoding::UTF8_BOM;
-                    } else if (_wcsicmp(parts[3].c_str(), L"utf16le") == 0) {
-                        cf_op.encoding = TextEncoding::UTF16_LE;
-                    } else if (_wcsicmp(parts[3].c_str(), L"utf16be") == 0) {
-                        cf_op.encoding = TextEncoding::UTF16_BE;
-                    }
-                    // 其他情况保持默认的 UTF8
-                }
+                // 修正：检查 parts.size() > 3 而不是 > 4
+                std::wstring encodingStr = (parts.size() > 3) ? parts[3] : L"utf8";
+                if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
+                else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
+                else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
+                else cf_op.encoding = TextEncoding::UTF8;
                 
-                // 参数5：文件内容（可选，默认空）
-                cf_op.content = L"";
-                if (parts.size() > 4) {
-                    cf_op.content = parts[4];
-                }
-                
+                cf_op.content = parts.back();
                 return true;
             }
             return false;
