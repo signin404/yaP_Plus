@@ -17,7 +17,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
-#include <atlbase.h> // [FIXED] Added for CComVariant and other ATL types
+#include <atlbase.h> // Required for CComVariant and other ATL/COM helpers
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -1150,6 +1150,8 @@ cleanup:
 void DeleteFirewallRule(const std::wstring& ruleName) {
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
+    IEnumVARIANT* pEnum = NULL;
+    IUnknown* pUnknown = NULL;
     HRESULT hr = S_OK;
 
     hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
@@ -1158,14 +1160,19 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
     hr = pFwPolicy->get_Rules(&pFwRules);
     if (FAILED(hr)) goto cleanup;
 
-    long currentCount = 0;
     int rulesToDelete = 0;
-    hr = pFwRules->get_Count(&currentCount);
-    if(SUCCEEDED(hr)) {
-        for (long i = 1; i <= currentCount; i++) { // COM collections are often 1-based
+    hr = pFwRules->get__NewEnum(&pUnknown);
+    if (FAILED(hr) || !pUnknown) goto cleanup;
+
+    hr = pUnknown->QueryInterface(__uuidof(IEnumVARIANT), (void**)&pEnum);
+    if (FAILED(hr) || !pEnum) goto cleanup;
+
+    VARIANT var;
+    VariantInit(&var);
+    while (pEnum->Next(1, &var, NULL) == S_OK) {
+        if (var.vt == VT_DISPATCH) {
             INetFwRule* pFwRule = NULL;
-            // [FIXED] Use get_Item with a long index
-            hr = pFwRules->Item(CComVariant(i), &pFwRule);
+            hr = var.pdispVal->QueryInterface(__uuidof(INetFwRule), (void**)&pFwRule);
             if (SUCCEEDED(hr)) {
                 BSTR bstrName = NULL;
                 hr = pFwRule->get_Name(&bstrName);
@@ -1178,19 +1185,22 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
                 pFwRule->Release();
             }
         }
+        VariantClear(&var);
     }
     
     if (rulesToDelete > 0) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
         if (bstrRuleName) {
             for (int i = 0; i < rulesToDelete; i++) {
-                pFwRules->Remove(bstrRuleName); // This might fail if rules change, but it's safer than a while loop
+                pFwRules->Remove(bstrRuleName);
             }
             SysFreeString(bstrRuleName);
         }
     }
 
 cleanup:
+    if (pUnknown) pUnknown->Release();
+    if (pEnum) pEnum->Release();
     if (pFwRules) pFwRules->Release();
     if (pFwPolicy) pFwPolicy->Release();
 }
@@ -1393,7 +1403,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
                 else cf_op.encoding = TextEncoding::UTF8;
                 
-                cf_op.content = parts.back(); // Store raw content with {LINEBREAK}
+                cf_op.content = parts.back();
                 return true;
             }
             return false;
