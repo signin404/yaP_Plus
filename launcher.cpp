@@ -10,7 +10,7 @@
 #include <map>
 #include <set>
 #include <variant>
-#include <optional> // Added missing header
+#include <optional>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
@@ -143,7 +143,6 @@ struct KillProcessOp {
 };
 
 enum class TextFormat { Win, Unix, Mac };
-// --- MODIFICATION START: Expanded TextEncoding enum ---
 enum class TextEncoding {
     ANSI,       // System Default ANSI
     UTF8,       // UTF-8 without BOM
@@ -154,7 +153,6 @@ enum class TextEncoding {
     EUC_KR,     // Korean, CP949
     BIG5        // Traditional Chinese, CP950
 };
-// --- MODIFICATION END ---
 
 
 struct CreateFileOp {
@@ -374,7 +372,6 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
-// This function is now a simple wrapper around the more advanced ActionHelpers::ReadFileWithFormatDetection
 bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
@@ -1046,7 +1043,6 @@ namespace ActionHelpers {
         std::wstring line_ending = L"\r\n";
     };
 
-    // --- MODIFICATION START: Rewritten encoding detection ---
     bool ReadFileWithFormatDetection(const std::wstring& path, FileContentInfo& info) {
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return false;
@@ -1109,9 +1105,7 @@ namespace ActionHelpers {
 
         return true;
     }
-    // --- MODIFICATION END ---
 
-    // --- MODIFICATION START: Updated to handle new encodings ---
     std::vector<std::wstring> GetLinesFromFile(const FileContentInfo& info) {
         std::wstring content;
         const char* start_ptr = info.raw_bytes.data();
@@ -1179,9 +1173,8 @@ namespace ActionHelpers {
         if (normalized_content.empty() && !info.raw_bytes.empty()) lines.clear();
         return lines;
     }
-    // --- MODIFICATION END ---
 
-    // --- MODIFICATION START: Updated to handle new encodings ---
+
     bool WriteFileWithFormat(const std::wstring& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
@@ -1245,30 +1238,38 @@ namespace ActionHelpers {
         file.close();
         return true;
     }
-    // --- MODIFICATION END ---
 
     void HandleIniWrite(const IniWriteOp& op) {
-        FileContentInfo formatInfo;
-        bool file_exists = PathFileExistsW(op.path.c_str());
-        if (file_exists) {
-            if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
-        } else {
-            formatInfo.encoding = TextEncoding::UTF8;
-            formatInfo.line_ending = L"\r\n";
+        // --- FIX #2: If the target file does not exist, skip the operation. ---
+        if (!PathFileExistsW(op.path.c_str())) {
+            return;
         }
+
+        FileContentInfo formatInfo;
+        if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
 
-        // Handle deleting a section
+        // --- FIX #1 (Logic): Corrected section deletion logic. ---
         if (op.deleteSection) {
             std::vector<std::wstring> new_lines;
             std::wstring section_to_delete_header = L"[" + op.section + L"]";
             bool in_section_to_delete = false;
+
             for (const auto& l : lines) {
                 std::wstring trimmed_line = trim(l);
                 if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                    in_section_to_delete = (_wcsicmp(trimmed_line.c_str(), section_to_delete_header.c_str()) == 0);
+                    // This is a section header. Check if it's the one we want to delete,
+                    // or if it's a different one (which ends the deletion block).
+                    if (_wcsicmp(trimmed_line.c_str(), section_to_delete_header.c_str()) == 0) {
+                        in_section_to_delete = true;
+                    } else {
+                        in_section_to_delete = false;
+                    }
                 }
+
+                // Only copy the line if we are NOT in the section to be deleted.
+                // This includes copying the new section header that turned the flag off.
                 if (!in_section_to_delete) {
                     new_lines.push_back(l);
                 }
@@ -1276,6 +1277,7 @@ namespace ActionHelpers {
             WriteFileWithFormat(op.path, new_lines, formatInfo);
             return;
         }
+        // --- END FIX #1 (Logic) ---
 
         bool key_found_and_handled = false;
         bool is_null_section = _wcsicmp(op.section.c_str(), L"null") == 0;
@@ -1879,7 +1881,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[2], parts[3]};
             }
         }
-        // --- NEW: Parse new action op types ---
         else if (_wcsicmp(key.c_str(), L"<-dir") == 0 || _wcsicmp(key.c_str(), L"->dir") == 0 || _wcsicmp(key.c_str(), L"<-file") == 0 || _wcsicmp(key.c_str(), L"->file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 2) {
@@ -1918,21 +1919,36 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
                 return op;
             }
-        } else if (_wcsicmp(key.c_str(), L"iniwrite") == 0) {
+        } 
+        // --- FIX #1 (Parser): Correctly parse iniwrite for section deletion. ---
+        else if (_wcsicmp(key.c_str(), L"iniwrite") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() >= 3) {
+            if (parts.size() >= 2) { // Minimum 2 parts: path and section/key
                 IniWriteOp op;
                 op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
                 op.section = parts[1];
+
+                // Check for section deletion syntax: "--SECTION"
                 if (op.section.rfind(L"--", 0) == 0) {
                     op.deleteSection = true;
                     op.section = op.section.substr(2);
+                    // For deletion, we only need 2 parts. Key and value are irrelevant.
+                    op.key = L"";
+                    op.value = L"";
+                    return op;
                 }
-                op.key = parts[2];
-                op.value = (parts.size() > 3) ? parts[3] : L"";
-                return op;
+
+                // If not deleting a section, we need at least a key (3 parts total)
+                if (parts.size() >= 3) {
+                    op.deleteSection = false;
+                    op.key = parts[2];
+                    op.value = (parts.size() > 3) ? parts[3] : L"null"; // Value is optional (for key deletion)
+                    return op;
+                }
             }
-        } else if (_wcsicmp(key.c_str(), L"replace") == 0) {
+        }
+        // --- END FIX #1 (Parser) ---
+        else if (_wcsicmp(key.c_str(), L"replace") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 3) {
                 ReplaceOp op;
@@ -2147,7 +2163,6 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.valueData = ExpandVariables(arg.valueData, variables);
             ActionHelpers::HandleCreateRegValue(mutable_op);
         }
-        // --- NEW: Execute new actions with variable expansion ---
         else if constexpr (std::is_same_v<T, CopyMoveOp>) {
             ActionHelpers::HandleCopyMove(arg);
         } else if constexpr (std::is_same_v<T, AttributesOp>) {
