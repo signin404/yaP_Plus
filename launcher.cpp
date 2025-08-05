@@ -146,9 +146,8 @@ enum class TextEncoding { UTF8, UTF8_BOM, UTF16_LE, UTF16_BE };
 struct CreateFileOp {
     std::wstring path;
     bool overwrite;
-    TextFormat format;
     TextEncoding encoding;
-    std::wstring content;
+    std::wstring content; // Content is now pre-processed with correct newlines
 };
 
 struct CreateRegKeyOp {
@@ -805,19 +804,6 @@ namespace ActionHelpers {
             return;
         }
 
-        std::wstring content = op.content;
-        std::wstring lineBreak;
-        if (op.format == TextFormat::Win) lineBreak = L"\r\n";
-        else if (op.format == TextFormat::Unix) lineBreak = L"\n";
-        else if (op.format == TextFormat::Mac) lineBreak = L"\r";
-
-        const std::wstring toFind = L"{LINEBREAK}";
-        size_t pos = content.find(toFind);
-        while(pos != std::wstring::npos) {
-            content.replace(pos, toFind.size(), lineBreak);
-            pos = content.find(toFind, pos + lineBreak.size());
-        }
-
         std::ofstream file(op.path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return;
 
@@ -830,15 +816,15 @@ namespace ActionHelpers {
         }
 
         if (op.encoding == TextEncoding::UTF8 || op.encoding == TextEncoding::UTF8_BOM) {
-            int size_needed = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, op.content.c_str(), (int)op.content.length(), NULL, 0, NULL, NULL);
             std::string utf8_str(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), &utf8_str[0], size_needed, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, op.content.c_str(), (int)op.content.length(), &utf8_str[0], size_needed, NULL, NULL);
             file.write(utf8_str.c_str(), utf8_str.length());
         } else { // UTF-16
             if (op.encoding == TextEncoding::UTF16_LE) {
-                 file.write(reinterpret_cast<const char*>(content.c_str()), content.length() * sizeof(wchar_t));
+                 file.write(reinterpret_cast<const char*>(op.content.c_str()), op.content.length() * sizeof(wchar_t));
             } else { // UTF-16 BE
-                std::vector<wchar_t> swapped_content(content.begin(), content.end());
+                std::vector<wchar_t> swapped_content(op.content.begin(), op.content.end());
                 for(wchar_t& ch : swapped_content) {
                     ch = _byteswap_ushort(ch);
                 }
@@ -862,7 +848,6 @@ namespace ActionHelpers {
         HKEY hRootKey;
         std::wstring rootKeyStr, subKey, ignoredValueName;
 
-        // [FIXED] Use 'true' to ensure the entire op.keyPath is treated as the key path.
         if (!ParseRegistryPath(op.keyPath, true, hRootKey, rootKeyStr, subKey, ignoredValueName)) return;
 
         const wchar_t* finalValueName = (_wcsicmp(op.valueName.c_str(), L"null") == 0) ? NULL : op.valueName.c_str();
@@ -877,7 +862,15 @@ namespace ActionHelpers {
                 DWORD data = _wtol(op.valueData.c_str());
                 RegSetValueExW(hKey, finalValueName, 0, REG_DWORD, (const BYTE*)&data, sizeof(data));
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_QWORD") == 0) {
-                ULONGLONG data = _wcstoui64(op.valueData.c_str(), NULL, 10);
+                // [FIXED] Parse comma-separated hex bytes for REG_QWORD
+                ULONGLONG data = 0;
+                BYTE* pBytes = reinterpret_cast<BYTE*>(&data);
+                std::wstringstream ss(op.valueData);
+                std::wstring byteStr;
+                int i = 0;
+                while(i < 8 && std::getline(ss, byteStr, L',')) {
+                    pBytes[i++] = (BYTE)wcstol(byteStr.c_str(), NULL, 16);
+                }
                 RegSetValueExW(hKey, finalValueName, 0, REG_QWORD, (const BYTE*)&data, sizeof(data));
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_BINARY") == 0) {
                 std::vector<BYTE> data;
@@ -888,15 +881,20 @@ namespace ActionHelpers {
                 }
                 RegSetValueExW(hKey, finalValueName, 0, REG_BINARY, data.data(), (DWORD)data.size());
             } else if (_wcsicmp(op.typeStr.c_str(), L"REG_MULTI_SZ") == 0) {
-                std::wstring data = op.valueData;
-                const std::wstring toFind = L"{LINEBREAK}";
-                const std::wstring toReplace = L"\0";
-                size_t pos = data.find(toFind);
-                while(pos != std::wstring::npos) {
-                    data.replace(pos, toFind.size(), toReplace);
-                    pos = data.find(toFind, pos + toReplace.size());
+                // [FIXED] Robustly handle {LINEBREAK} for REG_MULTI_SZ
+                std::vector<wchar_t> buffer;
+                std::wstring source = op.valueData;
+                std::wstring toFind = L"{LINEBREAK}";
+                size_t startPos = 0;
+                size_t findPos;
+                while ((findPos = source.find(toFind, startPos)) != std::wstring::npos) {
+                    std::wstring segment = source.substr(startPos, findPos - startPos);
+                    buffer.insert(buffer.end(), segment.begin(), segment.end());
+                    buffer.push_back(L'\0');
+                    startPos = findPos + toFind.length();
                 }
-                std::vector<wchar_t> buffer(data.begin(), data.end());
+                std::wstring lastSegment = source.substr(startPos);
+                buffer.insert(buffer.end(), lastSegment.begin(), lastSegment.end());
                 buffer.push_back(L'\0');
                 buffer.push_back(L'\0');
                 RegSetValueExW(hKey, finalValueName, 0, REG_MULTI_SZ, (const BYTE*)buffer.data(), (DWORD)buffer.size() * sizeof(wchar_t));
@@ -1129,8 +1127,9 @@ cleanup:
 void DeleteFirewallRule(const std::wstring& ruleName) {
     INetFwPolicy2* pFwPolicy = NULL;
     INetFwRules* pFwRules = NULL;
+    HRESULT hr = S_OK;
 
-    HRESULT hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
+    hr = CoCreateInstance(__uuidof(NetFwPolicy2), NULL, CLSCTX_INPROC_SERVER, __uuidof(INetFwPolicy2), (void**)&pFwPolicy);
     if (FAILED(hr)) goto cleanup;
 
     hr = pFwPolicy->get_Rules(&pFwRules);
@@ -1138,7 +1137,10 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
 
     BSTR bstrRuleName = SysAllocString(ruleName.c_str());
     if (bstrRuleName) {
-        pFwRules->Remove(bstrRuleName);
+        // [FIXED] Loop to delete all rules with the same name
+        while (SUCCEEDED(pFwRules->Remove(bstrRuleName))) {
+            // Keep removing until it fails (no more rules with this name)
+        }
         SysFreeString(bstrRuleName);
     }
 
@@ -1325,7 +1327,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             std::vector<std::wstring> parts;
             std::wstring temp_value = val;
             size_t pos = 0;
-            // Manually split to protect content from being split
             while (parts.size() < 4 && (pos = temp_value.find(delimiter)) != std::wstring::npos) {
                 parts.push_back(trim(temp_value.substr(0, pos)));
                 temp_value.erase(0, pos + delimiter.length());
@@ -1334,12 +1335,23 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
             if (parts.size() >= 2) {
                 cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                cf_op.content = ExpandVariables(parts.back(), variables);
                 cf_op.overwrite = (parts.size() > 2) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
+
                 std::wstring formatStr = (parts.size() > 3) ? parts[2] : L"win";
-                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
-                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
-                else cf_op.format = TextFormat::Win;
+                std::wstring lineBreak;
+                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) lineBreak = L"\n";
+                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) lineBreak = L"\r";
+                else lineBreak = L"\r\n";
+                
+                std::wstring content_raw = parts.back();
+                const std::wstring toFind = L"{LINEBREAK}";
+                size_t replace_pos = content_raw.find(toFind);
+                while(replace_pos != std::wstring::npos) {
+                    content_raw.replace(replace_pos, toFind.size(), lineBreak);
+                    replace_pos = content_raw.find(toFind, replace_pos + lineBreak.size());
+                }
+                cf_op.content = ExpandVariables(content_raw, variables);
+
                 std::wstring encodingStr = (parts.size() > 4) ? parts[3] : L"utf8";
                 if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
