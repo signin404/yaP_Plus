@@ -1378,35 +1378,51 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
+        // 在 ParseIniSections 函数中找到这个 lambda 函数并替换它
         auto parseCreateFileOp = [&](const std::wstring& val, CreateFileOp& cf_op) {
-            std::vector<std::wstring> parts;
-            std::wstring temp_value = val;
-            size_t pos = 0;
-            while (parts.size() < 4 && (pos = temp_value.find(delimiter)) != std::wstring::npos) {
-                parts.push_back(trim(temp_value.substr(0, pos)));
-                temp_value.erase(0, pos + delimiter.length());
+            // 使用您代码中已有的、更可靠的 split_string 函数
+            std::vector<std::wstring> parts = split_string(val, delimiter);
+        
+            if (parts.size() < 2) { // 至少需要路径和内容
+                return false;
             }
-            parts.push_back(trim(temp_value));
-
-            if (parts.size() >= 2) {
-                cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                cf_op.overwrite = (parts.size() > 2) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
-                
-                std::wstring formatStr = (parts.size() > 3) ? parts[2] : L"win";
-                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) cf_op.format = TextFormat::Unix;
-                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) cf_op.format = TextFormat::Mac;
-                else cf_op.format = TextFormat::Win;
-
-                std::wstring encodingStr = (parts.size() > 4) ? parts[3] : L"utf8";
-                if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) cf_op.encoding = TextEncoding::UTF8_BOM;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) cf_op.encoding = TextEncoding::UTF16_LE;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) cf_op.encoding = TextEncoding::UTF16_BE;
-                else cf_op.encoding = TextEncoding::UTF8;
-                
-                cf_op.content = parts.back();
-                return true;
+        
+            // 第一个部分总是路径
+            cf_op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+        
+            // 最后一个部分总是内容
+            cf_op.content = parts.back();
+        
+            // --- 以下是稳健的参数解析逻辑 ---
+            // 设置默认值
+            cf_op.overwrite = false;
+            cf_op.format = TextFormat::Win;
+            cf_op.encoding = TextEncoding::UTF8;
+        
+            // 遍历中间的参数部分 (从索引 1 到倒数第二个元素)
+            // 这样参数的顺序和有无就无关紧要了
+            for (size_t i = 1; i < parts.size() - 1; ++i) {
+                const std::wstring& param = parts[i];
+                if (_wcsicmp(param.c_str(), L"overwrite") == 0) {
+                    cf_op.overwrite = true;
+                } else if (_wcsicmp(param.c_str(), L"unix") == 0) {
+                    cf_op.format = TextFormat::Unix;
+                } else if (_wcsicmp(param.c_str(), L"mac") == 0) {
+                    cf_op.format = TextFormat::Mac;
+                } else if (_wcsicmp(param.c_str(), L"win") == 0) {
+                    cf_op.format = TextFormat::Win;
+                } else if (_wcsicmp(param.c_str(), L"utf8bom") == 0) {
+                    cf_op.encoding = TextEncoding::UTF8_BOM;
+                } else if (_wcsicmp(param.c_str(), L"utf16le") == 0) {
+                    cf_op.encoding = TextEncoding::UTF16_LE;
+                } else if (_wcsicmp(param.c_str(), L"utf16be") == 0) {
+                    cf_op.encoding = TextEncoding::UTF16_BE;
+                } else if (_wcsicmp(param.c_str(), L"utf8") == 0) {
+                    cf_op.encoding = TextEncoding::UTF8;
+                }
             }
-            return false;
+        
+            return true;
         };
 
         if (currentSection == Section::Before) {
