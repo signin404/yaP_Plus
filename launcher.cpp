@@ -1240,7 +1240,6 @@ namespace ActionHelpers {
     }
 
     void HandleIniWrite(const IniWriteOp& op) {
-        // --- FIX #2: If the target file does not exist, skip the operation. ---
         if (!PathFileExistsW(op.path.c_str())) {
             return;
         }
@@ -1250,7 +1249,6 @@ namespace ActionHelpers {
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
 
-        // --- FIX #1 (Logic): Corrected section deletion logic. ---
         if (op.deleteSection) {
             std::vector<std::wstring> new_lines;
             std::wstring section_to_delete_header = L"[" + op.section + L"]";
@@ -1259,8 +1257,6 @@ namespace ActionHelpers {
             for (const auto& l : lines) {
                 std::wstring trimmed_line = trim(l);
                 if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                    // This is a section header. Check if it's the one we want to delete,
-                    // or if it's a different one (which ends the deletion block).
                     if (_wcsicmp(trimmed_line.c_str(), section_to_delete_header.c_str()) == 0) {
                         in_section_to_delete = true;
                     } else {
@@ -1268,8 +1264,6 @@ namespace ActionHelpers {
                     }
                 }
 
-                // Only copy the line if we are NOT in the section to be deleted.
-                // This includes copying the new section header that turned the flag off.
                 if (!in_section_to_delete) {
                     new_lines.push_back(l);
                 }
@@ -1277,7 +1271,6 @@ namespace ActionHelpers {
             WriteFileWithFormat(op.path, new_lines, formatInfo);
             return;
         }
-        // --- END FIX #1 (Logic) ---
 
         bool key_found_and_handled = false;
         bool is_null_section = _wcsicmp(op.section.c_str(), L"null") == 0;
@@ -1289,7 +1282,7 @@ namespace ActionHelpers {
             std::wstring trimmed_line = trim(l);
 
             if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                if (is_null_section) { // We've hit the first section, stop searching for top-level keys
+                if (is_null_section) { 
                     in_target_section = false;
                 } else {
                     in_target_section = (_wcsicmp(trimmed_line.c_str(), search_section_header.c_str()) == 0);
@@ -1314,13 +1307,12 @@ namespace ActionHelpers {
                             --i; // Adjust loop counter
                         }
                         key_found_and_handled = true;
-                        if (is_null_section) break; // Done with top-level
+                        if (is_null_section) break; 
                     }
                 }
             }
         }
 
-        // If key was not found, add it
         if (!key_found_and_handled && _wcsicmp(op.value.c_str(), L"null") != 0) {
             if (is_null_section) {
                 lines.insert(lines.begin(), op.key + L"=" + op.value);
@@ -1334,9 +1326,9 @@ namespace ActionHelpers {
                 }
                 if (section_line != -1) {
                     lines.insert(lines.begin() + section_line + 1, op.key + L"=" + op.value);
-                } else { // Section not found, create it
+                } else { 
                     if (!lines.empty() && !trim(lines.back()).empty()) {
-                        lines.push_back(L""); // Add a blank line before new section
+                        lines.push_back(L""); 
                     }
                     lines.push_back(search_section_header);
                     lines.push_back(op.key + L"=" + op.value);
@@ -1358,10 +1350,20 @@ namespace ActionHelpers {
             if (i < lines.size() - 1) content += L"\n"; // Use normalized separator
         }
 
+        // --- MODIFICATION: Add support for {LINEBREAK} ---
+        std::wstring finalReplaceText = op.replaceText;
+        const std::wstring toFindToken = L"{LINEBREAK}";
+        size_t lb_pos = 0;
+        while ((lb_pos = finalReplaceText.find(toFindToken, lb_pos)) != std::wstring::npos) {
+            finalReplaceText.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
+            lb_pos += formatInfo.line_ending.length();
+        }
+        // --- END MODIFICATION ---
+
         size_t pos = 0;
         while ((pos = content.find(op.findText, pos)) != std::wstring::npos) {
-            content.replace(pos, op.findText.length(), op.replaceText);
-            pos += op.replaceText.length();
+            content.replace(pos, op.findText.length(), finalReplaceText);
+            pos += finalReplaceText.length();
         }
 
         std::vector<std::wstring> new_lines;
@@ -1379,11 +1381,21 @@ namespace ActionHelpers {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
+        // --- MODIFICATION: Add support for {LINEBREAK} ---
+        std::wstring finalReplaceLine = op.replaceLine;
+        const std::wstring toFindToken = L"{LINEBREAK}";
+        size_t lb_pos = 0;
+        while ((lb_pos = finalReplaceLine.find(toFindToken, lb_pos)) != std::wstring::npos) {
+            finalReplaceLine.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
+            lb_pos += formatInfo.line_ending.length();
+        }
+        // --- END MODIFICATION ---
+
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::vector<std::wstring> new_lines;
         for (const auto& l : lines) {
             if (l.rfind(op.lineStart, 0) == 0) {
-                new_lines.push_back(op.replaceLine);
+                new_lines.push_back(finalReplaceLine);
             } else {
                 new_lines.push_back(l);
             }
@@ -1920,34 +1932,29 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 return op;
             }
         } 
-        // --- FIX #1 (Parser): Correctly parse iniwrite for section deletion. ---
         else if (_wcsicmp(key.c_str(), L"iniwrite") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() >= 2) { // Minimum 2 parts: path and section/key
+            if (parts.size() >= 2) { 
                 IniWriteOp op;
                 op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
                 op.section = parts[1];
 
-                // Check for section deletion syntax: "--SECTION"
                 if (op.section.rfind(L"--", 0) == 0) {
                     op.deleteSection = true;
                     op.section = op.section.substr(2);
-                    // For deletion, we only need 2 parts. Key and value are irrelevant.
                     op.key = L"";
                     op.value = L"";
                     return op;
                 }
 
-                // If not deleting a section, we need at least a key (3 parts total)
                 if (parts.size() >= 3) {
                     op.deleteSection = false;
                     op.key = parts[2];
-                    op.value = (parts.size() > 3) ? parts[3] : L"null"; // Value is optional (for key deletion)
+                    op.value = (parts.size() > 3) ? parts[3] : L"null"; 
                     return op;
                 }
             }
         }
-        // --- END FIX #1 (Parser) ---
         else if (_wcsicmp(key.c_str(), L"replace") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 3) {
