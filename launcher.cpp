@@ -1383,7 +1383,7 @@ namespace ActionHelpers {
         const std::wstring toFindToken = L"{LINEBREAK}";
         size_t lb_pos = 0;
         while ((lb_pos = finalReplaceLine.find(toFindToken, lb_pos)) != std::wstring::npos) {
-            finalReplaceLine.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
+            finalReplaceLine.replace(lb_pos, toFindToken.length(), finalReplaceLine);
             lb_pos += formatInfo.line_ending.length();
         }
 
@@ -2188,7 +2188,6 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
     }, opData);
 }
 
-// --- MODIFICATION: Created a reusable cleanup function ---
 void PerformFullCleanup(
     std::vector<AfterOperation>& afterOps,
     std::vector<StartupShutdownOperation>& shutdownOps,
@@ -2301,9 +2300,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        // --- MODIFICATION: Crash recovery logic starts here ---
-
-        // 1. Determine temp file path
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
         std::wstring tempFileDir = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         if (tempFileDir.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
@@ -2311,43 +2307,48 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
 
-        // 2. Parse INI sections early to have operations available for cleanup
         std::vector<BeforeOperation> beforeOps;
         std::vector<AfterOperation> afterOps;
         BackupThreadData backupData;
         ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
-        // 3. Check for temp file (previous crash)
         if (PathFileExistsW(tempFilePath.c_str())) {
-            // Build a list of all possible shutdown operations from the [Before] section
             std::vector<StartupShutdownOperation> shutdownOpsForCrash;
             for (auto& op : beforeOps) {
                 std::visit([&](auto& arg) {
                     using T = std::decay_t<decltype(arg)>;
-                    // Check if it's a startup/shutdown type (not a one-shot action)
                     if constexpr (!std::is_same_v<T, ActionOpData>) {
-                        // Assume the operation was performed and needs cleanup.
-                        // The shutdown logic is safe and checks for existence before acting.
-                        shutdownOpsForCrash.push_back({arg});
+                        StartupShutdownOperation ssOp{arg};
+                        // --- FIX: Manually set the "backup created" flags to true ---
+                        // This tells PerformShutdownOperation to attempt restoration,
+                        // as we assume a backup was made before the crash.
+                        std::visit([](auto& op_data) {
+                            if constexpr (requires { op_data.backupCreated; }) {
+                                op_data.backupCreated = true;
+                            }
+                            if constexpr (requires { op_data.destBackupCreated; }) {
+                                op_data.destBackupCreated = true;
+                            }
+                             if constexpr (requires { op_data.ruleCreated; }) {
+                                op_data.ruleCreated = true;
+                            }
+                        }, ssOp.data);
+                        // --- END FIX ---
+                        shutdownOpsForCrash.push_back(ssOp);
                     }
                 }, op.data);
             }
 
-            // Perform the full cleanup
             PerformFullCleanup(afterOps, shutdownOpsForCrash, variables);
 
-            // Wait according to crashwait setting
             std::wstring crashWaitStr = GetValueFromIniContent(iniContent, L"General", L"crashwait");
             int crashWaitTime = crashWaitStr.empty() ? 1000 : _wtoi(crashWaitStr.c_str());
             if (crashWaitTime > 0) {
                 Sleep(crashWaitTime);
             }
 
-            // Delete the temp file now that cleanup is done
             DeleteFileW(tempFilePath.c_str());
         }
-        // --- End of crash recovery logic ---
-
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw);
         variables[L"APPEXE"] = absoluteAppPath;
@@ -2362,22 +2363,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         variables[L"WORKDIR"] = finalWorkDir;
 
-        // This list will be populated by the actual execution of [Before] operations
         std::vector<StartupShutdownOperation> shutdownOps;
 
-        // --- MODIFICATION: Create the temp file before operations start ---
         {
             std::ofstream tempFile(tempFilePath);
             tempFile.close();
         }
 
-        // Execute [Before] section
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
                     ExecuteActionOperation(arg, variables);
-                } else { // It's a startup/shutdown type
+                } else { 
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
@@ -2503,10 +2501,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hBackupThread);
         }
 
-        // Perform normal cleanup using the refactored function
         PerformFullCleanup(afterOps, shutdownOps, variables);
 
-        // --- MODIFICATION: Delete the temp file on successful exit ---
         DeleteFileW(tempFilePath.c_str());
 
         CloseHandle(hMutex);
