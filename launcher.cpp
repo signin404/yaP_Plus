@@ -71,8 +71,10 @@ struct LinkOp {
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    bool sourceExistedBefore = false; // MODIFICATION: For new hardlink logic
     std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
+    // --- 修改点 2.1: 为LinkOp结构体添加新标志 ---
+    // 如果为true，清理时执行移动操作而非删除链接
+    bool performMoveOnCleanup = false;
 };
 
 struct FirewallOp {
@@ -1191,10 +1193,6 @@ namespace ActionHelpers {
         std::wstringstream ss(normalized_content);
         std::wstring line;
         while (std::getline(ss, line, L'\n')) {
-            // FIX: Strip trailing carriage return if present
-            if (!line.empty() && line.back() == L'\r') {
-                line.pop_back();
-            }
             lines.push_back(line);
         }
         if (normalized_content.empty() && !info.raw_bytes.empty()) lines.clear();
@@ -1367,10 +1365,6 @@ namespace ActionHelpers {
     }
 
     void HandleReplace(const ReplaceOp& op) {
-        if (!PathFileExistsW(op.path.c_str())) {
-            return;
-        }
-
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1407,10 +1401,6 @@ namespace ActionHelpers {
     }
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
-        if (!PathFileExistsW(op.path.c_str())) {
-            return;
-        }
-
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1748,22 +1738,29 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
-            wchar_t dirPath[MAX_PATH];
-            wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
-            PathRemoveFileSpecW(dirPath);
-            if (wcslen(dirPath) > 0) {
-                SHCreateDirectoryExW(NULL, dirPath, NULL);
-            }
-
-            arg.sourceExistedBefore = PathFileExistsW(arg.targetPath.c_str());
-
-            if (PathFileExistsW(arg.linkPath.c_str())) {
-                if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
-                    arg.backupCreated = true;
+            // --- 修改点 2.3: 修改LinkOp的启动逻辑 ---
+            if (arg.performMoveOnCleanup) {
+                // 如果目标不存在，是“首次运行”模式。
+                // 我们只需清理链接路径（如果存在），以便游戏创建新文件。
+                if (PathFileExistsW(arg.linkPath.c_str())) {
+                    if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
+                        arg.backupCreated = true;
+                    }
                 }
-            }
-            
-            if (arg.sourceExistedBefore) {
+            } else {
+                // 目标存在，执行原有的链接创建逻辑。
+                wchar_t dirPath[MAX_PATH];
+                wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
+                PathRemoveFileSpecW(dirPath);
+                if (wcslen(dirPath) > 0) {
+                    SHCreateDirectoryExW(NULL, dirPath, NULL);
+                }
+
+                if (PathFileExistsW(arg.linkPath.c_str())) {
+                    if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
+                        arg.backupCreated = true;
+                    }
+                }
                 if (arg.isHardlink) {
                     if (arg.isDirectory) {
                         CreateDirectoryW(arg.linkPath.c_str(), NULL);
@@ -1827,19 +1824,22 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 else RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
-            if (!arg.sourceExistedBefore) {
-                // New logic: Move the file/dir back to source
+            // --- 修改点 2.4: 修改LinkOp的清理逻辑 ---
+            if (arg.performMoveOnCleanup) {
+                // 在“首次运行”模式下，将链接路径新生成的文件/目录移动到目标路径
                 if (PathFileExistsW(arg.linkPath.c_str())) {
-                    wchar_t dirPath[MAX_PATH];
-                    wcscpy_s(dirPath, MAX_PATH, arg.targetPath.c_str());
-                    PathRemoveFileSpecW(dirPath);
-                    if (wcslen(dirPath) > 0) {
-                        SHCreateDirectoryExW(NULL, dirPath, NULL);
+                    // 确保目标父目录存在
+                    wchar_t targetDirPath[MAX_PATH];
+                    wcscpy_s(targetDirPath, MAX_PATH, arg.targetPath.c_str());
+                    PathRemoveFileSpecW(targetDirPath);
+                    if (wcslen(targetDirPath) > 0) {
+                        SHCreateDirectoryExW(NULL, targetDirPath, NULL);
                     }
+                    // 移动文件/目录
                     PerformFileSystemOperation(FO_MOVE, arg.linkPath, arg.targetPath);
                 }
             } else {
-                // Old logic: Delete the link and restore backup
+                // 在常规模式下，删除创建的链接
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdRecursiveLinks.rbegin(); it != arg.createdRecursiveLinks.rend(); ++it) {
                         DeleteFileW(it->first.c_str());
@@ -1849,9 +1849,11 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
                     else DeleteFileW(arg.linkPath.c_str());
                 }
-                if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
-                    MoveFileW(arg.backupPath.c_str(), arg.linkPath.c_str());
-                }
+            }
+
+            // 两种情况下，都需要恢复链接路径下原始的备份文件（如果存在）
+            if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
+                MoveFileW(arg.backupPath.c_str(), arg.linkPath.c_str());
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             if (arg.ruleCreated) {
@@ -2094,6 +2096,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
                     if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
                     l_op.backupPath = l_op.linkPath + L"_Backup";
+                    
+                    // --- 修改点 2.2: 解析hardlink时，检查目标是否存在 ---
+                    if (l_op.isHardlink) {
+                        if (!PathFileExistsW(l_op.targetPath.c_str())) {
+                            l_op.performMoveOnCleanup = true;
+                        }
+                    }
+
                     beforeOp.data = l_op; op_created = true;
                 }
             } else if (_wcsicmp(key.c_str(), L"firewall") == 0) {
@@ -2444,6 +2454,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<StartupShutdownOperation> shutdownOps;
 
         {
+            // --- 修改点 1: 在创建临时文件前，确保其父目录存在 ---
             wchar_t dirPath[MAX_PATH];
             wcscpy_s(dirPath, MAX_PATH, tempFilePath.c_str());
             PathRemoveFileSpecW(dirPath);
