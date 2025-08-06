@@ -1855,33 +1855,45 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             return DelayOp{_wtoi(value.c_str())};
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
             return KillProcessOp{value};
-        } else if (_wcsicmp(key.c_str(), L"+file") == 0) {
-            std::vector<std::wstring> parts;
-            std::wstring temp_value = value;
-            size_t pos = 0;
-            while (parts.size() < 4 && (pos = temp_value.find(delimiter)) != std::wstring::npos) {
-                parts.push_back(trim(temp_value.substr(0, pos)));
-                temp_value.erase(0, pos + delimiter.length());
+        } 
+        // --- MODIFICATION: Rewritten parsing for +file ---
+        else if (_wcsicmp(key.c_str(), L"+file") == 0) {
+            auto parts = split_string(value, delimiter);
+            if (parts.empty() || parts[0].empty()) {
+                return std::nullopt; // Path is mandatory
             }
-            parts.push_back(trim(temp_value));
 
-            if (parts.size() >= 2) {
-                CreateFileOp op;
-                op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                op.overwrite = (parts.size() > 2) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
-                std::wstring formatStr = (parts.size() > 3) ? parts[2] : L"win";
+            CreateFileOp op;
+            // 1. Set defaults
+            op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+            op.overwrite = false;
+            op.format = TextFormat::Win;
+            op.encoding = TextEncoding::UTF8;
+            op.content = L"";
+
+            // 2. Override with provided values
+            if (parts.size() > 1) { // Overwrite flag
+                op.overwrite = (_wcsicmp(parts[1].c_str(), L"overwrite") == 0);
+            }
+            if (parts.size() > 2) { // Format
+                std::wstring formatStr = parts[2];
                 if (_wcsicmp(formatStr.c_str(), L"unix") == 0) op.format = TextFormat::Unix;
                 else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) op.format = TextFormat::Mac;
-                else op.format = TextFormat::Win;
-                std::wstring encodingStr = (parts.size() > 4) ? parts[3] : L"utf8";
+            }
+            if (parts.size() > 3) { // Encoding
+                std::wstring encodingStr = parts[3];
                 if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) op.encoding = TextEncoding::UTF8_BOM;
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) op.encoding = TextEncoding::UTF16_LE;
                 else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) op.encoding = TextEncoding::UTF16_BE;
-                else op.encoding = TextEncoding::UTF8;
-                op.content = parts.back();
-                return op;
+                else if (_wcsicmp(encodingStr.c_str(), L"ansi") == 0) op.encoding = TextEncoding::ANSI;
             }
-        } else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
+            if (parts.size() > 4) { // Content
+                op.content = parts[4];
+            }
+            return op;
+        }
+        // --- END MODIFICATION ---
+        else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{ExpandVariables(value, variables)};
         } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
@@ -2319,7 +2331,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     using T = std::decay_t<decltype(arg)>;
                     if constexpr (!std::is_same_v<T, ActionOpData>) {
                         StartupShutdownOperation ssOp{arg};
-                        // --- FIX: C++17 compatible way to set flags for restoration ---
                         std::visit([](auto& op_data) {
                             using OpType = std::decay_t<decltype(op_data)>;
                             if constexpr (std::is_same_v<OpType, FileOp>) {
@@ -2332,7 +2343,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                                 op_data.ruleCreated = true;
                             }
                         }, ssOp.data);
-                        // --- END FIX ---
                         shutdownOpsForCrash.push_back(ssOp);
                     }
                 }, op.data);
