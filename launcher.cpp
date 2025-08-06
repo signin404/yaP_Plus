@@ -397,8 +397,6 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-// --- MODIFICATION: Replaced CreateProcess with ShellExecuteEx ---
-// This allows running any file type with its system-associated program (e.g., .vbs, .ps1).
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
@@ -417,9 +415,9 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     SHELLEXECUTEINFOW sei;
     ZeroMemory(&sei, sizeof(sei));
     sei.cbSize = sizeof(SHELLEXECUTEINFOW);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS; // Needed to get a process handle for waiting
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
     sei.hwnd = NULL;
-    sei.lpVerb = L"open"; // The default action
+    sei.lpVerb = L"open";
     sei.lpFile = path.c_str();
     sei.lpParameters = args.empty() ? NULL : args.c_str();
     sei.lpDirectory = finalWorkDir.c_str();
@@ -433,13 +431,11 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
         if (wait) {
             WaitForSingleObject(sei.hProcess, INFINITE);
         }
-        // Always close the handle that ShellExecuteEx returns
         CloseHandle(sei.hProcess);
     }
 
     return true;
 }
-// --- END MODIFICATION ---
 
 
 void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"") {
@@ -1808,9 +1804,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         if (_wcsicmp(key.c_str(), L"run") == 0) {
             auto parts = split_string(value, delimiter);
             if (!parts.empty() && !parts[0].empty()) {
-                RunOp op; op.programPath = ExpandVariables(parts[0], variables);
+                RunOp op;
+                op.programPath = ExpandVariables(parts[0], variables);
                 op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
+                // --- MODIFICATION: Expand variables in command line arguments ---
+                op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? ExpandVariables(parts[2], variables) : L"";
+                // --- END MODIFICATION ---
                 op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
                 return op;
             }
@@ -2427,26 +2426,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
-        std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
-
-        if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
-            MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
-        } else {
-            while (true) {
-                DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
-                if (dwResult == WAIT_OBJECT_0) break;
-                else if (dwResult == WAIT_OBJECT_0 + 1) {
-                    MSG msg;
-                    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                        TranslateMessage(&msg);
-                        DispatchMessage(&msg);
-                    }
-                }
-                 else break;
-            }
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+        
+        // Use the main application path for ShellExecute
+        if (!ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false)) {
+             MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
         }
 
         std::vector<std::wstring> waitProcesses;
