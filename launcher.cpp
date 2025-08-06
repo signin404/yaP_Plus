@@ -1350,7 +1350,6 @@ namespace ActionHelpers {
             if (i < lines.size() - 1) content += L"\n"; // Use normalized separator
         }
 
-        // --- MODIFICATION: Add support for {LINEBREAK} ---
         std::wstring finalReplaceText = op.replaceText;
         const std::wstring toFindToken = L"{LINEBREAK}";
         size_t lb_pos = 0;
@@ -1358,7 +1357,6 @@ namespace ActionHelpers {
             finalReplaceText.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
             lb_pos += formatInfo.line_ending.length();
         }
-        // --- END MODIFICATION ---
 
         size_t pos = 0;
         while ((pos = content.find(op.findText, pos)) != std::wstring::npos) {
@@ -1381,7 +1379,6 @@ namespace ActionHelpers {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
-        // --- MODIFICATION: Add support for {LINEBREAK} ---
         std::wstring finalReplaceLine = op.replaceLine;
         const std::wstring toFindToken = L"{LINEBREAK}";
         size_t lb_pos = 0;
@@ -1389,7 +1386,6 @@ namespace ActionHelpers {
             finalReplaceLine.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
             lb_pos += formatInfo.line_ending.length();
         }
-        // --- END MODIFICATION ---
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::vector<std::wstring> new_lines;
@@ -2192,6 +2188,42 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
     }, opData);
 }
 
+// --- MODIFICATION: Created a reusable cleanup function ---
+void PerformFullCleanup(
+    std::vector<AfterOperation>& afterOps,
+    std::vector<StartupShutdownOperation>& shutdownOps,
+    std::map<std::wstring, std::wstring>& variables
+) {
+    bool restoreMarkerFound = false;
+    for (const auto& op : afterOps) {
+        if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
+            restoreMarkerFound = true;
+            break;
+        }
+    }
+
+    if (restoreMarkerFound) {
+        for (auto& op : afterOps) {
+            if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
+                for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
+                    PerformShutdownOperation(it->data);
+                }
+            } else {
+                ActionOperation actionOp = std::get<ActionOperation>(op.data);
+                ExecuteActionOperation(actionOp.data, variables);
+            }
+        }
+    } else {
+        for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
+            PerformShutdownOperation(it->data);
+        }
+        for (auto& op : afterOps) {
+            ActionOperation actionOp = std::get<ActionOperation>(op.data);
+            ExecuteActionOperation(actionOp.data, variables);
+        }
+    }
+}
+
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& base_variables) {
@@ -2268,6 +2300,54 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CoUninitialize();
             return 1;
         }
+        
+        // --- MODIFICATION: Crash recovery logic starts here ---
+
+        // 1. Determine temp file path
+        std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
+        std::wstring tempFileDir = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
+        if (tempFileDir.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
+            tempFileDir = variables[L"YAPROOT"];
+        }
+        std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
+
+        // 2. Parse INI sections early to have operations available for cleanup
+        std::vector<BeforeOperation> beforeOps;
+        std::vector<AfterOperation> afterOps;
+        BackupThreadData backupData;
+        ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
+
+        // 3. Check for temp file (previous crash)
+        if (PathFileExistsW(tempFilePath.c_str())) {
+            // Build a list of all possible shutdown operations from the [Before] section
+            std::vector<StartupShutdownOperation> shutdownOpsForCrash;
+            for (auto& op : beforeOps) {
+                std::visit([&](auto& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+                    // Check if it's a startup/shutdown type (not a one-shot action)
+                    if constexpr (!std::is_same_v<T, ActionOpData>) {
+                        // Assume the operation was performed and needs cleanup.
+                        // The shutdown logic is safe and checks for existence before acting.
+                        shutdownOpsForCrash.push_back({arg});
+                    }
+                }, op.data);
+            }
+
+            // Perform the full cleanup
+            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables);
+
+            // Wait according to crashwait setting
+            std::wstring crashWaitStr = GetValueFromIniContent(iniContent, L"General", L"crashwait");
+            int crashWaitTime = crashWaitStr.empty() ? 1000 : _wtoi(crashWaitStr.c_str());
+            if (crashWaitTime > 0) {
+                Sleep(crashWaitTime);
+            }
+
+            // Delete the temp file now that cleanup is done
+            DeleteFileW(tempFilePath.c_str());
+        }
+        // --- End of crash recovery logic ---
+
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw);
         variables[L"APPEXE"] = absoluteAppPath;
@@ -2282,11 +2362,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         variables[L"WORKDIR"] = finalWorkDir;
 
-        std::vector<BeforeOperation> beforeOps;
-        std::vector<AfterOperation> afterOps;
+        // This list will be populated by the actual execution of [Before] operations
         std::vector<StartupShutdownOperation> shutdownOps;
-        BackupThreadData backupData;
-        ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
+
+        // --- MODIFICATION: Create the temp file before operations start ---
+        {
+            std::ofstream tempFile(tempFilePath);
+            tempFile.close();
+        }
 
         // Execute [Before] section
         for (auto& op : beforeOps) {
@@ -2420,34 +2503,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hBackupThread);
         }
 
-        bool restoreMarkerFound = false;
-        for (const auto& op : afterOps) {
-            if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
-                restoreMarkerFound = true;
-                break;
-            }
-        }
+        // Perform normal cleanup using the refactored function
+        PerformFullCleanup(afterOps, shutdownOps, variables);
 
-        if (restoreMarkerFound) {
-            for (auto& op : afterOps) {
-                if (std::holds_alternative<RestoreMarkerOp>(op.data)) {
-                    for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
-                        PerformShutdownOperation(it->data);
-                    }
-                } else {
-                    ActionOperation actionOp = std::get<ActionOperation>(op.data);
-                    ExecuteActionOperation(actionOp.data, variables);
-                }
-            }
-        } else {
-            for (auto it = shutdownOps.rbegin(); it != shutdownOps.rend(); ++it) {
-                PerformShutdownOperation(it->data);
-            }
-            for (auto& op : afterOps) {
-                ActionOperation actionOp = std::get<ActionOperation>(op.data);
-                ExecuteActionOperation(actionOp.data, variables);
-            }
-        }
+        // --- MODIFICATION: Delete the temp file on successful exit ---
+        DeleteFileW(tempFilePath.c_str());
 
         CloseHandle(hMutex);
         CoUninitialize();
