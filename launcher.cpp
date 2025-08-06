@@ -170,8 +170,8 @@ struct CreateRegKeyOp {
 struct CreateRegValueOp {
     std::wstring keyPath;
     std::wstring valueName;
-    std::wstring valueData;
     std::wstring typeStr;
+    std::wstring valueData;
 };
 
 // --- NEW: Structures for new operations ---
@@ -1333,7 +1333,7 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
-    void HandleReplace(const std::wstring& op) {
+    void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1807,7 +1807,9 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 RunOp op;
                 op.programPath = ExpandVariables(parts[0], variables);
                 op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
+                // --- MODIFICATION: Expand variables in command line arguments ---
                 op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? ExpandVariables(parts[2], variables) : L"";
+                // --- END MODIFICATION ---
                 op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
                 return op;
             }
@@ -1879,17 +1881,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{ExpandVariables(value, variables)};
-        } 
-        // --- FIX: Corrected the order of arguments for CreateRegValueOp ---
-        else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
+        } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 4) {
-                // Correct mapping: parts[2] is type, parts[3] is data.
-                // Struct order: keyPath, valueName, valueData, typeStr.
-                return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[3], parts[2]};
+                return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[2], parts[3]};
             }
         }
-        // --- END FIX ---
         else if (_wcsicmp(key.c_str(), L"<-dir") == 0 || _wcsicmp(key.c_str(), L"->dir") == 0 || _wcsicmp(key.c_str(), L"<-file") == 0 || _wcsicmp(key.c_str(), L"->file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 2) {
@@ -2427,8 +2424,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
+        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
         
+        // Use the main application path for ShellExecute
         if (!ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false)) {
              MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
         }
