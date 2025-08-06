@@ -397,51 +397,49 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
+// --- MODIFICATION: Replaced CreateProcess with ShellExecuteEx ---
+// This allows running any file type with its system-associated program (e.g., .vbs, .ps1).
 bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
     if (path.empty() || !PathFileExistsW(path.c_str())) {
         return false;
     }
 
-    std::wstring commandLine = L"\"" + path + L"\" " + args;
-    std::vector<wchar_t> cmdBuffer(commandLine.begin(), commandLine.end());
-    cmdBuffer.push_back(0);
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
-
-    DWORD creationFlags = 0;
-
-    if (hide) {
-        si.dwFlags |= STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        creationFlags |= CREATE_NO_WINDOW;
-    }
-
-    const wchar_t* finalWorkDir = NULL;
+    std::wstring finalWorkDir;
     std::wstring exeDir;
     if (!workDir.empty() && PathIsDirectoryW(workDir.c_str())) {
-        finalWorkDir = workDir.c_str();
+        finalWorkDir = workDir;
     } else {
         exeDir = path;
         PathRemoveFileSpecW(&exeDir[0]);
-        finalWorkDir = exeDir.c_str();
+        finalWorkDir = exeDir;
     }
 
-    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, creationFlags, NULL, finalWorkDir, &si, &pi)) {
+    SHELLEXECUTEINFOW sei;
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(SHELLEXECUTEINFOW);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS; // Needed to get a process handle for waiting
+    sei.hwnd = NULL;
+    sei.lpVerb = L"open"; // The default action
+    sei.lpFile = path.c_str();
+    sei.lpParameters = args.empty() ? NULL : args.c_str();
+    sei.lpDirectory = finalWorkDir.c_str();
+    sei.nShow = hide ? SW_HIDE : SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&sei)) {
         return false;
     }
 
-    if (wait) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
+    if (sei.hProcess) {
+        if (wait) {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+        }
+        // Always close the handle that ShellExecuteEx returns
+        CloseHandle(sei.hProcess);
     }
 
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
     return true;
 }
+// --- END MODIFICATION ---
 
 
 void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"") {
@@ -1856,43 +1854,32 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
             return KillProcessOp{value};
         } 
-        // --- MODIFICATION: Rewritten parsing for +file ---
         else if (_wcsicmp(key.c_str(), L"+file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.empty() || parts[0].empty()) {
-                return std::nullopt; // Path is mandatory
+                return std::nullopt;
             }
 
             CreateFileOp op;
-            // 1. Set defaults
             op.path = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-            op.overwrite = false;
-            op.format = TextFormat::Win;
-            op.encoding = TextEncoding::UTF8;
-            op.content = L"";
+            op.overwrite = (parts.size() > 1) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
+            
+            std::wstring formatStr = (parts.size() > 2) ? parts[2] : L"win";
+            if (_wcsicmp(formatStr.c_str(), L"unix") == 0) op.format = TextFormat::Unix;
+            else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) op.format = TextFormat::Mac;
+            else op.format = TextFormat::Win;
 
-            // 2. Override with provided values
-            if (parts.size() > 1) { // Overwrite flag
-                op.overwrite = (_wcsicmp(parts[1].c_str(), L"overwrite") == 0);
-            }
-            if (parts.size() > 2) { // Format
-                std::wstring formatStr = parts[2];
-                if (_wcsicmp(formatStr.c_str(), L"unix") == 0) op.format = TextFormat::Unix;
-                else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) op.format = TextFormat::Mac;
-            }
-            if (parts.size() > 3) { // Encoding
-                std::wstring encodingStr = parts[3];
-                if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) op.encoding = TextEncoding::UTF8_BOM;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) op.encoding = TextEncoding::UTF16_LE;
-                else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) op.encoding = TextEncoding::UTF16_BE;
-                else if (_wcsicmp(encodingStr.c_str(), L"ansi") == 0) op.encoding = TextEncoding::ANSI;
-            }
-            if (parts.size() > 4) { // Content
-                op.content = parts[4];
-            }
+            std::wstring encodingStr = (parts.size() > 3) ? parts[3] : L"utf8";
+            if (_wcsicmp(encodingStr.c_str(), L"utf8bom") == 0) op.encoding = TextEncoding::UTF8_BOM;
+            else if (_wcsicmp(encodingStr.c_str(), L"utf16le") == 0) op.encoding = TextEncoding::UTF16_LE;
+            else if (_wcsicmp(encodingStr.c_str(), L"utf16be") == 0) op.encoding = TextEncoding::UTF16_BE;
+            else if (_wcsicmp(encodingStr.c_str(), L"ansi") == 0) op.encoding = TextEncoding::ANSI;
+            else op.encoding = TextEncoding::UTF8;
+
+            op.content = (parts.size() > 4) ? parts[4] : L"";
+            
             return op;
         }
-        // --- END MODIFICATION ---
         else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{ExpandVariables(value, variables)};
         } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
