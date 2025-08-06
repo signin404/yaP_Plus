@@ -1,3 +1,4 @@
+#include <windows.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -309,13 +310,34 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-std::wstring ResolveToAbsolutePath(const std::wstring& path) {
-    if (path.empty()) return L"";
-    wchar_t absolutePath[MAX_PATH];
-    if (GetFullPathNameW(path.c_str(), MAX_PATH, absolutePath, NULL) == 0) {
-        return path;
+// --- 修改点 1: 重写核心路径解析函数 ---
+// 使其不再依赖工作目录，而是始终以YAPROOT为基准解析相对路径。
+std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std::wstring, std::wstring>& variables) {
+    if (path.empty()) {
+        return L"";
     }
-    return absolutePath;
+
+    // 如果路径已经是绝对路径（例如 "C:\..." 或 "\\server..."），则直接处理。
+    if (!PathIsRelativeW(path.c_str())) {
+        wchar_t canonicalPath[MAX_PATH];
+        if (GetFullPathNameW(path.c_str(), MAX_PATH, canonicalPath, NULL) != 0) {
+            return canonicalPath; // 使用GetFullPathName来规范化路径（例如处理 ".."）
+        }
+        return path; // 出错则返回原始路径
+    }
+
+    // 如果路径是相对路径，则以YAPROOT为基准进行拼接。
+    auto it = variables.find(L"YAPROOT");
+    if (it != variables.end()) {
+        const std::wstring& yapRoot = it->second;
+        wchar_t combinedPath[MAX_PATH];
+        if (PathCombineW(combinedPath, yapRoot.c_str(), path.c_str())) {
+            return combinedPath;
+        }
+    }
+
+    // 如果YAPROOT未找到（理论上不应发生）或拼接失败，则返回原始路径。
+    return path;
 }
 
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
@@ -1521,12 +1543,13 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
+// --- 修改点 2: 更新所有调用点以传递 `variables` ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     const std::wstring delimiter = L" :: ";
     size_t separatorPos = entry.find(delimiter);
     if (separatorPos == std::wstring::npos) return {};
-    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables));
-    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + delimiter.length())), variables));
+    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables), variables);
+    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + delimiter.length())), variables), variables);
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
@@ -1945,8 +1968,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } 
         else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
-            // --- 修改点: 允许省略值数据来创建空值 ---
-            // 允许3个或4个部分。如果只有3个，则值数据视为空字符串。
             if (parts.size() >= 3) {
                 std::wstring valueData = (parts.size() > 3) ? parts[3] : L"";
                 return CreateRegValueOp{parts[0], parts[1], valueData, parts[2]};
@@ -2081,8 +2102,9 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 LinkOp l_op; l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
-                    l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
-                    l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
+                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+                    l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
+                    l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
                     l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
                     if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
                     l_op.backupPath = l_op.linkPath + L"_Backup";
@@ -2106,7 +2128,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     if (_wcsicmp(parts[2].c_str(), L"allow") == 0) f_op.action = NET_FW_ACTION_ALLOW;
                     else if (_wcsicmp(parts[2].c_str(), L"block") == 0) f_op.action = NET_FW_ACTION_BLOCK;
                     else continue;
-                    f_op.appPath = ResolveToAbsolutePath(ExpandVariables(parts[3], variables));
+                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+                    f_op.appPath = ResolveToAbsolutePath(ExpandVariables(parts[3], variables), variables);
                     beforeOp.data = f_op; op_created = true;
                 }
             } else if (_wcsicmp(key.c_str(), L"(regvalue)") == 0 || _wcsicmp(key.c_str(), L"(regkey)") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 || _wcsicmp(key.c_str(), L"regkey") == 0) {
@@ -2116,7 +2139,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     auto parts = split_string(value, delimiter);
                     if (!parts.empty()) {
                         regPathRaw = parts[0];
-                        if (parts.size() > 1) r_op.filePath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables));
+                        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+                        if (parts.size() > 1) r_op.filePath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
                     }
                 }
                 if (ParseRegistryPath(ExpandVariables(regPathRaw, variables), r_op.isKey, r_op.hRootKey, r_op.rootKeyStr, r_op.subKey, r_op.valueName)) {
@@ -2125,16 +2149,18 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             } else if (_wcsicmp(key.c_str(), L"(file)") == 0 || _wcsicmp(key.c_str(), L"(dir)") == 0) {
                 RestoreOnlyFileOp ro_op; ro_op.isDirectory = (_wcsicmp(key.c_str(), L"(dir)") == 0);
-                ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables));
+                // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+                ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables), variables);
                 ro_op.backupPath = ro_op.targetPath + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
             } else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
                 FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
-                    f_op.destPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables));
+                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+                    f_op.destPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     std::wstring sourceRaw = parts[1];
-                    std::wstring expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables));
+                    std::wstring expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables), variables);
                     if (f_op.isDirectory) f_op.sourcePath = expandedSource;
                     else {
                         if (sourceRaw.back() == L'\\') f_op.sourcePath = expandedSource + PathFindFileNameW(f_op.destPath.c_str());
@@ -2179,6 +2205,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
+// --- 修改点 2: 更新所有调用点以传递 `variables` ---
 void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -2186,47 +2213,47 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             std::wstring finalPath = ExpandVariables(arg.programPath, variables);
             std::wstring finalCmd = ExpandVariables(arg.commandLine, variables);
             std::wstring finalDir = ExpandVariables(arg.workDir, variables);
-            ExecuteProcess(ResolveToAbsolutePath(finalPath), finalCmd, ResolveToAbsolutePath(finalDir), arg.wait, false);
+            ExecuteProcess(ResolveToAbsolutePath(finalPath, variables), finalCmd, ResolveToAbsolutePath(finalDir, variables), arg.wait, false);
         } else if constexpr (std::is_same_v<T, BatchOp>) {
             std::wstring finalPath = ExpandVariables(arg.batchPath, variables);
             wchar_t systemPath[MAX_PATH];
             GetSystemDirectoryW(systemPath, MAX_PATH);
             std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
-            std::wstring args = L"/c \"" + ResolveToAbsolutePath(finalPath) + L"\"";
+            std::wstring args = L"/c \"" + ResolveToAbsolutePath(finalPath, variables) + L"\"";
             ExecuteProcess(cmdPath, args, L"", arg.wait, true);
         } else if constexpr (std::is_same_v<T, RegImportOp>) {
             std::wstring finalPath = ExpandVariables(arg.regPath, variables);
-            ImportRegistryFile(ResolveToAbsolutePath(finalPath));
+            ImportRegistryFile(ResolveToAbsolutePath(finalPath, variables));
         } else if constexpr (std::is_same_v<T, RegDllOp>) {
             std::wstring finalPath = ExpandVariables(arg.dllPath, variables);
             wchar_t systemPath[MAX_PATH];
             GetSystemDirectoryW(systemPath, MAX_PATH);
             std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
-            std::wstring args = L"/s \"" + ResolveToAbsolutePath(finalPath) + L"\"";
+            std::wstring args = L"/s \"" + ResolveToAbsolutePath(finalPath, variables) + L"\"";
             if (arg.unregister) {
                 args = L"/u " + args;
             }
             ExecuteProcess(regsvrPath, args, L"", true, true);
         } else if constexpr (std::is_same_v<T, DeleteFileOp>) {
             std::wstring finalPath = ExpandVariables(arg.pathPattern, variables);
-            ActionHelpers::HandleDeleteFile(ResolveToAbsolutePath(finalPath));
+            ActionHelpers::HandleDeleteFile(ResolveToAbsolutePath(finalPath, variables));
         } else if constexpr (std::is_same_v<T, DeleteDirOp>) {
             std::wstring finalPath = ExpandVariables(arg.pathPattern, variables);
-            ActionHelpers::HandleDeleteDir(ResolveToAbsolutePath(finalPath), arg.ifEmpty);
+            ActionHelpers::HandleDeleteDir(ResolveToAbsolutePath(finalPath, variables), arg.ifEmpty);
         } else if constexpr (std::is_same_v<T, DeleteRegKeyOp>) {
             ActionHelpers::HandleDeleteRegKey(ExpandVariables(arg.keyPattern, variables), arg.ifEmpty);
         } else if constexpr (std::is_same_v<T, DeleteRegValueOp>) {
             ActionHelpers::HandleDeleteRegValue(ExpandVariables(arg.keyPattern, variables), ExpandVariables(arg.valuePattern, variables));
         } else if constexpr (std::is_same_v<T, CreateDirOp>) {
             std::wstring finalPath = ExpandVariables(arg.path, variables);
-            SHCreateDirectoryExW(NULL, ResolveToAbsolutePath(finalPath).c_str(), NULL);
+            SHCreateDirectoryExW(NULL, ResolveToAbsolutePath(finalPath, variables).c_str(), NULL);
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             ActionHelpers::HandleKillProcess(ExpandVariables(arg.processPattern, variables));
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables));
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
             mutable_op.content = ExpandVariables(arg.content, variables);
             ActionHelpers::HandleCreateFile(mutable_op);
         } else if constexpr (std::is_same_v<T, CreateRegKeyOp>) {
@@ -2240,27 +2267,27 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         }
         else if constexpr (std::is_same_v<T, CopyMoveOp>) {
             CopyMoveOp mutable_op = arg;
-            mutable_op.sourcePath = ResolveToAbsolutePath(ExpandVariables(arg.sourcePath, variables));
-            mutable_op.destPath = ResolveToAbsolutePath(ExpandVariables(arg.destPath, variables));
+            mutable_op.sourcePath = ResolveToAbsolutePath(ExpandVariables(arg.sourcePath, variables), variables);
+            mutable_op.destPath = ResolveToAbsolutePath(ExpandVariables(arg.destPath, variables), variables);
             ActionHelpers::HandleCopyMove(mutable_op);
         } else if constexpr (std::is_same_v<T, AttributesOp>) {
             AttributesOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables));
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
             ActionHelpers::HandleAttributes(mutable_op);
         } else if constexpr (std::is_same_v<T, IniWriteOp>) {
             IniWriteOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables));
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
             mutable_op.value = ExpandVariables(arg.value, variables);
             ActionHelpers::HandleIniWrite(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceOp>) {
             ReplaceOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables));
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
             mutable_op.findText = ExpandVariables(arg.findText, variables);
             mutable_op.replaceText = ExpandVariables(arg.replaceText, variables);
             ActionHelpers::HandleReplace(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceLineOp>) {
             ReplaceLineOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables));
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
             mutable_op.lineStart = ExpandVariables(arg.lineStart, variables);
             mutable_op.replaceLine = ExpandVariables(arg.replaceLine, variables);
             ActionHelpers::HandleReplaceLine(mutable_op);
@@ -2305,14 +2332,14 @@ void PerformFullCleanup(
 
 
 // --- Main Application Logic ---
-void LaunchApplication(const std::wstring& iniContent, const std::map<std::wstring, std::wstring>& base_variables) {
-    std::map<std::wstring, std::wstring> variables = base_variables;
+// --- 修改点 2: 更新所有调用点以传递 `variables` ---
+void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
     if (appPathRaw.empty()) return;
 
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
-    ExecuteProcess(ResolveToAbsolutePath(appPathRaw), commandLine, ResolveToAbsolutePath(workDirRaw), false, false);
+    ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
@@ -2380,22 +2407,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw);
+        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+        std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
         variables[L"EXEPATH"] = appDir;
         std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
-        std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw);
+        std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
         if (finalWorkDir.empty() || !PathIsDirectoryW(finalWorkDir.c_str())) {
             finalWorkDir = appDir;
         }
         variables[L"WORKDIR"] = finalWorkDir;
 
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
-        std::wstring tempFileDir = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
-        if (tempFileDir.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
+        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
+        std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
+        std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
+        if (tempFileDirRaw.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
             tempFileDir = variables[L"YAPROOT"];
         }
         std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
