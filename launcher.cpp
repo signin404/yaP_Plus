@@ -560,6 +560,14 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
 }
 
 bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
+    // MODIFICATION: Ensure parent directory exists before writing file
+    wchar_t dirPath[MAX_PATH];
+    wcscpy_s(dirPath, MAX_PATH, filePath.c_str());
+    PathRemoveFileSpecW(dirPath);
+    if (wcslen(dirPath) > 0) {
+        SHCreateDirectoryExW(NULL, dirPath, NULL);
+    }
+
     std::wstring fullKeyPath = rootKeyStr + L"\\" + subKey;
     return RunSimpleCommand(L"reg export \"" + fullKeyPath + L"\" \"" + filePath + L"\" /y");
 }
@@ -579,6 +587,14 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         return false;
     }
     RegCloseKey(hKey);
+
+    // MODIFICATION: Ensure parent directory exists before writing file
+    wchar_t dirPath[MAX_PATH];
+    wcscpy_s(dirPath, MAX_PATH, filePath.c_str());
+    PathRemoveFileSpecW(dirPath);
+    if (wcslen(dirPath) > 0) {
+        SHCreateDirectoryExW(NULL, dirPath, NULL);
+    }
 
     std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
@@ -852,14 +868,12 @@ namespace ActionHelpers {
             return;
         }
 
-        // --- MODIFICATION: Automatically create parent directories ---
         wchar_t dirPath[MAX_PATH];
         wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
         PathRemoveFileSpecW(dirPath);
         if (wcslen(dirPath) > 0) {
             SHCreateDirectoryExW(NULL, dirPath, NULL);
         }
-        // --- END MODIFICATION ---
 
         std::wstring lineBreak;
         if (op.format == TextFormat::Unix) lineBreak = L"\n";
@@ -988,6 +1002,14 @@ namespace ActionHelpers {
     void HandleCopyMove(const CopyMoveOp& op) {
         if (!op.overwrite && PathFileExistsW(op.destPath.c_str())) {
             return; // Skip if destination exists and no overwrite flag
+        }
+
+        // MODIFICATION: Ensure parent directory exists before copying/moving
+        wchar_t dirPath[MAX_PATH];
+        wcscpy_s(dirPath, MAX_PATH, op.destPath.c_str());
+        PathRemoveFileSpecW(dirPath);
+        if (wcslen(dirPath) > 0) {
+            SHCreateDirectoryExW(NULL, dirPath, NULL);
         }
 
         // Backup existing item at destination if we are overwriting
@@ -1243,12 +1265,22 @@ namespace ActionHelpers {
     }
 
     void HandleIniWrite(const IniWriteOp& op) {
-        if (!PathFileExistsW(op.path.c_str())) {
-            return;
+        // MODIFICATION: Ensure parent directory exists before writing file
+        wchar_t dirPath[MAX_PATH];
+        wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
+        PathRemoveFileSpecW(dirPath);
+        if (wcslen(dirPath) > 0) {
+            SHCreateDirectoryExW(NULL, dirPath, NULL);
         }
-
+        
         FileContentInfo formatInfo;
-        if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
+        bool file_exists = PathFileExistsW(op.path.c_str());
+        if (file_exists) {
+            if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
+        } else {
+            formatInfo.encoding = TextEncoding::UTF8;
+            formatInfo.line_ending = L"\r\n";
+        }
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
 
@@ -1343,6 +1375,14 @@ namespace ActionHelpers {
     }
 
     void HandleReplace(const ReplaceOp& op) {
+        // MODIFICATION: Ensure parent directory exists before writing file
+        wchar_t dirPath[MAX_PATH];
+        wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
+        PathRemoveFileSpecW(dirPath);
+        if (wcslen(dirPath) > 0) {
+            SHCreateDirectoryExW(NULL, dirPath, NULL);
+        }
+
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1379,6 +1419,14 @@ namespace ActionHelpers {
     }
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
+        // MODIFICATION: Ensure parent directory exists before writing file
+        wchar_t dirPath[MAX_PATH];
+        wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
+        PathRemoveFileSpecW(dirPath);
+        if (wcslen(dirPath) > 0) {
+            SHCreateDirectoryExW(NULL, dirPath, NULL);
+        }
+
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1688,6 +1736,14 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
+            // MODIFICATION: Ensure parent directory exists
+            wchar_t dirPath[MAX_PATH];
+            wcscpy_s(dirPath, MAX_PATH, arg.destPath.c_str());
+            PathRemoveFileSpecW(dirPath);
+            if (wcslen(dirPath) > 0) {
+                SHCreateDirectoryExW(NULL, dirPath, NULL);
+            }
+
             if (PathFileExistsW(arg.destPath.c_str())) {
                 MoveFileW(arg.destPath.c_str(), arg.destBackupPath.c_str());
                 arg.destBackupCreated = true;
@@ -1709,6 +1765,14 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
+            // MODIFICATION: Ensure parent directory exists for the link
+            wchar_t dirPath[MAX_PATH];
+            wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
+            PathRemoveFileSpecW(dirPath);
+            if (wcslen(dirPath) > 0) {
+                SHCreateDirectoryExW(NULL, dirPath, NULL);
+            }
+
             if (PathFileExistsW(arg.linkPath.c_str())) {
                 if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
                     arg.backupCreated = true;
@@ -2369,6 +2433,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<StartupShutdownOperation> shutdownOps;
 
         {
+            // MODIFICATION: Ensure parent directory exists for temp file
+            wchar_t dirPath[MAX_PATH];
+            wcscpy_s(dirPath, MAX_PATH, tempFilePath.c_str());
+            PathRemoveFileSpecW(dirPath);
+            if (wcslen(dirPath) > 0) {
+                SHCreateDirectoryExW(NULL, dirPath, NULL);
+            }
             std::ofstream tempFile(tempFilePath);
             tempFile.close();
         }
