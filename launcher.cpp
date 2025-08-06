@@ -1383,7 +1383,7 @@ namespace ActionHelpers {
         const std::wstring toFindToken = L"{LINEBREAK}";
         size_t lb_pos = 0;
         while ((lb_pos = finalReplaceLine.find(toFindToken, lb_pos)) != std::wstring::npos) {
-            finalReplaceLine.replace(lb_pos, toFindToken.length(), finalReplaceLine);
+            finalReplaceLine.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
             lb_pos += formatInfo.line_ending.length();
         }
 
@@ -2319,17 +2319,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     using T = std::decay_t<decltype(arg)>;
                     if constexpr (!std::is_same_v<T, ActionOpData>) {
                         StartupShutdownOperation ssOp{arg};
-                        // --- FIX: Manually set the "backup created" flags to true ---
-                        // This tells PerformShutdownOperation to attempt restoration,
-                        // as we assume a backup was made before the crash.
+                        // --- FIX: C++17 compatible way to set flags for restoration ---
                         std::visit([](auto& op_data) {
-                            if constexpr (requires { op_data.backupCreated; }) {
-                                op_data.backupCreated = true;
-                            }
-                            if constexpr (requires { op_data.destBackupCreated; }) {
+                            using OpType = std::decay_t<decltype(op_data)>;
+                            if constexpr (std::is_same_v<OpType, FileOp>) {
                                 op_data.destBackupCreated = true;
-                            }
-                             if constexpr (requires { op_data.ruleCreated; }) {
+                            } else if constexpr (std::is_same_v<OpType, RestoreOnlyFileOp> ||
+                                               std::is_same_v<OpType, RegistryOp> ||
+                                               std::is_same_v<OpType, LinkOp>) {
+                                op_data.backupCreated = true;
+                            } else if constexpr (std::is_same_v<OpType, FirewallOp>) {
                                 op_data.ruleCreated = true;
                             }
                         }, ssOp.data);
