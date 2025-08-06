@@ -852,6 +852,15 @@ namespace ActionHelpers {
             return;
         }
 
+        // --- MODIFICATION: Automatically create parent directories ---
+        wchar_t dirPath[MAX_PATH];
+        wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
+        PathRemoveFileSpecW(dirPath);
+        if (wcslen(dirPath) > 0) {
+            SHCreateDirectoryExW(NULL, dirPath, NULL);
+        }
+        // --- END MODIFICATION ---
+
         std::wstring lineBreak;
         if (op.format == TextFormat::Unix) lineBreak = L"\n";
         else if (op.format == TextFormat::Mac) lineBreak = L"\r";
@@ -1880,15 +1889,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{ExpandVariables(value, variables)};
         } 
-        // --- FIX: Corrected argument order for CreateRegValueOp ---
         else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 4) {
-                // Correct order: key, name, data, type
                 return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[3], parts[2]};
             }
         }
-        // --- END FIX ---
         else if (_wcsicmp(key.c_str(), L"<-dir") == 0 || _wcsicmp(key.c_str(), L"->dir") == 0 || _wcsicmp(key.c_str(), L"<-file") == 0 || _wcsicmp(key.c_str(), L"->file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 2) {
@@ -2426,7 +2432,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
-        // --- FIX: Reverted main application launch to CreateProcessW ---
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
         std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
@@ -2435,7 +2440,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
         } else {
-            // This loop correctly waits for the main application to exit
             while (true) {
                 DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
                 if (dwResult == WAIT_OBJECT_0) break;
@@ -2451,7 +2455,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         }
-        // --- END FIX ---
 
         std::vector<std::wstring> waitProcesses;
         std::wstringstream waitStream(iniContent);
