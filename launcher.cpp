@@ -71,6 +71,7 @@ struct LinkOp {
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
+    bool sourceExistedBefore = false; // MODIFICATION: For new hardlink logic
     std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks;
 };
 
@@ -1190,6 +1191,10 @@ namespace ActionHelpers {
         std::wstringstream ss(normalized_content);
         std::wstring line;
         while (std::getline(ss, line, L'\n')) {
+            // FIX: Strip trailing carriage return if present
+            if (!line.empty() && line.back() == L'\r') {
+                line.pop_back();
+            }
             lines.push_back(line);
         }
         if (normalized_content.empty() && !info.raw_bytes.empty()) lines.clear();
@@ -1362,6 +1367,10 @@ namespace ActionHelpers {
     }
 
     void HandleReplace(const ReplaceOp& op) {
+        if (!PathFileExistsW(op.path.c_str())) {
+            return;
+        }
+
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1398,6 +1407,10 @@ namespace ActionHelpers {
     }
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
+        if (!PathFileExistsW(op.path.c_str())) {
+            return;
+        }
+
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
@@ -1742,21 +1755,26 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 SHCreateDirectoryExW(NULL, dirPath, NULL);
             }
 
+            arg.sourceExistedBefore = PathFileExistsW(arg.targetPath.c_str());
+
             if (PathFileExistsW(arg.linkPath.c_str())) {
                 if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
                     arg.backupCreated = true;
                 }
             }
-            if (arg.isHardlink) {
-                if (arg.isDirectory) {
-                    CreateDirectoryW(arg.linkPath.c_str(), NULL);
-                    CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdRecursiveLinks);
-                } else {
-                    CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
+            
+            if (arg.sourceExistedBefore) {
+                if (arg.isHardlink) {
+                    if (arg.isDirectory) {
+                        CreateDirectoryW(arg.linkPath.c_str(), NULL);
+                        CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdRecursiveLinks);
+                    } else {
+                        CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
+                    }
+                } else { // Symlink
+                    DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+                    CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
                 }
-            } else { // Symlink
-                DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
@@ -1809,17 +1827,31 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 else RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
-            if (arg.isHardlink && arg.isDirectory) {
-                for (auto it = arg.createdRecursiveLinks.rbegin(); it != arg.createdRecursiveLinks.rend(); ++it) {
-                    DeleteFileW(it->first.c_str());
+            if (!arg.sourceExistedBefore) {
+                // New logic: Move the file/dir back to source
+                if (PathFileExistsW(arg.linkPath.c_str())) {
+                    wchar_t dirPath[MAX_PATH];
+                    wcscpy_s(dirPath, MAX_PATH, arg.targetPath.c_str());
+                    PathRemoveFileSpecW(dirPath);
+                    if (wcslen(dirPath) > 0) {
+                        SHCreateDirectoryExW(NULL, dirPath, NULL);
+                    }
+                    PerformFileSystemOperation(FO_MOVE, arg.linkPath, arg.targetPath);
                 }
-                PerformFileSystemOperation(FO_DELETE, arg.linkPath);
             } else {
-                if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                else DeleteFileW(arg.linkPath.c_str());
-            }
-            if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
-                MoveFileW(arg.backupPath.c_str(), arg.linkPath.c_str());
+                // Old logic: Delete the link and restore backup
+                if (arg.isHardlink && arg.isDirectory) {
+                    for (auto it = arg.createdRecursiveLinks.rbegin(); it != arg.createdRecursiveLinks.rend(); ++it) {
+                        DeleteFileW(it->first.c_str());
+                    }
+                    PerformFileSystemOperation(FO_DELETE, arg.linkPath);
+                } else {
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
+                    else DeleteFileW(arg.linkPath.c_str());
+                }
+                if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
+                    MoveFileW(arg.backupPath.c_str(), arg.linkPath.c_str());
+                }
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             if (arg.ruleCreated) {
