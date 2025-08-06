@@ -170,8 +170,8 @@ struct CreateRegKeyOp {
 struct CreateRegValueOp {
     std::wstring keyPath;
     std::wstring valueName;
-    std::wstring typeStr;
     std::wstring valueData;
+    std::wstring typeStr;
 };
 
 // --- NEW: Structures for new operations ---
@@ -1807,9 +1807,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 RunOp op;
                 op.programPath = ExpandVariables(parts[0], variables);
                 op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                // --- MODIFICATION: Expand variables in command line arguments ---
                 op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? ExpandVariables(parts[2], variables) : L"";
-                // --- END MODIFICATION ---
                 op.workDir = (parts.size() > 3 && !parts[3].empty()) ? ExpandVariables(parts[3], variables) : L"";
                 return op;
             }
@@ -1881,12 +1879,16 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{ExpandVariables(value, variables)};
-        } else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
+        } 
+        // --- FIX: Corrected argument order for CreateRegValueOp ---
+        else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 4) {
-                return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[2], parts[3]};
+                // Correct order: key, name, data, type
+                return CreateRegValueOp{ExpandVariables(parts[0], variables), parts[1], parts[3], parts[2]};
             }
         }
+        // --- END FIX ---
         else if (_wcsicmp(key.c_str(), L"<-dir") == 0 || _wcsicmp(key.c_str(), L"->dir") == 0 || _wcsicmp(key.c_str(), L"<-file") == 0 || _wcsicmp(key.c_str(), L"->file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 2) {
@@ -2424,13 +2426,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
         }
 
+        // --- FIX: Reverted main application launch to CreateProcessW ---
         STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
         std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
-        
-        // Use the main application path for ShellExecute
-        if (!ExecuteProcess(absoluteAppPath, commandLine, finalWorkDir, false, false)) {
-             MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+        std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
+        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+
+        if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
+            MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+        } else {
+            // This loop correctly waits for the main application to exit
+            while (true) {
+                DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
+                if (dwResult == WAIT_OBJECT_0) break;
+                else if (dwResult == WAIT_OBJECT_0 + 1) {
+                    MSG msg;
+                    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessage(&msg);
+                    }
+                }
+                 else break;
+            }
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
         }
+        // --- END FIX ---
 
         std::vector<std::wstring> waitProcesses;
         std::wstringstream waitStream(iniContent);
