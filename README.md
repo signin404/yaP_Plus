@@ -1,0 +1,15 @@
+English | [中文](./README_zh-CN.md)
+
+# yaP Plus
+yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) Reimplementation
+
+## New Feature
+* Unicode support  
+* Wait for process  
+* Scheduled backup  
+* Create hard links  
+* Create firewall rules  
+* Hide console program window  
+* Detect foreground and suspend background processes  
+* File write format encoding detection  
+* Exception exit solutions
