@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # 新增: 允许手动触发工作流
+  workflow_dispatch:
 
 jobs:
   build:
