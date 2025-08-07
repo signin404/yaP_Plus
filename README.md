@@ -3,6 +3,8 @@ English | [中文](./README_zh-CN.md)
 # yaP Plus
 yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) Reimplementation
 
+Just copy and paste to create portable software.
+
 ## New Feature
 * Unicode support  
 * Wait for process  
