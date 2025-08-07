@@ -91,17 +91,17 @@ struct StartupShutdownOperation {
 
 
 // One-shot actions for [Before] and [After] sections
+// --- 修改点 3.1: 为 'run' 添加 hide 成员 ---
 struct RunOp {
     std::wstring programPath;
     std::wstring commandLine;
     std::wstring workDir;
     bool wait;
+    bool hide; // 新增成员
 };
 
-struct BatchOp {
-    std::wstring batchPath;
-    bool wait;
-};
+// --- 修改点 4.1: 移除 BatchOp 结构体 ---
+// struct BatchOp { ... }; // 已删除
 
 struct RegImportOp {
     std::wstring regPath;
@@ -211,8 +211,9 @@ struct ReplaceLineOp {
 
 
 // A variant for one-shot actions, used by [Before] and [After] sections
+// --- 修改点 4.2: 从 variant 中移除 BatchOp ---
 using ActionOpData = std::variant<
-    RunOp, BatchOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
+    RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
     CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp // NEW
 >;
@@ -310,23 +311,19 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-// --- 修改点 1: 重写核心路径解析函数 ---
-// 使其不再依赖工作目录，而是始终以YAPROOT为基准解析相对路径。
 std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std::wstring, std::wstring>& variables) {
     if (path.empty()) {
         return L"";
     }
 
-    // 如果路径已经是绝对路径（例如 "C:\..." 或 "\\server..."），则直接处理。
     if (!PathIsRelativeW(path.c_str())) {
         wchar_t canonicalPath[MAX_PATH];
         if (GetFullPathNameW(path.c_str(), MAX_PATH, canonicalPath, NULL) != 0) {
-            return canonicalPath; // 使用GetFullPathName来规范化路径（例如处理 ".."）
+            return canonicalPath;
         }
-        return path; // 出错则返回原始路径
+        return path;
     }
 
-    // 如果路径是相对路径，则以YAPROOT为基准进行拼接。
     auto it = variables.find(L"YAPROOT");
     if (it != variables.end()) {
         const std::wstring& yapRoot = it->second;
@@ -336,7 +333,6 @@ std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std:
         }
     }
 
-    // 如果YAPROOT未找到（理论上不应发生）或拼接失败，则返回原始路径。
     return path;
 }
 
@@ -1383,6 +1379,7 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
+    // --- 修改点 1.1: 修复并增强 HandleReplace ---
     void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
@@ -1391,23 +1388,35 @@ namespace ActionHelpers {
         std::wstring content;
         for(size_t i = 0; i < lines.size(); ++i) {
             content += lines[i];
-            if (i < lines.size() - 1) content += L"\n"; // Use normalized separator
+            if (i < lines.size() - 1) content += L"\n"; // 使用 \n 作为统一的内部换行符
+        }
+
+        // 将查找和替换内容中的 {LINEBREAK} 都统一转换成内部换行符 \n
+        const std::wstring toFindToken = L"{LINEBREAK}";
+        const std::wstring normalizedNewline = L"\n";
+
+        std::wstring finalFindText = op.findText;
+        size_t lb_pos_find = 0;
+        while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
+            finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
+            lb_pos_find += normalizedNewline.length();
         }
 
         std::wstring finalReplaceText = op.replaceText;
-        const std::wstring toFindToken = L"{LINEBREAK}";
-        size_t lb_pos = 0;
-        while ((lb_pos = finalReplaceText.find(toFindToken, lb_pos)) != std::wstring::npos) {
-            finalReplaceText.replace(lb_pos, toFindToken.length(), formatInfo.line_ending);
-            lb_pos += formatInfo.line_ending.length();
+        size_t lb_pos_replace = 0;
+        while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
+            finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
+            lb_pos_replace += normalizedNewline.length();
         }
 
+        // 在完全使用 \n 的字符串上执行查找和替换
         size_t pos = 0;
-        while ((pos = content.find(op.findText, pos)) != std::wstring::npos) {
-            content.replace(pos, op.findText.length(), finalReplaceText);
+        while ((pos = content.find(finalFindText, pos)) != std::wstring::npos) {
+            content.replace(pos, finalFindText.length(), finalReplaceText);
             pos += finalReplaceText.length();
         }
 
+        // 将处理后的内容重新按 \n 分割成行
         std::vector<std::wstring> new_lines;
         std::wstringstream ss(content);
         std::wstring line;
@@ -1416,6 +1425,7 @@ namespace ActionHelpers {
         }
         if (content.empty() && !lines.empty()) new_lines.clear();
 
+        // 使用 WriteFileWithFormat 将行写回文件，它会自动处理换行符的转换
         WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
 
@@ -1543,7 +1553,6 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- 修改点 2: 更新所有调用点以传递 `variables` ---
 std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     const std::wstring delimiter = L" :: ";
     size_t separatorPos = entry.find(delimiter);
@@ -1887,24 +1896,21 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     Section currentSection = Section::None;
 
     auto parse_action_op = [&](const std::wstring& key, const std::wstring& value) -> std::optional<ActionOpData> {
+        // --- 修改点 3.2: 更新 'run' 解析逻辑 ---
         if (_wcsicmp(key.c_str(), L"run") == 0) {
             auto parts = split_string(value, delimiter);
             if (!parts.empty() && !parts[0].empty()) {
                 RunOp op;
                 op.programPath = parts[0];
                 op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                op.commandLine = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"null") != 0) ? parts[2] : L"";
-                op.workDir = (parts.size() > 3 && !parts[3].empty()) ? parts[3] : L"";
+                op.hide = (parts.size() > 2 && _wcsicmp(parts[2].c_str(), L"hide") == 0);
+                op.commandLine = (parts.size() > 3 && _wcsicmp(parts[3].c_str(), L"null") != 0) ? parts[3] : L"";
+                op.workDir = (parts.size() > 4 && !parts[4].empty()) ? parts[4] : L"";
                 return op;
             }
-        } else if (_wcsicmp(key.c_str(), L"batch") == 0) {
-            auto parts = split_string(value, delimiter);
-            if (!parts.empty()) {
-                BatchOp op; op.batchPath = parts[0];
-                op.wait = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"wait") == 0);
-                return op;
-            }
-        } else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
+        // --- 修改点 4.3: 移除 'batch' 解析逻辑 ---
+        } /* else if (_wcsicmp(key.c_str(), L"batch") == 0) { ... } */ // 已删除
+        else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
             return RegImportOp{value};
         } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
             auto parts = split_string(value, delimiter);
@@ -2102,7 +2108,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 LinkOp l_op; l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
-                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
                     l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
                     l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
@@ -2128,7 +2133,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     if (_wcsicmp(parts[2].c_str(), L"allow") == 0) f_op.action = NET_FW_ACTION_ALLOW;
                     else if (_wcsicmp(parts[2].c_str(), L"block") == 0) f_op.action = NET_FW_ACTION_BLOCK;
                     else continue;
-                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
                     f_op.appPath = ResolveToAbsolutePath(ExpandVariables(parts[3], variables), variables);
                     beforeOp.data = f_op; op_created = true;
                 }
@@ -2139,7 +2143,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     auto parts = split_string(value, delimiter);
                     if (!parts.empty()) {
                         regPathRaw = parts[0];
-                        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
                         if (parts.size() > 1) r_op.filePath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
                     }
                 }
@@ -2149,7 +2152,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             } else if (_wcsicmp(key.c_str(), L"(file)") == 0 || _wcsicmp(key.c_str(), L"(dir)") == 0) {
                 RestoreOnlyFileOp ro_op; ro_op.isDirectory = (_wcsicmp(key.c_str(), L"(dir)") == 0);
-                // --- 修改点 2: 更新所有调用点以传递 `variables` ---
                 ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables), variables);
                 ro_op.backupPath = ro_op.targetPath + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
@@ -2157,7 +2159,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
-                    // --- 修改点 2: 更新所有调用点以传递 `variables` ---
                     f_op.destPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     std::wstring sourceRaw = parts[1];
                     std::wstring expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables), variables);
@@ -2205,7 +2206,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-// --- 修改点 2: 更新所有调用点以传递 `variables` ---
 void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -2213,15 +2213,11 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             std::wstring finalPath = ExpandVariables(arg.programPath, variables);
             std::wstring finalCmd = ExpandVariables(arg.commandLine, variables);
             std::wstring finalDir = ExpandVariables(arg.workDir, variables);
-            ExecuteProcess(ResolveToAbsolutePath(finalPath, variables), finalCmd, ResolveToAbsolutePath(finalDir, variables), arg.wait, false);
-        } else if constexpr (std::is_same_v<T, BatchOp>) {
-            std::wstring finalPath = ExpandVariables(arg.batchPath, variables);
-            wchar_t systemPath[MAX_PATH];
-            GetSystemDirectoryW(systemPath, MAX_PATH);
-            std::wstring cmdPath = std::wstring(systemPath) + L"\\cmd.exe";
-            std::wstring args = L"/c \"" + ResolveToAbsolutePath(finalPath, variables) + L"\"";
-            ExecuteProcess(cmdPath, args, L"", arg.wait, true);
-        } else if constexpr (std::is_same_v<T, RegImportOp>) {
+            // --- 修改点 3.3: 将 hide 标志传递给 ExecuteProcess ---
+            ExecuteProcess(ResolveToAbsolutePath(finalPath, variables), finalCmd, ResolveToAbsolutePath(finalDir, variables), arg.wait, arg.hide);
+        // --- 修改点 4.4: 移除 BatchOp 的执行逻辑 ---
+        } /* else if constexpr (std::is_same_v<T, BatchOp>) { ... } */ // 已删除
+        else if constexpr (std::is_same_v<T, RegImportOp>) {
             std::wstring finalPath = ExpandVariables(arg.regPath, variables);
             ImportRegistryFile(ResolveToAbsolutePath(finalPath, variables));
         } else if constexpr (std::is_same_v<T, RegDllOp>) {
@@ -2332,7 +2328,6 @@ void PerformFullCleanup(
 
 
 // --- Main Application Logic ---
-// --- 修改点 2: 更新所有调用点以传递 `variables` ---
 void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
     if (appPathRaw.empty()) return;
@@ -2407,7 +2402,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         wchar_t appDir[MAX_PATH];
@@ -2422,7 +2416,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         variables[L"WORKDIR"] = finalWorkDir;
 
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
-        // --- 修改点 2: 更新所有调用点以传递 `variables` ---
         std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
         if (tempFileDirRaw.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
