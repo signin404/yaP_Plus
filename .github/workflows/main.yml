@@ -2,9 +2,9 @@ name: Build C++ Launcher for Windows
 
 on:
   push:
-    branches: [ "main", "section" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main", "section" ]
+    branches: [ "main" ]
 
 jobs:
   build:
