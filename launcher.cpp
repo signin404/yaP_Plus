@@ -91,17 +91,13 @@ struct StartupShutdownOperation {
 
 
 // One-shot actions for [Before] and [After] sections
-// --- 修改点 3.1: 为 'run' 添加 hide 成员 ---
 struct RunOp {
     std::wstring programPath;
     std::wstring commandLine;
     std::wstring workDir;
     bool wait;
-    bool hide; // 新增成员
+    bool hide;
 };
-
-// --- 修改点 4.1: 移除 BatchOp 结构体 ---
-// struct BatchOp { ... }; // 已删除
 
 struct RegImportOp {
     std::wstring regPath;
@@ -211,7 +207,6 @@ struct ReplaceLineOp {
 
 
 // A variant for one-shot actions, used by [Before] and [After] sections
-// --- 修改点 4.2: 从 variant 中移除 BatchOp ---
 using ActionOpData = std::variant<
     RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
@@ -1379,7 +1374,6 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
-    // --- 修改点 1.1: 修复并增强 HandleReplace ---
     void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
@@ -1388,10 +1382,9 @@ namespace ActionHelpers {
         std::wstring content;
         for(size_t i = 0; i < lines.size(); ++i) {
             content += lines[i];
-            if (i < lines.size() - 1) content += L"\n"; // 使用 \n 作为统一的内部换行符
+            if (i < lines.size() - 1) content += L"\n";
         }
 
-        // 将查找和替换内容中的 {LINEBREAK} 都统一转换成内部换行符 \n
         const std::wstring toFindToken = L"{LINEBREAK}";
         const std::wstring normalizedNewline = L"\n";
 
@@ -1409,14 +1402,12 @@ namespace ActionHelpers {
             lb_pos_replace += normalizedNewline.length();
         }
 
-        // 在完全使用 \n 的字符串上执行查找和替换
         size_t pos = 0;
         while ((pos = content.find(finalFindText, pos)) != std::wstring::npos) {
             content.replace(pos, finalFindText.length(), finalReplaceText);
             pos += finalReplaceText.length();
         }
 
-        // 将处理后的内容重新按 \n 分割成行
         std::vector<std::wstring> new_lines;
         std::wstringstream ss(content);
         std::wstring line;
@@ -1425,7 +1416,6 @@ namespace ActionHelpers {
         }
         if (content.empty() && !lines.empty()) new_lines.clear();
 
-        // 使用 WriteFileWithFormat 将行写回文件，它会自动处理换行符的转换
         WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
 
@@ -1444,6 +1434,7 @@ namespace ActionHelpers {
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::vector<std::wstring> new_lines;
         for (const auto& l : lines) {
+            // The core logic remains the same: check if the raw line starts with the (now un-trimmed) lineStart string.
             if (l.rfind(op.lineStart, 0) == 0) {
                 new_lines.push_back(finalReplaceLine);
             } else {
@@ -1896,7 +1887,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     Section currentSection = Section::None;
 
     auto parse_action_op = [&](const std::wstring& key, const std::wstring& value) -> std::optional<ActionOpData> {
-        // --- 修改点 3.2: 更新 'run' 解析逻辑 ---
         if (_wcsicmp(key.c_str(), L"run") == 0) {
             auto parts = split_string(value, delimiter);
             if (!parts.empty() && !parts[0].empty()) {
@@ -1908,8 +1898,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 op.workDir = (parts.size() > 4 && !parts[4].empty()) ? parts[4] : L"";
                 return op;
             }
-        // --- 修改点 4.3: 移除 'batch' 解析逻辑 ---
-        } /* else if (_wcsicmp(key.c_str(), L"batch") == 0) { ... } */ // 已删除
+        }
         else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
             return RegImportOp{value};
         } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
@@ -2045,9 +2034,20 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 return ReplaceOp{parts[0], parts[1], parts[2]};
             }
         } else if (_wcsicmp(key.c_str(), L"replaceline") == 0) {
-            auto parts = split_string(value, delimiter);
-            if (parts.size() == 3) {
-                return ReplaceLineOp{parts[0], parts[1], parts[2]};
+            // --- 修改点 2.1: 为 'replaceline' 实现自定义解析，以保留缩进 ---
+            // 我们不再使用 split_string，因为它会 trim() 所有部分。
+            const std::wstring local_delimiter = L" :: ";
+            size_t first_delim_pos = value.find(local_delimiter);
+            if (first_delim_pos != std::wstring::npos) {
+                size_t second_delim_pos = value.find(local_delimiter, first_delim_pos + local_delimiter.length());
+                if (second_delim_pos != std::wstring::npos) {
+                    // 只有第一部分（文件路径）需要 trim。
+                    std::wstring path = trim(value.substr(0, first_delim_pos));
+                    // 第二部分（要查找的行首）和第三部分（要替换的整行）保持原样，包含所有空白。
+                    std::wstring lineStart = value.substr(first_delim_pos + local_delimiter.length(), second_delim_pos - (first_delim_pos + local_delimiter.length()));
+                    std::wstring replaceLine = value.substr(second_delim_pos + local_delimiter.length());
+                    return ReplaceLineOp{path, lineStart, replaceLine};
+                }
             }
         }
         return std::nullopt;
@@ -2213,10 +2213,8 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             std::wstring finalPath = ExpandVariables(arg.programPath, variables);
             std::wstring finalCmd = ExpandVariables(arg.commandLine, variables);
             std::wstring finalDir = ExpandVariables(arg.workDir, variables);
-            // --- 修改点 3.3: 将 hide 标志传递给 ExecuteProcess ---
             ExecuteProcess(ResolveToAbsolutePath(finalPath, variables), finalCmd, ResolveToAbsolutePath(finalDir, variables), arg.wait, arg.hide);
-        // --- 修改点 4.4: 移除 BatchOp 的执行逻辑 ---
-        } /* else if constexpr (std::is_same_v<T, BatchOp>) { ... } */ // 已删除
+        }
         else if constexpr (std::is_same_v<T, RegImportOp>) {
             std::wstring finalPath = ExpandVariables(arg.regPath, variables);
             ImportRegistryFile(ResolveToAbsolutePath(finalPath, variables));
