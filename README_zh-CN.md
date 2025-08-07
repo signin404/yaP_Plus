@@ -1,6 +1,8 @@
 # yaP Plus
 yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
 
+复制粘贴即可制作便携软件
+
 ## 新功能
 * 支持Unicode
 * 等待进程
