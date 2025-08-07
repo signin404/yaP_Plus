@@ -2,9 +2,9 @@ name: Build C++ Launcher for Windows
 
 on:
   push:
-    branches: [ "main", "signin404-patch-2" ]
+    branches: [ "main", "section" ]
   pull_request:
-    branches: [ "main", "signin404-patch-2" ]
+    branches: [ "main", "section" ]
 
 jobs:
   build:
@@ -20,9 +20,9 @@ jobs:
     - name: Compile resource script
       run: rc.exe launcher.rc
 
-    # Corrected command: Added /utf-8 flag
+    # MODIFIED: Added /std:c++17 to enable modern C++ features like std::variant
     - name: Compile C++ code and link resources
-      run: cl.exe /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib
+      run: cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
 
     - name: Find executable
       id: find_exe
