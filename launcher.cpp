@@ -703,7 +703,6 @@ namespace ActionHelpers {
         CloseHandle(hSnapshot);
     }
 
-    // --- 修改点 2.1: 增强 HandleDeleteFile 以处理只读文件 ---
     void HandleDeleteFile(const std::wstring& pathPattern) {
         wchar_t dirPath_w[MAX_PATH];
         wcscpy_s(dirPath_w, pathPattern.c_str());
@@ -732,16 +731,14 @@ namespace ActionHelpers {
             if (PathMatchSpecW(findData.cFileName, filePattern)) {
                 std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
                 
-                // 获取文件属性
+                // --- 修改点 2.1: 增强文件删除以处理只读文件 ---
                 DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES) {
-                    // 如果文件是只读的，移除只读属性
                     if (attributes & FILE_ATTRIBUTE_READONLY) {
                         SetFileAttributesW(fullPathToDelete.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
                     }
                 }
                 
-                // 删除文件
                 DeleteFileW(fullPathToDelete.c_str());
             }
         } while (FindNextFileW(hFind, &findData));
@@ -782,16 +779,62 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
-    bool IsRegistryKeyEmpty(HKEY hRootKey, const std::wstring& subKey) {
+    // --- 修改点 1.2: 新增底层注册表删除函数以处理32/64位视图 ---
+    LSTATUS RecursiveRegDeleteKey(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
-        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) {
-            return true;
+        LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
+        if (res != ERROR_SUCCESS) {
+            return res;
         }
-        DWORD subKeyCount = 0;
-        DWORD valueCount = 0;
-        RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
+
+        wchar_t subKeyName[MAX_PATH];
+        DWORD subKeyNameSize = MAX_PATH;
+        while (RegEnumKeyExW(hKey, 0, subKeyName, &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            res = RecursiveRegDeleteKey(hKey, subKeyName, samAccess);
+            if (res != ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return res;
+            }
+            subKeyNameSize = MAX_PATH;
+        }
+
         RegCloseKey(hKey);
-        return (subKeyCount == 0 && valueCount == 0);
+        return RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+    }
+
+    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
+        // 尝试从64位和32位视图中删除。忽略错误，因为键可能只存在于一个视图中。
+        RecursiveRegDeleteKey(hRootKey, subKey, KEY_WOW64_64KEY);
+        RecursiveRegDeleteKey(hRootKey, subKey, KEY_WOW64_32KEY);
+    }
+    
+    bool IsRegistryKeyEmpty(HKEY hRootKey, const std::wstring& subKey) {
+        bool isEmpty64 = false;
+        bool isEmpty32 = false;
+
+        HKEY hKey64;
+        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &hKey64) != ERROR_SUCCESS) {
+            isEmpty64 = true; // Key doesn't exist, so it's "empty"
+        } else {
+            DWORD subKeyCount = 0;
+            DWORD valueCount = 0;
+            RegQueryInfoKeyW(hKey64, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
+            RegCloseKey(hKey64);
+            isEmpty64 = (subKeyCount == 0 && valueCount == 0);
+        }
+
+        HKEY hKey32;
+        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &hKey32) != ERROR_SUCCESS) {
+            isEmpty32 = true; // Key doesn't exist, so it's "empty"
+        } else {
+            DWORD subKeyCount = 0;
+            DWORD valueCount = 0;
+            RegQueryInfoKeyW(hKey32, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
+            RegCloseKey(hKey32);
+            isEmpty32 = (subKeyCount == 0 && valueCount == 0);
+        }
+
+        return isEmpty64 && isEmpty32;
     }
 
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
@@ -813,32 +856,43 @@ namespace ActionHelpers {
                 if (!hasWildcard) {
                     std::wstring nextPath = currentPath.empty() ? patternSegment : currentPath + L"\\" + patternSegment;
                     HKEY hTempKey;
-                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
+                    // Check both views for existence
+                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &hTempKey) == ERROR_SUCCESS ||
+                        RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &hTempKey) == ERROR_SUCCESS) {
                         nextPathsToSearch.push_back(nextPath);
                         RegCloseKey(hTempKey);
                     }
                     continue;
                 }
 
-                HKEY hKey;
-                if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, &hKey) != ERROR_SUCCESS) {
-                    continue;
-                }
-
-                wchar_t keyName[256];
-                DWORD keyNameSize = 256;
-                for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
-                    if (PathMatchSpecW(keyName, patternSegment.c_str())) {
-                        nextPathsToSearch.push_back(currentPath.empty() ? keyName : currentPath + L"\\" + keyName);
+                // When using wildcards, we need to search both views and merge the results
+                std::set<std::wstring> foundSubKeys;
+                REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
+                for (REGSAM view : views) {
+                    HKEY hKey;
+                    if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
+                        continue;
                     }
+                    wchar_t keyName[256];
+                    DWORD keyNameSize = 256;
+                    for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
+                        if (PathMatchSpecW(keyName, patternSegment.c_str())) {
+                            foundSubKeys.insert(keyName);
+                        }
+                    }
+                    RegCloseKey(hKey);
                 }
-                RegCloseKey(hKey);
+                
+                for(const auto& subKey : foundSubKeys) {
+                    nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
+                }
             }
             pathsToSearch = nextPathsToSearch;
         }
         foundKeys = pathsToSearch;
     }
 
+    // --- 修改点 1.3: 更新 HandleDeleteRegKey 以使用新函数 ---
     void HandleDeleteRegKey(const std::wstring& keyPattern, bool ifEmpty) {
         HKEY hRootKey;
         std::wstring rootKeyStr, subKeyPattern, valueName;
@@ -850,10 +904,13 @@ namespace ActionHelpers {
         for (const auto& key : keysToDelete) {
             if (ifEmpty) {
                 if (IsRegistryKeyEmpty(hRootKey, key.c_str())) {
-                    RegDeleteKeyW(hRootKey, key.c_str());
+                    // 尝试从两个视图删除
+                    RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
+                    RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
                 }
             } else {
-                SHDeleteKeyW(hRootKey, key.c_str());
+                // 使用新的递归函数，它会自动处理两个视图
+                DeleteRegistryKeyTree(hRootKey, key.c_str());
             }
         }
     }
@@ -867,21 +924,24 @@ namespace ActionHelpers {
         FindMatchingRegKeys(hRootKey, subKeyPattern, keysToSearch);
 
         for (const auto& keyPath : keysToSearch) {
-            HKEY hKey;
-            if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-                wchar_t valName[16383];
-                DWORD valNameSize = 16383;
-                DWORD i = 0;
-                while (RegEnumValueW(hKey, i, valName, &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                    if (PathMatchSpecW(valName, valuePattern.c_str())) {
-                        RegDeleteValueW(hKey, valName);
-                        valNameSize = 16383;
-                    } else {
-                        i++;
-                        valNameSize = 16383;
+            REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
+            for (REGSAM view : views) {
+                HKEY hKey;
+                if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey) == ERROR_SUCCESS) {
+                    wchar_t valName[16383];
+                    DWORD valNameSize = 16383;
+                    DWORD i = 0;
+                    while (RegEnumValueW(hKey, i, valName, &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        if (PathMatchSpecW(valName, valuePattern.c_str())) {
+                            RegDeleteValueW(hKey, valName);
+                            valNameSize = 16383;
+                        } else {
+                            i++;
+                            valNameSize = 16383;
+                        }
                     }
+                    RegCloseKey(hKey);
                 }
-                RegCloseKey(hKey);
             }
         }
     }
@@ -2077,7 +2137,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         if (delimiterPos == std::wstring::npos) continue;
 
         std::wstring key = trim(line.substr(0, delimiterPos));
-        std::wstring value = trim(line.substr(delimiterPos + 1));
+        std::wstring value = line.substr(delimiterPos + 1); // Do not trim value for replaceline
 
         if (_wcsicmp(key.c_str(), L"uservar") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
@@ -2106,6 +2166,9 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
             continue;
         }
+
+        // Trim value for all other keys
+        value = trim(value);
 
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
