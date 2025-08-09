@@ -703,6 +703,7 @@ namespace ActionHelpers {
         CloseHandle(hSnapshot);
     }
 
+    // --- 修改点 2.1: 增强 HandleDeleteFile 以处理只读文件 ---
     void HandleDeleteFile(const std::wstring& pathPattern) {
         wchar_t dirPath_w[MAX_PATH];
         wcscpy_s(dirPath_w, pathPattern.c_str());
@@ -730,6 +731,17 @@ namespace ActionHelpers {
 
             if (PathMatchSpecW(findData.cFileName, filePattern)) {
                 std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
+                
+                // 获取文件属性
+                DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES) {
+                    // 如果文件是只读的，移除只读属性
+                    if (attributes & FILE_ATTRIBUTE_READONLY) {
+                        SetFileAttributesW(fullPathToDelete.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+                    }
+                }
+                
+                // 删除文件
                 DeleteFileW(fullPathToDelete.c_str());
             }
         } while (FindNextFileW(hFind, &findData));
@@ -1434,7 +1446,6 @@ namespace ActionHelpers {
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::vector<std::wstring> new_lines;
         for (const auto& l : lines) {
-            // The core logic remains the same: check if the raw line starts with the (now un-trimmed) lineStart string.
             if (l.rfind(op.lineStart, 0) == 0) {
                 new_lines.push_back(finalReplaceLine);
             } else {
@@ -2034,16 +2045,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 return ReplaceOp{parts[0], parts[1], parts[2]};
             }
         } else if (_wcsicmp(key.c_str(), L"replaceline") == 0) {
-            // --- 修改点 2.1: 为 'replaceline' 实现自定义解析，以保留缩进 ---
-            // 我们不再使用 split_string，因为它会 trim() 所有部分。
             const std::wstring local_delimiter = L" :: ";
             size_t first_delim_pos = value.find(local_delimiter);
             if (first_delim_pos != std::wstring::npos) {
                 size_t second_delim_pos = value.find(local_delimiter, first_delim_pos + local_delimiter.length());
                 if (second_delim_pos != std::wstring::npos) {
-                    // 只有第一部分（文件路径）需要 trim。
                     std::wstring path = trim(value.substr(0, first_delim_pos));
-                    // 第二部分（要查找的行首）和第三部分（要替换的整行）保持原样，包含所有空白。
                     std::wstring lineStart = value.substr(first_delim_pos + local_delimiter.length(), second_delim_pos - (first_delim_pos + local_delimiter.length()));
                     std::wstring replaceLine = value.substr(second_delim_pos + local_delimiter.length());
                     return ReplaceLineOp{path, lineStart, replaceLine};
@@ -2406,6 +2413,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
         variables[L"EXEPATH"] = appDir;
+        
+        // --- 修改点 1.1: 添加 {EXENAME} 内置变量 ---
+        const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
+        if (appFilename) {
+            variables[L"EXENAME"] = appFilename;
+        }
+
         std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
         std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
         if (finalWorkDir.empty() || !PathIsDirectoryW(finalWorkDir.c_str())) {
