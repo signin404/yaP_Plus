@@ -2133,7 +2133,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
 
     while (std::getline(stream, line)) {
-        std::wstring original_line = line; // Keep original for replaceline
         line = trim(line);
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
 
@@ -2145,11 +2144,11 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        size_t delimiterPos = original_line.find(L'=');
+        size_t delimiterPos = line.find(L'=');
         if (delimiterPos == std::wstring::npos) continue;
 
-        std::wstring key = trim(original_line.substr(0, delimiterPos));
-        std::wstring value = original_line.substr(delimiterPos + 1);
+        std::wstring key = trim(line.substr(0, delimiterPos));
+        std::wstring value = line.substr(delimiterPos + 1); // Do not trim value for replaceline
 
         if (_wcsicmp(key.c_str(), L"uservar") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
@@ -2179,10 +2178,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // For all other keys, trim the value now.
-        if (_wcsicmp(key.c_str(), L"replaceline") != 0) {
-            value = trim(value);
-        }
+        // Trim value for all other keys
+        value = trim(value);
 
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
