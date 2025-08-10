@@ -731,7 +731,6 @@ namespace ActionHelpers {
             if (PathMatchSpecW(findData.cFileName, filePattern)) {
                 std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
                 
-                // --- 修改点 2.1: 增强文件删除以处理只读文件 ---
                 DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES) {
                     if (attributes & FILE_ATTRIBUTE_READONLY) {
@@ -779,8 +778,10 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
-    // --- 修改点 1.2: 新增底层注册表删除函数以处理32/64位视图 ---
-    LSTATUS RecursiveRegDeleteKey(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
+    // --- 修改点 1.2: 重构注册表删除逻辑 ---
+
+    // 内部递归函数，处理指定的注册表视图
+    LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
         if (res != ERROR_SUCCESS) {
@@ -790,7 +791,7 @@ namespace ActionHelpers {
         wchar_t subKeyName[MAX_PATH];
         DWORD subKeyNameSize = MAX_PATH;
         while (RegEnumKeyExW(hKey, 0, subKeyName, &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            res = RecursiveRegDeleteKey(hKey, subKeyName, samAccess);
+            res = RecursiveRegDeleteKey_Internal(hKey, subKeyName, samAccess);
             if (res != ERROR_SUCCESS) {
                 RegCloseKey(hKey);
                 return res;
@@ -802,39 +803,29 @@ namespace ActionHelpers {
         return RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
     }
 
+    // 公开的删除函数，根据根键类型决定如何操作
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
-        // 尝试从64位和32位视图中删除。忽略错误，因为键可能只存在于一个视图中。
-        RecursiveRegDeleteKey(hRootKey, subKey, KEY_WOW64_64KEY);
-        RecursiveRegDeleteKey(hRootKey, subKey, KEY_WOW64_32KEY);
+        if (hRootKey == HKEY_LOCAL_MACHINE) {
+            // 对于 HKLM，尝试删除64位和32位两个视图
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_64KEY);
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_32KEY);
+        } else {
+            // 对于 HKCU 等，只进行一次标准删除
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey, 0);
+        }
     }
     
-    bool IsRegistryKeyEmpty(HKEY hRootKey, const std::wstring& subKey) {
-        bool isEmpty64 = false;
-        bool isEmpty32 = false;
-
-        HKEY hKey64;
-        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &hKey64) != ERROR_SUCCESS) {
-            isEmpty64 = true; // Key doesn't exist, so it's "empty"
-        } else {
-            DWORD subKeyCount = 0;
-            DWORD valueCount = 0;
-            RegQueryInfoKeyW(hKey64, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
-            RegCloseKey(hKey64);
-            isEmpty64 = (subKeyCount == 0 && valueCount == 0);
+    // 检查指定视图中的键是否为空
+    bool IsKeyEmptyInView(HKEY hRootKey, const std::wstring& subKey, REGSAM samAccess) {
+        HKEY hKey;
+        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | samAccess, &hKey) != ERROR_SUCCESS) {
+            return true; // 打不开，视为空
         }
-
-        HKEY hKey32;
-        if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &hKey32) != ERROR_SUCCESS) {
-            isEmpty32 = true; // Key doesn't exist, so it's "empty"
-        } else {
-            DWORD subKeyCount = 0;
-            DWORD valueCount = 0;
-            RegQueryInfoKeyW(hKey32, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
-            RegCloseKey(hKey32);
-            isEmpty32 = (subKeyCount == 0 && valueCount == 0);
-        }
-
-        return isEmpty64 && isEmpty32;
+        DWORD subKeyCount = 0;
+        DWORD valueCount = 0;
+        RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &subKeyCount, NULL, NULL, &valueCount, NULL, NULL, NULL, NULL);
+        RegCloseKey(hKey);
+        return (subKeyCount == 0 && valueCount == 0);
     }
 
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
@@ -856,19 +847,23 @@ namespace ActionHelpers {
                 if (!hasWildcard) {
                     std::wstring nextPath = currentPath.empty() ? patternSegment : currentPath + L"\\" + patternSegment;
                     HKEY hTempKey;
-                    // Check both views for existence
-                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &hTempKey) == ERROR_SUCCESS ||
-                        RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ | KEY_WOW64_32KEY, &hTempKey) == ERROR_SUCCESS) {
+                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
                         nextPathsToSearch.push_back(nextPath);
                         RegCloseKey(hTempKey);
                     }
                     continue;
                 }
 
-                // When using wildcards, we need to search both views and merge the results
                 std::set<std::wstring> foundSubKeys;
-                REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
-                for (REGSAM view : views) {
+                std::vector<REGSAM> viewsToSearch;
+                if (hRoot == HKEY_LOCAL_MACHINE) {
+                    viewsToSearch.push_back(KEY_WOW64_64KEY);
+                    viewsToSearch.push_back(KEY_WOW64_32KEY);
+                } else {
+                    viewsToSearch.push_back(0);
+                }
+
+                for (REGSAM view : viewsToSearch) {
                     HKEY hKey;
                     if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
                         continue;
@@ -892,7 +887,6 @@ namespace ActionHelpers {
         foundKeys = pathsToSearch;
     }
 
-    // --- 修改点 1.3: 更新 HandleDeleteRegKey 以使用新函数 ---
     void HandleDeleteRegKey(const std::wstring& keyPattern, bool ifEmpty) {
         HKEY hRootKey;
         std::wstring rootKeyStr, subKeyPattern, valueName;
@@ -903,13 +897,23 @@ namespace ActionHelpers {
 
         for (const auto& key : keysToDelete) {
             if (ifEmpty) {
-                if (IsRegistryKeyEmpty(hRootKey, key.c_str())) {
-                    // 尝试从两个视图删除
-                    RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
-                    RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                // --- 修改点 1.3: 修复 ifempty 逻辑 ---
+                if (hRootKey == HKEY_LOCAL_MACHINE) {
+                    // 对 HKLM，独立检查和删除每个视图
+                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_64KEY)) {
+                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
+                    }
+                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_32KEY)) {
+                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                    }
+                } else {
+                    // 对其他根键，只检查和删除一次
+                    if (IsKeyEmptyInView(hRootKey, key, 0)) {
+                        RegDeleteKeyW(hRootKey, key.c_str());
+                    }
                 }
             } else {
-                // 使用新的递归函数，它会自动处理两个视图
+                // 使用新的递归函数，它会自动处理不同根键
                 DeleteRegistryKeyTree(hRootKey, key.c_str());
             }
         }
@@ -924,8 +928,15 @@ namespace ActionHelpers {
         FindMatchingRegKeys(hRootKey, subKeyPattern, keysToSearch);
 
         for (const auto& keyPath : keysToSearch) {
-            REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
-            for (REGSAM view : views) {
+            std::vector<REGSAM> viewsToSearch;
+            if (hRootKey == HKEY_LOCAL_MACHINE) {
+                viewsToSearch.push_back(KEY_WOW64_64KEY);
+                viewsToSearch.push_back(KEY_WOW64_32KEY);
+            } else {
+                viewsToSearch.push_back(0);
+            }
+
+            for (REGSAM view : viewsToSearch) {
                 HKEY hKey;
                 if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey) == ERROR_SUCCESS) {
                     wchar_t valName[16383];
@@ -2122,6 +2133,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
 
     while (std::getline(stream, line)) {
+        std::wstring original_line = line; // Keep original for replaceline
         line = trim(line);
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
 
@@ -2133,11 +2145,11 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        size_t delimiterPos = line.find(L'=');
+        size_t delimiterPos = original_line.find(L'=');
         if (delimiterPos == std::wstring::npos) continue;
 
-        std::wstring key = trim(line.substr(0, delimiterPos));
-        std::wstring value = line.substr(delimiterPos + 1); // Do not trim value for replaceline
+        std::wstring key = trim(original_line.substr(0, delimiterPos));
+        std::wstring value = original_line.substr(delimiterPos + 1);
 
         if (_wcsicmp(key.c_str(), L"uservar") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
@@ -2167,8 +2179,10 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // Trim value for all other keys
-        value = trim(value);
+        // For all other keys, trim the value now.
+        if (_wcsicmp(key.c_str(), L"replaceline") != 0) {
+            value = trim(value);
+        }
 
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
@@ -2477,7 +2491,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         PathRemoveFileSpecW(appDir);
         variables[L"EXEPATH"] = appDir;
         
-        // --- 修改点 1.1: 添加 {EXENAME} 内置变量 ---
         const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
         if (appFilename) {
             variables[L"EXENAME"] = appFilename;
