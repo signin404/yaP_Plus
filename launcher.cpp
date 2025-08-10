@@ -778,9 +778,6 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
-    // --- 修改点 1.2: 重构注册表删除逻辑 ---
-
-    // 内部递归函数，处理指定的注册表视图
     LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
@@ -803,23 +800,19 @@ namespace ActionHelpers {
         return RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
     }
 
-    // 公开的删除函数，根据根键类型决定如何操作
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
         if (hRootKey == HKEY_LOCAL_MACHINE) {
-            // 对于 HKLM，尝试删除64位和32位两个视图
             RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_64KEY);
             RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_32KEY);
         } else {
-            // 对于 HKCU 等，只进行一次标准删除
             RecursiveRegDeleteKey_Internal(hRootKey, subKey, 0);
         }
     }
     
-    // 检查指定视图中的键是否为空
     bool IsKeyEmptyInView(HKEY hRootKey, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | samAccess, &hKey) != ERROR_SUCCESS) {
-            return true; // 打不开，视为空
+            return true;
         }
         DWORD subKeyCount = 0;
         DWORD valueCount = 0;
@@ -897,9 +890,7 @@ namespace ActionHelpers {
 
         for (const auto& key : keysToDelete) {
             if (ifEmpty) {
-                // --- 修改点 1.3: 修复 ifempty 逻辑 ---
                 if (hRootKey == HKEY_LOCAL_MACHINE) {
-                    // 对 HKLM，独立检查和删除每个视图
                     if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_64KEY)) {
                         RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
                     }
@@ -907,13 +898,11 @@ namespace ActionHelpers {
                         RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
                     }
                 } else {
-                    // 对其他根键，只检查和删除一次
                     if (IsKeyEmptyInView(hRootKey, key, 0)) {
                         RegDeleteKeyW(hRootKey, key.c_str());
                     }
                 }
             } else {
-                // 使用新的递归函数，它会自动处理不同根键
                 DeleteRegistryKeyTree(hRootKey, key.c_str());
             }
         }
@@ -1824,8 +1813,17 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 arg.destBackupCreated = true;
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
-                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
-                else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
+                if (arg.isDirectory) {
+                    // --- 修改点: 复制目录本身，而非其内容 ---
+                    // 为 SHFileOperationW 提供目标父目录，而不是完整的目标路径。
+                    wchar_t destParentPath[MAX_PATH];
+                    wcscpy_s(destParentPath, arg.destPath.c_str());
+                    PathRemoveFileSpecW(destParentPath);
+                    PerformFileSystemOperation(FO_COPY, arg.sourcePath, destParentPath);
+                }
+                else {
+                    CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
+                }
             }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
             if (PathFileExistsW(arg.targetPath.c_str())) {
@@ -1836,7 +1834,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
-            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
+            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
@@ -1884,8 +1882,18 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (PathFileExistsW(arg.destPath.c_str())) {
                 std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
                 if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
-                else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
+                
+                if (arg.isDirectory) {
+                    // --- 修改点: 复制目录本身，而非其内容 ---
+                    // 为 SHFileOperationW 提供源的父目录，以确保整个目录被复制。
+                    wchar_t sourceParentPath[MAX_PATH];
+                    wcscpy_s(sourceParentPath, arg.sourcePath.c_str());
+                    PathRemoveFileSpecW(sourceParentPath);
+                    PerformFileSystemOperation(FO_COPY, arg.destPath, sourceParentPath);
+                } else {
+                    CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
+                }
+
                 if (PathFileExistsW(sourceBackupPath.c_str())) {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
                     else DeleteFileW(sourceBackupPath.c_str());
@@ -1909,7 +1917,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 if (arg.isKey) ExportRegistryKey(arg.rootKeyStr, arg.subKey, arg.filePath);
                 else ExportRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.rootKeyStr, arg.filePath);
             }
-            if (arg.isKey) SHDeleteKeyW(arg.hRootKey, arg.subKey.c_str());
+            if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey.c_str());
             else {
                 HKEY hKey;
                 if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
