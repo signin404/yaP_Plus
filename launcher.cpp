@@ -1814,14 +1814,16 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
                 if (arg.isDirectory) {
-                    // --- 修改点: 复制目录本身，而非其内容 ---
-                    // 为 SHFileOperationW 提供目标父目录，而不是完整的目标路径。
-                    wchar_t destParentPath[MAX_PATH];
-                    wcscpy_s(destParentPath, arg.destPath.c_str());
-                    PathRemoveFileSpecW(destParentPath);
-                    PerformFileSystemOperation(FO_COPY, arg.sourcePath, destParentPath);
-                }
-                else {
+                    // --- 修改点: 解决目录复制时的嵌套问题 ---
+                    // 通过在源路径后附加 "\*"，我们告诉 SHFileOperationW 复制源目录的 *内容*，
+                    // 而不是源目录本身。
+                    std::wstring sourcePathForCopy = arg.sourcePath;
+                    if (!sourcePathForCopy.empty() && sourcePathForCopy.back() != L'\\') {
+                        sourcePathForCopy += L'\\';
+                    }
+                    sourcePathForCopy += L'*';
+                    PerformFileSystemOperation(FO_COPY, sourcePathForCopy, arg.destPath);
+                } else {
                     CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
                 }
             }
@@ -1834,7 +1836,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
-            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
+            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
@@ -1882,18 +1884,8 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (PathFileExistsW(arg.destPath.c_str())) {
                 std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
                 if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                
-                if (arg.isDirectory) {
-                    // --- 修改点: 复制目录本身，而非其内容 ---
-                    // 为 SHFileOperationW 提供源的父目录，以确保整个目录被复制。
-                    wchar_t sourceParentPath[MAX_PATH];
-                    wcscpy_s(sourceParentPath, arg.sourcePath.c_str());
-                    PathRemoveFileSpecW(sourceParentPath);
-                    PerformFileSystemOperation(FO_COPY, arg.destPath, sourceParentPath);
-                } else {
-                    CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
-                }
-
+                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
+                else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
                 if (PathFileExistsW(sourceBackupPath.c_str())) {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
                     else DeleteFileW(sourceBackupPath.c_str());
@@ -1917,7 +1909,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 if (arg.isKey) ExportRegistryKey(arg.rootKeyStr, arg.subKey, arg.filePath);
                 else ExportRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.rootKeyStr, arg.filePath);
             }
-            if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey.c_str());
+            if (arg.isKey) SHDeleteKeyW(arg.hRootKey, arg.subKey.c_str());
             else {
                 HKEY hKey;
                 if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
