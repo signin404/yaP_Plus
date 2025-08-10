@@ -1814,9 +1814,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
                 if (arg.isDirectory) {
-                    // --- 修改点: 解决目录复制时的嵌套问题 ---
-                    // 通过在源路径后附加 "\*"，我们告诉 SHFileOperationW 复制源目录的 *内容*，
-                    // 而不是源目录本身。
                     std::wstring sourcePathForCopy = arg.sourcePath;
                     if (!sourcePathForCopy.empty() && sourcePathForCopy.back() != L'\\') {
                         sourcePathForCopy += L'\\';
@@ -1883,15 +1880,10 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
         if constexpr (std::is_same_v<T, FileOp>) {
             if (PathFileExistsW(arg.destPath.c_str())) {
                 std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
-                if (PathFileExistsW(arg.sourcePath.c_str())) {
-                    MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                }
-
-                // --- 修改点: 修复清理时的目录回写嵌套问题 ---
+                if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
+                
+                // --- 修改点: 修复清理时目录回写的嵌套问题 ---
                 if (arg.isDirectory) {
-                    // 确保目标目录存在
-                    SHCreateDirectoryExW(NULL, arg.sourcePath.c_str(), NULL);
-                    // 与启动时类似，通过在源路径后附加 "\*" 来复制内容
                     std::wstring destPathForCopy = arg.destPath;
                     if (!destPathForCopy.empty() && destPathForCopy.back() != L'\\') {
                         destPathForCopy += L'\\';
@@ -1903,22 +1895,15 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 }
 
                 if (PathFileExistsW(sourceBackupPath.c_str())) {
-                    if (arg.isDirectory) {
-                        PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
-                    } else {
-                        DeleteFileW(sourceBackupPath.c_str());
-                    }
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
+                    else DeleteFileW(sourceBackupPath.c_str());
                 }
             }
-            if (arg.isDirectory) {
-                PerformFileSystemOperation(FO_DELETE, arg.destPath);
-            } else {
-                DeleteFileW(arg.destPath.c_str());
-            }
+            if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.destPath);
+            else DeleteFileW(arg.destPath.c_str());
             if (arg.destBackupCreated && PathFileExistsW(arg.destBackupPath.c_str())) {
                 MoveFileW(arg.destBackupPath.c_str(), arg.destPath.c_str());
             }
-        }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
             if (PathFileExistsW(arg.targetPath.c_str())) {
                 if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.targetPath);
