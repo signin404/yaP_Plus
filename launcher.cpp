@@ -2493,7 +2493,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
         std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
-        if (tempFileDirRaw.empty() || !PathIsDirectoryW(tempFileDir.c_str())) {
+        // 如果 tempfile 设置为空，则退回使用 YAPROOT。
+        if (tempFileDirRaw.empty()) {
             tempFileDir = variables[L"YAPROOT"];
         }
         std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
