@@ -778,6 +778,7 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
+    // --- 修改点 1.2: 重构注册表删除逻辑 ---
     LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
@@ -1813,16 +1814,8 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 arg.destBackupCreated = true;
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
-                if (arg.isDirectory) {
-                    std::wstring sourcePathForCopy = arg.sourcePath;
-                    if (!sourcePathForCopy.empty() && sourcePathForCopy.back() != L'\\') {
-                        sourcePathForCopy += L'\\';
-                    }
-                    sourcePathForCopy += L'*';
-                    PerformFileSystemOperation(FO_COPY, sourcePathForCopy, arg.destPath);
-                } else {
-                    CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
-                }
+                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
+                else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
             }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
             if (PathFileExistsW(arg.targetPath.c_str())) {
@@ -1881,19 +1874,8 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (PathFileExistsW(arg.destPath.c_str())) {
                 std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
                 if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                
-                // --- 修改点: 修复清理时目录回写的嵌套问题 ---
-                if (arg.isDirectory) {
-                    std::wstring destPathForCopy = arg.destPath;
-                    if (!destPathForCopy.empty() && destPathForCopy.back() != L'\\') {
-                        destPathForCopy += L'\\';
-                    }
-                    destPathForCopy += L'*';
-                    PerformFileSystemOperation(FO_COPY, destPathForCopy, arg.sourcePath);
-                } else {
-                    CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
-                }
-
+                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
+                else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
                 if (PathFileExistsW(sourceBackupPath.c_str())) {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
                     else DeleteFileW(sourceBackupPath.c_str());
@@ -2516,12 +2498,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
 
+        // --- 修改点 1.1: 逻辑调整，为崩溃清理和正常启动分别解析 ---
         std::vector<BeforeOperation> beforeOps;
         std::vector<AfterOperation> afterOps;
         BackupThreadData backupData;
-        ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
         if (PathFileExistsW(tempFilePath.c_str())) {
+            // 第一次解析：仅用于获取崩溃清理所需的信息
+            ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
+
             std::vector<StartupShutdownOperation> shutdownOpsForCrash;
             for (auto& op : beforeOps) {
                 std::visit([&](auto& arg) {
@@ -2554,7 +2539,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             DeleteFileW(tempFilePath.c_str());
+
+            // 清理旧的解析结果，因为文件系统状态已改变
+            beforeOps.clear();
+            afterOps.clear();
+            backupData = {}; // 重置
         }
+
+        // 第二次（或正常情况下的第一次）解析：获取本次启动要执行的操作
+        ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
         std::vector<StartupShutdownOperation> shutdownOps;
 
