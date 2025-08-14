@@ -500,6 +500,7 @@ bool RunSimpleCommand(const std::wstring& command) {
     return exitCode == 0;
 }
 
+// --- 修改点 1.1: 重构 ParseRegistryPath 以支持路径作为值名称 ---
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -518,14 +519,30 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
         subKey = restOfPath;
         valueName = L"";
     } else {
-        size_t lastSlash = restOfPath.find_last_of(L'\\');
-        if (lastSlash == std::wstring::npos) {
-            subKey = L"";
-            valueName = restOfPath;
-        } else {
-            subKey = restOfPath.substr(0, lastSlash);
-            valueName = restOfPath.substr(lastSlash + 1);
+        // 新逻辑：从右向左迭代查找最后一个有效的注册表项路径。
+        // 这可以正确处理值名称本身包含反斜杠的情况（例如文件路径）。
+        std::wstring currentPath = restOfPath;
+        size_t lastSlashPos = currentPath.find_last_of(L'\\');
+
+        while (lastSlashPos != std::wstring::npos) {
+            std::wstring potentialSubKey = currentPath.substr(0, lastSlashPos);
+            HKEY hTempKey;
+            // 尝试打开潜在的子键。由于这主要用于(regvalue)等操作，
+            // 键应该存在，所以这是一个有效的测试。
+            if (RegOpenKeyExW(hRootKey, potentialSubKey.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
+                RegCloseKey(hTempKey);
+                // 成功打开，我们找到了正确的分割点。
+                subKey = potentialSubKey;
+                valueName = currentPath.substr(lastSlashPos + 1);
+                return true;
+            }
+            // 未能打开，继续向左移动分隔符。
+            lastSlashPos = currentPath.find_last_of(L'\\', lastSlashPos - 1);
         }
+
+        // 如果循环结束仍未找到有效的子键，说明该值直接位于根键下。
+        subKey = L"";
+        valueName = restOfPath;
     }
     return true;
 }
@@ -778,7 +795,6 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
-    // --- 修改点 1.2: 重构注册表删除逻辑 ---
     LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
