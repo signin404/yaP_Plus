@@ -37,12 +37,14 @@ pfnNtResumeProcess g_NtResumeProcess = nullptr;
 // --- Data Structures ---
 
 // Operations with startup and shutdown/cleanup logic
+// --- 修改点 2.1: 为 FileOp 添加标志位 ---
 struct FileOp {
     std::wstring sourcePath;
     std::wstring destPath;
     std::wstring destBackupPath;
     bool isDirectory;
     bool destBackupCreated = false;
+    bool wasMoved = false; // 新增标志，如果为true，则执行的是移动操作
 };
 
 struct RestoreOnlyFileOp {
@@ -331,6 +333,25 @@ std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std:
     return path;
 }
 
+// --- 修改点 1.1: 新增辅助函数以检查路径是否在同一分区 ---
+bool ArePathsOnSameVolume(const std::wstring& path1, const std::wstring& path2) {
+    if (path1.empty() || path2.empty()) {
+        return false;
+    }
+
+    wchar_t root1[MAX_PATH];
+    if (!GetVolumePathNameW(path1.c_str(), root1, MAX_PATH)) {
+        return false;
+    }
+
+    wchar_t root2[MAX_PATH];
+    if (!GetVolumePathNameW(path2.c_str(), root2, MAX_PATH)) {
+        return false;
+    }
+
+    return _wcsicmp(root1, root2) == 0;
+}
+
 std::wstring ExpandVariables(std::wstring path, const std::map<std::wstring, std::wstring>& variables) {
     int safety_counter = 0;
     size_t current_pos = 0;
@@ -500,7 +521,6 @@ bool RunSimpleCommand(const std::wstring& command) {
     return exitCode == 0;
 }
 
-// --- 修改点 1.1: 重构 ParseRegistryPath 以支持路径作为值名称 ---
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -519,28 +539,21 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
         subKey = restOfPath;
         valueName = L"";
     } else {
-        // 新逻辑：从右向左迭代查找最后一个有效的注册表项路径。
-        // 这可以正确处理值名称本身包含反斜杠的情况（例如文件路径）。
         std::wstring currentPath = restOfPath;
         size_t lastSlashPos = currentPath.find_last_of(L'\\');
 
         while (lastSlashPos != std::wstring::npos) {
             std::wstring potentialSubKey = currentPath.substr(0, lastSlashPos);
             HKEY hTempKey;
-            // 尝试打开潜在的子键。由于这主要用于(regvalue)等操作，
-            // 键应该存在，所以这是一个有效的测试。
             if (RegOpenKeyExW(hRootKey, potentialSubKey.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
                 RegCloseKey(hTempKey);
-                // 成功打开，我们找到了正确的分割点。
                 subKey = potentialSubKey;
                 valueName = currentPath.substr(lastSlashPos + 1);
                 return true;
             }
-            // 未能打开，继续向左移动分隔符。
             lastSlashPos = currentPath.find_last_of(L'\\', lastSlashPos - 1);
         }
 
-        // 如果循环结束仍未找到有效的子键，说明该值直接位于根键下。
         subKey = L"";
         valueName = restOfPath;
     }
@@ -1814,6 +1827,7 @@ cleanup:
 
 // --- Unified Operation Handlers ---
 
+// --- 修改点 3.1: 更新 PerformStartupOperation 以处理移动/复制 ---
 void PerformStartupOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -1830,8 +1844,13 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 arg.destBackupCreated = true;
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
-                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
-                else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
+                if (arg.wasMoved) { // 如果是移动操作
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.sourcePath, arg.destPath);
+                    else MoveFileW(arg.sourcePath.c_str(), arg.destPath.c_str());
+                } else { // 如果是复制操作
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
+                    else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
+                }
             }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
             if (PathFileExistsW(arg.targetPath.c_str())) {
@@ -1842,7 +1861,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
-            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
+            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
@@ -1883,22 +1902,38 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
     }, opData);
 }
 
+// --- 修改点 3.2: 更新 PerformShutdownOperation 以处理移动/复制的清理 ---
 void PerformShutdownOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
-            if (PathFileExistsW(arg.destPath.c_str())) {
-                std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
-                if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
-                else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
-                if (PathFileExistsW(sourceBackupPath.c_str())) {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
-                    else DeleteFileW(sourceBackupPath.c_str());
+            if (arg.wasMoved) {
+                // 如果是移动操作，清理时只需移回去
+                if (PathFileExistsW(arg.destPath.c_str())) {
+                    // 在移回去之前，先删除源位置可能存在的任何文件（不太可能，但为了安全）
+                    if (PathFileExistsW(arg.sourcePath.c_str())) {
+                         if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.sourcePath);
+                         else DeleteFileW(arg.sourcePath.c_str());
+                    }
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.destPath, arg.sourcePath);
+                    else MoveFileW(arg.destPath.c_str(), arg.sourcePath.c_str());
                 }
+            } else {
+                // 如果是复制操作，执行原来的复制回去的逻辑
+                if (PathFileExistsW(arg.destPath.c_str())) {
+                    std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
+                    if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
+                    if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
+                    else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
+                    if (PathFileExistsW(sourceBackupPath.c_str())) {
+                        if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
+                        else DeleteFileW(sourceBackupPath.c_str());
+                    }
+                }
+                if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.destPath);
+                else DeleteFileW(arg.destPath.c_str());
             }
-            if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.destPath);
-            else DeleteFileW(arg.destPath.c_str());
+            // 恢复目标位置的原始备份（对移动和复制都适用）
             if (arg.destBackupCreated && PathFileExistsW(arg.destBackupPath.c_str())) {
                 MoveFileW(arg.destBackupPath.c_str(), arg.destPath.c_str());
             }
@@ -1915,7 +1950,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 if (arg.isKey) ExportRegistryKey(arg.rootKeyStr, arg.subKey, arg.filePath);
                 else ExportRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.rootKeyStr, arg.filePath);
             }
-            if (arg.isKey) SHDeleteKeyW(arg.hRootKey, arg.subKey.c_str());
+            if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey.c_str());
             else {
                 HKEY hKey;
                 if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
@@ -2242,19 +2277,24 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables), variables);
                 ro_op.backupPath = ro_op.targetPath + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
-            } else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
+            } 
+            // --- 修改点 2.2: 在解析 file/dir 时设置 wasMoved 标志 ---
+            else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
                 FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
                     f_op.destPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     std::wstring sourceRaw = parts[1];
                     std::wstring expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables), variables);
-                    if (f_op.isDirectory) f_op.sourcePath = expandedSource;
-                    else {
+                    if (f_op.isDirectory) {
+                        f_op.sourcePath = expandedSource;
+                    } else {
                         if (sourceRaw.back() == L'\\') f_op.sourcePath = expandedSource + PathFindFileNameW(f_op.destPath.c_str());
                         else f_op.sourcePath = expandedSource;
                     }
                     f_op.destBackupPath = f_op.destPath + L"_Backup";
+                    // 检查是否在同一分区并设置标志
+                    f_op.wasMoved = ArePathsOnSameVolume(f_op.sourcePath, f_op.destPath);
                     beforeOp.data = f_op; op_created = true;
                 }
             } else if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
@@ -2509,19 +2549,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
         std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
-        // 如果 tempfile 设置为空，则退回使用 YAPROOT。
         if (tempFileDirRaw.empty()) {
             tempFileDir = variables[L"YAPROOT"];
         }
         std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
 
-        // --- 修改点 1.1: 逻辑调整，为崩溃清理和正常启动分别解析 ---
         std::vector<BeforeOperation> beforeOps;
         std::vector<AfterOperation> afterOps;
         BackupThreadData backupData;
 
         if (PathFileExistsW(tempFilePath.c_str())) {
-            // 第一次解析：仅用于获取崩溃清理所需的信息
             ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
             std::vector<StartupShutdownOperation> shutdownOpsForCrash;
@@ -2557,13 +2594,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             DeleteFileW(tempFilePath.c_str());
 
-            // 清理旧的解析结果，因为文件系统状态已改变
             beforeOps.clear();
             afterOps.clear();
-            backupData = {}; // 重置
+            backupData = {};
         }
 
-        // 第二次（或正常情况下的第一次）解析：获取本次启动要执行的操作
         ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
         std::vector<StartupShutdownOperation> shutdownOps;
