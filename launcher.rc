@@ -1,8 +1,58 @@
 // launcher.rc
+
+// 引入 Windows 定义，这对于 VERSIONINFO 块是必需的
+#include <windows.h>
+
+// --- 图标资源 ---
 // 定义一个唯一的ID给我们的图标资源
 #define IDI_MAINICON 101
 
-// 将 icon.ico 文件作为图标资源嵌入，并赋予它上面的ID
-// "ICON" 是资源类型
-// "icon.ico" 是图标文件的路径
+// 将 icon.ico 文件作为图标资源嵌入
 IDI_MAINICON ICON "icon.ico"
+
+
+// --- 版本信息资源 ---
+// '1' 是这个版本信息资源的ID，通常设为1
+VS_VERSION_INFO VERSIONINFO
+// 文件版本（数字格式），供操作系统使用。格式：主版本, 次版本, 修订号, 内部版本号
+// FILEVERSION     1, 0, 0, 1
+// 产品版本（数字格式），供操作系统使用。
+// PRODUCTVERSION  1, 0, 0, 1
+// 文件标志掩码，通常设置为 0x3f 表示所有标志都有效
+// FILEFLAGSMASK   0x3fL
+// 文件标志，0L 表示这是一个标准的发布版本
+// FILEFLAGS       0x0L
+// 文件操作系统类型，VOS__WINDOWS32 表示为 Win32 应用程序
+// FILEOS          VOS__WINDOWS32
+// 文件类型，VFT_APP 表示这是一个应用程序 (.exe)
+// FILETYPE        VFT_APP
+// 文件子类型，VFT2_UNKNOWN 表示没有特定的子类型
+// FILESUBTYPE     VFT2_UNKNOWN
+// BEGIN
+    // 字符串信息块的开始
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 语言和代码页块。
+        // "040904b0" 表示 "美国英语, Unicode"。这是最常用的组合。
+        // 0409 = LangID for U.S. English
+        // 04b0 = CodePage for Unicode
+        BLOCK "040904b0"
+        BEGIN
+            // 在这里定义所有你想在文件属性中显示的字符串
+            // VALUE "键", "值"
+            // VALUE "CompanyName",      "Your Company Name"                 // 公司名称
+            // VALUE "FileDescription",  "yaP Plus"     // 文件描述
+            VALUE "FileVersion",      "1.3"                           // 文件版本（字符串格式）
+            // VALUE "InternalName",     "yaP Plus"                      // 内部名称
+            // VALUE "LegalCopyright",   "Copyright (C) 2025. All rights reserved." // 版权信息
+            // VALUE "OriginalFilename", "yaP_Plus.exe"                      // 原始文件名
+            VALUE "ProductName",      "yaP Plus"          // 产品名称
+            VALUE "ProductVersion",   "1.3"                               // 产品版本（字符串格式）
+        END
+    END
+    // 变量信息块的开始，用于指定语言和代码页
+    // BLOCK "VarFileInfo"
+    // BEGIN
+        // VALUE "Translation", 0x409, 1200 // 0x0409 = U.S. English, 1200 = Unicode
+    // END
+// END
