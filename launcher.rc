@@ -15,20 +15,20 @@ IDI_MAINICON ICON "icon.ico"
 // '1' 是这个版本信息资源的ID，通常设为1
 VS_VERSION_INFO VERSIONINFO
 // 文件版本（数字格式），供操作系统使用。格式：主版本, 次版本, 修订号, 内部版本号
-// FILEVERSION     1, 0, 0, 1
+FILEVERSION     1, 0, 0, 0
 // 产品版本（数字格式），供操作系统使用。
-// PRODUCTVERSION  1, 0, 0, 1
+PRODUCTVERSION  1, 0, 0, 0
 // 文件标志掩码，通常设置为 0x3f 表示所有标志都有效
-// FILEFLAGSMASK   0x3fL
+FILEFLAGSMASK   0x3fL
 // 文件标志，0L 表示这是一个标准的发布版本
-// FILEFLAGS       0x0L
+FILEFLAGS       0x0L
 // 文件操作系统类型，VOS__WINDOWS32 表示为 Win32 应用程序
-// FILEOS          VOS__WINDOWS32
+FILEOS          VOS__WINDOWS32
 // 文件类型，VFT_APP 表示这是一个应用程序 (.exe)
-// FILETYPE        VFT_APP
+FILETYPE        VFT_APP
 // 文件子类型，VFT2_UNKNOWN 表示没有特定的子类型
-// FILESUBTYPE     VFT2_UNKNOWN
-// BEGIN
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
     // 字符串信息块的开始
     BLOCK "StringFileInfo"
     BEGIN
@@ -51,8 +51,8 @@ VS_VERSION_INFO VERSIONINFO
         END
     END
     // 变量信息块的开始，用于指定语言和代码页
-    // BLOCK "VarFileInfo"
-    // BEGIN
-        // VALUE "Translation", 0x409, 1200 // 0x0409 = U.S. English, 1200 = Unicode
-    // END
-// END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200 // 0x0409 = U.S. English, 1200 = Unicode
+    END
+END
