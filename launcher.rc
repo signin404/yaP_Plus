@@ -36,7 +36,7 @@ BEGIN
         // "040904b0" 表示 "美国英语, Unicode"。这是最常用的组合。
         // 0409 = LangID for U.S. English
         // 04b0 = CodePage for Unicode
-        BLOCK "040904b0"
+        BLOCK "000004b0"
         BEGIN
             // 在这里定义所有你想在文件属性中显示的字符串
             // VALUE "键", "值"
@@ -53,6 +53,6 @@ BEGIN
     // 变量信息块的开始，用于指定语言和代码页
     BLOCK "VarFileInfo"
     BEGIN
-        VALUE "Translation", 0x409, 1200 // 0x0409 = U.S. English, 1200 = Unicode
+        VALUE "Translation", 0x0000, 1200 // 0x0409 = U.S. English, 1200 = Unicode
     END
 END
