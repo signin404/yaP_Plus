@@ -2537,6 +2537,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
         if (appFilename) {
             variables[L"EXENAME"] = appFilename;
+			wchar_t appNameBuffer[MAX_PATH];
+			wcscpy_s(appNameBuffer, MAX_PATH, appFilename);
+			PathRemoveExtensionW(appNameBuffer);
+			variables[L"APPNAME"] = appNameBuffer;
         }
 
         std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
