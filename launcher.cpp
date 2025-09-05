@@ -1868,6 +1868,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
+            // 场景 1: 为硬链接执行 "移动以进行清理" 的特殊模式
             if (arg.performMoveOnCleanup) {
                 if (PathFileExistsW(arg.linkPath.c_str())) {
                     if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
@@ -1875,35 +1876,58 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         arg.backupCreated = true;
                     }
                 }
-            } else if (!arg.traversalMode.empty()) {
+            }
+            // 场景 2: 遍历源目录并在目标目录创建多个链接
+            else if (!arg.traversalMode.empty()) {
+                // 确保目标链接目录存在
                 SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
+
                 WIN32_FIND_DATAW findData;
-                std::wstring searchPath = arg.targetPath + L"\\*";
+                std::wstring searchPath = arg.targetPath + L"\\*"; // 遍历源目录
                 HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
                 if (hFind != INVALID_HANDLE_VALUE) {
                     do {
                         std::wstring itemName = findData.cFileName;
                         if (itemName == L"." || itemName == L"..") continue;
+
                         bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+                        // 根据遍历模式决定是否应该链接此项
                         bool shouldLink = false;
                         if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
                         else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
                         else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
+                        
+                        // 硬链接不能用于目录
                         if (arg.isHardlink && isItemDirectory) shouldLink = false;
+
                         if (shouldLink) {
                             std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
                             std::wstring destFullPath = arg.linkPath + L"\\" + itemName;
+
+                            // !! 关键修复点 !!
+                            // 如果目标路径已存在同名项, 则备份它
                             if (PathFileExistsW(destFullPath.c_str())) {
                                 std::wstring backupDestPath = destFullPath + L"_Backup";
+                                // 先删除旧的备份，以防万一
+                                if (PathIsDirectoryW(backupDestPath.c_str())) {
+                                     PerformFileSystemOperation(FO_DELETE, backupDestPath);
+                                } else {
+                                    DeleteFileW(backupDestPath.c_str());
+                                }
+                                // 创建新的备份
                                 MoveFileW(destFullPath.c_str(), backupDestPath.c_str());
                                 arg.backedUpPaths.push_back({backupDestPath, destFullPath});
-                                arg.backupCreated = true;
+                                arg.backupCreated = true; // 标记已创建备份
                             }
+
+                            // 创建链接
                             if (arg.isHardlink) {
                                 if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
                                     arg.createdLinks.push_back({destFullPath, L""});
                                 }
-                            } else {
+                            } else { // Symlink
                                 DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                                 if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
                                     arg.createdLinks.push_back({destFullPath, L""});
@@ -1913,25 +1937,33 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     } while (FindNextFileW(hFind, &findData));
                     FindClose(hFind);
                 }
-            } else {
+            }
+            // 场景 3: 创建单个文件或目录链接
+            else {
+                // 确保链接的父目录存在
                 wchar_t dirPath[MAX_PATH];
                 wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
                 PathRemoveFileSpecW(dirPath);
                 if (wcslen(dirPath) > 0) SHCreateDirectoryExW(NULL, dirPath, NULL);
+
+                // 如果链接路径已存在，则备份它
                 if (PathFileExistsW(arg.linkPath.c_str())) {
                     if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
                         arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
                         arg.backupCreated = true;
                     }
                 }
+
+                // 创建链接
                 if (arg.isHardlink) {
+                    // 硬链接目录需要递归创建文件链接
                     if (arg.isDirectory) {
                         CreateDirectoryW(arg.linkPath.c_str(), NULL);
                         CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdLinks);
                     } else {
                         CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
                     }
-                } else {
+                } else { // Symlink
                     DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                     CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
                 }
