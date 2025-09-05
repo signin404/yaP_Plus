@@ -73,9 +73,9 @@ struct LinkOp {
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdLinks;
+    std::vector<std::pair<std::wstring, bool>> createdLinks; // pair<path, isDirectory>
     bool performMoveOnCleanup = false;
-    std::wstring traversalMode; // NEW: "dir", "file", "all", or empty
+    std::wstring traversalMode;
 };
 
 struct FirewallOp {
@@ -1706,7 +1706,7 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
+void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, bool>>& createdLinks) {
     WIN32_FIND_DATAW findData;
     std::wstring searchPath = srcDir + L"\\*";
     HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
@@ -1721,7 +1721,7 @@ void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& de
             CreateHardLinksRecursive(srcPath, destPath, createdLinks);
         } else {
             if (CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL)) {
-                createdLinks.push_back({destPath, srcPath});
+                createdLinks.push_back({destPath, false});
             }
         }
     } while (FindNextFileW(hFind, &findData));
@@ -1876,9 +1876,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 wchar_t dirPath[MAX_PATH];
                 wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
                 PathRemoveFileSpecW(dirPath);
-                if (wcslen(dirPath) > 0) {
-                    SHCreateDirectoryExW(NULL, dirPath, NULL);
-                }
+                if (wcslen(dirPath) > 0) SHCreateDirectoryExW(NULL, dirPath, NULL);
 
                 if (PathFileExistsW(arg.linkPath.c_str())) {
                     if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
@@ -1901,17 +1899,18 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                             else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
                             else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
                             if (arg.isHardlink && isItemDirectory) shouldLink = false;
+
                             if (shouldLink) {
                                 std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
                                 std::wstring destFullPath = arg.linkPath + L"\\" + itemName;
                                 if (arg.isHardlink) {
                                     if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
-                                        arg.createdLinks.push_back({destFullPath, L""});
+                                        arg.createdLinks.push_back({destFullPath, false});
                                     }
                                 } else {
                                     DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                                     if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
-                                        arg.createdLinks.push_back({destFullPath, L""});
+                                        arg.createdLinks.push_back({destFullPath, isItemDirectory});
                                     }
                                 }
                             }
@@ -1923,11 +1922,15 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         CreateDirectoryW(arg.linkPath.c_str(), NULL);
                         CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdLinks);
                     } else {
-                        CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
+                        if (CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL)) {
+                            arg.createdLinks.push_back({arg.linkPath, false});
+                        }
                     }
                 } else {
                     DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                    CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
+                    if (CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags)) {
+                        arg.createdLinks.push_back({arg.linkPath, arg.isDirectory});
+                    }
                 }
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
@@ -2008,11 +2011,19 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     PerformFileSystemOperation(FO_MOVE, arg.linkPath, arg.targetPath);
                 }
             } else {
-                if (!arg.createdLinks.empty()) {
-                    PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                } else {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                    else DeleteFileW(arg.linkPath.c_str());
+                for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
+                    const std::wstring& path = it->first;
+                    bool is_dir_link = it->second;
+                    if (is_dir_link) {
+                        RemoveDirectoryW(path.c_str());
+                    } else {
+                        DeleteFileW(path.c_str());
+                    }
+                }
+                if (!arg.traversalMode.empty()) {
+                    if (PathIsDirectoryW(arg.linkPath.c_str())) {
+                        RemoveDirectoryW(arg.linkPath.c_str());
+                    }
                 }
             }
             if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
@@ -2263,20 +2274,20 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 if (parts.size() >= 2) {
                     l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
+                    if (!l_op.linkPath.empty() && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
+                    if (!l_op.targetPath.empty() && l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
                     if (parts.size() > 2) {
                         l_op.traversalMode = trim(parts[2]);
                     }
                     if (!l_op.traversalMode.empty()) {
                         l_op.isDirectory = true;
                     } else {
-                        l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
+                        DWORD attribs = GetFileAttributesW(l_op.targetPath.c_str());
+                        l_op.isDirectory = (attribs != INVALID_FILE_ATTRIBUTES && (attribs & FILE_ATTRIBUTE_DIRECTORY));
                     }
-                    if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
                     l_op.backupPath = l_op.linkPath + L"_Backup";
-                    if (l_op.isHardlink) {
-                        if (!PathFileExistsW(l_op.targetPath.c_str())) {
-                            l_op.performMoveOnCleanup = true;
-                        }
+                    if (l_op.isHardlink && !PathFileExistsW(l_op.targetPath.c_str())) {
+                        l_op.performMoveOnCleanup = true;
                     }
                     beforeOp.data = l_op;
                     op_created = true;
