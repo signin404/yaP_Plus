@@ -2305,11 +2305,17 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     }
 
                     l_op.backupPath = l_op.linkPath + L"_Backup";
-                    if (l_op.isHardlink) {
+
+                    // --- BUG FIX ---
+                    // The "move on cleanup" behavior is only for simple hardlinks where the source
+                    // doesn't exist at startup, acting as a placeholder for the app to create files in.
+                    // It should NOT apply to traversal-mode links.
+                    if (l_op.isHardlink && l_op.traversalMode.empty()) {
                         if (!PathFileExistsW(l_op.targetPath.c_str())) {
                             l_op.performMoveOnCleanup = true;
                         }
                     }
+                    
                     beforeOp.data = l_op;
                     op_created = true;
                 }
