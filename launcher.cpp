@@ -2289,7 +2289,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     } else {
                         l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
                     }
-                    if (l_op.isDirectory && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
+                    
+                    if (l_op.isDirectory) {
+                        if (l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
+                        if (l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
+                    }
+
                     l_op.backupPath = l_op.linkPath + L"_Backup";
                     if (l_op.isHardlink) {
                         if (!PathFileExistsW(l_op.targetPath.c_str())) {
