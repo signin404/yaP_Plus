@@ -2633,16 +2633,41 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     using T = std::decay_t<decltype(arg)>;
                     if constexpr (!std::is_same_v<T, ActionOpData>) {
                         StartupShutdownOperation ssOp{arg};
-                        std::visit([](auto& op_data) {
+                        std::visit([&](auto& op_data) {
                             using OpType = std::decay_t<decltype(op_data)>;
                             if constexpr (std::is_same_v<OpType, FileOp>) {
                                 op_data.destBackupCreated = true;
                             } else if constexpr (std::is_same_v<OpType, RestoreOnlyFileOp> ||
                                                std::is_same_v<OpType, RegistryOp> ||
-                                               std::is_same_v<OpType, LinkOp>) {
+                                               std::is_same_v<OpType, FirewallOp>) {
                                 op_data.backupCreated = true;
-                            } else if constexpr (std::is_same_v<OpType, FirewallOp>) {
-                                op_data.ruleCreated = true;
+                            } else if constexpr (std::is_same_v<OpType, LinkOp>) {
+                                op_data.backupCreated = true;
+                                if (!op_data.traversalMode.empty()) {
+                                    WIN32_FIND_DATAW findData;
+                                    std::wstring searchPath = op_data.targetPath + L"\\*";
+                                    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                                    if (hFind != INVALID_HANDLE_VALUE) {
+                                        do {
+                                            std::wstring itemName = findData.cFileName;
+                                            if (itemName == L"." || itemName == L"..") continue;
+                                            bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+                                            bool shouldHaveBeenLinked = false;
+                                            if (_wcsicmp(op_data.traversalMode.c_str(), L"all") == 0) shouldHaveBeenLinked = true;
+                                            else if (_wcsicmp(op_data.traversalMode.c_str(), L"dir") == 0) shouldHaveBeenLinked = isItemDirectory;
+                                            else if (_wcsicmp(op_data.traversalMode.c_str(), L"file") == 0) shouldHaveBeenLinked = !isItemDirectory;
+                                            if (op_data.isHardlink && isItemDirectory) shouldHaveBeenLinked = false;
+
+                                            if (shouldHaveBeenLinked) {
+                                                std::wstring destFullPath = op_data.linkPath + L"\\" + itemName;
+                                                if (PathFileExistsW(destFullPath.c_str())) {
+                                                    op_data.createdLinks.push_back({destFullPath, L""});
+                                                }
+                                            }
+                                        } while (FindNextFileW(hFind, &findData));
+                                        FindClose(hFind);
+                                    }
+                                }
                             }
                         }, ssOp.data);
                         shutdownOpsForCrash.push_back(ssOp);
