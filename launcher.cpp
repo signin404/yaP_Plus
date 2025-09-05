@@ -1867,78 +1867,66 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
-        } else if constexpr (std::is_same_v<T, LinkOp>) {
-            // 场景 1: 为硬链接执行 "移动以进行清理" 的特殊模式
-            if (arg.performMoveOnCleanup) {
-                if (PathFileExistsW(arg.linkPath.c_str())) {
-                    if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
-                        arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
-                        arg.backupCreated = true;
-                    }
-                }
-            }
-            // 场景 2: 遍历源目录并在目标目录创建多个链接
-            else if (!arg.traversalMode.empty()) {
-                // 确保目标链接目录存在
-                SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
+        } 
+        // =================================================================================
+        // ============================ START OF CRITICAL FIX ============================
+        // =================================================================================
+        else if constexpr (std::is_same_v<T, LinkOp>) {
+            // 场景 1: "填充型"链接 (带遍历模式, e.g., ":: file")
+            // 意图: 将源目录(targetPath)中的内容链接到目标目录(linkPath)中.
+            // 行为: 不应该备份整个目标目录, 只需确保它存在, 然后在里面创建链接.
+            if (!arg.traversalMode.empty()) {
+                SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL); // 确保目标(容器)目录存在
 
                 WIN32_FIND_DATAW findData;
                 std::wstring searchPath = arg.targetPath + L"\\*"; // 遍历源目录
                 HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                if (hFind == INVALID_HANDLE_VALUE) return; // 源目录不存在或为空, 无事可做
 
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        std::wstring itemName = findData.cFileName;
-                        if (itemName == L"." || itemName == L"..") continue;
+                do {
+                    std::wstring itemName = findData.cFileName;
+                    if (itemName == L"." || itemName == L"..") continue;
 
-                        bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+                    bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
 
-                        // 根据遍历模式决定是否应该链接此项
-                        bool shouldLink = false;
-                        if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
-                        else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
-                        else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
-                        
-                        // 硬链接不能用于目录
-                        if (arg.isHardlink && isItemDirectory) shouldLink = false;
+                    // 根据遍历模式决定是否链接此项
+                    bool shouldLink = false;
+                    if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
+                    else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
+                    else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
+                    
+                    if (arg.isHardlink && isItemDirectory) shouldLink = false; // 硬链接不能用于目录
 
-                        if (shouldLink) {
-                            std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
-                            std::wstring destFullPath = arg.linkPath + L"\\" + itemName;
+                    if (shouldLink) {
+                        std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
+                        std::wstring destFullPath = arg.linkPath + L"\\" + itemName;
 
-                            // !! 关键修复点 !!
-                            // 如果目标路径已存在同名项, 则备份它
-                            if (PathFileExistsW(destFullPath.c_str())) {
-                                std::wstring backupDestPath = destFullPath + L"_Backup";
-                                // 先删除旧的备份，以防万一
-                                if (PathIsDirectoryW(backupDestPath.c_str())) {
-                                     PerformFileSystemOperation(FO_DELETE, backupDestPath);
-                                } else {
-                                    DeleteFileW(backupDestPath.c_str());
-                                }
-                                // 创建新的备份
-                                MoveFileW(destFullPath.c_str(), backupDestPath.c_str());
-                                arg.backedUpPaths.push_back({backupDestPath, destFullPath});
-                                arg.backupCreated = true; // 标记已创建备份
+                        // 如果目标目录中已有同名项, 只备份这个冲突的项
+                        if (PathFileExistsW(destFullPath.c_str())) {
+                            std::wstring backupDestPath = destFullPath + L"_Backup";
+                            MoveFileW(destFullPath.c_str(), backupDestPath.c_str());
+                            arg.backedUpPaths.push_back({backupDestPath, destFullPath});
+                            arg.backupCreated = true;
+                        }
+
+                        // 创建链接
+                        if (arg.isHardlink) {
+                            if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
+                                arg.createdLinks.push_back({destFullPath, L""});
                             }
-
-                            // 创建链接
-                            if (arg.isHardlink) {
-                                if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
-                                    arg.createdLinks.push_back({destFullPath, L""});
-                                }
-                            } else { // Symlink
-                                DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                                if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
-                                    arg.createdLinks.push_back({destFullPath, L""});
-                                }
+                        } else { // Symlink
+                            DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+                            if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
+                                arg.createdLinks.push_back({destFullPath, L""});
                             }
                         }
-                    } while (FindNextFileW(hFind, &findData));
-                    FindClose(hFind);
-                }
+                    }
+                } while (FindNextFileW(hFind, &findData));
+                FindClose(hFind);
             }
-            // 场景 3: 创建单个文件或目录链接
+            // 场景 2: "替换型"链接 (无遍历模式)
+            // 意图: 用一个链接替换掉一个路径(linkPath).
+            // 行为: 必须先备份linkPath(如果存在), 然后在原处创建链接.
             else {
                 // 确保链接的父目录存在
                 wchar_t dirPath[MAX_PATH];
@@ -1946,29 +1934,42 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 PathRemoveFileSpecW(dirPath);
                 if (wcslen(dirPath) > 0) SHCreateDirectoryExW(NULL, dirPath, NULL);
 
-                // 如果链接路径已存在，则备份它
-                if (PathFileExistsW(arg.linkPath.c_str())) {
-                    if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
-                        arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
-                        arg.backupCreated = true;
+                // 备份将要被替换的路径
+                if (arg.performMoveOnCleanup) { // 特殊的移动清理模式
+                     if (PathFileExistsW(arg.linkPath.c_str())) {
+                        if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
+                            arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
+                            arg.backupCreated = true;
+                        }
+                    }
+                }
+                else { // 标准备份
+                    if (PathFileExistsW(arg.linkPath.c_str())) {
+                        if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
+                            arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
+                            arg.backupCreated = true;
+                        }
                     }
                 }
 
                 // 创建链接
                 if (arg.isHardlink) {
-                    // 硬链接目录需要递归创建文件链接
-                    if (arg.isDirectory) {
+                    if (arg.isDirectory) { // 硬链接目录需要递归创建
                         CreateDirectoryW(arg.linkPath.c_str(), NULL);
                         CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdLinks);
-                    } else {
+                    } else { // 硬链接文件
                         CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
                     }
-                } else { // Symlink
+                } else { // 符号链接
                     DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                     CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
                 }
             }
-        } else if constexpr (std::is_same_v<T, FirewallOp>) {
+        }
+        // =================================================================================
+        // ============================= END OF CRITICAL FIX =============================
+        // =================================================================================
+        else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
         }
     }, opData);
