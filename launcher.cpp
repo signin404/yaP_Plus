@@ -73,7 +73,7 @@ struct LinkOp {
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdRecursiveLinks; // Only for recursive hardlinks
+    std::vector<std::pair<std::wstring, std::wstring>> createdLinks;
     bool performMoveOnCleanup = false;
     std::wstring traversalMode; // "dir", "file", "all", or empty
 };
@@ -1897,10 +1897,14 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                                 arg.backupCreated = true;
                             }
                             if (arg.isHardlink) {
-                                CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL);
+                                if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
+                                    arg.createdLinks.push_back({destFullPath, L""});
+                                }
                             } else {
                                 DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                                CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags);
+                                if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
+                                    arg.createdLinks.push_back({destFullPath, L""});
+                                }
                             }
                         }
                     } while (FindNextFileW(hFind, &findData));
@@ -1919,7 +1923,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 if (arg.isHardlink) {
                     if (arg.isDirectory) {
                         CreateDirectoryW(arg.linkPath.c_str(), NULL);
-                        CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdRecursiveLinks);
+                        CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdLinks);
                     } else {
                         CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
                     }
@@ -2000,39 +2004,34 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     PerformFileSystemOperation(FO_MOVE, arg.linkPath, arg.targetPath);
                 }
             } else if (!arg.traversalMode.empty()) {
-                WIN32_FIND_DATAW findData;
-                std::wstring searchPath = arg.linkPath + L"\\*";
-                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        std::wstring itemName = findData.cFileName;
-                        if (itemName == L"." || itemName == L"..") continue;
-                        std::wstring fullPath = arg.linkPath + L"\\" + itemName;
-                        DWORD attributes = GetFileAttributesW(fullPath.c_str());
-                        if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                            if (attributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(fullPath.c_str());
-                            else DeleteFileW(fullPath.c_str());
-                        }
-                    } while (FindNextFileW(hFind, &findData));
-                    FindClose(hFind);
+                for (const auto& linkPair : arg.createdLinks) {
+                    const std::wstring& pathToDelete = linkPair.first;
+                    if (PathIsDirectoryW(pathToDelete.c_str())) {
+                        RemoveDirectoryW(pathToDelete.c_str());
+                    } else {
+                        DeleteFileW(pathToDelete.c_str());
+                    }
                 }
-                hFind = FindFirstFileW(searchPath.c_str(), &findData);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        std::wstring itemName = findData.cFileName;
-                        if (itemName == L"." || itemName == L"..") continue;
-                        if (itemName.length() > 7 && itemName.substr(itemName.length() - 7) == L"_Backup") {
-                            std::wstring backupFullPath = arg.linkPath + L"\\" + itemName;
-                            std::wstring originalFullPath = arg.linkPath + L"\\" + itemName.substr(0, itemName.length() - 7);
-                            MoveFileW(backupFullPath.c_str(), originalFullPath.c_str());
-                        }
-                    } while (FindNextFileW(hFind, &findData));
-                    FindClose(hFind);
+                if (arg.backupCreated) {
+                    WIN32_FIND_DATAW findData;
+                    std::wstring searchPath = arg.linkPath + L"\\*";
+                    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                    if (hFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            std::wstring itemName = findData.cFileName;
+                            if (itemName.length() > 7 && itemName.substr(itemName.length() - 7) == L"_Backup") {
+                                std::wstring backupFullPath = arg.linkPath + L"\\" + itemName;
+                                std::wstring originalFullPath = arg.linkPath + L"\\" + itemName.substr(0, itemName.length() - 7);
+                                MoveFileW(backupFullPath.c_str(), originalFullPath.c_str());
+                            }
+                        } while (FindNextFileW(hFind, &findData));
+                        FindClose(hFind);
+                    }
                 }
                 RemoveDirectoryW(arg.linkPath.c_str());
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
-                    for (auto it = arg.createdRecursiveLinks.rbegin(); it != arg.createdRecursiveLinks.rend(); ++it) {
+                    for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
                         DeleteFileW(it->first.c_str());
                     }
                     PerformFileSystemOperation(FO_DELETE, arg.linkPath);
