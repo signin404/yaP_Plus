@@ -1868,7 +1868,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             if (renamed) arg.backupCreated = true;
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
-            // --- FIXED BEHAVIOR START ---
             if (!arg.traversalMode.empty()) {
                 // TRAVERSAL MODE: Populate the destination directory. Do not back up the directory itself.
                 SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
@@ -1924,13 +1923,13 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     }
                 }
 
+                // --- BUG FIX ---
+                // If performMoveOnCleanup is true, it means the source doesn't exist.
+                // We should do NOTHING at startup and let the application create the directory.
                 if (arg.performMoveOnCleanup) {
-                    // Just create an empty directory for the app to use.
-                    if (arg.isDirectory) {
-                        CreateDirectoryW(arg.linkPath.c_str(), NULL);
-                    }
+                    // DO NOTHING. Let the application create the directory at linkPath.
                 } else {
-                    // Create the actual link.
+                    // Create the actual link if it's not a placeholder operation.
                     if (arg.isHardlink) {
                         if (arg.isDirectory) {
                             CreateDirectoryW(arg.linkPath.c_str(), NULL);
@@ -1944,7 +1943,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     }
                 }
             }
-            // --- FIXED BEHAVIOR END ---
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
         }
@@ -2009,11 +2007,18 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (arg.performMoveOnCleanup) {
+                // --- BUG FIX & LOGIC IMPROVEMENT ---
+                // If the app created the directory at linkPath, move it to the targetPath.
                 if (PathFileExistsW(arg.linkPath.c_str())) {
-                    SHCreateDirectoryExW(NULL, arg.targetPath.c_str(), NULL);
-                    std::wstring sourceContents = arg.linkPath + L"\\*";
-                    PerformFileSystemOperation(FO_MOVE, sourceContents, arg.targetPath);
-                    RemoveDirectoryW(arg.linkPath.c_str());
+                    // Ensure the parent directory of the target exists.
+                    wchar_t targetParentDir[MAX_PATH];
+                    wcscpy_s(targetParentDir, MAX_PATH, arg.targetPath.c_str());
+                    PathRemoveFileSpecW(targetParentDir);
+                    if (wcslen(targetParentDir) > 0) {
+                        SHCreateDirectoryExW(NULL, targetParentDir, NULL);
+                    }
+                    // Move the entire directory.
+                    MoveFileW(arg.linkPath.c_str(), arg.targetPath.c_str());
                 }
             } else if (!arg.traversalMode.empty()) {
                 for (const auto& linkPair : arg.createdLinks) {
