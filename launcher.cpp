@@ -2638,9 +2638,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                             if constexpr (std::is_same_v<OpType, FileOp>) {
                                 op_data.destBackupCreated = true;
                             } else if constexpr (std::is_same_v<OpType, RestoreOnlyFileOp> ||
-                                               std::is_same_v<OpType, RegistryOp> ||
-                                               std::is_same_v<OpType, FirewallOp>) {
+                                               std::is_same_v<OpType, RegistryOp>) {
                                 op_data.backupCreated = true;
+                            } else if constexpr (std::is_same_v<OpType, FirewallOp>) {
+                                op_data.ruleCreated = true;
                             } else if constexpr (std::is_same_v<OpType, LinkOp>) {
                                 op_data.backupCreated = true;
                                 if (!op_data.traversalMode.empty()) {
