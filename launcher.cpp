@@ -1579,37 +1579,26 @@ std::vector<HANDLE> ScanForNewChildProcesses(
 }
 
 // Waits for the entire process tree using the "generational" waiting strategy.
-// This is now only called AFTER the main process has exited.
 void WaitForProcessTree(const std::set<DWORD>& initialTrustedPids, const std::vector<std::wstring>& waitProcessNames) {
     if (waitProcessNames.empty()) {
         return;
     }
 
     std::set<DWORD> trustedPids = initialTrustedPids;
-    std::set<DWORD> pidsWeAreWaitingFor; // Tracks PIDs we've already found to avoid duplicates
-    std::vector<HANDLE> handlesToWaitOn;
-
-    // The main loop starts with an initial scan, not a wait.
-    while (true) {
-        std::vector<HANDLE> newHandles = ScanForNewChildProcesses(waitProcessNames, trustedPids, pidsWeAreWaitingFor);
-
-        if (newHandles.empty()) {
-            // No new children found in this generation, we are done.
-            break;
-        }
-
-        for (HANDLE h : newHandles) {
-            DWORD pid = GetProcessId(h);
-            if (pid != 0) {
-                trustedPids.insert(pid);
-                handlesToWaitOn.push_back(h);
-            } else {
-                CloseHandle(h); // Should not happen, but safeguard.
-            }
-        }
+    std::set<DWORD> pidsWeAreWaitingFor;
+    
+    do {
+        std::vector<HANDLE> handlesToWaitOn = ScanForNewChildProcesses(waitProcessNames, trustedPids, pidsWeAreWaitingFor);
 
         if (handlesToWaitOn.empty()) {
             break;
+        }
+
+        for (HANDLE h : handlesToWaitOn) {
+            DWORD pid = GetProcessId(h);
+            if (pid != 0) {
+                trustedPids.insert(pid);
+            }
         }
 
         WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
@@ -1617,10 +1606,10 @@ void WaitForProcessTree(const std::set<DWORD>& initialTrustedPids, const std::ve
         for (HANDLE h : handlesToWaitOn) {
             CloseHandle(h);
         }
-        handlesToWaitOn.clear();
-
+        
         Sleep(3000);
-    }
+
+    } while (true);
 }
 
 
@@ -2855,18 +2844,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             // --- REVISED CONDITIONAL WAITING LOGIC ---
             
             // Phase 1: Always wait for the main process to exit.
-            // Using MsgWaitForMultipleObjects to keep the launcher responsive if it had a GUI.
             while (true) {
                 DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
-                if (dwResult == WAIT_OBJECT_0) break; // Process terminated
-                else if (dwResult == WAIT_OBJECT_0 + 1) { // New message in queue
+                if (dwResult == WAIT_OBJECT_0) break;
+                else if (dwResult == WAIT_OBJECT_0 + 1) {
                     MSG msg;
                     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
                         TranslateMessage(&msg);
                         DispatchMessage(&msg);
                     }
                 }
-                 else break; // Wait failed
+                 else break;
             }
             
             // Phase 2: After main process exits, decide how to wait for child processes.
@@ -2897,7 +2885,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             bool multiInstanceEnabled = (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1");
 
             if (multiInstanceEnabled) {
-                // For multi-instance, add the main app's name to the list and use polling.
                 const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
                 if (appFilename && wcslen(appFilename) > 0) {
                     waitProcesses.push_back(appFilename);
@@ -2908,13 +2895,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                     if (waitCheck <= 0) waitCheck = 10;
                     
-                    // No initial sleep needed here, main process already exited.
+                    Sleep(3000);
                     while (AreWaitProcessesRunning(waitProcesses)) {
                         Sleep(waitCheck * 1000);
                     }
                 }
             } else {
-                // For single-instance, use the precise PPID tracking method if needed.
                 if (!waitProcesses.empty()) {
                     std::set<DWORD> initialTrustedPids;
                     initialTrustedPids.insert(pi.dwProcessId);
@@ -2922,7 +2908,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 }
             }
             
-            // Clean up the initial process handles now that all waiting is complete.
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         }
