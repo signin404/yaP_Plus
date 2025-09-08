@@ -1590,6 +1590,35 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
 }
 
 
+// REVISED CORE WAITING LOGIC
+void WaitForProcessTree(
+    std::set<DWORD>& trustedPids, 
+    const std::vector<std::wstring>& waitProcessNames, 
+    std::set<DWORD>& pidsWeHaveWaitedFor) 
+{
+    if (waitProcessNames.empty()) {
+        return;
+    }
+    
+    do {
+        std::vector<HANDLE> handlesToWaitOn = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
+
+        if (handlesToWaitOn.empty()) {
+            break; // No more descendants to wait for.
+        }
+
+        WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
+
+        for (HANDLE h : handlesToWaitOn) {
+            CloseHandle(h);
+        }
+        
+        Sleep(3000);
+
+    } while (true);
+}
+
+
 // Reinstated for multi-instance polling.
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
@@ -2821,9 +2850,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             // --- FINAL HYBRID WAITING LOGIC ---
             
             std::vector<std::wstring> waitProcesses;
-            // (Code to populate waitProcesses is identical to previous version, so it's omitted for brevity)
-            // ...
-            
+            std::wstringstream waitStream(iniContent);
+            std::wstring waitLine;
+            std::wstring waitCurrentSection;
+            bool waitInSettings = false;
+            while (std::getline(waitStream, waitLine)) {
+                waitLine = trim(waitLine);
+                if (waitLine.empty() || waitLine[0] == L';' || waitLine[0] == L'#') continue;
+                if (waitLine[0] == L'[' && waitLine.back() == L']') {
+                    waitCurrentSection = waitLine;
+                    waitInSettings = (_wcsicmp(waitCurrentSection.c_str(), L"[General]") == 0);
+                    continue;
+                }
+                if (!waitInSettings) continue;
+                size_t delimiterPos = waitLine.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(waitLine.substr(0, delimiterPos));
+                    if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
+                        std::wstring value = trim(waitLine.substr(delimiterPos + 1));
+                        waitProcesses.push_back(ExpandVariables(value, variables));
+                    }
+                }
+            }
+
             bool multiInstanceEnabled = (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1");
 
             if (multiInstanceEnabled) {
