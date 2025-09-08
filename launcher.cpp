@@ -37,14 +37,13 @@ pfnNtResumeProcess g_NtResumeProcess = nullptr;
 // --- Data Structures ---
 
 // Operations with startup and shutdown/cleanup logic
-// --- 修改点 2.1: 为 FileOp 添加标志位 ---
 struct FileOp {
     std::wstring sourcePath;
     std::wstring destPath;
     std::wstring destBackupPath;
     bool isDirectory;
     bool destBackupCreated = false;
-    bool wasMoved = false; // 新增标志，如果为true，则执行的是移动操作
+    bool wasMoved = false;
 };
 
 struct RestoreOnlyFileOp {
@@ -176,7 +175,6 @@ struct CreateRegValueOp {
     std::wstring typeStr;
 };
 
-// --- NEW: Structures for new operations ---
 struct CopyMoveOp {
     std::wstring sourcePath;
     std::wstring destPath;
@@ -215,7 +213,7 @@ struct ReplaceLineOp {
 using ActionOpData = std::variant<
     RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
-    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp // NEW
+    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp
 >;
 struct ActionOperation {
     ActionOpData data;
@@ -238,6 +236,27 @@ using BeforeOperationData = std::variant<
 >;
 struct BeforeOperation {
     BeforeOperationData data;
+};
+
+// Forward declarations for thread data structures
+struct MonitorThreadData;
+struct BackupThreadData;
+
+// Data structure to pass to the worker thread
+struct LauncherThreadData {
+    std::wstring iniContent;
+    std::map<std::wstring, std::wstring> variables;
+    std::vector<StartupShutdownOperation> shutdownOps;
+    std::vector<AfterOperation> afterOps;
+    std::wstring absoluteAppPath;
+    std::wstring finalWorkDir;
+    std::wstring tempFilePath;
+    HANDLE hMonitorThread = NULL;
+    MonitorThreadData* monitorData = nullptr;
+    HANDLE hBackupThread = NULL;
+    BackupThreadData* backupData = nullptr;
+    std::atomic<bool>* stopMonitor = nullptr;
+    std::atomic<bool>* isBackupWorking = nullptr;
 };
 
 
@@ -336,7 +355,6 @@ std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std:
     return path;
 }
 
-// --- 修改点 1.1: 新增辅助函数以检查路径是否在同一分区 ---
 bool ArePathsOnSameVolume(const std::wstring& path1, const std::wstring& path2) {
     if (path1.empty() || path2.empty()) {
         return false;
@@ -1113,11 +1131,9 @@ namespace ActionHelpers {
         }
     }
 
-    // --- NEW: Handlers for new operations ---
-
     void HandleCopyMove(const CopyMoveOp& op) {
         if (!op.overwrite && PathFileExistsW(op.destPath.c_str())) {
-            return; // Skip if destination exists and no overwrite flag
+            return;
         }
 
         wchar_t dirPath[MAX_PATH];
@@ -1127,10 +1143,8 @@ namespace ActionHelpers {
             SHCreateDirectoryExW(NULL, dirPath, NULL);
         }
 
-        // Backup existing item at destination if we are overwriting
         if (op.overwrite && PathFileExistsW(op.destPath.c_str())) {
             std::wstring backupPath = op.destPath + L"_Backup";
-            // Ensure old backup is gone
             if (PathIsDirectoryW(backupPath.c_str())) {
                  PerformFileSystemOperation(FO_DELETE, backupPath);
             } else {
@@ -1141,11 +1155,11 @@ namespace ActionHelpers {
 
         wchar_t fromPath[MAX_PATH * 2] = {0};
         wcscpy_s(fromPath, op.sourcePath.c_str());
-        fromPath[op.sourcePath.length() + 1] = L'\0'; // Double null-terminate
+        fromPath[op.sourcePath.length() + 1] = L'\0';
 
         wchar_t toPath[MAX_PATH * 2] = {0};
         wcscpy_s(toPath, op.destPath.c_str());
-        toPath[op.destPath.length() + 1] = L'\0'; // Double null-terminate
+        toPath[op.destPath.length() + 1] = L'\0';
 
         SHFILEOPSTRUCTW sfos = {0};
         sfos.wFunc = op.isMove ? FO_MOVE : FO_COPY;
@@ -1161,7 +1175,6 @@ namespace ActionHelpers {
 
         SHFileOperationW(&sfos);
 
-        // Cleanup backup if operation was successful
         std::wstring backupPath = op.destPath + L"_Backup";
         if (PathFileExistsW(backupPath.c_str())) {
             if (op.isDirectory) {
@@ -1176,7 +1189,6 @@ namespace ActionHelpers {
         SetFileAttributesW(op.path.c_str(), op.attributes);
     }
 
-    // --- NEW: Core text file handling logic ---
     struct FileContentInfo {
         std::vector<char> raw_bytes;
         TextEncoding encoding = TextEncoding::ANSI;
@@ -1190,7 +1202,7 @@ namespace ActionHelpers {
         file.close();
 
         if (info.raw_bytes.empty()) {
-            info.encoding = TextEncoding::UTF8; // Default for new files
+            info.encoding = TextEncoding::UTF8;
             info.line_ending = L"\r\n";
             return true;
         }
@@ -1198,7 +1210,6 @@ namespace ActionHelpers {
         const char* data = info.raw_bytes.data();
         const int size = static_cast<int>(info.raw_bytes.size());
 
-        // 1. Check for BOMs (Byte Order Marks)
         if (size >= 3 && (BYTE)data[0] == 0xEF && (BYTE)data[1] == 0xBB && (BYTE)data[2] == 0xBF) {
             info.encoding = TextEncoding::UTF8_BOM;
         } else if (size >= 2 && (BYTE)data[0] == 0xFF && (BYTE)data[1] == 0xFE) {
@@ -1206,34 +1217,29 @@ namespace ActionHelpers {
         } else if (size >= 2 && (BYTE)data[0] == 0xFE && (BYTE)data[1] == 0xFF) {
             info.encoding = TextEncoding::UTF16_BE;
         } else {
-            // 2. No BOM, try to validate against different encodings
-            // Helper lambda to test a codepage
             auto is_valid_for_codepage = [&](UINT cp) -> bool {
                 if (size == 0) return true;
                 int wsize = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, data, size, NULL, 0);
                 return wsize > 0;
             };
 
-            // The order of checks is important
             if (is_valid_for_codepage(CP_UTF8)) {
                 info.encoding = TextEncoding::UTF8;
-            } else if (is_valid_for_codepage(932)) { // Shift-JIS
+            } else if (is_valid_for_codepage(932)) {
                 info.encoding = TextEncoding::SHIFT_JIS;
-            } else if (is_valid_for_codepage(949)) { // EUC-KR
+            } else if (is_valid_for_codepage(949)) {
                 info.encoding = TextEncoding::EUC_KR;
-            } else if (is_valid_for_codepage(950)) { // Big5
+            } else if (is_valid_for_codepage(950)) {
                 info.encoding = TextEncoding::BIG5;
             } else {
-                // 3. Fallback to system default ANSI
                 info.encoding = TextEncoding::ANSI;
             }
         }
 
-        // Detect line endings from a sample of the file
         std::string sample(info.raw_bytes.begin(), info.raw_bytes.begin() + min(1024, info.raw_bytes.size()));
         size_t cr_count = std::count(sample.begin(), sample.end(), '\r');
         size_t lf_count = std::count(sample.begin(), sample.end(), '\n');
-        size_t crlf_count = sample.find("\r\n") != std::string::npos ? 1 : 0; // Just check for presence
+        size_t crlf_count = sample.find("\r\n") != std::string::npos ? 1 : 0;
 
         if (crlf_count > 0 || (cr_count > 0 && cr_count == lf_count)) {
             info.line_ending = L"\r\n";
@@ -1262,7 +1268,7 @@ namespace ActionHelpers {
             }
             content = std::wstring(temp_buffer.data() + 1, (byte_count / 2) - 1);
         } else {
-            UINT codePage = CP_ACP; // Default to ANSI
+            UINT codePage = CP_ACP;
             if (info.encoding == TextEncoding::UTF8_BOM) {
                 codePage = CP_UTF8;
                 if (byte_count >= 3) {
@@ -1286,17 +1292,14 @@ namespace ActionHelpers {
             }
         }
 
-        // Normalize line endings to \n for processing
         std::wstring normalized_content;
         normalized_content.reserve(content.length());
         for (size_t i = 0; i < content.length(); ++i) {
             if (content[i] == L'\r') {
                 if (i + 1 < content.length() && content[i+1] == L'\n') {
-                    // CRLF -> LF
                     normalized_content += L'\n';
                     i++;
                 } else {
-                    // CR -> LF
                     normalized_content += L'\n';
                 }
             } else {
@@ -1319,7 +1322,6 @@ namespace ActionHelpers {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
 
-        // Write BOM if needed
         if (info.encoding == TextEncoding::UTF8_BOM) {
             file.write("\xEF\xBB\xBF", 3);
         } else if (info.encoding == TextEncoding::UTF16_LE) {
@@ -1330,7 +1332,6 @@ namespace ActionHelpers {
 
         for (size_t i = 0; i < lines.size(); ++i) {
             std::wstring line_to_write = lines[i];
-            // Add line ending, except for the very last line if the original file didn't have one
             if (i < lines.size() - 1 || !lines.back().empty()) {
                  line_to_write += info.line_ending;
             }
@@ -1355,20 +1356,20 @@ namespace ActionHelpers {
                     break;
                 case TextEncoding::UTF16_LE: {
                     file.write(reinterpret_cast<const char*>(line_to_write.c_str()), line_to_write.length() * sizeof(wchar_t));
-                    continue; // Skip common path
+                    continue;
                 }
                 case TextEncoding::UTF16_BE: {
                     std::vector<wchar_t> swapped_content(line_to_write.begin(), line_to_write.end());
                     for(wchar_t& ch : swapped_content) { ch = _byteswap_ushort(ch); }
                     file.write(reinterpret_cast<const char*>(swapped_content.data()), swapped_content.size() * sizeof(wchar_t));
-                    continue; // Skip common path
+                    continue;
                 }
             }
 
             if (codePage != 0) {
                 if (line_to_write.empty()) continue;
                 int size = WideCharToMultiByte(codePage, 0, line_to_write.c_str(), -1, NULL, 0, NULL, NULL);
-                if (size > 1) { // size includes null terminator
+                if (size > 1) {
                     std::string mb_str(size - 1, 0);
                     WideCharToMultiByte(codePage, 0, line_to_write.c_str(), -1, &mb_str[0], size, NULL, NULL);
                     file.write(mb_str.c_str(), mb_str.length());
@@ -1444,7 +1445,7 @@ namespace ActionHelpers {
                             }
                         } else { // Delete
                             lines.erase(lines.begin() + i);
-                            --i; // Adjust loop counter
+                            --i;
                         }
                         key_found_and_handled = true;
                         if (is_null_section) break; 
@@ -1553,6 +1554,93 @@ namespace ActionHelpers {
 
 
 // --- Process Management Functions ---
+
+// REVISED HELPER FUNCTION
+// Scans for ALL new descendants of trusted PIDs, adds them to the trusted set,
+// and returns handles for the ones that match the wait list.
+std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
+    std::set<DWORD>& trustedPids,
+    const std::vector<std::wstring>& waitProcessNames,
+    std::set<DWORD>& pidsToIgnore)
+{
+    std::vector<HANDLE> handlesToWaitOn;
+    std::set<DWORD> newlyTrustedPids;
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return handlesToWaitOn;
+    }
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            // Is this process a child of a process we already trust?
+            if (trustedPids.count(pe32.th32ParentProcessID)) {
+                // If so, we now trust this child process as well.
+                newlyTrustedPids.insert(pe32.th32ProcessID);
+
+                // Have we already handled this specific process? If so, skip.
+                if (pidsToIgnore.count(pe32.th32ProcessID)) {
+                    continue;
+                }
+
+                // Does its name match one of the names we should wait for?
+                for (const auto& name : waitProcessNames) {
+                    if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
+                        HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
+                        if (hProcess) {
+                            handlesToWaitOn.push_back(hProcess);
+                            // Mark it so we don't try to find it again.
+                            pidsToIgnore.insert(pe32.th32ProcessID);
+                        }
+                        break; // Found a match, no need to check other names for this process
+                    }
+                }
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+
+    // Propagate trust: add all newly found descendants to the main trusted set.
+    trustedPids.insert(newlyTrustedPids.begin(), newlyTrustedPids.end());
+
+    return handlesToWaitOn;
+}
+
+
+// REVISED CORE WAITING LOGIC
+void WaitForProcessTree(
+    std::set<DWORD>& trustedPids, 
+    const std::vector<std::wstring>& waitProcessNames, 
+    std::set<DWORD>& pidsWeHaveWaitedFor) 
+{
+    if (waitProcessNames.empty()) {
+        return;
+    }
+    
+    do {
+        std::vector<HANDLE> handlesToWaitOn = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
+
+        if (handlesToWaitOn.empty()) {
+            break; // No more descendants to wait for.
+        }
+
+        WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
+
+        for (HANDLE h : handlesToWaitOn) {
+            CloseHandle(h);
+        }
+        
+        Sleep(3000);
+
+    } while (true);
+}
+
+
+// Reinstated for multi-instance polling.
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1830,7 +1918,6 @@ cleanup:
 
 // --- Unified Operation Handlers ---
 
-// --- 修改点 3.1: 更新 PerformStartupOperation 以处理移动/复制 ---
 void PerformStartupOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -1847,10 +1934,10 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 arg.destBackupCreated = true;
             }
             if (PathFileExistsW(arg.sourcePath.c_str())) {
-                if (arg.wasMoved) { // 如果是移动操作
+                if (arg.wasMoved) {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.sourcePath, arg.destPath);
                     else MoveFileW(arg.sourcePath.c_str(), arg.destPath.c_str());
-                } else { // 如果是复制操作
+                } else {
                     if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
                     else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
                 }
@@ -1869,7 +1956,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (!arg.traversalMode.empty()) {
-                // TRAVERSAL MODE: Populate the destination directory. Do not back up the directory itself.
                 SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
                 WIN32_FIND_DATAW findData;
                 std::wstring searchPath = arg.targetPath + L"\\*";
@@ -1910,7 +1996,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     FindClose(hFind);
                 }
             } else {
-                // SIMPLE LINK MODE: Replace the destination path. Back it up first.
                 wchar_t dirPath[MAX_PATH];
                 wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
                 PathRemoveFileSpecW(dirPath);
@@ -1923,13 +2008,9 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     }
                 }
 
-                // --- BUG FIX ---
-                // If performMoveOnCleanup is true, it means the source doesn't exist.
-                // We should do NOTHING at startup and let the application create the directory.
                 if (arg.performMoveOnCleanup) {
                     // DO NOTHING. Let the application create the directory at linkPath.
                 } else {
-                    // Create the actual link if it's not a placeholder operation.
                     if (arg.isHardlink) {
                         if (arg.isDirectory) {
                             CreateDirectoryW(arg.linkPath.c_str(), NULL);
@@ -1937,7 +2018,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         } else {
                             CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
                         }
-                    } else { // isSymlink
+                    } else {
                         DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                         CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
                     }
@@ -1949,7 +2030,6 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
     }, opData);
 }
 
-// --- 修改点 3.2: 更新 PerformShutdownOperation 以处理移动/复制的清理 ---
 void PerformShutdownOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
@@ -2007,17 +2087,13 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (arg.performMoveOnCleanup) {
-                // --- BUG FIX & LOGIC IMPROVEMENT ---
-                // If the app created the directory at linkPath, move it to the targetPath.
                 if (PathFileExistsW(arg.linkPath.c_str())) {
-                    // Ensure the parent directory of the target exists.
                     wchar_t targetParentDir[MAX_PATH];
                     wcscpy_s(targetParentDir, MAX_PATH, arg.targetPath.c_str());
                     PathRemoveFileSpecW(targetParentDir);
                     if (wcslen(targetParentDir) > 0) {
                         SHCreateDirectoryExW(NULL, targetParentDir, NULL);
                     }
-                    // Move the entire directory.
                     MoveFileW(arg.linkPath.c_str(), arg.targetPath.c_str());
                 }
             } else if (!arg.traversalMode.empty()) {
@@ -2029,9 +2105,10 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                         DeleteFileW(pathToDelete.c_str());
                     }
                 }
-                if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
-                    RemoveDirectoryW(arg.linkPath.c_str());
-                }
+                // *** FIX: REMOVED THE DELETION OF THE CONTAINER DIRECTORY ***
+                // if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
+                //     RemoveDirectoryW(arg.linkPath.c_str());
+                // }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
@@ -2161,8 +2238,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 bool is_reversed = (key.find(L"->") != std::wstring::npos);
                 op.destPath = is_reversed ? parts[1] : parts[0];
                 op.sourcePath = is_reversed ? parts[0] : parts[1];
-                op.overwrite = true; // Default
-                op.isMove = false; // Default
+                op.overwrite = true;
+                op.isMove = false;
                 for (size_t i = 2; i < parts.size(); ++i) {
                     if (_wcsicmp(parts[i].c_str(), L"no overwrite") == 0) op.overwrite = false;
                     if (_wcsicmp(parts[i].c_str(), L"overwrite") == 0) op.overwrite = true;
@@ -2175,7 +2252,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             if (!parts.empty()) {
                 AttributesOp op;
                 op.path = parts[0];
-                op.attributes = FILE_ATTRIBUTE_NORMAL; // Default
+                op.attributes = FILE_ATTRIBUTE_NORMAL;
                 if (parts.size() > 1) {
                     op.attributes = 0;
                     auto attr_parts = split_string(parts[1], L",");
@@ -2251,7 +2328,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         if (delimiterPos == std::wstring::npos) continue;
 
         std::wstring key = trim(line.substr(0, delimiterPos));
-        std::wstring value = line.substr(delimiterPos + 1); // Do not trim value for replaceline
+        std::wstring value = line.substr(delimiterPos + 1);
 
         if (_wcsicmp(key.c_str(), L"uservar") == 0) {
             if (currentSection == Section::Before || currentSection == Section::After) {
@@ -2281,7 +2358,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             continue;
         }
 
-        // Trim value for all other keys
         value = trim(value);
 
         if (currentSection == Section::Before) {
@@ -2311,10 +2387,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
                     l_op.backupPath = l_op.linkPath + L"_Backup";
 
-                    // --- BUG FIX ---
-                    // The "move on cleanup" behavior is only for simple hardlinks where the source
-                    // doesn't exist at startup, acting as a placeholder for the app to create files in.
-                    // It should NOT apply to traversal-mode links.
                     if (l_op.isHardlink && l_op.traversalMode.empty()) {
                         if (!PathFileExistsW(l_op.targetPath.c_str())) {
                             l_op.performMoveOnCleanup = true;
@@ -2358,7 +2430,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 ro_op.backupPath = ro_op.targetPath + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
             } 
-            // --- 修改点 2.2: 在解析 file/dir 时设置 wasMoved 标志 ---
             else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
                 FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
                 auto parts = split_string(value, delimiter);
@@ -2373,7 +2444,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         else f_op.sourcePath = expandedSource;
                     }
                     f_op.destBackupPath = f_op.destPath + L"_Backup";
-                    // 检查是否在同一分区并设置标志
                     f_op.wasMoved = ArePathsOnSameVolume(f_op.sourcePath, f_op.destPath);
                     beforeOp.data = f_op; op_created = true;
                 }
@@ -2542,6 +2612,128 @@ void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, st
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
 
+// NEW: Worker thread function
+DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
+    LauncherThreadData* data = static_cast<LauncherThreadData*>(lpParam);
+    if (!data) {
+        return 1;
+    }
+
+    STARTUPINFOW si; 
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si)); 
+    si.cb = sizeof(si); 
+    ZeroMemory(&pi, sizeof(pi));
+    
+    std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
+    std::wstring fullCommandLine = L"\"" + data->absoluteAppPath + L"\" " + commandLine;
+    wchar_t commandLineBuffer[4096]; 
+    wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+
+    if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
+        MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+    } else {
+        std::vector<std::wstring> waitProcesses;
+        std::wstringstream waitStream(data->iniContent);
+        std::wstring waitLine;
+        std::wstring waitCurrentSection;
+        bool waitInSettings = false;
+        while (std::getline(waitStream, waitLine)) {
+            waitLine = trim(waitLine);
+            if (waitLine.empty() || waitLine[0] == L';' || waitLine[0] == L'#') continue;
+            if (waitLine[0] == L'[' && waitLine.back() == L']') {
+                waitCurrentSection = waitLine;
+                waitInSettings = (_wcsicmp(waitCurrentSection.c_str(), L"[General]") == 0);
+                continue;
+            }
+            if (!waitInSettings) continue;
+            size_t delimiterPos = waitLine.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(waitLine.substr(0, delimiterPos));
+                if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
+                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
+                    waitProcesses.push_back(ExpandVariables(value, data->variables));
+                }
+            }
+        }
+
+        bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
+
+        if (multiInstanceEnabled) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+
+            const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
+            if (appFilename && wcslen(appFilename) > 0) {
+                waitProcesses.push_back(appFilename);
+            }
+
+            if (!waitProcesses.empty()) {
+                std::wstring waitCheckStr = GetValueFromIniContent(data->iniContent, L"General", L"waitcheck");
+                int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
+                if (waitCheck <= 0) waitCheck = 10;
+                
+                Sleep(3000);
+                while (AreWaitProcessesRunning(waitProcesses)) {
+                    Sleep(waitCheck * 1000);
+                }
+            }
+        } else {
+            std::set<DWORD> trustedPids;
+            std::set<DWORD> pidsWeHaveWaitedFor;
+            std::vector<HANDLE> initialHandlesToWait;
+
+            trustedPids.insert(pi.dwProcessId);
+
+            if (!waitProcesses.empty()) {
+                DWORD startTime = GetTickCount();
+                while (GetTickCount() - startTime < 3000) {
+                    std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
+                    if (!foundHandles.empty()) {
+                        initialHandlesToWait.insert(initialHandlesToWait.end(), foundHandles.begin(), foundHandles.end());
+                    }
+                    Sleep(50);
+                }
+            }
+
+            WaitForSingleObject(pi.hProcess, INFINITE);
+
+            if (!initialHandlesToWait.empty()) {
+                WaitForMultipleObjects((DWORD)initialHandlesToWait.size(), initialHandlesToWait.data(), TRUE, INFINITE);
+                for (HANDLE h : initialHandlesToWait) {
+                    CloseHandle(h);
+                }
+            }
+
+            if (!waitProcesses.empty()) {
+                WaitForProcessTree(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
+            }
+            
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    }
+
+    if (data->hMonitorThread) {
+        *(data->stopMonitor) = true;
+        WaitForSingleObject(data->hMonitorThread, 1500);
+        CloseHandle(data->hMonitorThread);
+        SetAllProcessesState(data->monitorData->suspendProcesses, false);
+    }
+    if (data->hBackupThread) {
+        *(data->stopMonitor) = true;
+        while (*(data->isBackupWorking)) Sleep(100);
+        WaitForSingleObject(data->hBackupThread, 1500);
+        CloseHandle(data->hBackupThread);
+    }
+
+    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables);
+
+    DeleteFileW(data->tempFilePath.c_str());
+    
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
 
@@ -2558,7 +2750,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
     std::wstring iniContent;
     if (!ReadFileToWString(iniPath, iniContent)) {
-        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
+        MessageBoxW(NULL, L"无法读取INI文件", L"错误", MB_ICONERROR);
         return 1;
     }
 
@@ -2601,7 +2793,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
         if (appPathRaw.empty()) {
-            MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
+            MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径", L"配置错误", MB_ICONERROR);
             CloseHandle(hMutex);
             CoUninitialize();
             return 1;
@@ -2745,8 +2937,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }, op.data);
         }
 
-        HANDLE hMonitorThread = NULL; MonitorThreadData monitorData; std::atomic<bool> stopMonitor(false);
-        HANDLE hBackupThread = NULL; std::atomic<bool> isBackupWorking(false);
+        MonitorThreadData monitorData;
+        std::atomic<bool> stopMonitor(false);
+        std::atomic<bool> isBackupWorking(false);
+
+        LauncherThreadData threadData;
+        threadData.iniContent = iniContent;
+        threadData.variables = variables;
+        threadData.shutdownOps = shutdownOps;
+        threadData.afterOps = afterOps;
+        threadData.absoluteAppPath = absoluteAppPath;
+        threadData.finalWorkDir = finalWorkDir;
+        threadData.tempFilePath = tempFilePath;
+        threadData.monitorData = &monitorData;
+        threadData.backupData = &backupData;
+        threadData.stopMonitor = &stopMonitor;
+        threadData.isBackupWorking = &isBackupWorking;
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
@@ -2779,7 +2985,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"General", L"foregroundcheck");
             monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
             if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
-            if (!monitorData.suspendProcesses.empty()) hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+            if (!monitorData.suspendProcesses.empty()) {
+                threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+            }
         }
 
         std::wstring backupTimeStr = GetValueFromIniContent(iniContent, L"General", L"backuptime");
@@ -2788,84 +2996,31 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             backupData.shouldStop = &stopMonitor;
             backupData.isWorking = &isBackupWorking;
             backupData.backupInterval = backupTime * 60 * 1000;
-            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
+            if (!backupData.backupDirs.empty() || !backupData.backupFiles.empty()) {
+                threadData.hBackupThread = CreateThread(NULL, 0, BackupWorkerThread, &backupData, 0, NULL);
+            }
         }
 
-        STARTUPINFOW si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
-        std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
-        std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
-        wchar_t commandLineBuffer[4096]; wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+        HANDLE hWorkerThread = CreateThread(NULL, 0, LauncherWorkerThread, &threadData, 0, NULL);
 
-        if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
-            MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
-        } else {
+        if (hWorkerThread) {
             while (true) {
-                DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
-                if (dwResult == WAIT_OBJECT_0) break;
+                DWORD dwResult = MsgWaitForMultipleObjects(1, &hWorkerThread, FALSE, INFINITE, QS_ALLINPUT);
+                if (dwResult == WAIT_OBJECT_0) {
+                    break; // Thread finished
+                }
                 else if (dwResult == WAIT_OBJECT_0 + 1) {
                     MSG msg;
                     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
                         TranslateMessage(&msg);
                         DispatchMessage(&msg);
                     }
-                }
-                 else break;
-            }
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-
-        std::vector<std::wstring> waitProcesses;
-        std::wstringstream waitStream(iniContent);
-        std::wstring waitLine;
-        std::wstring waitCurrentSection;
-        bool waitInSettings = false;
-        while (std::getline(waitStream, waitLine)) {
-            waitLine = trim(waitLine);
-            if (waitLine.empty() || waitLine[0] == L';' || waitLine[0] == L'#') continue;
-            if (waitLine[0] == L'[' && waitLine.back() == L']') {
-                waitCurrentSection = waitLine;
-                waitInSettings = (_wcsicmp(waitCurrentSection.c_str(), L"[General]") == 0);
-                continue;
-            }
-            if (!waitInSettings) continue;
-            size_t delimiterPos = waitLine.find(L'=');
-            if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(waitLine.substr(0, delimiterPos));
-                if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
-                    waitProcesses.push_back(ExpandVariables(value, variables));
+                } else {
+                    break; // Wait failed
                 }
             }
+            CloseHandle(hWorkerThread);
         }
-        if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
-            const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
-            if (appFilename && wcslen(appFilename) > 0) waitProcesses.push_back(appFilename);
-        }
-        if (!waitProcesses.empty()) {
-            std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"General", L"waitcheck");
-            int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
-            if (waitCheck <= 0) waitCheck = 10;
-            Sleep(3000);
-            while (AreWaitProcessesRunning(waitProcesses)) Sleep(waitCheck * 1000);
-        }
-
-        if (hMonitorThread) {
-            stopMonitor = true;
-            WaitForSingleObject(hMonitorThread, 1500);
-            CloseHandle(hMonitorThread);
-            SetAllProcessesState(monitorData.suspendProcesses, false);
-        }
-        if (hBackupThread) {
-            stopMonitor = true;
-            while (isBackupWorking) Sleep(100);
-            WaitForSingleObject(hBackupThread, 1500);
-            CloseHandle(hBackupThread);
-        }
-
-        PerformFullCleanup(afterOps, shutdownOps, variables);
-
-        DeleteFileW(tempFilePath.c_str());
 
         CloseHandle(hMutex);
         CoUninitialize();
