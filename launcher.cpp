@@ -1534,20 +1534,20 @@ namespace ActionHelpers {
 
 // --- Process Management Functions ---
 
-// Scans for new child processes to wait for.
-std::vector<HANDLE> ScanForNewChildProcesses(
-    const std::vector<std::wstring>& waitProcessNames,
+// REVISED HELPER FUNCTION
+// Scans for ALL new descendants of trusted PIDs, adds them to the trusted set,
+// and returns handles for the ones that match the wait list.
+std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
-    std::set<DWORD>& alreadyFoundPids)
+    const std::vector<std::wstring>& waitProcessNames,
+    std::set<DWORD>& pidsWeHaveWaitedFor)
 {
-    std::vector<HANDLE> newHandles;
-    if (waitProcessNames.empty() || trustedPids.empty()) {
-        return newHandles;
-    }
+    std::vector<HANDLE> handlesToWaitOn;
+    std::set<DWORD> newlyTrustedPids;
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) {
-        return newHandles;
+        return handlesToWaitOn;
     }
 
     PROCESSENTRY32W pe32;
@@ -1555,19 +1555,26 @@ std::vector<HANDLE> ScanForNewChildProcesses(
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            if (alreadyFoundPids.count(pe32.th32ProcessID)) {
-                continue;
-            }
-
+            // Is this process a child of a process we already trust?
             if (trustedPids.count(pe32.th32ParentProcessID)) {
+                // If so, we now trust this child process as well.
+                newlyTrustedPids.insert(pe32.th32ProcessID);
+
+                // Have we already waited for this specific process? If so, skip.
+                if (pidsWeHaveWaitedFor.count(pe32.th32ProcessID)) {
+                    continue;
+                }
+
+                // Does its name match one of the names we should wait for?
                 for (const auto& name : waitProcessNames) {
                     if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
                         HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
-                            newHandles.push_back(hProcess);
-                            alreadyFoundPids.insert(pe32.th32ProcessID);
+                            handlesToWaitOn.push_back(hProcess);
+                            // Mark it so we don't try to wait for it again.
+                            pidsWeHaveWaitedFor.insert(pe32.th32ProcessID);
                         }
-                        break;
+                        break; // Found a match, no need to check other names for this process
                     }
                 }
             }
@@ -1575,30 +1582,29 @@ std::vector<HANDLE> ScanForNewChildProcesses(
     }
 
     CloseHandle(hSnapshot);
-    return newHandles;
+
+    // Propagate trust: add all newly found descendants to the main trusted set.
+    trustedPids.insert(newlyTrustedPids.begin(), newlyTrustedPids.end());
+
+    return handlesToWaitOn;
 }
 
-// Waits for the entire process tree using the "generational" waiting strategy.
+
+// REVISED CORE WAITING LOGIC
 void WaitForProcessTree(const std::set<DWORD>& initialTrustedPids, const std::vector<std::wstring>& waitProcessNames) {
     if (waitProcessNames.empty()) {
         return;
     }
 
     std::set<DWORD> trustedPids = initialTrustedPids;
-    std::set<DWORD> pidsWeAreWaitingFor;
+    std::set<DWORD> pidsWeHaveWaitedFor;
     
     do {
-        std::vector<HANDLE> handlesToWaitOn = ScanForNewChildProcesses(waitProcessNames, trustedPids, pidsWeAreWaitingFor);
+        std::vector<HANDLE> handlesToWaitOn = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
 
         if (handlesToWaitOn.empty()) {
+            // No new children found in this generation that we need to wait for. We are done.
             break;
-        }
-
-        for (HANDLE h : handlesToWaitOn) {
-            DWORD pid = GetProcessId(h);
-            if (pid != 0) {
-                trustedPids.insert(pid);
-            }
         }
 
         WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
