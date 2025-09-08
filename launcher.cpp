@@ -238,7 +238,7 @@ struct BeforeOperation {
     BeforeOperationData data;
 };
 
-// *** FIX: Forward declarations for thread data structures ***
+// Forward declarations for thread data structures
 struct MonitorThreadData;
 struct BackupThreadData;
 
@@ -2105,9 +2105,10 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                         DeleteFileW(pathToDelete.c_str());
                     }
                 }
-                if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
-                    RemoveDirectoryW(arg.linkPath.c_str());
-                }
+                // *** FIX: REMOVED THE DELETION OF THE CONTAINER DIRECTORY ***
+                // if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
+                //     RemoveDirectoryW(arg.linkPath.c_str());
+                // }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
@@ -2749,7 +2750,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
     std::wstring iniContent;
     if (!ReadFileToWString(iniPath, iniContent)) {
-        MessageBoxW(NULL, L"无法读取INI文件。", L"错误", MB_ICONERROR);
+        MessageBoxW(NULL, L"无法读取INI文件", L"错误", MB_ICONERROR);
         return 1;
     }
 
@@ -2792,7 +2793,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
         if (appPathRaw.empty()) {
-            MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径。", L"配置错误", MB_ICONERROR);
+            MessageBoxW(NULL, L"INI配置文件中未找到或未设置 'application' 路径", L"配置错误", MB_ICONERROR);
             CloseHandle(hMutex);
             CoUninitialize();
             return 1;
