@@ -1579,21 +1579,40 @@ std::vector<HANDLE> ScanForNewChildProcesses(
 }
 
 // Waits for the entire process tree using the "generational" waiting strategy.
-void WaitForProcessTree(HANDLE hInitialProcess, DWORD dwInitialPid, const std::vector<std::wstring>& waitProcessNames) {
-    std::set<DWORD> trustedPids;
-    std::set<DWORD> pidsWeAreWaitingFor;
-    std::vector<HANDLE> handlesToWaitOn;
-
-    if (hInitialProcess != NULL && dwInitialPid != 0) {
-        trustedPids.insert(dwInitialPid);
-        pidsWeAreWaitingFor.insert(dwInitialPid);
-        handlesToWaitOn.push_back(hInitialProcess);
+// This is now only called AFTER the main process has exited.
+void WaitForProcessTree(const std::set<DWORD>& initialTrustedPids, const std::vector<std::wstring>& waitProcessNames) {
+    if (waitProcessNames.empty()) {
+        return;
     }
 
-    while (!handlesToWaitOn.empty()) {
-        if (handlesToWaitOn.size() > 0) {
-            WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
+    std::set<DWORD> trustedPids = initialTrustedPids;
+    std::set<DWORD> pidsWeAreWaitingFor; // Tracks PIDs we've already found to avoid duplicates
+    std::vector<HANDLE> handlesToWaitOn;
+
+    // The main loop starts with an initial scan, not a wait.
+    while (true) {
+        std::vector<HANDLE> newHandles = ScanForNewChildProcesses(waitProcessNames, trustedPids, pidsWeAreWaitingFor);
+
+        if (newHandles.empty()) {
+            // No new children found in this generation, we are done.
+            break;
         }
+
+        for (HANDLE h : newHandles) {
+            DWORD pid = GetProcessId(h);
+            if (pid != 0) {
+                trustedPids.insert(pid);
+                handlesToWaitOn.push_back(h);
+            } else {
+                CloseHandle(h); // Should not happen, but safeguard.
+            }
+        }
+
+        if (handlesToWaitOn.empty()) {
+            break;
+        }
+
+        WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
 
         for (HANDLE h : handlesToWaitOn) {
             CloseHandle(h);
@@ -1601,22 +1620,9 @@ void WaitForProcessTree(HANDLE hInitialProcess, DWORD dwInitialPid, const std::v
         handlesToWaitOn.clear();
 
         Sleep(3000);
-
-        std::vector<HANDLE> newHandles = ScanForNewChildProcesses(waitProcessNames, trustedPids, pidsWeAreWaitingFor);
-        
-        if (!newHandles.empty()) {
-            for (HANDLE h : newHandles) {
-                DWORD pid = GetProcessId(h);
-                if (pid != 0) {
-                    trustedPids.insert(pid);
-                    handlesToWaitOn.push_back(h);
-                } else {
-                    CloseHandle(h);
-                }
-            }
-        }
     }
 }
+
 
 // Reinstated for multi-instance polling.
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
@@ -2846,7 +2852,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, finalWorkDir.c_str(), &si, &pi)) {
             MessageBoxW(NULL, (L"启动程序失败: \n" + absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
         } else {
-            // --- CONDITIONAL WAITING LOGIC ---
+            // --- REVISED CONDITIONAL WAITING LOGIC ---
+            
+            // Phase 1: Always wait for the main process to exit.
+            // Using MsgWaitForMultipleObjects to keep the launcher responsive if it had a GUI.
+            while (true) {
+                DWORD dwResult = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, INFINITE, QS_ALLINPUT);
+                if (dwResult == WAIT_OBJECT_0) break; // Process terminated
+                else if (dwResult == WAIT_OBJECT_0 + 1) { // New message in queue
+                    MSG msg;
+                    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessage(&msg);
+                    }
+                }
+                 else break; // Wait failed
+            }
+            
+            // Phase 2: After main process exits, decide how to wait for child processes.
             std::vector<std::wstring> waitProcesses;
             std::wstringstream waitStream(iniContent);
             std::wstring waitLine;
@@ -2880,25 +2903,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     waitProcesses.push_back(appFilename);
                 }
 
-                // We don't need the initial handles for polling, so close them.
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-
                 if (!waitProcesses.empty()) {
                     std::wstring waitCheckStr = GetValueFromIniContent(iniContent, L"General", L"waitcheck");
                     int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                     if (waitCheck <= 0) waitCheck = 10;
                     
-                    Sleep(3000); // Initial delay
+                    // No initial sleep needed here, main process already exited.
                     while (AreWaitProcessesRunning(waitProcesses)) {
                         Sleep(waitCheck * 1000);
                     }
                 }
             } else {
-                // For single-instance, use the precise PPID tracking method.
-                WaitForProcessTree(pi.hProcess, pi.dwProcessId, waitProcesses);
-                CloseHandle(pi.hThread);
+                // For single-instance, use the precise PPID tracking method if needed.
+                if (!waitProcesses.empty()) {
+                    std::set<DWORD> initialTrustedPids;
+                    initialTrustedPids.insert(pi.dwProcessId);
+                    WaitForProcessTree(initialTrustedPids, waitProcesses);
+                }
             }
+            
+            // Clean up the initial process handles now that all waiting is complete.
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
         }
 
         if (hMonitorThread) {
