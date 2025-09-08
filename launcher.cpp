@@ -238,7 +238,11 @@ struct BeforeOperation {
     BeforeOperationData data;
 };
 
-// NEW: Data structure to pass to the worker thread
+// *** FIX: Forward declarations for thread data structures ***
+struct MonitorThreadData;
+struct BackupThreadData;
+
+// Data structure to pass to the worker thread
 struct LauncherThreadData {
     std::wstring iniContent;
     std::map<std::wstring, std::wstring> variables;
