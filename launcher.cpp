@@ -1622,10 +1622,20 @@ void WaitForProcessTree(
     }
     
     do {
-        std::vector<HANDLE> handlesToWaitOn = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
+        std::vector<HANDLE> handlesToWaitOn;
+        
+        // Rapid scan phase
+        DWORD startTime = GetTickCount();
+        while (GetTickCount() - startTime < 3000) {
+            std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
+            if (!foundHandles.empty()) {
+                handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
+            }
+            Sleep(50);
+        }
 
         if (handlesToWaitOn.empty()) {
-            break; // No more descendants to wait for.
+            break; // No new descendants to wait for.
         }
 
         WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
@@ -1634,8 +1644,6 @@ void WaitForProcessTree(
             CloseHandle(h);
         }
         
-        Sleep(3000);
-
     } while (true);
 }
 
