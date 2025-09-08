@@ -2660,8 +2660,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
 
         if (multiInstanceEnabled) {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+            // *** FIX: Wait for main process first, THEN poll ***
+            WaitForSingleObject(pi.hProcess, INFINITE);
 
             const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
             if (appFilename && wcslen(appFilename) > 0) {
@@ -2679,12 +2679,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
         } else {
+            // SINGLE-INSTANCE: Use the robust hybrid method
             std::set<DWORD> trustedPids;
             std::set<DWORD> pidsWeHaveWaitedFor;
             std::vector<HANDLE> initialHandlesToWait;
 
             trustedPids.insert(pi.dwProcessId);
 
+            // Phase 1: Rapid scan to build the initial process map
             if (!waitProcesses.empty()) {
                 DWORD startTime = GetTickCount();
                 while (GetTickCount() - startTime < 3000) {
@@ -2696,8 +2698,10 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
 
+            // Phase 2: Wait for the main process to exit
             WaitForSingleObject(pi.hProcess, INFINITE);
 
+            // Phase 3: Wait for the initially discovered children
             if (!initialHandlesToWait.empty()) {
                 WaitForMultipleObjects((DWORD)initialHandlesToWait.size(), initialHandlesToWait.data(), TRUE, INFINITE);
                 for (HANDLE h : initialHandlesToWait) {
@@ -2705,13 +2709,15 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
 
+            // Phase 4: Do a final generational wait for any late spawns
             if (!waitProcesses.empty()) {
                 WaitForProcessTree(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
             }
-            
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
         }
+        
+        // Clean up the initial process handles now that all waiting is complete.
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
     }
 
     if (data->hMonitorThread) {
