@@ -1610,44 +1610,6 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     return handlesToWaitOn;
 }
 
-
-// REVISED CORE WAITING LOGIC
-void WaitForProcessTree(
-    std::set<DWORD>& trustedPids, 
-    const std::vector<std::wstring>& waitProcessNames, 
-    std::set<DWORD>& pidsWeHaveWaitedFor) 
-{
-    if (waitProcessNames.empty()) {
-        return;
-    }
-    
-    do {
-        std::vector<HANDLE> handlesToWaitOn;
-        
-        // Rapid scan phase
-        DWORD startTime = GetTickCount();
-        while (GetTickCount() - startTime < 3000) {
-            std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcessNames, pidsWeHaveWaitedFor);
-            if (!foundHandles.empty()) {
-                handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
-            }
-            Sleep(50);
-        }
-
-        if (handlesToWaitOn.empty()) {
-            break; // No new descendants to wait for.
-        }
-
-        WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
-
-        for (HANDLE h : handlesToWaitOn) {
-            CloseHandle(h);
-        }
-        
-    } while (true);
-}
-
-
 // Reinstated for multi-instance polling.
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
@@ -2657,9 +2619,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             if (!waitInSettings) continue;
             size_t delimiterPos = waitLine.find(L'=');
             if (delimiterPos != std::wstring::npos) {
-                std::wstring key = trim(waitLine.substr(0, delimiterPos));
+                std::wstring key = trim(line.substr(0, delimiterPos));
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    std::wstring value = trim(waitLine.substr(delimiterPos + 1));
+                    std::wstring value = trim(line.substr(delimiterPos + 1));
                     waitProcesses.push_back(ExpandVariables(value, data->variables));
                 }
             }
@@ -2687,39 +2649,53 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
         } else {
-            // SINGLE-INSTANCE: Use the robust hybrid method
-            std::set<DWORD> trustedPids;
-            std::set<DWORD> pidsWeHaveWaitedFor;
-            std::vector<HANDLE> initialHandlesToWait;
+            // SINGLE-INSTANCE: Use the robust event-driven hybrid method
+            if (waitProcesses.empty()) {
+                // No wait processes, just wait for the main app
+                WaitForSingleObject(pi.hProcess, INFINITE);
+            } else {
+                std::set<DWORD> trustedPids;
+                std::set<DWORD> pidsWeHaveWaitedFor;
+                std::vector<HANDLE> handlesToWaitOn;
 
-            trustedPids.insert(pi.dwProcessId);
+                trustedPids.insert(pi.dwProcessId);
+                handlesToWaitOn.push_back(pi.hProcess);
+                pidsWeHaveWaitedFor.insert(pi.dwProcessId);
 
-            // Phase 1: Rapid scan to build the initial process map
-            if (!waitProcesses.empty()) {
+                // Initial rapid scan to catch fast-spawning children of the main process
                 DWORD startTime = GetTickCount();
                 while (GetTickCount() - startTime < 3000) {
                     std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
                     if (!foundHandles.empty()) {
-                        initialHandlesToWait.insert(initialHandlesToWait.end(), foundHandles.begin(), foundHandles.end());
+                        handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                     }
                     Sleep(50);
                 }
-            }
 
-            // Phase 2: Wait for the main process to exit
-            WaitForSingleObject(pi.hProcess, INFINITE);
+                // Main event-driven wait loop
+                while (!handlesToWaitOn.empty()) {
+                    DWORD waitResult = WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), FALSE, INFINITE);
+                    
+                    if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + handlesToWaitOn.size()) {
+                        int index = waitResult - WAIT_OBJECT_0;
+                        
+                        CloseHandle(handlesToWaitOn[index]);
+                        handlesToWaitOn.erase(handlesToWaitOn.begin() + index);
 
-            // Phase 3: Wait for the initially discovered children
-            if (!initialHandlesToWait.empty()) {
-                WaitForMultipleObjects((DWORD)initialHandlesToWait.size(), initialHandlesToWait.data(), TRUE, INFINITE);
-                for (HANDLE h : initialHandlesToWait) {
-                    CloseHandle(h);
+                        // A process exited, so immediately do a new rapid scan for its potential children
+                        startTime = GetTickCount();
+                        while (GetTickCount() - startTime < 3000) {
+                             std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
+                            if (!foundHandles.empty()) {
+                                handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
+                            }
+                            Sleep(50);
+                        }
+                    } else {
+                        // Wait failed or abandoned, break the loop
+                        break;
+                    }
                 }
-            }
-
-            // Phase 4: Do a final generational wait for any late spawns
-            if (!waitProcesses.empty()) {
-                WaitForProcessTree(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
             }
         }
         
