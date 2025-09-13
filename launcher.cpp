@@ -1558,9 +1558,6 @@ namespace ActionHelpers {
 
 // --- Process Management Functions ---
 
-// REVISED HELPER FUNCTION
-// Scans for ALL new descendants of trusted PIDs, adds them to the trusted set,
-// and returns handles for the ones that match the wait list.
 std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
     const std::vector<std::wstring>& waitProcessNames,
@@ -1579,26 +1576,21 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            // Is this process a child of a process we already trust?
             if (trustedPids.count(pe32.th32ParentProcessID)) {
-                // If so, we now trust this child process as well.
                 newlyTrustedPids.insert(pe32.th32ProcessID);
 
-                // Have we already handled this specific process? If so, skip.
                 if (pidsToIgnore.count(pe32.th32ProcessID)) {
                     continue;
                 }
 
-                // Does its name match one of the names we should wait for?
                 for (const auto& name : waitProcessNames) {
                     if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
                         HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
                             handlesToWaitOn.push_back(hProcess);
-                            // Mark it so we don't try to find it again.
                             pidsToIgnore.insert(pe32.th32ProcessID);
                         }
-                        break; // Found a match, no need to check other names for this process
+                        break;
                     }
                 }
             }
@@ -1606,14 +1598,10 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     }
 
     CloseHandle(hSnapshot);
-
-    // Propagate trust: add all newly found descendants to the main trusted set.
     trustedPids.insert(newlyTrustedPids.begin(), newlyTrustedPids.end());
-
     return handlesToWaitOn;
 }
 
-// Reinstated for multi-instance polling.
 bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     if (waitProcesses.empty()) return false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1634,14 +1622,12 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     return false;
 }
 
-// *** CORRECTED FUNCTION ***
 std::wstring GetProcessNameByPid(DWORD pid) {
     if (pid == 0) return L"";
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (hProcess) {
         wchar_t processName[MAX_PATH];
-        DWORD size = MAX_PATH; // Create a DWORD variable for the size
-        // Pass the ADDRESS of the size variable (&size)
+        DWORD size = MAX_PATH;
         if (QueryFullProcessImageNameW(hProcess, 0, processName, &size) > 0) {
             CloseHandle(hProcess);
             return PathFindFileNameW(processName);
@@ -1685,6 +1671,7 @@ struct MonitorThreadData {
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
 static bool g_areProcessesSuspended = false;
+static HANDLE g_hProcessEvent = NULL; // <-- 新增: 用于进程活动的事件句柄
 
 // The callback function that Windows calls when a system event occurs
 VOID CALLBACK WinEventProc(
@@ -1716,6 +1703,24 @@ VOID CALLBACK WinEventProc(
         }
     }
 }
+
+// <-- 新增: 用于多实例等待的回调函数
+VOID CALLBACK WinEventProcProcesses(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD dwEventThread,
+    DWORD dwmsEventTime)
+{
+    // 我们只关心事件的发生，不关心具体内容
+    // 只需设置事件，让等待循环知道有活动发生
+    if (g_hProcessEvent) {
+        SetEvent(g_hProcessEvent);
+    }
+}
+
 
 // The new, efficient monitor thread function
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
@@ -2619,12 +2624,14 @@ void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, st
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
 
-// NEW: Worker thread function
 DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     LauncherThreadData* data = static_cast<LauncherThreadData*>(lpParam);
     if (!data) {
         return 1;
     }
+
+    // <-- 新增: 为此线程初始化COM
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     STARTUPINFOW si; 
     PROCESS_INFORMATION pi;
@@ -2678,11 +2685,35 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 std::wstring waitCheckStr = GetValueFromIniContent(data->iniContent, L"General", L"waitcheck");
                 int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                 if (waitCheck <= 0) waitCheck = 10;
-                
+
+                // <-- 修改: 高效的混合事件/轮询等待逻辑
+                g_hProcessEvent = CreateEvent(NULL, TRUE, FALSE, NULL); // 创建事件对象
+                HWINEVENTHOOK hHook = SetWinEventHook(
+                    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+                    NULL, WinEventProcProcesses, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+                // 初始延迟，等待子进程稳定
                 Sleep(3000);
-                while (AreWaitProcessesRunning(waitProcesses)) {
-                    Sleep(waitCheck * 1000);
+
+                while (true) {
+                    // 检查一次进程是否存在
+                    if (!AreWaitProcessesRunning(waitProcesses)) {
+                        break; // 如果已经不存在，直接退出
+                    }
+                    
+                    // 等待事件或超时
+                    DWORD waitResult = WaitForSingleObject(g_hProcessEvent, waitCheck * 1000);
+
+                    if (waitResult == WAIT_OBJECT_0) {
+                        // 事件被触发，重置它以便下次使用
+                        ResetEvent(g_hProcessEvent);
+                    }
+                    // 无论是事件触发还是超时，我们都将循环并重新检查
                 }
+
+                if (hHook) UnhookWinEvent(hHook);
+                if (g_hProcessEvent) CloseHandle(g_hProcessEvent);
+                g_hProcessEvent = NULL;
             }
         } else {
             if (waitProcesses.empty()) {
@@ -2760,6 +2791,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     DeleteFileW(data->tempFilePath.c_str());
     
+    // <-- 新增: 释放COM
+    CoUninitialize();
     return 0;
 }
 
@@ -3034,7 +3067,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             while (true) {
                 DWORD dwResult = MsgWaitForMultipleObjects(1, &hWorkerThread, FALSE, INFINITE, QS_ALLINPUT);
                 if (dwResult == WAIT_OBJECT_0) {
-                    break; // Thread finished
+                    break;
                 }
                 else if (dwResult == WAIT_OBJECT_0 + 1) {
                     MSG msg;
@@ -3043,7 +3076,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                         DispatchMessage(&msg);
                     }
                 } else {
-                    break; // Wait failed
+                    break;
                 }
             }
             CloseHandle(hWorkerThread);
