@@ -19,6 +19,7 @@
 #include <winreg.h>
 #include <iomanip>
 #include <atlbase.h>
+#include <psapi.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -27,6 +28,7 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
+#pragma comment(lib, "Psapi.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -252,6 +254,7 @@ struct LauncherThreadData {
     std::wstring finalWorkDir;
     std::wstring tempFilePath;
     HANDLE hMonitorThread = NULL;
+    DWORD hMonitorThreadId = 0;
     MonitorThreadData* monitorData = nullptr;
     HANDLE hBackupThread = NULL;
     BackupThreadData* backupData = nullptr;
@@ -1555,9 +1558,7 @@ namespace ActionHelpers {
 
 // --- Process Management Functions ---
 
-// REVISED HELPER FUNCTION
-// Scans for ALL new descendants of trusted PIDs, adds them to the trusted set,
-// and returns handles for the ones that match the wait list.
+// REVISED HELPER FUNCTION for single-instance wait
 std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
     const std::vector<std::wstring>& waitProcessNames,
@@ -1576,26 +1577,19 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            // Is this process a child of a process we already trust?
             if (trustedPids.count(pe32.th32ParentProcessID)) {
-                // If so, we now trust this child process as well.
                 newlyTrustedPids.insert(pe32.th32ProcessID);
-
-                // Have we already handled this specific process? If so, skip.
                 if (pidsToIgnore.count(pe32.th32ProcessID)) {
                     continue;
                 }
-
-                // Does its name match one of the names we should wait for?
                 for (const auto& name : waitProcessNames) {
                     if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
                         HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
                             handlesToWaitOn.push_back(hProcess);
-                            // Mark it so we don't try to find it again.
                             pidsToIgnore.insert(pe32.th32ProcessID);
                         }
-                        break; // Found a match, no need to check other names for this process
+                        break;
                     }
                 }
             }
@@ -1603,48 +1597,47 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     }
 
     CloseHandle(hSnapshot);
-
-    // Propagate trust: add all newly found descendants to the main trusted set.
     trustedPids.insert(newlyTrustedPids.begin(), newlyTrustedPids.end());
-
     return handlesToWaitOn;
 }
 
-// Reinstated for multi-instance polling.
-bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
-    if (waitProcesses.empty()) return false;
+// <-- [新增] 多实例模式的辅助函数：执行一次全系统扫描，填充PID列表
+void PopulateWaitPids(const std::vector<std::wstring>& processNames, std::set<DWORD>& pids) {
+    pids.clear(); // 开始扫描前清空列表
+    if (processNames.empty()) return;
+
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
+
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            for (const auto& processName : waitProcesses) {
-                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
-                    CloseHandle(hSnapshot);
-                    return true;
+            for (const auto& name : processNames) {
+                if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
+                    pids.insert(pe32.th32ProcessID);
+                    break; 
                 }
             }
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
-    return false;
 }
 
+
 std::wstring GetProcessNameByPid(DWORD pid) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    if (Process32FirstW(hSnapshot, &pe32)) {
-        do {
-            if (pe32.th32ProcessID == pid) {
-                CloseHandle(hSnapshot);
-                return pe32.szExeFile;
-            }
-        } while (Process32NextW(hSnapshot, &pe32));
+    if (pid == 0) return L"";
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess) {
+        wchar_t processName[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProcess, 0, processName, &size) > 0) {
+            CloseHandle(hProcess);
+            return PathFindFileNameW(processName);
+        }
+        CloseHandle(hProcess);
     }
-    CloseHandle(hSnapshot);
     return L"";
 }
 
@@ -1674,35 +1667,70 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
 
 // --- Foreground Monitoring, Backup, Link, Firewall Sections ---
 struct MonitorThreadData {
-    std::atomic<bool>* shouldStop;
-    int checkInterval;
     std::wstring foregroundAppName;
     std::vector<std::wstring> suspendProcesses;
 };
 
-DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
-    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
-    bool areProcessesSuspended = false;
-    while (!*(data->shouldStop)) {
-        HWND hForegroundWnd = GetForegroundWindow();
-        if (hForegroundWnd) {
-            DWORD foregroundPid = 0;
-            GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
+static std::vector<std::wstring>* g_suspendProcesses = nullptr;
+static std::wstring g_foregroundAppName;
+static bool g_areProcessesSuspended = false;
+
+VOID CALLBACK WinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD dwEventThread,
+    DWORD dwmsEventTime)
+{
+    if (event == EVENT_SYSTEM_FOREGROUND && hwnd) {
+        DWORD foregroundPid = 0;
+        GetWindowThreadProcessId(hwnd, &foregroundPid);
+        if (foregroundPid > 0) {
             std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
-            if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
-                if (!areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, true);
-                    areProcessesSuspended = true;
+            
+            if (_wcsicmp(foregroundProcessName.c_str(), g_foregroundAppName.c_str()) == 0) {
+                if (!g_areProcessesSuspended) {
+                    SetAllProcessesState(*g_suspendProcesses, true);
+                    g_areProcessesSuspended = true;
                 }
             } else {
-                if (areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, false);
-                    areProcessesSuspended = false;
+                if (g_areProcessesSuspended) {
+                    SetAllProcessesState(*g_suspendProcesses, false);
+                    g_areProcessesSuspended = false;
                 }
             }
         }
-        Sleep(data->checkInterval * 1000);
     }
+}
+
+DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
+    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
+    
+    g_suspendProcesses = &(data->suspendProcesses);
+    g_foregroundAppName = data->foregroundAppName;
+    g_areProcessesSuspended = false;
+
+    HWINEVENTHOOK hHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+    if (hHook) {
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        
+        UnhookWinEvent(hHook);
+    }
+
+    if (g_areProcessesSuspended) {
+        SetAllProcessesState(*g_suspendProcesses, false);
+        g_areProcessesSuspended = false;
+    }
+
     return 0;
 }
 
@@ -2075,10 +2103,6 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                         DeleteFileW(pathToDelete.c_str());
                     }
                 }
-                // *** FIX: REMOVED THE DELETION OF THE CONTAINER DIRECTORY ***
-                // if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
-                //     RemoveDirectoryW(arg.linkPath.c_str());
-                // }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
@@ -2582,7 +2606,6 @@ void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, st
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
 
-// NEW: Worker thread function
 DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     LauncherThreadData* data = static_cast<LauncherThreadData*>(lpParam);
     if (!data) {
@@ -2621,7 +2644,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             if (delimiterPos != std::wstring::npos) {
                 std::wstring key = trim(waitLine.substr(0, delimiterPos));
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    // *** FIX: Corrected variable name from 'line' to 'waitLine' ***
                     std::wstring value = trim(waitLine.substr(delimiterPos + 1));
                     waitProcesses.push_back(ExpandVariables(value, data->variables));
                 }
@@ -2631,7 +2653,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
 
         if (multiInstanceEnabled) {
-            // *** FIX: Wait for main process first, THEN poll ***
             WaitForSingleObject(pi.hProcess, INFINITE);
 
             const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
@@ -2644,29 +2665,56 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                 if (waitCheck <= 0) waitCheck = 10;
                 
+                // <-- [修改] 以下是新的、高效的多实例轮询逻辑
+                
+                // 1. 主程序退出后，等待3秒
                 Sleep(3000);
-                while (AreWaitProcessesRunning(waitProcesses)) {
-                    Sleep(waitCheck * 1000);
+
+                // 2. 进入主循环
+                while (true) {
+                    std::set<DWORD> runningWaitPids;
+
+                    // 3. 执行一次全系统扫描，填充PID列表
+                    PopulateWaitPids(waitProcesses, runningWaitPids);
+
+                    // 4. 如果扫描后列表为空，说明没有要等的进程了，终止循环
+                    if (runningWaitPids.empty()) {
+                        break;
+                    }
+
+                    // 5. 如果列表不为空，进入内部的快速检查循环
+                    while (!runningWaitPids.empty()) {
+                        Sleep(waitCheck * 1000);
+
+                        // 遍历PID列表，移除已退出的进程
+                        for (auto it = runningWaitPids.begin(); it != runningWaitPids.end(); ) {
+                            HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, *it);
+                            if (hProcess) {
+                                // 句柄能打开，说明进程还存在（或刚退出）
+                                CloseHandle(hProcess);
+                                ++it; // 继续检查下一个
+                            } else {
+                                // 无法打开句柄，说明进程已不存在，从列表移除
+                                it = runningWaitPids.erase(it);
+                            }
+                        }
+                    }
+                    // 6. 当内部循环结束（所有已知PID都退出），主循环会再次开始，进行下一次全系统扫描
                 }
             }
-        } else {
-            // SINGLE-INSTANCE: Use the robust event-driven hybrid method
+        } else { // 单实例逻辑 (保持不变)
             if (waitProcesses.empty()) {
-                // No wait processes, just wait for the main app
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
                 std::set<DWORD> trustedPids;
                 std::set<DWORD> pidsWeHaveWaitedFor;
                 std::vector<HANDLE> handlesToWaitOn;
 
-                trustedPids.insert(GetCurrentProcessId()); // Trust the launcher itself
+                trustedPids.insert(GetCurrentProcessId());
                 trustedPids.insert(pi.dwProcessId);
                 handlesToWaitOn.push_back(pi.hProcess);
-                // pidsWeHaveWaitedFor is for processes found by name, not the main process.
 
-                // Main event-driven wait loop
                 while (!handlesToWaitOn.empty()) {
-                    // Phase 1: Rapid Scan to find any new children before we wait
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
                          std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
@@ -2676,7 +2724,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         Sleep(50);
                     }
                     
-                    // Phase 2: Wait for ANY process in the current list to exit
                     DWORD waitResult = WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), FALSE, INFINITE);
                     
                     if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + handlesToWaitOn.size()) {
@@ -2685,9 +2732,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         CloseHandle(handlesToWaitOn[index]);
                         handlesToWaitOn.erase(handlesToWaitOn.begin() + index);
                         
-                        // If that was the last handle, we are done.
                         if (handlesToWaitOn.empty()) {
-                            // Do one final scan to catch anything spawned by the very last process.
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
                                 std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
@@ -2696,13 +2741,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                                 }
                                 Sleep(50);
                             }
-                            // If the final scan still finds nothing, we can exit.
                             if (handlesToWaitOn.empty()) {
                                 break;
                             }
                         }
                     } else {
-                        // Wait failed or abandoned, clean up remaining handles and break
                         for(HANDLE h : handlesToWaitOn) {
                             CloseHandle(h);
                         }
@@ -2712,14 +2755,15 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
         }
         
-        // Clean up the initial process handles if they haven't been closed already
         if (pi.hProcess) CloseHandle(pi.hProcess);
         if (pi.hThread) CloseHandle(pi.hThread);
     }
 
     if (data->hMonitorThread) {
-        *(data->stopMonitor) = true;
-        WaitForSingleObject(data->hMonitorThread, 1500);
+        if (data->hMonitorThreadId != 0) {
+            PostThreadMessageW(data->hMonitorThreadId, WM_QUIT, 0, 0);
+        }
+        WaitForSingleObject(data->hMonitorThread, 2000); 
         CloseHandle(data->hMonitorThread);
         SetAllProcessesState(data->monitorData->suspendProcesses, false);
     }
@@ -2959,7 +3003,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
-            monitorData.shouldStop = &stopMonitor;
             monitorData.foregroundAppName = foregroundAppName;
 
             std::wstringstream stream(iniContent);
@@ -2984,12 +3027,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     }
                 }
             }
-
-            std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"General", L"foregroundcheck");
-            monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
-            if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
+            
             if (!monitorData.suspendProcesses.empty()) {
-                threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+                DWORD monitorThreadId = 0;
+                threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, &monitorThreadId);
+                threadData.hMonitorThreadId = monitorThreadId;
             }
         }
 
@@ -3010,7 +3052,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             while (true) {
                 DWORD dwResult = MsgWaitForMultipleObjects(1, &hWorkerThread, FALSE, INFINITE, QS_ALLINPUT);
                 if (dwResult == WAIT_OBJECT_0) {
-                    break; // Thread finished
+                    break;
                 }
                 else if (dwResult == WAIT_OBJECT_0 + 1) {
                     MSG msg;
@@ -3019,7 +3061,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                         DispatchMessage(&msg);
                     }
                 } else {
-                    break; // Wait failed
+                    break;
                 }
             }
             CloseHandle(hWorkerThread);
