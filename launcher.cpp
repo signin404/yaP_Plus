@@ -19,6 +19,7 @@
 #include <winreg.h>
 #include <iomanip>
 #include <atlbase.h>
+#include <psapi.h> // <-- 新增: 用于高效获取进程名
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -27,6 +28,7 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
+#pragma comment(lib, "Psapi.lib") // <-- 新增: 链接Psapi库
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -252,6 +254,7 @@ struct LauncherThreadData {
     std::wstring finalWorkDir;
     std::wstring tempFilePath;
     HANDLE hMonitorThread = NULL;
+    DWORD hMonitorThreadId = 0; // <-- 新增: 存储监控线程ID用于发消息
     MonitorThreadData* monitorData = nullptr;
     HANDLE hBackupThread = NULL;
     BackupThreadData* backupData = nullptr;
@@ -1631,20 +1634,19 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     return false;
 }
 
+// <-- 修改: 高效的进程名获取函数
+// 使用QueryFullProcessImageNameW直接查询指定PID的进程，避免了高开销的CreateToolhelp32Snapshot
 std::wstring GetProcessNameByPid(DWORD pid) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return L"";
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    if (Process32FirstW(hSnapshot, &pe32)) {
-        do {
-            if (pe32.th32ProcessID == pid) {
-                CloseHandle(hSnapshot);
-                return pe32.szExeFile;
-            }
-        } while (Process32NextW(hSnapshot, &pe32));
+    if (pid == 0) return L"";
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess) {
+        wchar_t processName[MAX_PATH];
+        if (QueryFullProcessImageNameW(hProcess, 0, processName, MAX_PATH) > 0) {
+            CloseHandle(hProcess);
+            return PathFindFileNameW(processName);
+        }
+        CloseHandle(hProcess);
     }
-    CloseHandle(hSnapshot);
     return L"";
 }
 
@@ -1674,35 +1676,84 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
 
 // --- Foreground Monitoring, Backup, Link, Firewall Sections ---
 struct MonitorThreadData {
-    std::atomic<bool>* shouldStop;
-    int checkInterval;
+    // std::atomic<bool>* shouldStop; // 不再需要
+    // int checkInterval; // 不再需要
     std::wstring foregroundAppName;
     std::vector<std::wstring> suspendProcesses;
 };
 
-DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
-    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
-    bool areProcessesSuspended = false;
-    while (!*(data->shouldStop)) {
-        HWND hForegroundWnd = GetForegroundWindow();
-        if (hForegroundWnd) {
-            DWORD foregroundPid = 0;
-            GetWindowThreadProcessId(hForegroundWnd, &foregroundPid);
+// <-- 修改: 以下是新的事件驱动监控逻辑
+// 用于WinEventProc回调的静态变量，因为回调函数是C风格的
+static std::vector<std::wstring>* g_suspendProcesses = nullptr;
+static std::wstring g_foregroundAppName;
+static bool g_areProcessesSuspended = false;
+
+// 当系统事件发生时，Windows会调用此回调函数
+VOID CALLBACK WinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD dwEventThread,
+    DWORD dwmsEventTime)
+{
+    // 我们只关心前台窗口切换事件
+    if (event == EVENT_SYSTEM_FOREGROUND && hwnd) {
+        DWORD foregroundPid = 0;
+        GetWindowThreadProcessId(hwnd, &foregroundPid);
+        if (foregroundPid > 0) {
             std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
-            if (_wcsicmp(foregroundProcessName.c_str(), data->foregroundAppName.c_str()) == 0) {
-                if (!areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, true);
-                    areProcessesSuspended = true;
+            
+            if (_wcsicmp(foregroundProcessName.c_str(), g_foregroundAppName.c_str()) == 0) {
+                if (!g_areProcessesSuspended) {
+                    SetAllProcessesState(*g_suspendProcesses, true);
+                    g_areProcessesSuspended = true;
                 }
             } else {
-                if (areProcessesSuspended) {
-                    SetAllProcessesState(data->suspendProcesses, false);
-                    areProcessesSuspended = false;
+                if (g_areProcessesSuspended) {
+                    SetAllProcessesState(*g_suspendProcesses, false);
+                    g_areProcessesSuspended = false;
                 }
             }
         }
-        Sleep(data->checkInterval * 1000);
     }
+}
+
+// 新的、高效的监控线程函数
+DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
+    MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
+    
+    // 初始化静态变量，以便回调函数可以访问它们
+    g_suspendProcesses = &(data->suspendProcesses);
+    g_foregroundAppName = data->foregroundAppName;
+    g_areProcessesSuspended = false;
+
+    // 设置Windows事件钩子，监听前台窗口变化
+    // WINEVENT_OUTOFCONTEXT表示回调函数在我们的进程中运行，而不是在事件源进程中
+    HWINEVENTHOOK hHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+    if (hHook) {
+        // 为了接收钩子事件，线程必须有一个消息循环。
+        // 当没有事件时，GetMessage会使线程休眠，不消耗CPU。
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        
+        // 当收到WM_QUIT消息后，循环结束，我们在这里取消钩子
+        UnhookWinEvent(hHook);
+    }
+
+    // 线程退出前，确保所有进程都已恢复，以防万一
+    if (g_areProcessesSuspended) {
+        SetAllProcessesState(*g_suspendProcesses, false);
+        g_areProcessesSuspended = false;
+    }
+
     return 0;
 }
 
@@ -2717,10 +2768,16 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (pi.hThread) CloseHandle(pi.hThread);
     }
 
+    // <-- 修改: 终止监控线程的逻辑
     if (data->hMonitorThread) {
-        *(data->stopMonitor) = true;
-        WaitForSingleObject(data->hMonitorThread, 1500);
+        // 向监控线程的消息循环发送WM_QUIT消息，使其优雅退出
+        if (data->hMonitorThreadId != 0) {
+            PostThreadMessageW(data->hMonitorThreadId, WM_QUIT, 0, 0);
+        }
+        // 等待线程结束
+        WaitForSingleObject(data->hMonitorThread, 2000); 
         CloseHandle(data->hMonitorThread);
+        // 最后的安全保障：确保进程被恢复（尽管线程退出时自己会做）
         SetAllProcessesState(data->monitorData->suspendProcesses, false);
     }
     if (data->hBackupThread) {
@@ -2959,7 +3016,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
-            monitorData.shouldStop = &stopMonitor;
+            // monitorData.shouldStop = &stopMonitor; // 不再需要
             monitorData.foregroundAppName = foregroundAppName;
 
             std::wstringstream stream(iniContent);
@@ -2984,12 +3041,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     }
                 }
             }
+            
+            // foregroundcheck也不再需要，因为是事件驱动
+            // std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"General", L"foregroundcheck");
+            // monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
+            // if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
 
-            std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"General", L"foregroundcheck");
-            monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
-            if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
             if (!monitorData.suspendProcesses.empty()) {
-                threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, NULL);
+                // <-- 修改: 创建线程并捕获其ID
+                DWORD monitorThreadId = 0;
+                threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, &monitorThreadId);
+                threadData.hMonitorThreadId = monitorThreadId;
             }
         }
 
