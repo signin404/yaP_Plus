@@ -1667,13 +1667,11 @@ struct MonitorThreadData {
     std::vector<std::wstring> suspendProcesses;
 };
 
-// Static variables for the WinEventProc callback
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
 static bool g_areProcessesSuspended = false;
-static HANDLE g_hProcessEvent = NULL; // <-- 新增: 用于进程活动的事件句柄
+static HANDLE g_hProcessEvent = NULL;
 
-// The callback function that Windows calls when a system event occurs
 VOID CALLBACK WinEventProc(
     HWINEVENTHOOK hWinEventHook,
     DWORD event,
@@ -1704,7 +1702,6 @@ VOID CALLBACK WinEventProc(
     }
 }
 
-// <-- 新增: 用于多实例等待的回调函数
 VOID CALLBACK WinEventProcProcesses(
     HWINEVENTHOOK hWinEventHook,
     DWORD event,
@@ -1714,15 +1711,12 @@ VOID CALLBACK WinEventProcProcesses(
     DWORD dwEventThread,
     DWORD dwmsEventTime)
 {
-    // 我们只关心事件的发生，不关心具体内容
-    // 只需设置事件，让等待循环知道有活动发生
     if (g_hProcessEvent) {
         SetEvent(g_hProcessEvent);
     }
 }
 
 
-// The new, efficient monitor thread function
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
     
@@ -2630,7 +2624,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         return 1;
     }
 
-    // <-- 新增: 为此线程初始化COM
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     STARTUPINFOW si; 
@@ -2686,36 +2679,43 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                 if (waitCheck <= 0) waitCheck = 10;
 
-                // <-- 修改: 高效的混合事件/轮询等待逻辑
-                g_hProcessEvent = CreateEvent(NULL, TRUE, FALSE, NULL); // 创建事件对象
-                HWINEVENTHOOK hHook = SetWinEventHook(
-                    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-                    NULL, WinEventProcProcesses, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+                // --- NEW LOGIC AS PER YOUR REQUEST ---
 
-                // 初始延迟，等待子进程稳定
+                // 1. Initial 3-second wait
                 Sleep(3000);
 
-                while (true) {
-                    // 检查一次进程是否存在
-                    if (!AreWaitProcessesRunning(waitProcesses)) {
-                        break; // 如果已经不存在，直接退出
-                    }
-                    
-                    // 等待事件或超时
-                    DWORD waitResult = WaitForSingleObject(g_hProcessEvent, waitCheck * 1000);
+                // 2. Pre-check if processes exist
+                if (AreWaitProcessesRunning(waitProcesses)) {
+                    // 3. If they exist, set up hooks and enter the loop
+                    g_hProcessEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                    HWINEVENTHOOK hHook = SetWinEventHook(
+                        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+                        NULL, WinEventProcProcesses, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-                    if (waitResult == WAIT_OBJECT_0) {
-                        // 事件被触发，重置它以便下次使用
+                    while (true) {
+                        // At the start of the interval, reset the event flag
                         ResetEvent(g_hProcessEvent);
-                    }
-                    // 无论是事件触发还是超时，我们都将循环并重新检查
-                }
 
-                if (hHook) UnhookWinEvent(hHook);
-                if (g_hProcessEvent) CloseHandle(g_hProcessEvent);
-                g_hProcessEvent = NULL;
+                        // Wait for the full interval
+                        Sleep(waitCheck * 1000);
+
+                        // 4 & 5. After sleeping, check if the event was signaled during the interval
+                        DWORD eventState = WaitForSingleObject(g_hProcessEvent, 0);
+                        if (eventState == WAIT_OBJECT_0) {
+                            // Event was signaled, so perform the process check
+                            if (!AreWaitProcessesRunning(waitProcesses)) {
+                                break; // All processes are gone, exit the loop
+                            }
+                        }
+                        // If no event was signaled, do nothing and loop for another interval
+                    }
+
+                    if (hHook) UnhookWinEvent(hHook);
+                    if (g_hProcessEvent) CloseHandle(g_hProcessEvent);
+                    g_hProcessEvent = NULL;
+                }
             }
-        } else {
+        } else { // Single-instance logic remains the same
             if (waitProcesses.empty()) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
@@ -2791,7 +2791,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     DeleteFileW(data->tempFilePath.c_str());
     
-    // <-- 新增: 释放COM
     CoUninitialize();
     return 0;
 }
