@@ -19,7 +19,7 @@
 #include <winreg.h>
 #include <iomanip>
 #include <atlbase.h>
-#include <psapi.h> // <-- 新增: 用于高效获取进程名
+#include <psapi.h>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -28,7 +28,7 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
-#pragma comment(lib, "Psapi.lib") // <-- 新增: 链接Psapi库
+#pragma comment(lib, "Psapi.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -254,7 +254,7 @@ struct LauncherThreadData {
     std::wstring finalWorkDir;
     std::wstring tempFilePath;
     HANDLE hMonitorThread = NULL;
-    DWORD hMonitorThreadId = 0; // <-- 新增: 存储监控线程ID用于发消息
+    DWORD hMonitorThreadId = 0;
     MonitorThreadData* monitorData = nullptr;
     HANDLE hBackupThread = NULL;
     BackupThreadData* backupData = nullptr;
@@ -1634,14 +1634,15 @@ bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
     return false;
 }
 
-// <-- 修改: 高效的进程名获取函数
-// 使用QueryFullProcessImageNameW直接查询指定PID的进程，避免了高开销的CreateToolhelp32Snapshot
+// *** CORRECTED FUNCTION ***
 std::wstring GetProcessNameByPid(DWORD pid) {
     if (pid == 0) return L"";
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (hProcess) {
         wchar_t processName[MAX_PATH];
-        if (QueryFullProcessImageNameW(hProcess, 0, processName, MAX_PATH) > 0) {
+        DWORD size = MAX_PATH; // Create a DWORD variable for the size
+        // Pass the ADDRESS of the size variable (&size)
+        if (QueryFullProcessImageNameW(hProcess, 0, processName, &size) > 0) {
             CloseHandle(hProcess);
             return PathFindFileNameW(processName);
         }
@@ -1676,19 +1677,16 @@ void SetAllProcessesState(const std::vector<std::wstring>& processList, bool sus
 
 // --- Foreground Monitoring, Backup, Link, Firewall Sections ---
 struct MonitorThreadData {
-    // std::atomic<bool>* shouldStop; // 不再需要
-    // int checkInterval; // 不再需要
     std::wstring foregroundAppName;
     std::vector<std::wstring> suspendProcesses;
 };
 
-// <-- 修改: 以下是新的事件驱动监控逻辑
-// 用于WinEventProc回调的静态变量，因为回调函数是C风格的
+// Static variables for the WinEventProc callback
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
 static bool g_areProcessesSuspended = false;
 
-// 当系统事件发生时，Windows会调用此回调函数
+// The callback function that Windows calls when a system event occurs
 VOID CALLBACK WinEventProc(
     HWINEVENTHOOK hWinEventHook,
     DWORD event,
@@ -1698,7 +1696,6 @@ VOID CALLBACK WinEventProc(
     DWORD dwEventThread,
     DWORD dwmsEventTime)
 {
-    // 我们只关心前台窗口切换事件
     if (event == EVENT_SYSTEM_FOREGROUND && hwnd) {
         DWORD foregroundPid = 0;
         GetWindowThreadProcessId(hwnd, &foregroundPid);
@@ -1720,35 +1717,28 @@ VOID CALLBACK WinEventProc(
     }
 }
 
-// 新的、高效的监控线程函数
+// The new, efficient monitor thread function
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
     
-    // 初始化静态变量，以便回调函数可以访问它们
     g_suspendProcesses = &(data->suspendProcesses);
     g_foregroundAppName = data->foregroundAppName;
     g_areProcessesSuspended = false;
 
-    // 设置Windows事件钩子，监听前台窗口变化
-    // WINEVENT_OUTOFCONTEXT表示回调函数在我们的进程中运行，而不是在事件源进程中
     HWINEVENTHOOK hHook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     if (hHook) {
-        // 为了接收钩子事件，线程必须有一个消息循环。
-        // 当没有事件时，GetMessage会使线程休眠，不消耗CPU。
         MSG msg;
         while (GetMessage(&msg, NULL, 0, 0)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
         
-        // 当收到WM_QUIT消息后，循环结束，我们在这里取消钩子
         UnhookWinEvent(hHook);
     }
 
-    // 线程退出前，确保所有进程都已恢复，以防万一
     if (g_areProcessesSuspended) {
         SetAllProcessesState(*g_suspendProcesses, false);
         g_areProcessesSuspended = false;
@@ -2126,10 +2116,6 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                         DeleteFileW(pathToDelete.c_str());
                     }
                 }
-                // *** FIX: REMOVED THE DELETION OF THE CONTAINER DIRECTORY ***
-                // if (PathIsDirectoryEmptyW(arg.linkPath.c_str())) {
-                //     RemoveDirectoryW(arg.linkPath.c_str());
-                // }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
@@ -2672,7 +2658,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             if (delimiterPos != std::wstring::npos) {
                 std::wstring key = trim(waitLine.substr(0, delimiterPos));
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
-                    // *** FIX: Corrected variable name from 'line' to 'waitLine' ***
                     std::wstring value = trim(waitLine.substr(delimiterPos + 1));
                     waitProcesses.push_back(ExpandVariables(value, data->variables));
                 }
@@ -2682,7 +2667,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
 
         if (multiInstanceEnabled) {
-            // *** FIX: Wait for main process first, THEN poll ***
             WaitForSingleObject(pi.hProcess, INFINITE);
 
             const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
@@ -2701,23 +2685,18 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
         } else {
-            // SINGLE-INSTANCE: Use the robust event-driven hybrid method
             if (waitProcesses.empty()) {
-                // No wait processes, just wait for the main app
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
                 std::set<DWORD> trustedPids;
                 std::set<DWORD> pidsWeHaveWaitedFor;
                 std::vector<HANDLE> handlesToWaitOn;
 
-                trustedPids.insert(GetCurrentProcessId()); // Trust the launcher itself
+                trustedPids.insert(GetCurrentProcessId());
                 trustedPids.insert(pi.dwProcessId);
                 handlesToWaitOn.push_back(pi.hProcess);
-                // pidsWeHaveWaitedFor is for processes found by name, not the main process.
 
-                // Main event-driven wait loop
                 while (!handlesToWaitOn.empty()) {
-                    // Phase 1: Rapid Scan to find any new children before we wait
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
                          std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
@@ -2727,7 +2706,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         Sleep(50);
                     }
                     
-                    // Phase 2: Wait for ANY process in the current list to exit
                     DWORD waitResult = WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), FALSE, INFINITE);
                     
                     if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + handlesToWaitOn.size()) {
@@ -2736,9 +2714,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         CloseHandle(handlesToWaitOn[index]);
                         handlesToWaitOn.erase(handlesToWaitOn.begin() + index);
                         
-                        // If that was the last handle, we are done.
                         if (handlesToWaitOn.empty()) {
-                            // Do one final scan to catch anything spawned by the very last process.
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
                                 std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
@@ -2747,13 +2723,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                                 }
                                 Sleep(50);
                             }
-                            // If the final scan still finds nothing, we can exit.
                             if (handlesToWaitOn.empty()) {
                                 break;
                             }
                         }
                     } else {
-                        // Wait failed or abandoned, clean up remaining handles and break
                         for(HANDLE h : handlesToWaitOn) {
                             CloseHandle(h);
                         }
@@ -2763,21 +2737,16 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
         }
         
-        // Clean up the initial process handles if they haven't been closed already
         if (pi.hProcess) CloseHandle(pi.hProcess);
         if (pi.hThread) CloseHandle(pi.hThread);
     }
 
-    // <-- 修改: 终止监控线程的逻辑
     if (data->hMonitorThread) {
-        // 向监控线程的消息循环发送WM_QUIT消息，使其优雅退出
         if (data->hMonitorThreadId != 0) {
             PostThreadMessageW(data->hMonitorThreadId, WM_QUIT, 0, 0);
         }
-        // 等待线程结束
         WaitForSingleObject(data->hMonitorThread, 2000); 
         CloseHandle(data->hMonitorThread);
-        // 最后的安全保障：确保进程被恢复（尽管线程退出时自己会做）
         SetAllProcessesState(data->monitorData->suspendProcesses, false);
     }
     if (data->hBackupThread) {
@@ -3016,7 +2985,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
-            // monitorData.shouldStop = &stopMonitor; // 不再需要
             monitorData.foregroundAppName = foregroundAppName;
 
             std::wstringstream stream(iniContent);
@@ -3042,13 +3010,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 }
             }
             
-            // foregroundcheck也不再需要，因为是事件驱动
-            // std::wstring fgCheckStr = GetValueFromIniContent(iniContent, L"General", L"foregroundcheck");
-            // monitorData.checkInterval = fgCheckStr.empty() ? 1 : _wtoi(fgCheckStr.c_str());
-            // if (monitorData.checkInterval <= 0) monitorData.checkInterval = 1;
-
             if (!monitorData.suspendProcesses.empty()) {
-                // <-- 修改: 创建线程并捕获其ID
                 DWORD monitorThreadId = 0;
                 threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, &monitorThreadId);
                 threadData.hMonitorThreadId = monitorThreadId;
