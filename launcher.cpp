@@ -2659,6 +2659,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 std::set<DWORD> pidsWeHaveWaitedFor;
                 std::vector<HANDLE> handlesToWaitOn;
 
+                trustedPids.insert(GetCurrentProcessId()); // Trust the launcher itself
                 trustedPids.insert(pi.dwProcessId);
                 handlesToWaitOn.push_back(pi.hProcess);
                 // pidsWeHaveWaitedFor is for processes found by name, not the main process.
