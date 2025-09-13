@@ -1558,6 +1558,7 @@ namespace ActionHelpers {
 
 // --- Process Management Functions ---
 
+// REVISED HELPER FUNCTION for single-instance wait
 std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
     const std::vector<std::wstring>& waitProcessNames,
@@ -1578,11 +1579,9 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
         do {
             if (trustedPids.count(pe32.th32ParentProcessID)) {
                 newlyTrustedPids.insert(pe32.th32ProcessID);
-
                 if (pidsToIgnore.count(pe32.th32ProcessID)) {
                     continue;
                 }
-
                 for (const auto& name : waitProcessNames) {
                     if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
                         HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
@@ -1602,25 +1601,30 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     return handlesToWaitOn;
 }
 
-bool AreWaitProcessesRunning(const std::vector<std::wstring>& waitProcesses) {
-    if (waitProcesses.empty()) return false;
+// <-- [新增] 多实例模式的辅助函数：执行一次全系统扫描，填充PID列表
+void PopulateWaitPids(const std::vector<std::wstring>& processNames, std::set<DWORD>& pids) {
+    pids.clear(); // 开始扫描前清空列表
+    if (processNames.empty()) return;
+
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
+
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            for (const auto& processName : waitProcesses) {
-                if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
-                    CloseHandle(hSnapshot);
-                    return true;
+            for (const auto& name : processNames) {
+                if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
+                    pids.insert(pe32.th32ProcessID);
+                    break; 
                 }
             }
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
-    return false;
 }
+
 
 std::wstring GetProcessNameByPid(DWORD pid) {
     if (pid == 0) return L"";
@@ -1670,7 +1674,6 @@ struct MonitorThreadData {
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
 static bool g_areProcessesSuspended = false;
-static HANDLE g_hProcessEvent = NULL;
 
 VOID CALLBACK WinEventProc(
     HWINEVENTHOOK hWinEventHook,
@@ -1701,21 +1704,6 @@ VOID CALLBACK WinEventProc(
         }
     }
 }
-
-VOID CALLBACK WinEventProcProcesses(
-    HWINEVENTHOOK hWinEventHook,
-    DWORD event,
-    HWND hwnd,
-    LONG idObject,
-    LONG idChild,
-    DWORD dwEventThread,
-    DWORD dwmsEventTime)
-{
-    if (g_hProcessEvent) {
-        SetEvent(g_hProcessEvent);
-    }
-}
-
 
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
@@ -2624,8 +2612,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         return 1;
     }
 
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
     STARTUPINFOW si; 
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si)); 
@@ -2678,44 +2664,45 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 std::wstring waitCheckStr = GetValueFromIniContent(data->iniContent, L"General", L"waitcheck");
                 int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
                 if (waitCheck <= 0) waitCheck = 10;
-
-                // --- NEW LOGIC AS PER YOUR REQUEST ---
-
-                // 1. Initial 3-second wait
+                
+                // <-- [修改] 以下是新的、高效的多实例轮询逻辑
+                
+                // 1. 主程序退出后，等待3秒
                 Sleep(3000);
 
-                // 2. Pre-check if processes exist
-                if (AreWaitProcessesRunning(waitProcesses)) {
-                    // 3. If they exist, set up hooks and enter the loop
-                    g_hProcessEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-                    HWINEVENTHOOK hHook = SetWinEventHook(
-                        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-                        NULL, WinEventProcProcesses, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+                // 2. 进入主循环
+                while (true) {
+                    std::set<DWORD> runningWaitPids;
 
-                    while (true) {
-                        // At the start of the interval, reset the event flag
-                        ResetEvent(g_hProcessEvent);
+                    // 3. 执行一次全系统扫描，填充PID列表
+                    PopulateWaitPids(waitProcesses, runningWaitPids);
 
-                        // Wait for the full interval
-                        Sleep(waitCheck * 1000);
-
-                        // 4 & 5. After sleeping, check if the event was signaled during the interval
-                        DWORD eventState = WaitForSingleObject(g_hProcessEvent, 0);
-                        if (eventState == WAIT_OBJECT_0) {
-                            // Event was signaled, so perform the process check
-                            if (!AreWaitProcessesRunning(waitProcesses)) {
-                                break; // All processes are gone, exit the loop
-                            }
-                        }
-                        // If no event was signaled, do nothing and loop for another interval
+                    // 4. 如果扫描后列表为空，说明没有要等的进程了，终止循环
+                    if (runningWaitPids.empty()) {
+                        break;
                     }
 
-                    if (hHook) UnhookWinEvent(hHook);
-                    if (g_hProcessEvent) CloseHandle(g_hProcessEvent);
-                    g_hProcessEvent = NULL;
+                    // 5. 如果列表不为空，进入内部的快速检查循环
+                    while (!runningWaitPids.empty()) {
+                        Sleep(waitCheck * 1000);
+
+                        // 遍历PID列表，移除已退出的进程
+                        for (auto it = runningWaitPids.begin(); it != runningWaitPids.end(); ) {
+                            HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, *it);
+                            if (hProcess) {
+                                // 句柄能打开，说明进程还存在（或刚退出）
+                                CloseHandle(hProcess);
+                                ++it; // 继续检查下一个
+                            } else {
+                                // 无法打开句柄，说明进程已不存在，从列表移除
+                                it = runningWaitPids.erase(it);
+                            }
+                        }
+                    }
+                    // 6. 当内部循环结束（所有已知PID都退出），主循环会再次开始，进行下一次全系统扫描
                 }
             }
-        } else { // Single-instance logic remains the same
+        } else { // 单实例逻辑 (保持不变)
             if (waitProcesses.empty()) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
@@ -2791,7 +2778,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     DeleteFileW(data->tempFilePath.c_str());
     
-    CoUninitialize();
     return 0;
 }
 
