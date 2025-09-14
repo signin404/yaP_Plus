@@ -1558,7 +1558,7 @@ namespace ActionHelpers {
 
 // --- Process Management Functions ---
 
-// REVISED HELPER FUNCTION for single-instance wait
+// Helper for single-instance wait
 std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
     const std::vector<std::wstring>& waitProcessNames,
@@ -1601,13 +1601,13 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     return handlesToWaitOn;
 }
 
-// <-- [新增] 多实例模式的辅助函数：执行一次全系统扫描，填充PID列表
-void PopulateWaitPids(const std::vector<std::wstring>& processNames, std::set<DWORD>& pids) {
-    pids.clear(); // 开始扫描前清空列表
-    if (processNames.empty()) return;
+// <-- [新增] 多实例模式的辅助函数：扫描并返回等待进程的句柄列表
+std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<std::wstring>& processNames) {
+    std::vector<HANDLE> handles;
+    if (processNames.empty()) return handles;
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    if (hSnapshot == INVALID_HANDLE_VALUE) return handles;
 
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
@@ -1616,13 +1616,17 @@ void PopulateWaitPids(const std::vector<std::wstring>& processNames, std::set<DW
         do {
             for (const auto& name : processNames) {
                 if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
-                    pids.insert(pe32.th32ProcessID);
+                    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        handles.push_back(hProcess);
+                    }
                     break; 
                 }
             }
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
+    return handles;
 }
 
 
@@ -2661,45 +2665,36 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
 
             if (!waitProcesses.empty()) {
-                std::wstring waitCheckStr = GetValueFromIniContent(data->iniContent, L"General", L"waitcheck");
-                int waitCheck = waitCheckStr.empty() ? 10 : _wtoi(waitCheckStr.c_str());
-                if (waitCheck <= 0) waitCheck = 10;
-                
-                // <-- [修改] 以下是新的、高效的多实例轮询逻辑
+                // <-- [修改] 新的多实例等待逻辑
                 
                 // 1. 主程序退出后，等待3秒
                 Sleep(3000);
 
                 // 2. 进入主循环
                 while (true) {
-                    std::set<DWORD> runningWaitPids;
+                    // 3. 执行一次全系统扫描，获取当前所有等待进程的句柄
+                    std::vector<HANDLE> handlesToWaitOn = ScanForWaitProcessHandles(waitProcesses);
 
-                    // 3. 执行一次全系统扫描，填充PID列表
-                    PopulateWaitPids(waitProcesses, runningWaitPids);
-
-                    // 4. 如果扫描后列表为空，说明没有要等的进程了，终止循环
-                    if (runningWaitPids.empty()) {
+                    // 4. 如果扫描后列表为空，终止循环
+                    if (handlesToWaitOn.empty()) {
                         break;
                     }
 
-                    // 5. 如果列表不为空，进入内部的快速检查循环
-                    while (!runningWaitPids.empty()) {
-                        Sleep(waitCheck * 1000);
-
-                        // 遍历PID列表，移除已退出的进程
-                        for (auto it = runningWaitPids.begin(); it != runningWaitPids.end(); ) {
-                            HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, *it);
-                            if (hProcess) {
-                                // 句柄能打开，说明进程还存在（或刚退出）
-                                CloseHandle(hProcess);
-                                ++it; // 继续检查下一个
-                            } else {
-                                // 无法打开句柄，说明进程已不存在，从列表移除
-                                it = runningWaitPids.erase(it);
-                            }
-                        }
+                    // 5. 使用WaitForMultipleObjects高效等待这一批进程全部退出
+                    // 注意：第三个参数为TRUE，表示等待所有句柄
+                    if (!handlesToWaitOn.empty()) {
+                        WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
                     }
-                    // 6. 当内部循环结束（所有已知PID都退出），主循环会再次开始，进行下一次全系统扫描
+
+                    // 6. 关闭本批次的所有句柄，防止资源泄露
+                    for (HANDLE h : handlesToWaitOn) {
+                        CloseHandle(h);
+                    }
+
+                    // 7. 等待3秒，为新进程的启动留出时间
+                    Sleep(3000);
+
+                    // 8. 循环回到起点，进行下一次扫描
                 }
             }
         } else { // 单实例逻辑 (保持不变)
