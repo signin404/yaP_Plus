@@ -210,12 +210,19 @@ struct ReplaceLineOp {
     std::wstring replaceLine;
 };
 
+// <-- [新增] 环境变量操作的结构体
+struct EnvVarOp {
+    std::wstring name;
+    std::wstring value;
+};
+
 
 // A variant for one-shot actions, used by [Before] and [After] sections
 using ActionOpData = std::variant<
     RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
-    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp
+    CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp,
+    EnvVarOp // <-- [新增] 将环境变量操作添加到variant中
 >;
 struct ActionOperation {
     ActionOpData data;
@@ -2316,6 +2323,13 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             }
         }
+        // <-- [新增] 解析envvar
+        else if (_wcsicmp(key.c_str(), L"envvar") == 0) {
+            auto parts = split_string(value, delimiter);
+            if (parts.size() == 2) {
+                return EnvVarOp{parts[0], parts[1]};
+            }
+        }
         return std::nullopt;
     };
 
@@ -2571,6 +2585,17 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.replaceLine = ExpandVariables(arg.replaceLine, variables);
             ActionHelpers::HandleReplaceLine(mutable_op);
         }
+        // <-- [新增] 执行环境变量设置
+        else if constexpr (std::is_same_v<T, EnvVarOp>) {
+            std::wstring finalName = ExpandVariables(arg.name, variables);
+            std::wstring finalValue = ExpandVariables(arg.value, variables);
+            // 如果值为"null"，则删除环境变量，否则设置它
+            if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
+                SetEnvironmentVariableW(finalName.c_str(), NULL);
+            } else {
+                SetEnvironmentVariableW(finalName.c_str(), finalValue.c_str());
+            }
+        }
     }, opData);
 }
 
@@ -2675,7 +2700,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
 
             if (!waitProcesses.empty()) {
-                // <-- [修改] 新的多实例等待逻辑
                 Sleep(3000);
                 while (true) {
                     std::vector<HANDLE> handlesToWaitOn = ScanForWaitProcessHandles(waitProcesses);
@@ -2685,7 +2709,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                     if (handlesToWaitOn.size() <= MAXIMUM_WAIT_OBJECTS) {
                         WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
                     } else {
-                        // 如果句柄超过64个，则分批等待
                         for (size_t i = 0; i < handlesToWaitOn.size(); i += MAXIMUM_WAIT_OBJECTS) {
                             size_t count = min(MAXIMUM_WAIT_OBJECTS, handlesToWaitOn.size() - i);
                             WaitForMultipleObjects((DWORD)count, &handlesToWaitOn[i], TRUE, INFINITE);

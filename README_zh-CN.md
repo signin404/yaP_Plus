@@ -1,3 +1,5 @@
+[English](./README.md) | 中文
+
 # yaP Plus
 yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
 
@@ -13,3 +15,21 @@ yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
 * 检测前台并挂起后台
 * 文件写入格式编码检测
 * 异常退出解决方案
+
+## 未移植功能
+* !admin
+* !dotnet
+* !java
+* !online
+* !os
+* clip
+* ->regkey
+* ->regvalue
+* date
+* iniread
+* message
+* nowait
+* quit
+* regexport
+* regmerge
+* systemrefresh

@@ -15,3 +15,21 @@ Just copy and paste to create portable software.
 * Detect foreground and suspend background processes  
 * File write format encoding detection  
 * Exception exit solutions
+
+## Unported Features
+* !admin
+* !dotnet
+* !java
+* !online
+* !os
+* clip
+* ->regkey
+* ->regvalue
+* date
+* iniread
+* message
+* nowait
+* quit
+* regexport
+* regmerge
+* systemrefresh
