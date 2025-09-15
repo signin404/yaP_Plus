@@ -545,6 +545,7 @@ bool RunSimpleCommand(const std::wstring& command) {
     return exitCode == 0;
 }
 
+// <-- [修改] 增强的注册表路径解析函数
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -553,10 +554,11 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
     std::wstring restOfPath = fullPath.substr(firstSlash + 1);
 
-    if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKU") == 0) { hRootKey = HKEY_USERS; rootKeyStr = L"HKEY_USERS"; }
+    // 同时检查缩写和完整名称
+    if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_USERS") == 0) { hRootKey = HKEY_USERS; rootKeyStr = L"HKEY_USERS"; }
     else return false;
 
     if (isKey) {
@@ -1601,7 +1603,7 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     return handlesToWaitOn;
 }
 
-// <-- [新增] 多实例模式的辅助函数：扫描并返回等待进程的句柄列表
+// Helper for multi-instance wait: Scans and returns handles for all matching processes
 std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<std::wstring>& processNames) {
     std::vector<HANDLE> handles;
     if (processNames.empty()) return handles;
@@ -1952,10 +1954,18 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
-            if (arg.isKey) renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
-            else renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
-            if (renamed) arg.backupCreated = true;
-            if (arg.isSaveRestore) ImportRegistryFile(arg.filePath);
+            if (arg.isKey) {
+                renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
+            } else {
+                // <-- [修改] 修正了注册表值备份的逻辑
+                renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
+            }
+            if (renamed) {
+                arg.backupCreated = true;
+            }
+            if (arg.isSaveRestore) {
+                ImportRegistryFile(arg.filePath);
+            }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (!arg.traversalMode.empty()) {
                 SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
@@ -2666,38 +2676,28 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
             if (!waitProcesses.empty()) {
                 // <-- [修改] 新的多实例等待逻辑
-                
-                // 1. 主程序退出后，等待3秒
                 Sleep(3000);
-
-                // 2. 进入主循环
                 while (true) {
-                    // 3. 执行一次全系统扫描，获取当前所有等待进程的句柄
                     std::vector<HANDLE> handlesToWaitOn = ScanForWaitProcessHandles(waitProcesses);
-
-                    // 4. 如果扫描后列表为空，终止循环
                     if (handlesToWaitOn.empty()) {
                         break;
                     }
-
-                    // 5. 使用WaitForMultipleObjects高效等待这一批进程全部退出
-                    // 注意：第三个参数为TRUE，表示等待所有句柄
-                    if (!handlesToWaitOn.empty()) {
+                    if (handlesToWaitOn.size() <= MAXIMUM_WAIT_OBJECTS) {
                         WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), TRUE, INFINITE);
+                    } else {
+                        // 如果句柄超过64个，则分批等待
+                        for (size_t i = 0; i < handlesToWaitOn.size(); i += MAXIMUM_WAIT_OBJECTS) {
+                            size_t count = min(MAXIMUM_WAIT_OBJECTS, handlesToWaitOn.size() - i);
+                            WaitForMultipleObjects((DWORD)count, &handlesToWaitOn[i], TRUE, INFINITE);
+                        }
                     }
-
-                    // 6. 关闭本批次的所有句柄，防止资源泄露
                     for (HANDLE h : handlesToWaitOn) {
                         CloseHandle(h);
                     }
-
-                    // 7. 等待3秒，为新进程的启动留出时间
                     Sleep(3000);
-
-                    // 8. 循环回到起点，进行下一次扫描
                 }
             }
-        } else { // 单实例逻辑 (保持不变)
+        } else { // 单实例逻辑
             if (waitProcesses.empty()) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
