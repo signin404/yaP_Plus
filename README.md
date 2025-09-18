@@ -60,6 +60,7 @@ Just copy and paste to create portable software.
 *   **Cons:**
     *   Not suitable for "badly-behaved" software.
     *   Software that requires drivers might not be applicable.
+    *   If the software doesn't support symbolic links and the configuration file is large, it could result in excessive data writes.
 *   **Software using this solution:**
     *   PortableApps.com Launcher
     *   X-Launcher

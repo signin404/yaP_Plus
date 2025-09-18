@@ -60,6 +60,7 @@ yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
 *   **缺点:**
     *   不适合行为不良的软件
     *   需要加载驱动的软件可能不适用
+    *   如果软件不支持符号链接且配置文件很大 会导致大量写入
 *   **使用此方案的软件:**
     *   PortableApps.com Launcher
     *   X-Launcher
