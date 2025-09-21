@@ -6,14 +6,14 @@ yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) Reimplementation
 Just copy and paste to create portable software.
 
 ## New Feature
-* Unicode support  
-* Wait for process  
-* Scheduled backup  
-* Create hard links  
-* Create firewall rules  
-* Hide console program window  
-* Detect foreground and suspend background processes  
-* File write format encoding detection  
+* Unicode support
+* Wait for process
+* Scheduled backup
+* Create hard links
+* Create firewall rules
+* Hide console program window
+* Detect foreground and suspend background processes
+* File write format encoding detection
 * Exception exit solutions
 
 ## Unported Features
@@ -62,9 +62,9 @@ Just copy and paste to create portable software.
     *   Software that requires drivers might not be applicable.
     *   If the software doesn't support symbolic links and the configuration file is large, it could result in excessive data writes.
 *   **Software using this solution:**
-    *   PortableApps.com Launcher
-    *   X-Launcher
-    *   AutoRun LWMenu
+    *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
+    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
+    *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
 
 ### Virtualization
 
@@ -80,6 +80,22 @@ Just copy and paste to create portable software.
     *   **Compatibility Issues:** Game plugins that rely on hooking may not be compatible with the virtualized environment.
     *   **Performance Bottleneck:** The performance overhead from the translation/virtualization layer is significant, making it unsuitable for gaming or other high-performance software.
 *   **Software using this solution:**
-    *   Turbo Studio
+    *   [Turbo Studio](https://turbo.net/studio)
     *   VMware ThinApp
-    *   Enigma Virtual Box
+    *   [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
+
+### Self-extracting file
+
+*   **Compatibility:** High
+*   **Performance Overhead:** None
+*   **Isolation Level:** None
+*   **Core Principle:** Run after releasing the software and configuration to the temporary directory (%TEMP%), and delete afterward.
+*   **Pros:**
+    *   Easy to make—just package the software and configuration directly.
+*   **Cons:**
+    *   Unable to process the registry.
+    *   Software configurations changed at runtime cannot be saved.
+    *   Files need to be released again every time it runs.
+*   **Software using this solution:**
+    *   [PortableR](https://github.com/Shuunen/portabler)
+    *   [Single-file creation tool](http://wuyou.net/forum.php?mod=viewthread&tid=437991)

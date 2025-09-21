@@ -62,9 +62,9 @@ yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
     *   需要加载驱动的软件可能不适用
     *   如果软件不支持符号链接且配置文件很大 会导致大量写入
 *   **使用此方案的软件:**
-    *   PortableApps.com Launcher
-    *   X-Launcher
-    *   AutoRun LWMenu
+    *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
+    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
+    *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
 
 ### 虚拟化
 
@@ -80,6 +80,22 @@ yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
     *   **兼容性问题:** 需要挂钩的游戏插件可能无法在虚拟化环境中正常工作
     *   **性能瓶颈:** 虚拟化转译带来的性能损耗不可忽视 因此**不适合游戏或对性能要求高的软件**
 *   **使用此方案的软件:**
-    *   Turbo Studio
+    *   [Turbo Studio](https://turbo.net/studio)
     *   VMware ThinApp
-    *   Enigma Virtual Box
+    *   [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
+
+### 自解压文件
+
+*   **兼容性:** 高
+*   **性能损耗:** 无
+*   **隔离程度:** 无
+*   **核心原理:** 将软件和配置释放到临时目录(%TEMP%)后运行 退出后删除
+*   **优点:**
+    *   制作简单 只需将软件和配置直接打包即可
+*   **缺点:**
+    *   无法处理注册表
+    *   运行时更改的软件配置无法被保存
+    *   每次运行都需要重新释放
+*   **使用此方案的软件:**
+    *   [PortableR](https://github.com/Shuunen/portabler)
+    *   [单文件制作工具](http://wuyou.net/forum.php?mod=viewthread&tid=437991)
