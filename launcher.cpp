@@ -210,7 +210,6 @@ struct ReplaceLineOp {
     std::wstring replaceLine;
 };
 
-// <-- [新增] 环境变量操作的结构体
 struct EnvVarOp {
     std::wstring name;
     std::wstring value;
@@ -222,7 +221,7 @@ using ActionOpData = std::variant<
     RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
     CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp,
-    EnvVarOp // <-- [新增] 将环境变量操作添加到variant中
+    EnvVarOp 
 >;
 struct ActionOperation {
     ActionOpData data;
@@ -2323,7 +2322,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             }
         }
-        // <-- [新增] 解析envvar
         else if (_wcsicmp(key.c_str(), L"envvar") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() == 2) {
@@ -2585,11 +2583,9 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.replaceLine = ExpandVariables(arg.replaceLine, variables);
             ActionHelpers::HandleReplaceLine(mutable_op);
         }
-        // <-- [新增] 执行环境变量设置
         else if constexpr (std::is_same_v<T, EnvVarOp>) {
             std::wstring finalName = ExpandVariables(arg.name, variables);
             std::wstring finalValue = ExpandVariables(arg.value, variables);
-            // 如果值为"null"，则删除环境变量，否则设置它
             if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
                 SetEnvironmentVariableW(finalName.c_str(), NULL);
             } else {
@@ -2650,6 +2646,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     if (!data) {
         return 1;
     }
+
+    // <-- [修改] 为工作线程初始化COM
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     STARTUPINFOW si; 
     PROCESS_INFORMATION pi;
@@ -2796,6 +2795,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     DeleteFileW(data->tempFilePath.c_str());
     
+    // <-- [修改] 释放工作线程的COM资源
+    CoUninitialize();
     return 0;
 }
 
