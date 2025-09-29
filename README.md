@@ -1,7 +1,7 @@
 English | [中文](./README_zh-CN.md)
 
 # yaP Plus
-yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) Reimplementation
+[yaP](https://yap.rolandtoth.hu) (yet another Portablizer) Reimplementation
 
 Just copy and paste to create portable software.
 

@@ -1,7 +1,7 @@
 [English](./README.md) | 中文
 
 # yaP Plus
-yet another Portablizer [(yaP)](https://yap.rolandtoth.hu) 的重新实现
+[yaP](https://yap.rolandtoth.hu) (yet another Portablizer) 的重新实现
 
 复制粘贴即可制作便携软件
 
