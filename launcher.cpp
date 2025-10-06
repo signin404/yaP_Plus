@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <atlbase.h>
 #include <psapi.h>
+#include <filesystem>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -40,17 +41,17 @@ pfnNtResumeProcess g_NtResumeProcess = nullptr;
 
 // Operations with startup and shutdown/cleanup logic
 struct FileOp {
-    std::wstring sourcePath;
-    std::wstring destPath;
-    std::wstring destBackupPath;
+    std::filesystem::path sourcePath;
+    std::filesystem::path destPath;
+    std::filesystem::path destBackupPath;
     bool isDirectory;
     bool destBackupCreated = false;
     bool wasMoved = false;
 };
 
 struct RestoreOnlyFileOp {
-    std::wstring targetPath;
-    std::wstring backupPath;
+    std::filesystem::path targetPath;
+    std::filesystem::path backupPath;
     bool isDirectory;
     bool backupCreated = false;
 };
@@ -63,19 +64,19 @@ struct RegistryOp {
     std::wstring subKey;
     std::wstring valueName;
     std::wstring backupName;
-    std::wstring filePath;
+    std::filesystem::path filePath;
     bool backupCreated = false;
 };
 
 struct LinkOp {
-    std::wstring linkPath;
-    std::wstring targetPath;
-    std::wstring backupPath;
+    std::filesystem::path linkPath;
+    std::filesystem::path targetPath;
+    std::filesystem::path backupPath;
     bool isDirectory;
     bool isHardlink;
     bool backupCreated = false;
-    std::vector<std::pair<std::wstring, std::wstring>> createdLinks;
-    std::vector<std::pair<std::wstring, std::wstring>> backedUpPaths;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> createdLinks;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> backedUpPaths;
     bool performMoveOnCleanup = false;
     std::wstring traversalMode; // "dir", "file", "all", or empty
 };
@@ -83,7 +84,7 @@ struct LinkOp {
 
 struct FirewallOp {
     std::wstring ruleName;
-    std::wstring appPath;
+    std::filesystem::path appPath;
     NET_FW_RULE_DIRECTION direction;
     NET_FW_ACTION action;
     bool ruleCreated = false;
@@ -98,28 +99,28 @@ struct StartupShutdownOperation {
 
 // One-shot actions for [Before] and [After] sections
 struct RunOp {
-    std::wstring programPath;
+    std::filesystem::path programPath;
     std::wstring commandLine;
-    std::wstring workDir;
+    std::filesystem::path workDir;
     bool wait;
     bool hide;
 };
 
 struct RegImportOp {
-    std::wstring regPath;
+    std::filesystem::path regPath;
 };
 
 struct RegDllOp {
-    std::wstring dllPath;
+    std::filesystem::path dllPath;
     bool unregister;
 };
 
 struct DeleteFileOp {
-    std::wstring pathPattern;
+    std::filesystem::path pathPattern;
 };
 
 struct DeleteDirOp {
-    std::wstring pathPattern;
+    std::filesystem::path pathPattern;
     bool ifEmpty;
 };
 
@@ -134,7 +135,7 @@ struct DeleteRegValueOp {
 };
 
 struct CreateDirOp {
-    std::wstring path;
+    std::filesystem::path path;
 };
 
 struct DelayOp {
@@ -159,7 +160,7 @@ enum class TextEncoding {
 
 
 struct CreateFileOp {
-    std::wstring path;
+    std::filesystem::path path;
     bool overwrite;
     TextFormat format;
     TextEncoding encoding;
@@ -178,20 +179,20 @@ struct CreateRegValueOp {
 };
 
 struct CopyMoveOp {
-    std::wstring sourcePath;
-    std::wstring destPath;
+    std::filesystem::path sourcePath;
+    std::filesystem::path destPath;
     bool isDirectory;
     bool isMove;
     bool overwrite;
 };
 
 struct AttributesOp {
-    std::wstring path;
+    std::filesystem::path path;
     DWORD attributes;
 };
 
 struct IniWriteOp {
-    std::wstring path;
+    std::filesystem::path path;
     std::wstring section;
     std::wstring key;
     std::wstring value;
@@ -199,13 +200,13 @@ struct IniWriteOp {
 };
 
 struct ReplaceOp {
-    std::wstring path;
+    std::filesystem::path path;
     std::wstring findText;
     std::wstring replaceText;
 };
 
 struct ReplaceLineOp {
-    std::wstring path;
+    std::filesystem::path path;
     std::wstring lineStart;
     std::wstring replaceLine;
 };
@@ -256,9 +257,9 @@ struct LauncherThreadData {
     std::map<std::wstring, std::wstring> variables;
     std::vector<StartupShutdownOperation> shutdownOps;
     std::vector<AfterOperation> afterOps;
-    std::wstring absoluteAppPath;
-    std::wstring finalWorkDir;
-    std::wstring tempFilePath;
+    std::filesystem::path absoluteAppPath;
+    std::filesystem::path finalWorkDir;
+    std::filesystem::path tempFilePath;
     HANDLE hMonitorThread = NULL;
     DWORD hMonitorThreadId = 0;
     MonitorThreadData* monitorData = nullptr;
@@ -339,43 +340,36 @@ std::wstring GetKnownFolderPath(const KNOWNFOLDERID& rfid) {
     return L"";
 }
 
-std::wstring ResolveToAbsolutePath(const std::wstring& path, const std::map<std::wstring, std::wstring>& variables) {
+std::filesystem::path ResolveToAbsolutePath(const std::filesystem::path& path, const std::map<std::wstring, std::wstring>& variables) {
     if (path.empty()) {
-        return L"";
+        return {};
     }
 
-    if (!PathIsRelativeW(path.c_str())) {
-        wchar_t canonicalPath[MAX_PATH];
-        if (GetFullPathNameW(path.c_str(), MAX_PATH, canonicalPath, NULL) != 0) {
-            return canonicalPath;
-        }
-        return path;
+    if (path.is_absolute()) {
+        return std::filesystem::weakly_canonical(path);
     }
 
     auto it = variables.find(L"YAPROOT");
     if (it != variables.end()) {
-        const std::wstring& yapRoot = it->second;
-        wchar_t combinedPath[MAX_PATH];
-        if (PathCombineW(combinedPath, yapRoot.c_str(), path.c_str())) {
-            return combinedPath;
-        }
+        std::filesystem::path yapRoot(it->second);
+        return std::filesystem::weakly_canonical(yapRoot / path);
     }
 
-    return path;
+    return std::filesystem::absolute(path);
 }
 
-bool ArePathsOnSameVolume(const std::wstring& path1, const std::wstring& path2) {
+bool ArePathsOnSameVolume(const std::filesystem::path& path1, const std::filesystem::path& path2) {
     if (path1.empty() || path2.empty()) {
         return false;
     }
 
     wchar_t root1[MAX_PATH];
-    if (!GetVolumePathNameW(path1.c_str(), root1, MAX_PATH)) {
+    if (GetVolumePathNameW(path1.c_str(), root1, MAX_PATH) == 0) {
         return false;
     }
 
     wchar_t root2[MAX_PATH];
-    if (!GetVolumePathNameW(path2.c_str(), root2, MAX_PATH)) {
+    if (GetVolumePathNameW(path2.c_str(), root2, MAX_PATH) == 0) {
         return false;
     }
 
@@ -436,7 +430,7 @@ std::wstring GetValueFromIniContent(const std::wstring& content, const std::wstr
     return L"";
 }
 
-bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
+bool ReadFileToWString(const std::filesystem::path& path, std::wstring& out_content) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
     std::vector<char> buffer((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -461,19 +455,16 @@ bool ReadFileToWString(const std::wstring& path, std::wstring& out_content) {
 
 // --- File System & Command Helpers ---
 
-bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const std::wstring& workDir, bool wait, bool hide) {
-    if (path.empty() || !PathFileExistsW(path.c_str())) {
+bool ExecuteProcess(const std::filesystem::path& path, const std::wstring& args, const std::filesystem::path& workDir, bool wait, bool hide) {
+    if (path.empty() || !std::filesystem::exists(path)) {
         return false;
     }
 
-    std::wstring finalWorkDir;
-    std::wstring exeDir;
-    if (!workDir.empty() && PathIsDirectoryW(workDir.c_str())) {
+    std::filesystem::path finalWorkDir;
+    if (!workDir.empty() && std::filesystem::is_directory(workDir)) {
         finalWorkDir = workDir;
     } else {
-        exeDir = path;
-        PathRemoveFileSpecW(&exeDir[0]);
-        finalWorkDir = exeDir;
+        finalWorkDir = path.parent_path();
     }
 
     SHELLEXECUTEINFOW sei;
@@ -501,57 +492,157 @@ bool ExecuteProcess(const std::wstring& path, const std::wstring& args, const st
     return true;
 }
 
-
-void PerformFileSystemOperation(int func, const std::wstring& from, const std::wstring& to = L"") {
-    wchar_t fromPath[MAX_PATH * 2] = {0};
-    wcscpy_s(fromPath, from.c_str());
-    fromPath[from.length() + 1] = L'\0';
-
-    wchar_t toPath[MAX_PATH * 2] = {0};
-    if (!to.empty()) {
-        wcscpy_s(toPath, to.c_str());
-        toPath[to.length() + 1] = L'\0';
-    }
-
-    SHFILEOPSTRUCTW sfos = {0};
-    sfos.wFunc = func;
-    sfos.pFrom = fromPath;
-    sfos.pTo = to.empty() ? NULL : toPath;
-    sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-    if (func == FO_COPY) {
-        sfos.fFlags |= FOF_NOCONFIRMMKDIR;
-    }
-    SHFileOperationW(&sfos);
-}
-
 // --- Registry Helpers ---
 
-bool RunSimpleCommand(const std::wstring& command) {
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+// <-- [新增] 递归删除注册表项的API实现
+LSTATUS RecursiveRegDeleteKey(HKEY hKeyParent, const wchar_t* subKeyName, REGSAM samDesired) {
+    HKEY hKey;
+    LSTATUS res = RegOpenKeyExW(hKeyParent, subKeyName, 0, KEY_ENUMERATE_SUB_KEYS | samDesired, &hKey);
+    if (res != ERROR_SUCCESS) {
+        if (res == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+        return res;
+    }
 
-    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
-    cmdBuffer.push_back(0);
+    wchar_t childKeyName[MAX_PATH];
+    DWORD childKeyNameSize = MAX_PATH;
+    while (RegEnumKeyExW(hKey, 0, childKeyName, &childKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+        res = RecursiveRegDeleteKey(hKey, childKeyName, samDesired);
+        if (res != ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            return res;
+        }
+        childKeyNameSize = MAX_PATH;
+    }
 
-    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    RegCloseKey(hKey);
+    return RegDeleteKeyExW(hKeyParent, subKeyName, samDesired, 0);
+}
+
+// <-- [新增] 递归复制注册表项的API实现
+LSTATUS RecursiveRegCopyKey(HKEY hKeySrc, HKEY hKeyDest) {
+    DWORD dwValues, dwMaxValueNameLen, dwMaxValueDataLen;
+    RegQueryInfoKeyW(hKeyDest, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &dwMaxValueNameLen, &dwMaxValueDataLen, NULL, NULL);
+
+    // 复制所有值
+    std::vector<wchar_t> valueNameBuffer(dwMaxValueNameLen + 1);
+    std::vector<BYTE> dataBuffer(dwMaxValueDataLen);
+    for (DWORD i = 0; i < dwValues; ++i) {
+        DWORD valueNameLen = static_cast<DWORD>(valueNameBuffer.size());
+        DWORD dataLen = static_cast<DWORD>(dataBuffer.size());
+        DWORD type;
+        LSTATUS res = RegEnumValueW(hKeySrc, i, valueNameBuffer.data(), &valueNameLen, NULL, &type, dataBuffer.data(), &dataLen);
+        if (res == ERROR_SUCCESS) {
+            RegSetValueExW(hKeyDest, valueNameBuffer.data(), 0, type, dataBuffer.data(), dataLen);
+        }
+    }
+
+    // 递归复制所有子键
+    DWORD dwSubKeys, dwMaxSubKeyLen;
+    RegQueryInfoKeyW(hKeySrc, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL);
+    std::vector<wchar_t> subKeyNameBuffer(dwMaxSubKeyLen + 1);
+
+    for (DWORD i = 0; i < dwSubKeys; ++i) {
+        DWORD subKeyNameLen = static_cast<DWORD>(subKeyNameBuffer.size());
+        LSTATUS res = RegEnumKeyExW(hKeySrc, i, subKeyNameBuffer.data(), &subKeyNameLen, NULL, NULL, NULL, NULL);
+        if (res == ERROR_SUCCESS) {
+            HKEY hSubKeySrc, hSubKeyDest;
+            if (RegOpenKeyExW(hKeySrc, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKeySrc) == ERROR_SUCCESS) {
+                if (RegCreateKeyExW(hKeyDest, subKeyNameBuffer.data(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hSubKeyDest, NULL) == ERROR_SUCCESS) {
+                    RecursiveRegCopyKey(hSubKeySrc, hSubKeyDest);
+                    RegCloseKey(hSubKeyDest);
+                }
+                RegCloseKey(hSubKeySrc);
+            }
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
+// <-- [新增] 将注册表值写入.reg文件的辅助函数
+bool WriteRegValueToFile(HKEY hKey, const std::wstring& valueName, std::wofstream& regFile) {
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        return false;
+    }
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
         return false;
     }
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
+    regFile << displayName << L"=";
 
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return exitCode == 0;
+    std::wstringstream wss;
+    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
+        std::wstring escapedStr;
+        for (wchar_t c : strValue) {
+            if (c == L'\\') escapedStr += L"\\\\";
+            else if (c == L'"') escapedStr += L"\\\"";
+            else escapedStr += c;
+        }
+        wss << L"\"" << escapedStr << L"\"";
+    } else if (type == REG_DWORD) {
+        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
+        wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
+    } else if (type == REG_QWORD) {
+        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
+        wss << L"hex(b):";
+        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
+        for (int i = 0; i < 8; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]) << (i < 7 ? L"," : L"");
+        }
+    } else { // REG_BINARY, REG_MULTI_SZ, etc.
+        wss << L"hex";
+        if (type == REG_EXPAND_SZ) wss << L"(2)";
+        else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type != REG_BINARY) wss << L"(" << type << L")";
+        wss << L":";
+        for (DWORD i = 0; i < size; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            if (i < size - 1) {
+                wss << L",";
+                if ((i + 1) % 38 == 0) wss << L"\\\r\n  ";
+            }
+        }
+    }
+    regFile << wss.str() << L"\r\n";
+    return true;
 }
 
-// <-- [修改] 增强的注册表路径解析函数
+// <-- [新增] 递归导出注册表项的API实现
+bool RecursiveRegExportKey(HKEY hKey, const std::wstring& currentPath, std::wofstream& regFile) {
+    regFile << L"\r\n[" << currentPath << L"]\r\n";
+
+    DWORD cValues, cchMaxValue, cbMaxValueData;
+    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &cValues, &cchMaxValue, &cbMaxValueData, NULL, NULL);
+    
+    std::vector<wchar_t> valueNameBuffer(cchMaxValue + 1);
+    for (DWORD i = 0; i < cValues; i++) {
+        DWORD cchValue = static_cast<DWORD>(valueNameBuffer.size());
+        valueNameBuffer[0] = L'\0';
+        if (RegEnumValueW(hKey, i, valueNameBuffer.data(), &cchValue, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            WriteRegValueToFile(hKey, valueNameBuffer.data(), regFile);
+        }
+    }
+
+    DWORD cSubKeys, cchMaxSubKey;
+    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &cSubKeys, &cchMaxSubKey, NULL, NULL, NULL, NULL, NULL, NULL);
+    std::vector<wchar_t> subKeyNameBuffer(cchMaxSubKey + 1);
+
+    for (DWORD i = 0; i < cSubKeys; i++) {
+        DWORD cchSubKey = static_cast<DWORD>(subKeyNameBuffer.size());
+        if (RegEnumKeyExW(hKey, i, subKeyNameBuffer.data(), &cchSubKey, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            HKEY hSubKey;
+            if (RegOpenKeyExW(hKey, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                RecursiveRegExportKey(hSubKey, currentPath + L"\\" + subKeyNameBuffer.data(), regFile);
+                RegCloseKey(hSubKey);
+            }
+        }
+    }
+    return true;
+}
+
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -560,7 +651,6 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
     std::wstring restOfPath = fullPath.substr(firstSlash + 1);
 
-    // 同时检查缩写和完整名称
     if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
     else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
     else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
@@ -592,20 +682,24 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     return true;
 }
 
-bool RenameRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
-    std::wstring fullSourcePath = rootKeyStr + L"\\" + subKey;
-    std::wstring fullDestPath = rootKeyStr + L"\\" + newSubKey;
-
-    HKEY hKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
+    HKEY hSrcKey, hDestKey;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey) != ERROR_SUCCESS) {
         return false;
     }
-    RegCloseKey(hKey);
-
-    if (!RunSimpleCommand(L"reg copy \"" + fullSourcePath + L"\" \"" + fullDestPath + L"\" /s /f")) {
+    if (RegCreateKeyExW(hRootKey, newSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestKey, NULL) != ERROR_SUCCESS) {
+        RegCloseKey(hSrcKey);
         return false;
     }
-    return SHDeleteKeyW(hRootKey, subKey.c_str()) == ERROR_SUCCESS;
+    
+    RecursiveRegCopyKey(hSrcKey, hDestKey);
+    
+    RegCloseKey(hSrcKey);
+    RegCloseKey(hDestKey);
+    
+    // The old helper is fine here as it calls our new recursive function
+    ActionHelpers::DeleteRegistryKeyTree(hRootKey, subKey);
+    return true;
 }
 
 bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName) {
@@ -634,108 +728,56 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
-    wchar_t dirPath[MAX_PATH];
-    wcscpy_s(dirPath, MAX_PATH, filePath.c_str());
-    PathRemoveFileSpecW(dirPath);
-    if (wcslen(dirPath) > 0) {
-        SHCreateDirectoryExW(NULL, dirPath, NULL);
+bool ExportRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::filesystem::path& filePath) {
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path());
     }
 
-    std::wstring fullKeyPath = rootKeyStr + L"\\" + subKey;
-    return RunSimpleCommand(L"reg export \"" + fullKeyPath + L"\" \"" + filePath + L"\" /y");
-}
-
-bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
-    HKEY hKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
-
-    DWORD type, size = 0;
-    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return false;
-    }
-    std::vector<BYTE> data(size);
-    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return false;
-    }
-    RegCloseKey(hKey);
-
-    wchar_t dirPath[MAX_PATH];
-    wcscpy_s(dirPath, MAX_PATH, filePath.c_str());
-    PathRemoveFileSpecW(dirPath);
-    if (wcslen(dirPath) > 0) {
-        SHCreateDirectoryExW(NULL, dirPath, NULL);
-    }
-
-    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
 
-    auto write_wstring = [&](const std::wstring& s) {
-        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
-    };
+    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
+    regFile << L"Windows Registry Editor Version 5.00\r\n";
 
-    regFile.put((char)0xFF);
-    regFile.put((char)0xFE);
-
-    write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
-    write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
-
-    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
-    write_wstring(displayName + L"=");
-
-    std::wstringstream wss;
-    if (type == REG_SZ) {
-        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
-        std::wstring escapedStr;
-        for (wchar_t c : strValue) {
-            if (c == L'\\') escapedStr += L"\\\\";
-            else if (c == L'"') escapedStr += L"\\\"";
-            else escapedStr += c;
-        }
-        wss << L"\"" << escapedStr << L"\"";
-    } else if (type == REG_DWORD) {
-        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
-        wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
-    } else if (type == REG_QWORD) {
-        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
-        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
-        wss << L"hex(b):";
-        for (int i = 0; i < 8; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
-            if (i < 7) wss << L",";
-        }
-    } else {
-        wss << L"hex";
-        if (type == REG_EXPAND_SZ) wss << L"(2)";
-        else if (type == REG_MULTI_SZ) wss << L"(7)";
-        else if (type != REG_BINARY) wss << L"(" << type << L")";
-        wss << L":";
-
-        for (DWORD i = 0; i < size; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
-            if (i < size - 1) {
-                wss << L",";
-                if ((i + 1) % 38 == 0) {
-                    wss << L"\\\r\n  ";
-                }
-            }
-        }
+    HKEY hKey;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RecursiveRegExportKey(hKey, rootKeyStr + L"\\" + subKey, regFile);
+        RegCloseKey(hKey);
     }
-    write_wstring(wss.str());
-    write_wstring(L"\r\n");
+    
     regFile.close();
     return true;
 }
 
-bool ImportRegistryFile(const std::wstring& filePath) {
-    if (!PathFileExistsW(filePath.c_str())) return true;
+bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::filesystem::path& filePath) {
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path());
+    }
+
+    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    if (!regFile.is_open()) return false;
+    
+    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
+    regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
+    regFile << L"[" << rootKeyStr << L"\\" << subKey << L"]\r\n";
+
+    HKEY hKey;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        WriteRegValueToFile(hKey, valueName, regFile);
+        RegCloseKey(hKey);
+    }
+
+    regFile.close();
+    return true;
+}
+
+bool ImportRegistryFile(const std::filesystem::path& filePath) {
+    if (!std::filesystem::exists(filePath)) return true;
 
     wchar_t windir[MAX_PATH];
     GetWindowsDirectoryW(windir, MAX_PATH);
-    std::wstring regeditPath = std::wstring(windir) + L"\\regedit.exe";
-    std::wstring args = L"/s \"" + filePath + L"\"";
+    std::filesystem::path regeditPath = std::filesystem::path(windir) / L"regedit.exe";
+    std::wstring args = L"/s \"" + filePath.wstring() + L"\"";
 
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
@@ -765,109 +807,44 @@ namespace ActionHelpers {
         CloseHandle(hSnapshot);
     }
 
-    void HandleDeleteFile(const std::wstring& pathPattern) {
-        wchar_t dirPath_w[MAX_PATH];
-        wcscpy_s(dirPath_w, pathPattern.c_str());
-        PathRemoveFileSpecW(dirPath_w);
-        std::wstring dirPath = dirPath_w;
+    void HandleDeleteFile(const std::filesystem::path& pathPattern) {
+        std::filesystem::path dirPath = pathPattern.parent_path();
+        std::wstring filePattern = pathPattern.filename().wstring();
 
-        const wchar_t* filePattern = PathFindFileNameW(pathPattern.c_str());
+        if (!std::filesystem::exists(dirPath)) return;
 
-        if (dirPath == pathPattern) {
-            dirPath = L".";
-        }
-
-        std::wstring searchPattern = dirPath + L"\\*";
-
-        WIN32_FIND_DATAW findData;
-        HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
-        if (hFind == INVALID_HANDLE_VALUE) {
-            return;
-        }
-
-        do {
-            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                continue;
+        for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
+            if (entry.is_regular_file() && PathMatchSpecW(entry.path().filename().c_str(), filePattern.c_str())) {
+                std::filesystem::remove(entry.path());
             }
-
-            if (PathMatchSpecW(findData.cFileName, filePattern)) {
-                std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
-                
-                DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
-                if (attributes != INVALID_FILE_ATTRIBUTES) {
-                    if (attributes & FILE_ATTRIBUTE_READONLY) {
-                        SetFileAttributesW(fullPathToDelete.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
-                    }
-                }
-                
-                DeleteFileW(fullPathToDelete.c_str());
-            }
-        } while (FindNextFileW(hFind, &findData));
-
-        FindClose(hFind);
+        }
     }
 
-    void HandleDeleteDir(const std::wstring& pathPattern, bool ifEmpty) {
-        wchar_t dirPart_w[MAX_PATH];
-        wcscpy_s(dirPart_w, pathPattern.c_str());
-        PathRemoveFileSpecW(dirPart_w);
-        std::wstring dirPart = dirPart_w;
-        std::wstring patternPart = PathFindFileNameW(pathPattern.c_str());
+    void HandleDeleteDir(const std::filesystem::path& pathPattern, bool ifEmpty) {
+        std::filesystem::path dirPart = pathPattern.parent_path();
+        std::wstring patternPart = pathPattern.filename().wstring();
 
-        if (dirPart == pathPattern) {
-            dirPart = L".";
-        }
+        if (!std::filesystem::exists(dirPart)) return;
 
-        WIN32_FIND_DATAW findData;
-        HANDLE hFind = FindFirstFileW((dirPart + L"\\*").c_str(), &findData);
-        if (hFind == INVALID_HANDLE_VALUE) {
-            return;
-        }
-        do {
-            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
-                if (PathMatchSpecW(findData.cFileName, patternPart.c_str())) {
-                    std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
-                    if (ifEmpty) {
-                        if (PathIsDirectoryEmptyW(fullPath.c_str())) {
-                            RemoveDirectoryW(fullPath.c_str());
-                        }
-                    } else {
-                        PerformFileSystemOperation(FO_DELETE, fullPath);
+        for (const auto& entry : std::filesystem::directory_iterator(dirPart)) {
+            if (entry.is_directory() && PathMatchSpecW(entry.path().filename().c_str(), patternPart.c_str())) {
+                if (ifEmpty) {
+                    if (std::filesystem::is_empty(entry.path())) {
+                        std::filesystem::remove(entry.path());
                     }
+                } else {
+                    std::filesystem::remove_all(entry.path());
                 }
             }
-        } while (FindNextFileW(hFind, &findData));
-        FindClose(hFind);
-    }
-
-    LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
-        HKEY hKey;
-        LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
-        if (res != ERROR_SUCCESS) {
-            return res;
         }
-
-        wchar_t subKeyName[MAX_PATH];
-        DWORD subKeyNameSize = MAX_PATH;
-        while (RegEnumKeyExW(hKey, 0, subKeyName, &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            res = RecursiveRegDeleteKey_Internal(hKey, subKeyName, samAccess);
-            if (res != ERROR_SUCCESS) {
-                RegCloseKey(hKey);
-                return res;
-            }
-            subKeyNameSize = MAX_PATH;
-        }
-
-        RegCloseKey(hKey);
-        return RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
     }
 
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
         if (hRootKey == HKEY_LOCAL_MACHINE) {
-            RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_64KEY);
-            RecursiveRegDeleteKey_Internal(hRootKey, subKey, KEY_WOW64_32KEY);
+            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), KEY_WOW64_64KEY);
+            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), KEY_WOW64_32KEY);
         } else {
-            RecursiveRegDeleteKey_Internal(hRootKey, subKey, 0);
+            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), 0);
         }
     }
     
@@ -1009,15 +986,12 @@ namespace ActionHelpers {
     }
 
     void HandleCreateFile(const CreateFileOp& op) {
-        if (!op.overwrite && PathFileExistsW(op.path.c_str())) {
+        if (!op.overwrite && std::filesystem::exists(op.path)) {
             return;
         }
 
-        wchar_t dirPath[MAX_PATH];
-        wcscpy_s(dirPath, MAX_PATH, op.path.c_str());
-        PathRemoveFileSpecW(dirPath);
-        if (wcslen(dirPath) > 0) {
-            SHCreateDirectoryExW(NULL, dirPath, NULL);
+        if (op.path.has_parent_path()) {
+            std::filesystem::create_directories(op.path.parent_path());
         }
 
         std::wstring lineBreak;
@@ -1143,56 +1117,28 @@ namespace ActionHelpers {
     }
 
     void HandleCopyMove(const CopyMoveOp& op) {
-        if (!op.overwrite && PathFileExistsW(op.destPath.c_str())) {
+        if (!op.overwrite && std::filesystem::exists(op.destPath)) {
             return;
         }
 
-        wchar_t dirPath[MAX_PATH];
-        wcscpy_s(dirPath, MAX_PATH, op.destPath.c_str());
-        PathRemoveFileSpecW(dirPath);
-        if (wcslen(dirPath) > 0) {
-            SHCreateDirectoryExW(NULL, dirPath, NULL);
+        if (op.destPath.has_parent_path()) {
+            std::filesystem::create_directories(op.destPath.parent_path());
         }
 
-        if (op.overwrite && PathFileExistsW(op.destPath.c_str())) {
-            std::wstring backupPath = op.destPath + L"_Backup";
-            if (PathIsDirectoryW(backupPath.c_str())) {
-                 PerformFileSystemOperation(FO_DELETE, backupPath);
-            } else {
-                DeleteFileW(backupPath.c_str());
-            }
-            MoveFileW(op.destPath.c_str(), backupPath.c_str());
+        if (op.overwrite && std::filesystem::exists(op.destPath)) {
+            std::filesystem::path backupPath = op.destPath.wstring() + L"_Backup";
+            std::filesystem::rename(op.destPath, backupPath);
+            std::filesystem::remove_all(backupPath);
         }
 
-        wchar_t fromPath[MAX_PATH * 2] = {0};
-        wcscpy_s(fromPath, op.sourcePath.c_str());
-        fromPath[op.sourcePath.length() + 1] = L'\0';
-
-        wchar_t toPath[MAX_PATH * 2] = {0};
-        wcscpy_s(toPath, op.destPath.c_str());
-        toPath[op.destPath.length() + 1] = L'\0';
-
-        SHFILEOPSTRUCTW sfos = {0};
-        sfos.wFunc = op.isMove ? FO_MOVE : FO_COPY;
-        sfos.pFrom = fromPath;
-        sfos.pTo = toPath;
-        sfos.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-        if (!op.overwrite) {
-            sfos.fFlags |= FOF_RENAMEONCOLLISION;
-        }
-        if (sfos.wFunc == FO_COPY) {
-            sfos.fFlags |= FOF_NOCONFIRMMKDIR;
-        }
-
-        SHFileOperationW(&sfos);
-
-        std::wstring backupPath = op.destPath + L"_Backup";
-        if (PathFileExistsW(backupPath.c_str())) {
+        if (op.isMove) {
+            std::filesystem::rename(op.sourcePath, op.destPath);
+        } else {
+            auto copyOptions = std::filesystem::copy_options::overwrite_existing;
             if (op.isDirectory) {
-                PerformFileSystemOperation(FO_DELETE, backupPath);
-            } else {
-                DeleteFileW(backupPath.c_str());
+                copyOptions |= std::filesystem::copy_options::recursive;
             }
+            std::filesystem::copy(op.sourcePath, op.destPath, copyOptions);
         }
     }
 
@@ -1206,7 +1152,7 @@ namespace ActionHelpers {
         std::wstring line_ending = L"\r\n";
     };
 
-    bool ReadFileWithFormatDetection(const std::wstring& path, FileContentInfo& info) {
+    bool ReadFileWithFormatDetection(const std::filesystem::path& path, FileContentInfo& info) {
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return false;
         info.raw_bytes = std::vector<char>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -1329,7 +1275,7 @@ namespace ActionHelpers {
     }
 
 
-    bool WriteFileWithFormat(const std::wstring& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
+    bool WriteFileWithFormat(const std::filesystem::path& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
 
@@ -1392,7 +1338,7 @@ namespace ActionHelpers {
     }
 
     void HandleIniWrite(const IniWriteOp& op) {
-        if (!PathFileExistsW(op.path.c_str())) {
+        if (!std::filesystem::exists(op.path)) {
             return;
         }
 
@@ -1637,16 +1583,22 @@ std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<std::wstring>& p
     return handles;
 }
 
-
 std::wstring GetProcessNameByPid(DWORD pid) {
     if (pid == 0) return L"";
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (hProcess) {
-        wchar_t processName[MAX_PATH];
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameW(hProcess, 0, processName, &size) > 0) {
-            CloseHandle(hProcess);
-            return PathFindFileNameW(processName);
+        std::vector<wchar_t> buffer(MAX_PATH);
+        while (true) {
+            DWORD size = static_cast<DWORD>(buffer.size());
+            if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+                CloseHandle(hProcess);
+                return std::filesystem::path(buffer.data()).filename().wstring();
+            }
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                buffer.resize(buffer.size() * 2);
+            } else {
+                break;
+            }
         }
         CloseHandle(hProcess);
     }
@@ -1685,7 +1637,7 @@ struct MonitorThreadData {
 
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
-static bool g_areProcessesSuspended = false;
+static std::atomic<bool> g_areProcessesSuspended = false;
 
 VOID CALLBACK WinEventProc(
     HWINEVENTHOOK hWinEventHook,
@@ -1746,38 +1698,37 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     return 0;
 }
 
-std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
+std::pair<std::filesystem::path, std::filesystem::path> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
     const std::wstring delimiter = L" :: ";
     size_t separatorPos = entry.find(delimiter);
     if (separatorPos == std::wstring::npos) return {};
-    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables), variables);
-    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + delimiter.length())), variables), variables);
+    auto src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables), variables);
+    auto dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + delimiter.length())), variables), variables);
     if (dest.empty() || src.empty()) return {};
     return {dest, src};
 }
 
-void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
-    if (!PathFileExistsW(src.c_str())) return;
-    std::wstring backupDest = dest + L"_Backup";
-    if (PathFileExistsW(dest.c_str())) {
-        MoveFileW(dest.c_str(), backupDest.c_str());
+void PerformDirectoryBackup(const std::filesystem::path& dest, const std::filesystem::path& src) {
+    if (!std::filesystem::exists(src)) return;
+    std::filesystem::path backupDest = dest.wstring() + L"_Backup";
+    if (std::filesystem::exists(dest)) {
+        std::filesystem::rename(dest, backupDest);
     }
-    PerformFileSystemOperation(FO_COPY, src, dest);
-    if (PathFileExistsW(backupDest.c_str())) {
-        PerformFileSystemOperation(FO_DELETE, backupDest);
+    std::filesystem::copy(src, dest, std::filesystem::copy_options::recursive);
+    if (std::filesystem::exists(backupDest)) {
+        std::filesystem::remove_all(backupDest);
     }
 }
 
-void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
-    if (!PathFileExistsW(src.c_str())) return;
-    std::wstring backupDest = dest + L"_Backup";
-    if (PathFileExistsW(dest.c_str())) {
-        MoveFileW(dest.c_str(), backupDest.c_str());
+void PerformFileBackup(const std::filesystem::path& dest, const std::filesystem::path& src) {
+    if (!std::filesystem::exists(src)) return;
+    std::filesystem::path backupDest = dest.wstring() + L"_Backup";
+    if (std::filesystem::exists(dest)) {
+        std::filesystem::rename(dest, backupDest);
     }
-    if (CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
-        if (PathFileExistsW(backupDest.c_str())) {
-            DeleteFileW(backupDest.c_str());
-        }
+    std::filesystem::copy_file(src, dest);
+    if (std::filesystem::exists(backupDest)) {
+        std::filesystem::remove(backupDest);
     }
 }
 
@@ -1785,8 +1736,8 @@ struct BackupThreadData {
     std::atomic<bool>* shouldStop;
     std::atomic<bool>* isWorking;
     int backupInterval;
-    std::vector<std::pair<std::wstring, std::wstring>> backupDirs;
-    std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> backupDirs;
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> backupFiles;
 };
 
 DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
@@ -1806,26 +1757,19 @@ DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-void CreateHardLinksRecursive(const std::wstring& srcDir, const std::wstring& destDir, std::vector<std::pair<std::wstring, std::wstring>>& createdLinks) {
-    WIN32_FIND_DATAW findData;
-    std::wstring searchPath = srcDir + L"\\*";
-    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-    do {
-        std::wstring fileName = findData.cFileName;
-        if (fileName == L"." || fileName == L"..") continue;
-        std::wstring srcPath = srcDir + L"\\" + fileName;
-        std::wstring destPath = destDir + L"\\" + fileName;
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            CreateDirectoryW(destPath.c_str(), NULL);
+void CreateHardLinksRecursive(const std::filesystem::path& srcDir, const std::filesystem::path& destDir, std::vector<std::pair<std::filesystem::path, std::filesystem::path>>& createdLinks) {
+    for (const auto& entry : std::filesystem::directory_iterator(srcDir)) {
+        const auto& srcPath = entry.path();
+        const auto destPath = destDir / srcPath.filename();
+        if (entry.is_directory()) {
+            std::filesystem::create_directory(destPath);
             CreateHardLinksRecursive(srcPath, destPath, createdLinks);
         } else {
             if (CreateHardLinkW(destPath.c_str(), srcPath.c_str(), NULL)) {
                 createdLinks.push_back({destPath, srcPath});
             }
         }
-    } while (FindNextFileW(hFind, &findData));
-    FindClose(hFind);
+    }
 }
 
 void CreateFirewallRule(FirewallOp& op) {
@@ -1932,38 +1876,33 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
-            wchar_t dirPath[MAX_PATH];
-            wcscpy_s(dirPath, MAX_PATH, arg.destPath.c_str());
-            PathRemoveFileSpecW(dirPath);
-            if (wcslen(dirPath) > 0) {
-                SHCreateDirectoryExW(NULL, dirPath, NULL);
+            if (arg.destPath.has_parent_path()) {
+                std::filesystem::create_directories(arg.destPath.parent_path());
             }
 
-            if (PathFileExistsW(arg.destPath.c_str())) {
-                MoveFileW(arg.destPath.c_str(), arg.destBackupPath.c_str());
+            if (std::filesystem::exists(arg.destPath)) {
+                std::filesystem::rename(arg.destPath, arg.destBackupPath);
                 arg.destBackupCreated = true;
             }
-            if (PathFileExistsW(arg.sourcePath.c_str())) {
+            if (std::filesystem::exists(arg.sourcePath)) {
                 if (arg.wasMoved) {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.sourcePath, arg.destPath);
-                    else MoveFileW(arg.sourcePath.c_str(), arg.destPath.c_str());
+                    std::filesystem::rename(arg.sourcePath, arg.destPath);
                 } else {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.sourcePath, arg.destPath);
-                    else CopyFileW(arg.sourcePath.c_str(), arg.destPath.c_str(), FALSE);
+                    auto opts = std::filesystem::copy_options::overwrite_existing;
+                    if (arg.isDirectory) opts |= std::filesystem::copy_options::recursive;
+                    std::filesystem::copy(arg.sourcePath, arg.destPath, opts);
                 }
             }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
-            if (PathFileExistsW(arg.targetPath.c_str())) {
-                if (MoveFileW(arg.targetPath.c_str(), arg.backupPath.c_str())) {
-                    arg.backupCreated = true;
-                }
+            if (std::filesystem::exists(arg.targetPath)) {
+                std::filesystem::rename(arg.targetPath, arg.backupPath);
+                arg.backupCreated = true;
             }
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) {
-                renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
+                renamed = RenameRegistryKey(arg.hRootKey, arg.subKey, arg.backupName);
             } else {
-                // <-- [修改] 修正了注册表值备份的逻辑
                 renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
             }
             if (renamed) {
@@ -1974,71 +1913,60 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (!arg.traversalMode.empty()) {
-                SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
-                WIN32_FIND_DATAW findData;
-                std::wstring searchPath = arg.targetPath + L"\\*";
-                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        std::wstring itemName = findData.cFileName;
-                        if (itemName == L"." || itemName == L"..") continue;
-                        bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
-                        bool shouldLink = false;
-                        if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
-                        else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
-                        else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
-                        
-                        if (arg.isHardlink && isItemDirectory) shouldLink = false;
+                std::filesystem::create_directories(arg.linkPath);
+                for(const auto& entry : std::filesystem::directory_iterator(arg.targetPath)) {
+                    const auto& itemName = entry.path().filename();
+                    bool isItemDirectory = entry.is_directory();
+                    bool shouldLink = false;
+                    if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
+                    else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
+                    else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
+                    
+                    if (arg.isHardlink && isItemDirectory) shouldLink = false;
 
-                        if (shouldLink) {
-                            std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
-                            std::wstring destFullPath = arg.linkPath + L"\\" + itemName;
-                            if (PathFileExistsW(destFullPath.c_str())) {
-                                std::wstring backupDestPath = destFullPath + L"_Backup";
-                                MoveFileW(destFullPath.c_str(), backupDestPath.c_str());
-                                arg.backedUpPaths.push_back({backupDestPath, destFullPath});
-                                arg.backupCreated = true;
-                            }
-                            if (arg.isHardlink) {
-                                if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
-                                    arg.createdLinks.push_back({destFullPath, L""});
-                                }
-                            } else {
-                                DWORD flags = isItemDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                                if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
-                                    arg.createdLinks.push_back({destFullPath, L""});
-                                }
-                            }
+                    if (shouldLink) {
+                        auto srcFullPath = arg.targetPath / itemName;
+                        auto destFullPath = arg.linkPath / itemName;
+                        if (std::filesystem::exists(destFullPath)) {
+                            auto backupDestPath = destFullPath.wstring() + L"_Backup";
+                            std::filesystem::rename(destFullPath, backupDestPath);
+                            arg.backedUpPaths.push_back({backupDestPath, destFullPath});
+                            arg.backupCreated = true;
                         }
-                    } while (FindNextFileW(hFind, &findData));
-                    FindClose(hFind);
+                        if (arg.isHardlink) {
+                            std::filesystem::create_hard_link(srcFullPath, destFullPath);
+                            arg.createdLinks.push_back({destFullPath, L""});
+                        } else {
+                            if (isItemDirectory) std::filesystem::create_directory_symlink(srcFullPath, destFullPath);
+                            else std::filesystem::create_symlink(srcFullPath, destFullPath);
+                            arg.createdLinks.push_back({destFullPath, L""});
+                        }
+                    }
                 }
             } else {
-                wchar_t dirPath[MAX_PATH];
-                wcscpy_s(dirPath, MAX_PATH, arg.linkPath.c_str());
-                PathRemoveFileSpecW(dirPath);
-                if (wcslen(dirPath) > 0) SHCreateDirectoryExW(NULL, dirPath, NULL);
+                if (arg.linkPath.has_parent_path()) {
+                    std::filesystem::create_directories(arg.linkPath.parent_path());
+                }
 
-                if (PathFileExistsW(arg.linkPath.c_str())) {
-                    if (MoveFileW(arg.linkPath.c_str(), arg.backupPath.c_str())) {
-                        arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
-                        arg.backupCreated = true;
-                    }
+                if (std::filesystem::exists(arg.linkPath)) {
+                    std::filesystem::rename(arg.linkPath, arg.backupPath);
+                    arg.backedUpPaths.push_back({arg.backupPath, arg.linkPath});
+                    arg.backupCreated = true;
                 }
 
                 if (arg.performMoveOnCleanup) {
-                    // DO NOTHING. Let the application create the directory at linkPath.
+                    // DO NOTHING.
                 } else {
                     if (arg.isHardlink) {
                         if (arg.isDirectory) {
-                            CreateDirectoryW(arg.linkPath.c_str(), NULL);
+                            std::filesystem::create_directory(arg.linkPath);
                             CreateHardLinksRecursive(arg.targetPath, arg.linkPath, arg.createdLinks);
                         } else {
-                            CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
+                            std::filesystem::create_hard_link(arg.targetPath, arg.linkPath);
                         }
                     } else {
-                        DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
-                        CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
+                        if (arg.isDirectory) std::filesystem::create_directory_symlink(arg.targetPath, arg.linkPath);
+                        else std::filesystem::create_symlink(arg.targetPath, arg.linkPath);
                     }
                 }
             }
@@ -2053,45 +1981,39 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
             if (arg.wasMoved) {
-                if (PathFileExistsW(arg.destPath.c_str())) {
-                    if (PathFileExistsW(arg.sourcePath.c_str())) {
-                         if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.sourcePath);
-                         else DeleteFileW(arg.sourcePath.c_str());
+                if (std::filesystem::exists(arg.destPath)) {
+                    if (std::filesystem::exists(arg.sourcePath)) {
+                         std::filesystem::remove_all(arg.sourcePath);
                     }
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.destPath, arg.sourcePath);
-                    else MoveFileW(arg.destPath.c_str(), arg.sourcePath.c_str());
+                    std::filesystem::rename(arg.destPath, arg.sourcePath);
                 }
             } else {
-                if (PathFileExistsW(arg.destPath.c_str())) {
-                    std::wstring sourceBackupPath = arg.sourcePath + L"_Backup";
-                    if (PathFileExistsW(arg.sourcePath.c_str())) MoveFileW(arg.sourcePath.c_str(), sourceBackupPath.c_str());
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_COPY, arg.destPath, arg.sourcePath);
-                    else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
-                    if (PathFileExistsW(sourceBackupPath.c_str())) {
-                        if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
-                        else DeleteFileW(sourceBackupPath.c_str());
+                if (std::filesystem::exists(arg.destPath)) {
+                    auto sourceBackupPath = arg.sourcePath.wstring() + L"_Backup";
+                    if (std::filesystem::exists(arg.sourcePath)) std::filesystem::rename(arg.sourcePath, sourceBackupPath);
+                    std::filesystem::copy(arg.destPath, arg.sourcePath, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+                    if (std::filesystem::exists(sourceBackupPath)) {
+                        std::filesystem::remove_all(sourceBackupPath);
                     }
                 }
-                if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.destPath);
-                else DeleteFileW(arg.destPath.c_str());
+                std::filesystem::remove_all(arg.destPath);
             }
-            if (arg.destBackupCreated && PathFileExistsW(arg.destBackupPath.c_str())) {
-                MoveFileW(arg.destBackupPath.c_str(), arg.destPath.c_str());
+            if (arg.destBackupCreated && std::filesystem::exists(arg.destBackupPath)) {
+                std::filesystem::rename(arg.destBackupPath, arg.destPath);
             }
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
-            if (PathFileExistsW(arg.targetPath.c_str())) {
-                if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.targetPath);
-                else DeleteFileW(arg.targetPath.c_str());
+            if (std::filesystem::exists(arg.targetPath)) {
+                std::filesystem::remove_all(arg.targetPath);
             }
-            if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
-                MoveFileW(arg.backupPath.c_str(), arg.targetPath.c_str());
+            if (arg.backupCreated && std::filesystem::exists(arg.backupPath)) {
+                std::filesystem::rename(arg.backupPath, arg.targetPath);
             }
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             if (arg.isSaveRestore) {
-                if (arg.isKey) ExportRegistryKey(arg.rootKeyStr, arg.subKey, arg.filePath);
+                if (arg.isKey) ExportRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.filePath);
                 else ExportRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.rootKeyStr, arg.filePath);
             }
-            if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey.c_str());
+            if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey);
             else {
                 HKEY hKey;
                 if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
@@ -2100,44 +2022,33 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 }
             }
             if (arg.backupCreated) {
-                if (arg.isKey) RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.backupName, arg.subKey);
+                if (arg.isKey) RenameRegistryKey(arg.hRootKey, arg.backupName, arg.subKey);
                 else RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (arg.performMoveOnCleanup) {
-                if (PathFileExistsW(arg.linkPath.c_str())) {
-                    wchar_t targetParentDir[MAX_PATH];
-                    wcscpy_s(targetParentDir, MAX_PATH, arg.targetPath.c_str());
-                    PathRemoveFileSpecW(targetParentDir);
-                    if (wcslen(targetParentDir) > 0) {
-                        SHCreateDirectoryExW(NULL, targetParentDir, NULL);
+                if (std::filesystem::exists(arg.linkPath)) {
+                    if (arg.targetPath.has_parent_path()) {
+                        std::filesystem::create_directories(arg.targetPath.parent_path());
                     }
-                    MoveFileW(arg.linkPath.c_str(), arg.targetPath.c_str());
+                    std::filesystem::rename(arg.linkPath, arg.targetPath);
                 }
             } else if (!arg.traversalMode.empty()) {
                 for (const auto& linkPair : arg.createdLinks) {
-                    const std::wstring& pathToDelete = linkPair.first;
-                    if (PathIsDirectoryW(pathToDelete.c_str())) {
-                        RemoveDirectoryW(pathToDelete.c_str());
-                    } else {
-                        DeleteFileW(pathToDelete.c_str());
-                    }
+                    std::filesystem::remove(linkPair.first);
                 }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
-                        DeleteFileW(it->first.c_str());
+                        std::filesystem::remove(it->first);
                     }
-                    PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                } else {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                    else DeleteFileW(arg.linkPath.c_str());
                 }
+                std::filesystem::remove_all(arg.linkPath);
             }
             if (arg.backupCreated) {
                 for (const auto& backupPair : arg.backedUpPaths) {
-                    if (PathFileExistsW(backupPair.first.c_str())) {
-                        MoveFileW(backupPair.first.c_str(), backupPair.second.c_str());
+                    if (std::filesystem::exists(backupPair.first)) {
+                        std::filesystem::rename(backupPair.first, backupPair.second);
                     }
                 }
             }
@@ -2400,15 +2311,10 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
                     }
                     
-                    if (l_op.isDirectory) {
-                        if (l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
-                        if (l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
-                    }
-
-                    l_op.backupPath = l_op.linkPath + L"_Backup";
+                    l_op.backupPath = l_op.linkPath.wstring() + L"_Backup";
 
                     if (l_op.isHardlink && l_op.traversalMode.empty()) {
-                        if (!PathFileExistsW(l_op.targetPath.c_str())) {
+                        if (!std::filesystem::exists(l_op.targetPath)) {
                             l_op.performMoveOnCleanup = true;
                         }
                     }
@@ -2447,7 +2353,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             } else if (_wcsicmp(key.c_str(), L"(file)") == 0 || _wcsicmp(key.c_str(), L"(dir)") == 0) {
                 RestoreOnlyFileOp ro_op; ro_op.isDirectory = (_wcsicmp(key.c_str(), L"(dir)") == 0);
                 ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables), variables);
-                ro_op.backupPath = ro_op.targetPath + L"_Backup";
+                ro_op.backupPath = ro_op.targetPath.wstring() + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
             } 
             else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
@@ -2456,14 +2362,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 if (parts.size() == 2) {
                     f_op.destPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
                     std::wstring sourceRaw = parts[1];
-                    std::wstring expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables), variables);
+                    auto expandedSource = ResolveToAbsolutePath(ExpandVariables(sourceRaw, variables), variables);
                     if (f_op.isDirectory) {
                         f_op.sourcePath = expandedSource;
                     } else {
-                        if (sourceRaw.back() == L'\\') f_op.sourcePath = expandedSource + PathFindFileNameW(f_op.destPath.c_str());
+                        if (sourceRaw.back() == L'\\') f_op.sourcePath = expandedSource / f_op.destPath.filename();
                         else f_op.sourcePath = expandedSource;
                     }
-                    f_op.destBackupPath = f_op.destPath + L"_Backup";
+                    f_op.destBackupPath = f_op.destPath.wstring() + L"_Backup";
                     f_op.wasMoved = ArePathsOnSameVolume(f_op.sourcePath, f_op.destPath);
                     beforeOp.data = f_op; op_created = true;
                 }
@@ -2507,44 +2413,44 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
-            std::wstring finalPath = ExpandVariables(arg.programPath, variables);
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.programPath.wstring(), variables), variables);
             std::wstring finalCmd = ExpandVariables(arg.commandLine, variables);
-            std::wstring finalDir = ExpandVariables(arg.workDir, variables);
-            ExecuteProcess(ResolveToAbsolutePath(finalPath, variables), finalCmd, ResolveToAbsolutePath(finalDir, variables), arg.wait, arg.hide);
+            auto finalDir = ResolveToAbsolutePath(ExpandVariables(arg.workDir.wstring(), variables), variables);
+            ExecuteProcess(finalPath, finalCmd, finalDir, arg.wait, arg.hide);
         }
         else if constexpr (std::is_same_v<T, RegImportOp>) {
-            std::wstring finalPath = ExpandVariables(arg.regPath, variables);
-            ImportRegistryFile(ResolveToAbsolutePath(finalPath, variables));
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.regPath.wstring(), variables), variables);
+            ImportRegistryFile(finalPath);
         } else if constexpr (std::is_same_v<T, RegDllOp>) {
-            std::wstring finalPath = ExpandVariables(arg.dllPath, variables);
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.dllPath.wstring(), variables), variables);
             wchar_t systemPath[MAX_PATH];
             GetSystemDirectoryW(systemPath, MAX_PATH);
-            std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
-            std::wstring args = L"/s \"" + ResolveToAbsolutePath(finalPath, variables) + L"\"";
+            std::filesystem::path regsvrPath = std::filesystem::path(systemPath) / L"regsvr32.exe";
+            std::wstring args = L"/s \"" + finalPath.wstring() + L"\"";
             if (arg.unregister) {
                 args = L"/u " + args;
             }
             ExecuteProcess(regsvrPath, args, L"", true, true);
         } else if constexpr (std::is_same_v<T, DeleteFileOp>) {
-            std::wstring finalPath = ExpandVariables(arg.pathPattern, variables);
-            ActionHelpers::HandleDeleteFile(ResolveToAbsolutePath(finalPath, variables));
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.pathPattern.wstring(), variables), variables);
+            ActionHelpers::HandleDeleteFile(finalPath);
         } else if constexpr (std::is_same_v<T, DeleteDirOp>) {
-            std::wstring finalPath = ExpandVariables(arg.pathPattern, variables);
-            ActionHelpers::HandleDeleteDir(ResolveToAbsolutePath(finalPath, variables), arg.ifEmpty);
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.pathPattern.wstring(), variables), variables);
+            ActionHelpers::HandleDeleteDir(finalPath, arg.ifEmpty);
         } else if constexpr (std::is_same_v<T, DeleteRegKeyOp>) {
             ActionHelpers::HandleDeleteRegKey(ExpandVariables(arg.keyPattern, variables), arg.ifEmpty);
         } else if constexpr (std::is_same_v<T, DeleteRegValueOp>) {
             ActionHelpers::HandleDeleteRegValue(ExpandVariables(arg.keyPattern, variables), ExpandVariables(arg.valuePattern, variables));
         } else if constexpr (std::is_same_v<T, CreateDirOp>) {
-            std::wstring finalPath = ExpandVariables(arg.path, variables);
-            SHCreateDirectoryExW(NULL, ResolveToAbsolutePath(finalPath, variables).c_str(), NULL);
+            auto finalPath = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
+            std::filesystem::create_directories(finalPath);
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             ActionHelpers::HandleKillProcess(ExpandVariables(arg.processPattern, variables));
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
             mutable_op.content = ExpandVariables(arg.content, variables);
             ActionHelpers::HandleCreateFile(mutable_op);
         } else if constexpr (std::is_same_v<T, CreateRegKeyOp>) {
@@ -2558,27 +2464,27 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         }
         else if constexpr (std::is_same_v<T, CopyMoveOp>) {
             CopyMoveOp mutable_op = arg;
-            mutable_op.sourcePath = ResolveToAbsolutePath(ExpandVariables(arg.sourcePath, variables), variables);
-            mutable_op.destPath = ResolveToAbsolutePath(ExpandVariables(arg.destPath, variables), variables);
+            mutable_op.sourcePath = ResolveToAbsolutePath(ExpandVariables(arg.sourcePath.wstring(), variables), variables);
+            mutable_op.destPath = ResolveToAbsolutePath(ExpandVariables(arg.destPath.wstring(), variables), variables);
             ActionHelpers::HandleCopyMove(mutable_op);
         } else if constexpr (std::is_same_v<T, AttributesOp>) {
             AttributesOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
             ActionHelpers::HandleAttributes(mutable_op);
         } else if constexpr (std::is_same_v<T, IniWriteOp>) {
             IniWriteOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
             mutable_op.value = ExpandVariables(arg.value, variables);
             ActionHelpers::HandleIniWrite(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceOp>) {
             ReplaceOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
             mutable_op.findText = ExpandVariables(arg.findText, variables);
             mutable_op.replaceText = ExpandVariables(arg.replaceText, variables);
             ActionHelpers::HandleReplace(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceLineOp>) {
             ReplaceLineOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path.wstring(), variables), variables);
             mutable_op.lineStart = ExpandVariables(arg.lineStart, variables);
             mutable_op.replaceLine = ExpandVariables(arg.replaceLine, variables);
             ActionHelpers::HandleReplaceLine(mutable_op);
@@ -2633,10 +2539,10 @@ void PerformFullCleanup(
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
-    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
+    std::filesystem::path appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
     if (appPathRaw.empty()) return;
 
-    std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
+    std::filesystem::path workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
@@ -2647,7 +2553,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         return 1;
     }
 
-    // <-- [修改] 为工作线程初始化COM
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     STARTUPINFOW si; 
@@ -2657,12 +2562,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     ZeroMemory(&pi, sizeof(pi));
     
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
-    std::wstring fullCommandLine = L"\"" + data->absoluteAppPath + L"\" " + commandLine;
-    wchar_t commandLineBuffer[4096]; 
-    wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+    std::wstring fullCommandLine = L"\"" + data->absoluteAppPath.wstring() + L"\" " + commandLine;
+    std::vector<wchar_t> commandLineBuffer(fullCommandLine.begin(), fullCommandLine.end());
+    commandLineBuffer.push_back(0);
 
-    if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
-        MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+    if (!CreateProcessW(NULL, commandLineBuffer.data(), NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
+        MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath.wstring()).c_str(), L"启动错误", MB_ICONERROR);
     } else {
         std::vector<std::wstring> waitProcesses;
         std::wstringstream waitStream(data->iniContent);
@@ -2693,9 +2598,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (multiInstanceEnabled) {
             WaitForSingleObject(pi.hProcess, INFINITE);
 
-            const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
-            if (appFilename && wcslen(appFilename) > 0) {
-                waitProcesses.push_back(appFilename);
+            if (data->absoluteAppPath.has_filename()) {
+                waitProcesses.push_back(data->absoluteAppPath.filename().wstring());
             }
 
             if (!waitProcesses.empty()) {
@@ -2793,9 +2697,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables);
 
-    DeleteFileW(data->tempFilePath.c_str());
+    std::filesystem::remove(data->tempFilePath);
     
-    // <-- [修改] 释放工作线程的COM资源
     CoUninitialize();
     return 0;
 }
@@ -2809,11 +2712,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
     }
 
-    wchar_t launcherFullPath[MAX_PATH];
-    GetModuleFileNameW(NULL, launcherFullPath, MAX_PATH);
-    std::wstring iniPath = launcherFullPath;
-    size_t pos = iniPath.find_last_of(L".");
-    if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
+    std::filesystem::path launcherFullPath;
+    {
+        std::vector<wchar_t> buffer(MAX_PATH);
+        DWORD size = MAX_PATH;
+        while (true) {
+            size = GetModuleFileNameW(NULL, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (size < buffer.size()) {
+                launcherFullPath = buffer.data();
+                break;
+            }
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                buffer.resize(buffer.size() * 2);
+            } else {
+                MessageBoxW(NULL, L"无法获取启动器路径", L"致命错误", MB_ICONERROR);
+                return 1;
+            }
+        }
+    }
+    
+    std::filesystem::path iniPath = launcherFullPath;
+    iniPath.replace_extension(L".ini");
+
     std::wstring iniContent;
     if (!ReadFileToWString(iniPath, iniContent)) {
         MessageBoxW(NULL, L"无法读取INI文件", L"错误", MB_ICONERROR);
@@ -2828,25 +2748,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     variables[L"ProgramData"] = GetKnownFolderPath(FOLDERID_ProgramData);
     variables[L"SavedGames"] = GetKnownFolderPath(FOLDERID_SavedGames);
     variables[L"PublicDocuments"] = GetKnownFolderPath(FOLDERID_PublicDocuments);
-    wchar_t drive[_MAX_DRIVE];
-    _wsplitpath_s(launcherFullPath, drive, _MAX_DRIVE, NULL, 0, NULL, 0, NULL, 0);
-    variables[L"DRIVE"] = drive;
-    wchar_t launcherDir[MAX_PATH];
-    wcscpy_s(launcherDir, launcherFullPath);
-    PathRemoveFileSpecW(launcherDir);
-    variables[L"YAPROOT"] = launcherDir;
+    variables[L"DRIVE"] = launcherFullPath.root_name().wstring();
+    variables[L"YAPROOT"] = launcherFullPath.parent_path().wstring();
 
-    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
+    std::filesystem::path appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
 
-    wchar_t launcherBaseName[MAX_PATH];
-    wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
-    PathRemoveExtensionW(launcherBaseName);
-    wchar_t appBaseName[MAX_PATH] = L"";
-    if (!appPathRaw.empty()) {
-        wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
-        PathRemoveExtensionW(appBaseName);
-    }
-    std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
+    std::wstring launcherBaseName = launcherFullPath.stem().wstring();
+    std::wstring appBaseName = appPathRaw.stem().wstring();
+    std::wstring mutexName = L"Global\\" + launcherBaseName + L"_" + appBaseName;
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -2865,42 +2774,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
         
-        std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
-        variables[L"APPEXE"] = absoluteAppPath;
-        wchar_t appDir[MAX_PATH];
-        wcscpy_s(appDir, absoluteAppPath.c_str());
-        PathRemoveFileSpecW(appDir);
-        variables[L"EXEPATH"] = appDir;
+        auto absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
+        variables[L"APPEXE"] = absoluteAppPath.wstring();
+        variables[L"EXEPATH"] = absoluteAppPath.parent_path().wstring();
         
-        const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
-        if (appFilename) {
-            variables[L"EXENAME"] = appFilename;
-			wchar_t appNameBuffer[MAX_PATH];
-			wcscpy_s(appNameBuffer, MAX_PATH, appFilename);
-			PathRemoveExtensionW(appNameBuffer);
-			variables[L"APPNAME"] = appNameBuffer;
+        if (absoluteAppPath.has_filename()) {
+            variables[L"EXENAME"] = absoluteAppPath.filename().wstring();
+			variables[L"APPNAME"] = absoluteAppPath.stem().wstring();
         }
 
-        std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
-        std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
-        if (finalWorkDir.empty() || !PathIsDirectoryW(finalWorkDir.c_str())) {
-            finalWorkDir = appDir;
+        std::filesystem::path workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
+        auto finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
+        if (finalWorkDir.empty() || !std::filesystem::is_directory(finalWorkDir)) {
+            finalWorkDir = absoluteAppPath.parent_path();
         }
-        variables[L"WORKDIR"] = finalWorkDir;
+        variables[L"WORKDIR"] = finalWorkDir.wstring();
 
-        std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
-        std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
-        std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
+        std::filesystem::path tempFileDir;
+        std::filesystem::path tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         if (tempFileDirRaw.empty()) {
             tempFileDir = variables[L"YAPROOT"];
+        } else {
+            tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
         }
-        std::wstring tempFilePath = tempFileDir + L"\\" + tempFileName;
+        std::filesystem::path tempFilePath = tempFileDir / (launcherBaseName + L"Temp.ini");
 
         std::vector<BeforeOperation> beforeOps;
         std::vector<AfterOperation> afterOps;
         BackupThreadData backupData;
 
-        if (PathFileExistsW(tempFilePath.c_str())) {
+        if (std::filesystem::exists(tempFilePath)) {
             ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
 
             std::vector<StartupShutdownOperation> shutdownOpsForCrash;
@@ -2921,35 +2824,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                             } else if constexpr (std::is_same_v<OpType, LinkOp>) {
                                 op_data.backupCreated = true;
                                 if (!op_data.traversalMode.empty()) {
-                                    WIN32_FIND_DATAW findData;
-                                    std::wstring searchPath = op_data.targetPath + L"\\*";
-                                    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
-                                    if (hFind != INVALID_HANDLE_VALUE) {
-                                        do {
-                                            std::wstring itemName = findData.cFileName;
-                                            if (itemName == L"." || itemName == L"..") continue;
-                                            bool isItemDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
-                                            bool shouldHaveBeenLinked = false;
-                                            if (_wcsicmp(op_data.traversalMode.c_str(), L"all") == 0) shouldHaveBeenLinked = true;
-                                            else if (_wcsicmp(op_data.traversalMode.c_str(), L"dir") == 0) shouldHaveBeenLinked = isItemDirectory;
-                                            else if (_wcsicmp(op_data.traversalMode.c_str(), L"file") == 0) shouldHaveBeenLinked = !isItemDirectory;
-                                            if (op_data.isHardlink && isItemDirectory) shouldHaveBeenLinked = false;
+                                    for(const auto& entry : std::filesystem::directory_iterator(op_data.targetPath)) {
+                                        const auto& itemName = entry.path().filename();
+                                        bool isItemDirectory = entry.is_directory();
+                                        bool shouldHaveBeenLinked = false;
+                                        if (_wcsicmp(op_data.traversalMode.c_str(), L"all") == 0) shouldHaveBeenLinked = true;
+                                        else if (_wcsicmp(op_data.traversalMode.c_str(), L"dir") == 0) shouldHaveBeenLinked = isItemDirectory;
+                                        else if (_wcsicmp(op_data.traversalMode.c_str(), L"file") == 0) shouldHaveBeenLinked = !isItemDirectory;
+                                        if (op_data.isHardlink && isItemDirectory) shouldHaveBeenLinked = false;
 
-                                            if (shouldHaveBeenLinked) {
-                                                std::wstring destFullPath = op_data.linkPath + L"\\" + itemName;
-                                                if (PathFileExistsW(destFullPath.c_str())) {
-                                                    op_data.createdLinks.push_back({destFullPath, L""});
-                                                }
-                                                std::wstring backupPath = destFullPath + L"_Backup";
-                                                if (PathFileExistsW(backupPath.c_str())) {
-                                                    op_data.backedUpPaths.push_back({backupPath, destFullPath});
-                                                }
+                                        if (shouldHaveBeenLinked) {
+                                            auto destFullPath = op_data.linkPath / itemName;
+                                            if (std::filesystem::exists(destFullPath)) {
+                                                op_data.createdLinks.push_back({destFullPath, L""});
                                             }
-                                        } while (FindNextFileW(hFind, &findData));
-                                        FindClose(hFind);
+                                            auto backupPath = destFullPath.wstring() + L"_Backup";
+                                            if (std::filesystem::exists(backupPath)) {
+                                                op_data.backedUpPaths.push_back({backupPath, destFullPath});
+                                            }
+                                        }
                                     }
                                 } else {
-                                     if (PathFileExistsW(op_data.backupPath.c_str())) {
+                                     if (std::filesystem::exists(op_data.backupPath)) {
                                         op_data.backedUpPaths.push_back({op_data.backupPath, op_data.linkPath});
                                      }
                                 }
@@ -2968,7 +2864,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 Sleep(crashWaitTime);
             }
 
-            DeleteFileW(tempFilePath.c_str());
+            std::filesystem::remove(tempFilePath);
 
             beforeOps.clear();
             afterOps.clear();
@@ -2980,11 +2876,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::vector<StartupShutdownOperation> shutdownOps;
 
         {
-            wchar_t dirPath[MAX_PATH];
-            wcscpy_s(dirPath, MAX_PATH, tempFilePath.c_str());
-            PathRemoveFileSpecW(dirPath);
-            if (wcslen(dirPath) > 0) {
-                SHCreateDirectoryExW(NULL, dirPath, NULL);
+            if (tempFilePath.has_parent_path()) {
+                std::filesystem::create_directories(tempFilePath.parent_path());
             }
             std::ofstream tempFile(tempFilePath);
             tempFile.close();
