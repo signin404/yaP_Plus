@@ -528,6 +528,33 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // --- Registry Helpers ---
 
+// <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
+bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
+    const wchar_t* star_text = nullptr;
+    const wchar_t* star_pattern = nullptr;
+
+    while (*text) {
+        if (*pattern == L'*') {
+            star_pattern = pattern++;
+            star_text = text;
+        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+            pattern++;
+            text++;
+        } else if (star_pattern) {
+            pattern = star_pattern + 1;
+            text = ++star_text;
+        } else {
+            return false;
+        }
+    }
+
+    while (*pattern == L'*') {
+        pattern++;
+    }
+
+    return !*pattern;
+}
+
 // Forward declaration for recursive delete
 namespace ActionHelpers {
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
@@ -666,7 +693,7 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [修改] 递归导出注册表项的API实现，现在会对值名称进行转义
+// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑
 void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
@@ -705,7 +732,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
             std::wstringstream wss;
             wss << displayName << L"=";
 
-            if (type == REG_SZ || type == REG_EXPAND_SZ) {
+            if (type == REG_SZ) { // <-- 修改点: 不再包含 REG_EXPAND_SZ
                 std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), dataSize / sizeof(wchar_t));
                 if (!strValue.empty() && strValue.back() == L'\0') {
                     strValue.pop_back();
@@ -798,7 +825,7 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     return true;
 }
 
-// <-- [修改] 增加了对值名称中特殊字符的转义
+// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -851,7 +878,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     std::wstringstream wss;
     wss << displayName << L"=";
 
-    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+    if (type == REG_SZ) { // <-- 修改点: 不再包含 REG_EXPAND_SZ
         std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
         if (!strValue.empty() && strValue.back() == L'\0') {
             strValue.pop_back();
@@ -933,6 +960,7 @@ namespace ActionHelpers {
         CloseHandle(hSnapshot);
     }
 
+     // <-- [修改] 使用新的 WildcardMatch 函数
     void HandleDeleteFile(const std::wstring& pathPattern) {
         wchar_t dirPath_w[MAX_PATH];
         wcscpy_s(dirPath_w, pathPattern.c_str());
@@ -958,7 +986,7 @@ namespace ActionHelpers {
                 continue;
             }
 
-            if (PathMatchSpecW(findData.cFileName, filePattern)) {
+            if (WildcardMatch(findData.cFileName, filePattern)) { // <-- 修改点
                 std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
                 
                 DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
@@ -975,6 +1003,7 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
+    // <-- [修改] 使用新的 WildcardMatch 函数
     void HandleDeleteDir(const std::wstring& pathPattern, bool ifEmpty) {
         wchar_t dirPart_w[MAX_PATH];
         wcscpy_s(dirPart_w, pathPattern.c_str());
@@ -993,7 +1022,7 @@ namespace ActionHelpers {
         }
         do {
             if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
-                if (PathMatchSpecW(findData.cFileName, patternPart.c_str())) {
+                if (WildcardMatch(findData.cFileName, patternPart.c_str())) { // <-- 修改点
                     std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
                     if (ifEmpty) {
                         if (PathIsDirectoryEmptyW(fullPath.c_str())) {
@@ -1051,6 +1080,7 @@ namespace ActionHelpers {
         return (subKeyCount == 0 && valueCount == 0);
     }
 
+    // <-- [修改] 使用新的 WildcardMatch 函数
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
         std::vector<std::wstring> pathSegments;
         std::wstringstream ss(subKeyPattern);
@@ -1094,7 +1124,7 @@ namespace ActionHelpers {
                     wchar_t keyName[256];
                     DWORD keyNameSize = 256;
                     for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
-                        if (PathMatchSpecW(keyName, patternSegment.c_str())) {
+                        if (WildcardMatch(keyName, patternSegment.c_str())) { // <-- 修改点
                             foundSubKeys.insert(keyName);
                         }
                     }
@@ -1138,6 +1168,7 @@ namespace ActionHelpers {
         }
     }
 
+    // <-- [修改] 使用新的 WildcardMatch 函数
     void HandleDeleteRegValue(const std::wstring& keyPattern, const std::wstring& valuePattern) {
         HKEY hRootKey;
         std::wstring rootKeyStr, subKeyPattern, valueName;
@@ -1162,7 +1193,7 @@ namespace ActionHelpers {
                     DWORD valNameSize = 16383;
                     DWORD i = 0;
                     while (RegEnumValueW(hKey, i, valName, &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        if (PathMatchSpecW(valName, valuePattern.c_str())) {
+                        if (WildcardMatch(valName, valuePattern.c_str())) { // <-- 修改点
                             RegDeleteValueW(hKey, valName);
                             valNameSize = 16383;
                         } else {
