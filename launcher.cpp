@@ -21,8 +21,8 @@
 #include <atlbase.h>
 #include <psapi.h>
 #include <filesystem>
-#include <locale> // <-- [新增] 为修复codecvt问题
-#include <codecvt> // <-- [新增] 为修复codecvt问题
+#include <locale>
+#include <codecvt>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -2632,7 +2632,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
                 std::set<DWORD> trustedPids;
-                std::set<DWORD> pidsWeHaveWaitedFor;
+                std::set<DWORD> pidsWeHaveWaitedFor; // <-- [修正] 重新声明
                 std::vector<HANDLE> handlesToWaitOn;
 
                 trustedPids.insert(GetCurrentProcessId());
@@ -2642,7 +2642,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 while (!handlesToWaitOn.empty()) {
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
-                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsToIgnore);
+                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor); // <-- [修正] 使用正确的变量名
                         if (!foundHandles.empty()) {
                             handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                         }
@@ -2660,7 +2660,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         if (handlesToWaitOn.empty()) {
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
-                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
+                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor); // <-- [修正] 使用正确的变量名
                                 if (!foundHandles.empty()) {
                                     handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                                 }
