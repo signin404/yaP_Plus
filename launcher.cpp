@@ -2106,7 +2106,8 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) {
-                renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
+                // <-- [修改] 修正了函数调用，移除了多余的第一个参数
+                renamed = RenameRegistryKey(arg.hRootKey, arg.subKey, arg.backupName);
             } else {
                 renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
             }
@@ -2244,8 +2245,13 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 }
             }
             if (arg.backupCreated) {
-                if (arg.isKey) RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.backupName, arg.subKey);
-                else RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
+                if (arg.isKey) {
+                    // <-- [修改] 修正了函数调用，移除了多余的第一个参数
+                    RenameRegistryKey(arg.hRootKey, arg.backupName, arg.subKey);
+                }
+                else {
+                    RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
+                }
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (arg.performMoveOnCleanup) {
