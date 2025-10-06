@@ -21,8 +21,6 @@
 #include <atlbase.h>
 #include <psapi.h>
 #include <filesystem>
-#include <locale>
-#include <codecvt>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -708,15 +706,19 @@ bool RecursiveRegExportKey(HKEY hKey, const std::wstring& currentPath, std::ofst
     return true;
 }
 
+// 修复后的 ExportRegistryKey
 bool ExportRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::filesystem::path& filePath) {
     if (filePath.has_parent_path()) {
         std::filesystem::create_directories(filePath.parent_path());
     }
 
-    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc); // 使用 ofstream
     if (!regFile.is_open()) return false;
 
-    regFile.put((char)0xFF); regFile.put((char)0xFE);
+    // 手动写入 UTF-16 LE BOM
+    regFile.put((char)0xFF); 
+    regFile.put((char)0xFE);
+
     std::wstring header = L"Windows Registry Editor Version 5.00\r\n";
     regFile.write(reinterpret_cast<const char*>(header.c_str()), header.length() * sizeof(wchar_t));
 
@@ -730,15 +732,19 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std:
     return true;
 }
 
+// 修复后的 ExportRegistryValue
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::filesystem::path& filePath) {
     if (filePath.has_parent_path()) {
         std::filesystem::create_directories(filePath.parent_path());
     }
 
-    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc); // 使用 ofstream
     if (!regFile.is_open()) return false;
     
-    regFile.put((char)0xFF); regFile.put((char)0xFE);
+    // 手动写入 UTF-16 LE BOM
+    regFile.put((char)0xFF); 
+    regFile.put((char)0xFE);
+
     std::wstring header = L"Windows Registry Editor Version 5.00\r\n\r\n[" + rootKeyStr + L"\\" + subKey + L"]\r\n";
     regFile.write(reinterpret_cast<const char*>(header.c_str()), header.length() * sizeof(wchar_t));
 
@@ -2566,12 +2572,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     ZeroMemory(&pi, sizeof(pi));
     
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
-    std::wstring fullCommandLine = L"\"" + data->absoluteAppPath.wstring() + L"\" " + commandLine;
-    std::vector<wchar_t> commandLineBuffer(fullCommandLine.begin(), fullCommandLine.end());
+    std::wstring fullCommandLineForDisplay = L"\"" + data->absoluteAppPath.wstring() + L"\" " + commandLine;
+    std::vector<wchar_t> commandLineBuffer(fullCommandLineForDisplay.begin(), fullCommandLineForDisplay.end());
     commandLineBuffer.push_back(0);
 
-    // <-- [修改] 使用更健壮的CreateProcessW调用方式
-    if (!CreateProcessW(data->absoluteAppPath.c_str(), commandLineBuffer.data(), NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
+    if (!CreateProcessW(NULL, commandLineBuffer.data(), NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
         MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath.wstring()).c_str(), L"启动错误", MB_ICONERROR);
     } else {
         std::vector<std::wstring> waitProcesses;
