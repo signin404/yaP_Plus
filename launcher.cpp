@@ -599,18 +599,15 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     return true;
 }
 
-// <-- [新增] 递归复制注册表项的API实现
-// <-- [修改] 使用API重写RenameRegistryKey的辅助函数，采用动态缓冲区
+// <-- [修改] 为子键名称枚举也使用动态缓冲区
 LSTATUS RecursiveRegCopyKey(HKEY hSrcKey, HKEY hDestKey) {
-    DWORD dwSubKeys, dwValues, maxValueNameLen, maxValueDataSize;
+    DWORD dwSubKeys, dwValues, dwMaxSubKeyLen, maxValueNameLen, maxValueDataSize;
     
-    // 1. 查询最大缓冲区大小
-    LSTATUS status = RegQueryInfoKeyW(hSrcKey, NULL, NULL, NULL, &dwSubKeys, NULL, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL);
+    LSTATUS status = RegQueryInfoKeyW(hSrcKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL);
     if (status != ERROR_SUCCESS) {
         return status;
     }
 
-    // 2. 动态分配所需的最大缓冲区
     std::vector<wchar_t> valueName(maxValueNameLen + 1);
     std::vector<BYTE> data(maxValueDataSize);
 
@@ -620,26 +617,26 @@ LSTATUS RecursiveRegCopyKey(HKEY hSrcKey, HKEY hDestKey) {
         DWORD dataSize = (DWORD)data.size();
         DWORD type;
         
-        // 3. 使用动态缓冲区进行枚举
         status = RegEnumValueW(hSrcKey, i, valueName.data(), &valueNameSize, NULL, &type, data.data(), &dataSize);
         if (status == ERROR_SUCCESS) {
-            // 4. 使用实际返回的大小来设置新值
             RegSetValueExW(hDestKey, valueName.data(), 0, type, data.data(), dataSize);
         }
     }
 
-    // 递归复制所有子项 (这部分逻辑无需修改)
-    for (DWORD i = 0; i < dwSubKeys; i++) {
-        wchar_t subKeyName[MAX_PATH];
-        DWORD subKeyNameSize = MAX_PATH;
-        if (RegEnumKeyExW(hSrcKey, i, subKeyName, &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            HKEY hSrcSubKey, hDestSubKey;
-            if (RegOpenKeyExW(hSrcKey, subKeyName, 0, KEY_READ, &hSrcSubKey) == ERROR_SUCCESS) {
-                if (RegCreateKeyExW(hDestKey, subKeyName, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestSubKey, NULL) == ERROR_SUCCESS) {
-                    RecursiveRegCopyKey(hSrcSubKey, hDestSubKey);
-                    RegCloseKey(hDestSubKey);
+    // 递归复制所有子项
+    if (dwSubKeys > 0) {
+        std::vector<wchar_t> subKeyName(dwMaxSubKeyLen + 1);
+        for (DWORD i = 0; i < dwSubKeys; i++) {
+            DWORD subKeyNameSize = (DWORD)subKeyName.size();
+            if (RegEnumKeyExW(hSrcKey, i, subKeyName.data(), &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSrcSubKey, hDestSubKey;
+                if (RegOpenKeyExW(hSrcKey, subKeyName.data(), 0, KEY_READ, &hSrcSubKey) == ERROR_SUCCESS) {
+                    if (RegCreateKeyExW(hDestKey, subKeyName.data(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestSubKey, NULL) == ERROR_SUCCESS) {
+                        RecursiveRegCopyKey(hSrcSubKey, hDestSubKey);
+                        RegCloseKey(hDestSubKey);
+                    }
+                    RegCloseKey(hSrcSubKey);
                 }
-                RegCloseKey(hSrcSubKey);
             }
         }
     }
@@ -693,7 +690,7 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑
+// <-- [修改] 为子键名称枚举也使用动态缓冲区
 void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
@@ -701,8 +698,8 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
 
     write_wstring(L"[" + currentPath + L"]\r\n");
 
-    DWORD dwSubKeys, dwValues, maxValueNameLen, maxValueDataSize;
-    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, NULL, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL) != ERROR_SUCCESS) {
+    DWORD dwSubKeys, dwValues, dwMaxSubKeyLen, maxValueNameLen, maxValueDataSize;
+    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL) != ERROR_SUCCESS) {
         return;
     }
 
@@ -732,7 +729,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
             std::wstringstream wss;
             wss << displayName << L"=";
 
-            if (type == REG_SZ) { // <-- 修改点: 不再包含 REG_EXPAND_SZ
+            if (type == REG_SZ) {
                 std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), dataSize / sizeof(wchar_t));
                 if (!strValue.empty() && strValue.back() == L'\0') {
                     strValue.pop_back();
@@ -768,20 +765,22 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
     }
     write_wstring(L"\r\n");
 
-    for (DWORD i = 0; i < dwSubKeys; i++) {
-        wchar_t subKeyName[MAX_PATH];
-        DWORD subKeyNameSize = MAX_PATH;
-        if (RegEnumKeyExW(hKey, i, subKeyName, &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            HKEY hSubKey;
-            if (RegOpenKeyExW(hKey, subKeyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
-                RecursiveRegExport(hSubKey, currentPath + L"\\" + subKeyName, regFile);
-                RegCloseKey(hSubKey);
+    if (dwSubKeys > 0) {
+        std::vector<wchar_t> subKeyName(dwMaxSubKeyLen + 1);
+        for (DWORD i = 0; i < dwSubKeys; i++) {
+            DWORD subKeyNameSize = (DWORD)subKeyName.size();
+            if (RegEnumKeyExW(hKey, i, subKeyName.data(), &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSubKey;
+                if (RegOpenKeyExW(hKey, subKeyName.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                    RecursiveRegExport(hSubKey, currentPath + L"\\" + subKeyName.data(), regFile);
+                    RegCloseKey(hSubKey);
+                }
             }
         }
     }
 }
 
-// <-- [修改] 增强了根键名称解析，以同时支持缩写和完整名称
+// <-- [修改] 增强了根键名称解析 以同时支持缩写和完整名称
 bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
     HKEY hRootKey;
     std::wstring fullRootKeyStr;
@@ -2160,7 +2159,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) {
-                // <-- [修改] 修正了函数调用，移除了多余的第一个参数
+                // <-- [修改] 修正了函数调用 移除了多余的第一个参数
                 renamed = RenameRegistryKey(arg.hRootKey, arg.subKey, arg.backupName);
             } else {
                 renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
@@ -2300,7 +2299,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             }
             if (arg.backupCreated) {
                 if (arg.isKey) {
-                    // <-- [修改] 修正了函数调用，移除了多余的第一个参数
+                    // <-- [修改] 修正了函数调用 移除了多余的第一个参数
                     RenameRegistryKey(arg.hRootKey, arg.backupName, arg.subKey);
                 }
                 else {
