@@ -20,6 +20,8 @@
 #include <iomanip>
 #include <atlbase.h>
 #include <psapi.h>
+#include <locale>   // <-- 新增
+#include <codecvt>  // <-- 新增
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -664,18 +666,19 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [新增] 递归导出注册表项的API实现
-// <-- [修改] 递归导出注册表项的API实现，采用动态缓冲区
-void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::wofstream& regFile) {
-    regFile << L"[" << currentPath << L"]\r\n";
+// <-- [修改] 递归导出注册表项的API实现，采用动态缓冲区并直接写入二进制流
+void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+
+    write_wstring(L"[" + currentPath + L"]\r\n");
 
     DWORD dwSubKeys, dwValues, maxValueNameLen, maxValueDataSize;
-    // 1. 查询最大缓冲区大小
     if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, NULL, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL) != ERROR_SUCCESS) {
         return;
     }
 
-    // 2. 动态分配所需的最大缓冲区
     std::vector<wchar_t> valueName(maxValueNameLen + 1);
     std::vector<BYTE> data(maxValueDataSize);
 
@@ -684,16 +687,14 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::wofstre
         DWORD dataSize = (DWORD)data.size();
         DWORD type;
         
-        // 3. 使用动态缓冲区进行枚举
         if (RegEnumValueW(hKey, i, valueName.data(), &valueNameSize, NULL, &type, data.data(), &dataSize) == ERROR_SUCCESS) {
             std::wstring displayName = (valueNameSize == 0) ? L"@" : (L"\"" + std::wstring(valueName.data()) + L"\"");
-            regFile << displayName << L"=";
-
+            
             std::wstringstream wss;
+            wss << displayName << L"=";
+
             if (type == REG_SZ || type == REG_EXPAND_SZ) {
-                // 使用实际返回的大小来构造字符串，避免多余的空字符
                 std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), dataSize / sizeof(wchar_t));
-                // 移除末尾可能存在的空字符
                 if (!strValue.empty() && strValue.back() == L'\0') {
                     strValue.pop_back();
                 }
@@ -722,12 +723,12 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::wofstre
                     }
                 }
             }
-            regFile << wss.str() << L"\r\n";
+            wss << L"\r\n";
+            write_wstring(wss.str());
         }
     }
-    regFile << L"\r\n";
+    write_wstring(L"\r\n");
 
-    // 递归处理子项 (这部分逻辑无需修改)
     for (DWORD i = 0; i < dwSubKeys; i++) {
         wchar_t subKeyName[MAX_PATH];
         DWORD subKeyNameSize = MAX_PATH;
@@ -741,7 +742,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::wofstre
     }
 }
 
-// <-- [修改] 使用API重写ExportRegistryKey
+// <-- [修改] 使用API重写ExportRegistryKey，并手动处理UTF-16 LE BOM
 bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
     HKEY hRootKey;
     if (_wcsicmp(rootKeyStr.c_str(), L"HKEY_CURRENT_USER") == 0) hRootKey = HKEY_CURRENT_USER;
@@ -762,16 +763,21 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
         SHCreateDirectoryExW(NULL, dirPath, NULL);
     }
 
-    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) {
         RegCloseKey(hKeyToExport);
         return false;
     }
 
-    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
-    regFile << L'\uFEFF'; // BOM
+    // 手动写入UTF-16 LE BOM
+    regFile.put((char)0xFF);
+    regFile.put((char)0xFE);
 
-    regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+
+    write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     RecursiveRegExport(hKeyToExport, rootKeyStr + L"\\" + subKey, regFile);
 
     RegCloseKey(hKeyToExport);
@@ -779,6 +785,7 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     return true;
 }
 
+// <-- [修改] 手动处理UTF-16 LE BOM
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -802,21 +809,30 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         SHCreateDirectoryExW(NULL, dirPath, NULL);
     }
 
-    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
-    
-    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
-    regFile << L'\uFEFF'; // BOM
 
-    regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
-    regFile << L"[" << rootKeyStr << L"\\" << subKey << L"]\r\n";
+    // 手动写入UTF-16 LE BOM
+    regFile.put((char)0xFF);
+    regFile.put((char)0xFE);
+
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+
+    write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
+    write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
 
     std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
-    regFile << displayName << L"=";
-
+    
     std::wstringstream wss;
-    if (type == REG_SZ) {
-        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
+    wss << displayName << L"=";
+
+    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
+        if (!strValue.empty() && strValue.back() == L'\0') {
+            strValue.pop_back();
+        }
         std::wstring escapedStr;
         for (wchar_t c : strValue) {
             if (c == L'\\') escapedStr += L"\\\\";
@@ -852,7 +868,8 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
             }
         }
     }
-    regFile << wss.str() << L"\r\n";
+    wss << L"\r\n";
+    write_wstring(wss.str());
     regFile.close();
     return true;
 }
