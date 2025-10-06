@@ -21,6 +21,8 @@
 #include <atlbase.h>
 #include <psapi.h>
 #include <filesystem>
+#include <locale> // <-- [新增] 为修复codecvt问题
+#include <codecvt> // <-- [新增] 为修复codecvt问题
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -494,153 +496,9 @@ bool ExecuteProcess(const std::filesystem::path& path, const std::wstring& args,
 
 // --- Registry Helpers ---
 
-// <-- [新增] 递归删除注册表项的API实现
-LSTATUS RecursiveRegDeleteKey(HKEY hKeyParent, const wchar_t* subKeyName, REGSAM samDesired) {
-    HKEY hKey;
-    LSTATUS res = RegOpenKeyExW(hKeyParent, subKeyName, 0, KEY_ENUMERATE_SUB_KEYS | samDesired, &hKey);
-    if (res != ERROR_SUCCESS) {
-        if (res == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
-        return res;
-    }
-
-    wchar_t childKeyName[MAX_PATH];
-    DWORD childKeyNameSize = MAX_PATH;
-    while (RegEnumKeyExW(hKey, 0, childKeyName, &childKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-        res = RecursiveRegDeleteKey(hKey, childKeyName, samDesired);
-        if (res != ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return res;
-        }
-        childKeyNameSize = MAX_PATH;
-    }
-
-    RegCloseKey(hKey);
-    return RegDeleteKeyExW(hKeyParent, subKeyName, samDesired, 0);
-}
-
-// <-- [新增] 递归复制注册表项的API实现
-LSTATUS RecursiveRegCopyKey(HKEY hKeySrc, HKEY hKeyDest) {
-    DWORD dwValues, dwMaxValueNameLen, dwMaxValueDataLen;
-    RegQueryInfoKeyW(hKeyDest, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &dwMaxValueNameLen, &dwMaxValueDataLen, NULL, NULL);
-
-    // 复制所有值
-    std::vector<wchar_t> valueNameBuffer(dwMaxValueNameLen + 1);
-    std::vector<BYTE> dataBuffer(dwMaxValueDataLen);
-    for (DWORD i = 0; i < dwValues; ++i) {
-        DWORD valueNameLen = static_cast<DWORD>(valueNameBuffer.size());
-        DWORD dataLen = static_cast<DWORD>(dataBuffer.size());
-        DWORD type;
-        LSTATUS res = RegEnumValueW(hKeySrc, i, valueNameBuffer.data(), &valueNameLen, NULL, &type, dataBuffer.data(), &dataLen);
-        if (res == ERROR_SUCCESS) {
-            RegSetValueExW(hKeyDest, valueNameBuffer.data(), 0, type, dataBuffer.data(), dataLen);
-        }
-    }
-
-    // 递归复制所有子键
-    DWORD dwSubKeys, dwMaxSubKeyLen;
-    RegQueryInfoKeyW(hKeySrc, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL);
-    std::vector<wchar_t> subKeyNameBuffer(dwMaxSubKeyLen + 1);
-
-    for (DWORD i = 0; i < dwSubKeys; ++i) {
-        DWORD subKeyNameLen = static_cast<DWORD>(subKeyNameBuffer.size());
-        LSTATUS res = RegEnumKeyExW(hKeySrc, i, subKeyNameBuffer.data(), &subKeyNameLen, NULL, NULL, NULL, NULL);
-        if (res == ERROR_SUCCESS) {
-            HKEY hSubKeySrc, hSubKeyDest;
-            if (RegOpenKeyExW(hKeySrc, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKeySrc) == ERROR_SUCCESS) {
-                if (RegCreateKeyExW(hKeyDest, subKeyNameBuffer.data(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hSubKeyDest, NULL) == ERROR_SUCCESS) {
-                    RecursiveRegCopyKey(hSubKeySrc, hSubKeyDest);
-                    RegCloseKey(hSubKeyDest);
-                }
-                RegCloseKey(hSubKeySrc);
-            }
-        }
-    }
-    return ERROR_SUCCESS;
-}
-
-// <-- [新增] 将注册表值写入.reg文件的辅助函数
-bool WriteRegValueToFile(HKEY hKey, const std::wstring& valueName, std::wofstream& regFile) {
-    DWORD type, size = 0;
-    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
-        return false;
-    }
-    std::vector<BYTE> data(size);
-    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
-    regFile << displayName << L"=";
-
-    std::wstringstream wss;
-    if (type == REG_SZ || type == REG_EXPAND_SZ) {
-        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
-        std::wstring escapedStr;
-        for (wchar_t c : strValue) {
-            if (c == L'\\') escapedStr += L"\\\\";
-            else if (c == L'"') escapedStr += L"\\\"";
-            else escapedStr += c;
-        }
-        wss << L"\"" << escapedStr << L"\"";
-    } else if (type == REG_DWORD) {
-        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
-        wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
-    } else if (type == REG_QWORD) {
-        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
-        wss << L"hex(b):";
-        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
-        for (int i = 0; i < 8; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]) << (i < 7 ? L"," : L"");
-        }
-    } else { // REG_BINARY, REG_MULTI_SZ, etc.
-        wss << L"hex";
-        if (type == REG_EXPAND_SZ) wss << L"(2)";
-        else if (type == REG_MULTI_SZ) wss << L"(7)";
-        else if (type != REG_BINARY) wss << L"(" << type << L")";
-        wss << L":";
-        for (DWORD i = 0; i < size; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
-            if (i < size - 1) {
-                wss << L",";
-                if ((i + 1) % 38 == 0) wss << L"\\\r\n  ";
-            }
-        }
-    }
-    regFile << wss.str() << L"\r\n";
-    return true;
-}
-
-// <-- [新增] 递归导出注册表项的API实现
-bool RecursiveRegExportKey(HKEY hKey, const std::wstring& currentPath, std::wofstream& regFile) {
-    regFile << L"\r\n[" << currentPath << L"]\r\n";
-
-    DWORD cValues, cchMaxValue, cbMaxValueData;
-    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &cValues, &cchMaxValue, &cbMaxValueData, NULL, NULL);
-    
-    std::vector<wchar_t> valueNameBuffer(cchMaxValue + 1);
-    for (DWORD i = 0; i < cValues; i++) {
-        DWORD cchValue = static_cast<DWORD>(valueNameBuffer.size());
-        valueNameBuffer[0] = L'\0';
-        if (RegEnumValueW(hKey, i, valueNameBuffer.data(), &cchValue, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            WriteRegValueToFile(hKey, valueNameBuffer.data(), regFile);
-        }
-    }
-
-    DWORD cSubKeys, cchMaxSubKey;
-    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &cSubKeys, &cchMaxSubKey, NULL, NULL, NULL, NULL, NULL, NULL);
-    std::vector<wchar_t> subKeyNameBuffer(cchMaxSubKey + 1);
-
-    for (DWORD i = 0; i < cSubKeys; i++) {
-        DWORD cchSubKey = static_cast<DWORD>(subKeyNameBuffer.size());
-        if (RegEnumKeyExW(hKey, i, subKeyNameBuffer.data(), &cchSubKey, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-            HKEY hSubKey;
-            if (RegOpenKeyExW(hKey, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
-                RecursiveRegExportKey(hSubKey, currentPath + L"\\" + subKeyNameBuffer.data(), regFile);
-                RegCloseKey(hSubKey);
-            }
-        }
-    }
-    return true;
+namespace ActionHelpers {
+    // Forward declaration
+    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
 }
 
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
@@ -682,6 +540,43 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     return true;
 }
 
+LSTATUS RecursiveRegCopyKey(HKEY hKeySrc, HKEY hKeyDest) {
+    DWORD dwValues, dwMaxValueNameLen, dwMaxValueDataLen;
+    RegQueryInfoKeyW(hKeySrc, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &dwMaxValueNameLen, &dwMaxValueDataLen, NULL, NULL);
+
+    std::vector<wchar_t> valueNameBuffer(dwMaxValueNameLen + 1);
+    std::vector<BYTE> dataBuffer(dwMaxValueDataLen);
+    for (DWORD i = 0; i < dwValues; ++i) {
+        DWORD valueNameLen = static_cast<DWORD>(valueNameBuffer.size());
+        DWORD dataLen = static_cast<DWORD>(dataBuffer.size());
+        DWORD type;
+        LSTATUS res = RegEnumValueW(hKeySrc, i, valueNameBuffer.data(), &valueNameLen, NULL, &type, dataBuffer.data(), &dataLen);
+        if (res == ERROR_SUCCESS) {
+            RegSetValueExW(hKeyDest, valueNameBuffer.data(), 0, type, dataBuffer.data(), dataLen);
+        }
+    }
+
+    DWORD dwSubKeys, dwMaxSubKeyLen;
+    RegQueryInfoKeyW(hKeySrc, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL);
+    std::vector<wchar_t> subKeyNameBuffer(dwMaxSubKeyLen + 1);
+
+    for (DWORD i = 0; i < dwSubKeys; ++i) {
+        DWORD subKeyNameLen = static_cast<DWORD>(subKeyNameBuffer.size());
+        LSTATUS res = RegEnumKeyExW(hKeySrc, i, subKeyNameBuffer.data(), &subKeyNameLen, NULL, NULL, NULL, NULL);
+        if (res == ERROR_SUCCESS) {
+            HKEY hSubKeySrc, hSubKeyDest;
+            if (RegOpenKeyExW(hKeySrc, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKeySrc) == ERROR_SUCCESS) {
+                if (RegCreateKeyExW(hKeyDest, subKeyNameBuffer.data(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hSubKeyDest, NULL) == ERROR_SUCCESS) {
+                    RecursiveRegCopyKey(hSubKeySrc, hSubKeyDest);
+                    RegCloseKey(hSubKeyDest);
+                }
+                RegCloseKey(hSubKeySrc);
+            }
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
 bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
     HKEY hSrcKey, hDestKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey) != ERROR_SUCCESS) {
@@ -697,7 +592,6 @@ bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wst
     RegCloseKey(hSrcKey);
     RegCloseKey(hDestKey);
     
-    // The old helper is fine here as it calls our new recursive function
     ActionHelpers::DeleteRegistryKeyTree(hRootKey, subKey);
     return true;
 }
@@ -728,16 +622,103 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
+bool WriteRegValueToFile(HKEY hKey, const std::wstring& valueName, std::ofstream& regFile) {
+    DWORD type, size = 0;
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
+        return false;
+    }
+    std::vector<BYTE> data(size);
+    if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, data.data(), &size) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    std::wstringstream wss;
+    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
+    wss << displayName << L"=";
+
+    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
+        std::wstring escapedStr;
+        for (wchar_t c : strValue) {
+            if (c == L'\\') escapedStr += L"\\\\";
+            else if (c == L'"') escapedStr += L"\\\"";
+            else escapedStr += c;
+        }
+        wss << L"\"" << escapedStr << L"\"";
+    } else if (type == REG_DWORD) {
+        DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
+        wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
+    } else if (type == REG_QWORD) {
+        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
+        wss << L"hex(b):";
+        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
+        for (int i = 0; i < 8; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]) << (i < 7 ? L"," : L"");
+        }
+    } else { 
+        wss << L"hex";
+        if (type == REG_EXPAND_SZ) wss << L"(2)";
+        else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type != REG_BINARY) wss << L"(" << type << L")";
+        wss << L":";
+        for (DWORD i = 0; i < size; ++i) {
+            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            if (i < size - 1) {
+                wss << L",";
+                if ((i + 1) % 38 == 0) wss << L"\\\r\n  ";
+            }
+        }
+    }
+    wss << L"\r\n";
+    std::wstring line = wss.str();
+    regFile.write(reinterpret_cast<const char*>(line.c_str()), line.length() * sizeof(wchar_t));
+    return true;
+}
+
+bool RecursiveRegExportKey(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
+    std::wstring header = L"\r\n[" + currentPath + L"]\r\n";
+    regFile.write(reinterpret_cast<const char*>(header.c_str()), header.length() * sizeof(wchar_t));
+
+    DWORD cValues, cchMaxValue, cbMaxValueData;
+    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &cValues, &cchMaxValue, &cbMaxValueData, NULL, NULL);
+    
+    std::vector<wchar_t> valueNameBuffer(cchMaxValue + 1);
+    for (DWORD i = 0; i < cValues; i++) {
+        DWORD cchValue = static_cast<DWORD>(valueNameBuffer.size());
+        valueNameBuffer[0] = L'\0';
+        if (RegEnumValueW(hKey, i, valueNameBuffer.data(), &cchValue, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            WriteRegValueToFile(hKey, valueNameBuffer.data(), regFile);
+        }
+    }
+
+    DWORD cSubKeys, cchMaxSubKey;
+    RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &cSubKeys, &cchMaxSubKey, NULL, NULL, NULL, NULL, NULL, NULL);
+    std::vector<wchar_t> subKeyNameBuffer(cchMaxSubKey + 1);
+
+    for (DWORD i = 0; i < cSubKeys; i++) {
+        DWORD cchSubKey = static_cast<DWORD>(subKeyNameBuffer.size());
+        if (RegEnumKeyExW(hKey, i, subKeyNameBuffer.data(), &cchSubKey, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            HKEY hSubKey;
+            if (RegOpenKeyExW(hKey, subKeyNameBuffer.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                RecursiveRegExportKey(hSubKey, currentPath + L"\\" + subKeyNameBuffer.data(), regFile);
+                RegCloseKey(hSubKey);
+            }
+        }
+    }
+    return true;
+}
+
 bool ExportRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::filesystem::path& filePath) {
     if (filePath.has_parent_path()) {
         std::filesystem::create_directories(filePath.parent_path());
     }
 
-    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
 
-    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
-    regFile << L"Windows Registry Editor Version 5.00\r\n";
+    regFile.put((char)0xFF); regFile.put((char)0xFE);
+    std::wstring header = L"Windows Registry Editor Version 5.00\r\n";
+    regFile.write(reinterpret_cast<const char*>(header.c_str()), header.length() * sizeof(wchar_t));
 
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -754,12 +735,12 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         std::filesystem::create_directories(filePath.parent_path());
     }
 
-    std::wofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
     
-    regFile.imbue(std::locale(regFile.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::little_endian>));
-    regFile << L"Windows Registry Editor Version 5.00\r\n\r\n";
-    regFile << L"[" << rootKeyStr << L"\\" << subKey << L"]\r\n";
+    regFile.put((char)0xFF); regFile.put((char)0xFE);
+    std::wstring header = L"Windows Registry Editor Version 5.00\r\n\r\n[" + rootKeyStr + L"\\" + subKey + L"]\r\n";
+    regFile.write(reinterpret_cast<const char*>(header.c_str()), header.length() * sizeof(wchar_t));
 
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -785,6 +766,38 @@ bool ImportRegistryFile(const std::filesystem::path& filePath) {
 
 // Deletion and Action Helpers
 namespace ActionHelpers {
+
+    LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const wchar_t* subKeyName, REGSAM samDesired) {
+        HKEY hKey;
+        LSTATUS res = RegOpenKeyExW(hKeyParent, subKeyName, 0, KEY_ENUMERATE_SUB_KEYS | samDesired, &hKey);
+        if (res != ERROR_SUCCESS) {
+            if (res == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+            return res;
+        }
+
+        wchar_t childKeyName[MAX_PATH];
+        DWORD childKeyNameSize = MAX_PATH;
+        while (RegEnumKeyExW(hKey, 0, childKeyName, &childKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            res = RecursiveRegDeleteKey_Internal(hKey, childKeyName, samDesired);
+            if (res != ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                return res;
+            }
+            childKeyNameSize = MAX_PATH;
+        }
+
+        RegCloseKey(hKey);
+        return RegDeleteKeyExW(hKeyParent, subKeyName, samDesired, 0);
+    }
+
+    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
+        if (hRootKey == HKEY_LOCAL_MACHINE) {
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey.c_str(), KEY_WOW64_64KEY);
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey.c_str(), KEY_WOW64_32KEY);
+        } else {
+            RecursiveRegDeleteKey_Internal(hRootKey, subKey.c_str(), 0);
+        }
+    }
 
     void HandleKillProcess(const std::wstring& processPattern) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -836,15 +849,6 @@ namespace ActionHelpers {
                     std::filesystem::remove_all(entry.path());
                 }
             }
-        }
-    }
-
-    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
-        if (hRootKey == HKEY_LOCAL_MACHINE) {
-            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), KEY_WOW64_64KEY);
-            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), KEY_WOW64_32KEY);
-        } else {
-            RecursiveRegDeleteKey(hRootKey, subKey.c_str(), 0);
         }
     }
     
@@ -2638,7 +2642,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 while (!handlesToWaitOn.empty()) {
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
-                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
+                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsToIgnore);
                         if (!foundHandles.empty()) {
                             handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                         }
