@@ -666,7 +666,7 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [修改] 递归导出注册表项的API实现，采用动态缓冲区并直接写入二进制流
+// <-- [修改] 递归导出注册表项的API实现，现在会对值名称进行转义
 void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
@@ -679,16 +679,28 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
         return;
     }
 
-    std::vector<wchar_t> valueName(maxValueNameLen + 1);
+    std::vector<wchar_t> valueNameBuffer(maxValueNameLen + 1);
     std::vector<BYTE> data(maxValueDataSize);
 
     for (DWORD i = 0; i < dwValues; i++) {
-        DWORD valueNameSize = (DWORD)valueName.size();
+        DWORD valueNameSize = (DWORD)valueNameBuffer.size();
         DWORD dataSize = (DWORD)data.size();
         DWORD type;
         
-        if (RegEnumValueW(hKey, i, valueName.data(), &valueNameSize, NULL, &type, data.data(), &dataSize) == ERROR_SUCCESS) {
-            std::wstring displayName = (valueNameSize == 0) ? L"@" : (L"\"" + std::wstring(valueName.data()) + L"\"");
+        if (RegEnumValueW(hKey, i, valueNameBuffer.data(), &valueNameSize, NULL, &type, data.data(), &dataSize) == ERROR_SUCCESS) {
+            std::wstring valueName(valueNameBuffer.data());
+            std::wstring displayName;
+            if (valueName.empty()) {
+                displayName = L"@";
+            } else {
+                std::wstring escapedValueName;
+                for (wchar_t c : valueName) {
+                    if (c == L'\\') escapedValueName += L"\\\\";
+                    else if (c == L'"') escapedValueName += L"\\\"";
+                    else escapedValueName += c;
+                }
+                displayName = L"\"" + escapedValueName + L"\"";
+            }
             
             std::wstringstream wss;
             wss << displayName << L"=";
@@ -742,13 +754,15 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
     }
 }
 
-// <-- [修改] 使用API重写ExportRegistryKey，并手动处理UTF-16 LE BOM
+// <-- [修改] 增强了根键名称解析，以同时支持缩写和完整名称
 bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
     HKEY hRootKey;
-    if (_wcsicmp(rootKeyStr.c_str(), L"HKEY_CURRENT_USER") == 0) hRootKey = HKEY_CURRENT_USER;
-    else if (_wcsicmp(rootKeyStr.c_str(), L"HKEY_LOCAL_MACHINE") == 0) hRootKey = HKEY_LOCAL_MACHINE;
-    else if (_wcsicmp(rootKeyStr.c_str(), L"HKEY_CLASSES_ROOT") == 0) hRootKey = HKEY_CLASSES_ROOT;
-    else if (_wcsicmp(rootKeyStr.c_str(), L"HKEY_USERS") == 0) hRootKey = HKEY_USERS;
+    std::wstring fullRootKeyStr;
+    // 同时检查缩写和完整名称
+    if (_wcsicmp(rootKeyStr.c_str(), L"HKCU") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; fullRootKeyStr = L"HKEY_CURRENT_USER"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKLM") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; fullRootKeyStr = L"HKEY_LOCAL_MACHINE"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKCR") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; fullRootKeyStr = L"HKEY_CLASSES_ROOT"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKU") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_USERS") == 0) { hRootKey = HKEY_USERS; fullRootKeyStr = L"HKEY_USERS"; }
     else return false;
 
     HKEY hKeyToExport;
@@ -769,7 +783,6 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
         return false;
     }
 
-    // 手动写入UTF-16 LE BOM
     regFile.put((char)0xFF);
     regFile.put((char)0xFE);
 
@@ -778,14 +791,14 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     };
 
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
-    RecursiveRegExport(hKeyToExport, rootKeyStr + L"\\" + subKey, regFile);
+    RecursiveRegExport(hKeyToExport, fullRootKeyStr + L"\\" + subKey, regFile);
 
     RegCloseKey(hKeyToExport);
     regFile.close();
     return true;
 }
 
-// <-- [修改] 手动处理UTF-16 LE BOM
+// <-- [修改] 增加了对值名称中特殊字符的转义
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -811,8 +824,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
 
     std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
-
-    // 手动写入UTF-16 LE BOM
+    
     regFile.put((char)0xFF);
     regFile.put((char)0xFE);
 
@@ -823,7 +835,18 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
 
-    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
+    std::wstring displayName;
+    if (valueName.empty()) {
+        displayName = L"@";
+    } else {
+        std::wstring escapedValueName;
+        for (wchar_t c : valueName) {
+            if (c == L'\\') escapedValueName += L"\\\\";
+            else if (c == L'"') escapedValueName += L"\\\"";
+            else escapedValueName += c;
+        }
+        displayName = L"\"" + escapedValueName + L"\"";
+    }
     
     std::wstringstream wss;
     wss << displayName << L"=";
