@@ -2570,7 +2570,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::vector<wchar_t> commandLineBuffer(fullCommandLine.begin(), fullCommandLine.end());
     commandLineBuffer.push_back(0);
 
-    if (!CreateProcessW(NULL, commandLineBuffer.data(), NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
+    // <-- [修改] 使用更健壮的CreateProcessW调用方式
+    if (!CreateProcessW(data->absoluteAppPath.c_str(), commandLineBuffer.data(), NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
         MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath.wstring()).c_str(), L"启动错误", MB_ICONERROR);
     } else {
         std::vector<std::wstring> waitProcesses;
@@ -2632,7 +2633,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
             } else {
                 std::set<DWORD> trustedPids;
-                std::set<DWORD> pidsWeHaveWaitedFor; // <-- [修正] 重新声明
+                std::set<DWORD> pidsWeHaveWaitedFor;
                 std::vector<HANDLE> handlesToWaitOn;
 
                 trustedPids.insert(GetCurrentProcessId());
@@ -2642,7 +2643,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 while (!handlesToWaitOn.empty()) {
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
-                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor); // <-- [修正] 使用正确的变量名
+                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
                         if (!foundHandles.empty()) {
                             handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                         }
@@ -2660,7 +2661,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         if (handlesToWaitOn.empty()) {
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
-                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor); // <-- [修正] 使用正确的变量名
+                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
                                 if (!foundHandles.empty()) {
                                     handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                                 }
