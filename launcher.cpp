@@ -690,7 +690,7 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [修改] 为子键名称枚举也使用动态缓冲区
+// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑并统一了换行格式
 void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
@@ -749,13 +749,18 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                 wss << L"hex";
                 if (type == REG_EXPAND_SZ) wss << L"(2)";
                 else if (type == REG_MULTI_SZ) wss << L"(7)";
+                else if (type == REG_QWORD) wss << L"(b)";
                 else if (type != REG_BINARY) wss << L"(" << type << L")";
                 wss << L":";
+                
+                const size_t bytesPerLine = 25; // 与reg.exe格式接近
                 for (DWORD j = 0; j < dataSize; ++j) {
                     wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[j]);
                     if (j < dataSize - 1) {
                         wss << L",";
-                        if ((j + 1) % 38 == 0) wss << L"\\\r\n  ";
+                        if ((j + 1) % bytesPerLine == 0) {
+                            wss << L"\\\r\n  ";
+                        }
                     }
                 }
             }
@@ -824,7 +829,7 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     return true;
 }
 
-// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑
+// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑并统一了换行格式
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -877,7 +882,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     std::wstringstream wss;
     wss << displayName << L"=";
 
-    if (type == REG_SZ) { // <-- 修改点: 不再包含 REG_EXPAND_SZ
+    if (type == REG_SZ) {
         std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
         if (!strValue.empty() && strValue.back() == L'\0') {
             strValue.pop_back();
@@ -892,26 +897,20 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     } else if (type == REG_DWORD) {
         DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
         wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
-    } else if (type == REG_QWORD) {
-        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
-        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
-        wss << L"hex(b):";
-        for (int i = 0; i < 8; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
-            if (i < 7) wss << L",";
-        }
     } else {
         wss << L"hex";
         if (type == REG_EXPAND_SZ) wss << L"(2)";
         else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type == REG_QWORD) wss << L"(b)";
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
 
+        const size_t bytesPerLine = 25;
         for (DWORD i = 0; i < size; ++i) {
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
             if (i < size - 1) {
                 wss << L",";
-                if ((i + 1) % 38 == 0) {
+                if ((i + 1) % bytesPerLine == 0) {
                     wss << L"\\\r\n  ";
                 }
             }
@@ -1079,7 +1078,7 @@ namespace ActionHelpers {
         return (subKeyCount == 0 && valueCount == 0);
     }
 
-    // <-- [修改] 使用新的 WildcardMatch 函数
+    // <-- [修改] 使用动态缓冲区并替换为 WildcardMatch
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
         std::vector<std::wstring> pathSegments;
         std::wstringstream ss(subKeyPattern);
@@ -1120,11 +1119,17 @@ namespace ActionHelpers {
                     if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
                         continue;
                     }
-                    wchar_t keyName[256];
-                    DWORD keyNameSize = 256;
-                    for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
-                        if (WildcardMatch(keyName, patternSegment.c_str())) { // <-- 修改点
-                            foundSubKeys.insert(keyName);
+                    
+                    DWORD dwSubKeys, dwMaxSubKeyLen;
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
+                        for (DWORD i = 0; i < dwSubKeys; i++) {
+                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
+                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
+                                    foundSubKeys.insert(keyNameBuffer.data());
+                                }
+                            }
                         }
                     }
                     RegCloseKey(hKey);
@@ -1188,16 +1193,21 @@ namespace ActionHelpers {
             for (REGSAM view : viewsToSearch) {
                 HKEY hKey;
                 if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey) == ERROR_SUCCESS) {
-                    wchar_t valName[16383];
-                    DWORD valNameSize = 16383;
-                    DWORD i = 0;
-                    while (RegEnumValueW(hKey, i, valName, &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        if (WildcardMatch(valName, valuePattern.c_str())) { // <-- 修改点
-                            RegDeleteValueW(hKey, valName);
-                            valNameSize = 16383;
-                        } else {
-                            i++;
-                            valNameSize = 16383;
+                    DWORD dwValues, maxValueNameLen;
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &maxValueNameLen, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        std::vector<wchar_t> valNameBuffer(maxValueNameLen + 1);
+                        for (DWORD i = 0; i < dwValues; ) {
+                            DWORD valNameSize = (DWORD)valNameBuffer.size();
+                            if (RegEnumValueW(hKey, i, valNameBuffer.data(), &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                if (WildcardMatch(valNameBuffer.data(), valuePattern.c_str())) {
+                                    RegDeleteValueW(hKey, valNameBuffer.data());
+                                    // 删除后不递增i，因为列表会变化
+                                } else {
+                                    i++;
+                                }
+                            } else {
+                                i++; // 如果枚举失败，继续下一个
+                            }
                         }
                     }
                     RegCloseKey(hKey);
