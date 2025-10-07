@@ -753,14 +753,24 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                 else if (type != REG_BINARY) wss << L"(" << type << L")";
                 wss << L":";
                 
-                const size_t bytesPerLine = 25; // 与reg.exe格式接近
+                // <-- [最终修正] 基于总行长进行换行，与 reg.exe 行为一致
+                const size_t lineCharLimit = 78; // reg.exe 倾向于在80字符内换行
+                size_t currentLineLength = wss.str().length(); // 获取前缀长度
+
                 for (DWORD j = 0; j < dataSize; ++j) {
+                    // 检查在添加下一个字节前是否需要换行
+                    // 每个字节占用3个字符 "XX," (最后一个字节占2个)
+                    if (currentLineLength + 3 > lineCharLimit) {
+                        wss << L"\\\r\n  ";
+                        currentLineLength = 2; // 重置为新行的缩进长度
+                    }
+
                     wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[j]);
+                    currentLineLength += 2;
+
                     if (j < dataSize - 1) {
                         wss << L",";
-                        if ((j + 1) % bytesPerLine == 0) {
-                            wss << L"\\\r\n  ";
-                        }
+                        currentLineLength += 1;
                     }
                 }
             }
@@ -905,14 +915,23 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
 
-        const size_t bytesPerLine = 25;
+        // <-- [最终修正] 基于总行长进行换行，与 reg.exe 行为一致
+        const size_t lineCharLimit = 78; // reg.exe 倾向于在80字符内换行
+        size_t currentLineLength = wss.str().length(); // 获取前缀长度
+
         for (DWORD i = 0; i < size; ++i) {
+            // 检查在添加下一个字节前是否需要换行
+            if (currentLineLength + 3 > lineCharLimit) {
+                wss << L"\\\r\n  ";
+                currentLineLength = 2; // 重置为新行的缩进长度
+            }
+
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            currentLineLength += 2;
+
             if (i < size - 1) {
                 wss << L",";
-                if ((i + 1) % bytesPerLine == 0) {
-                    wss << L"\\\r\n  ";
-                }
+                currentLineLength += 1;
             }
         }
     }
