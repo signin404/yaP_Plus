@@ -1935,9 +1935,8 @@ VOID CALLBACK WinEventProc(
                     g_areProcessesSuspended = true;
                 }
             } else {
-                if (g_areProcessesSuspended) {
+                if (g_areProcessesSuspended.exchange(false)) {
                     SetAllProcessesState(*g_suspendProcesses, false);
-                    g_areProcessesSuspended = false;
                 }
             }
         }
@@ -1965,9 +1964,8 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
         UnhookWinEvent(hHook);
     }
 
-    if (g_areProcessesSuspended) {
+    if (g_areProcessesSuspended.exchange(false)) {
         SetAllProcessesState(*g_suspendProcesses, false);
-        g_areProcessesSuspended = false;
     }
 
     return 0;
