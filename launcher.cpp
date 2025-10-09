@@ -2008,8 +2008,8 @@ void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
     }
 }
 
-// <-- [新增] 生成带时间戳的文件/目录名
-std::wstring GetTimestampedName(const std::wstring& originalPath) {
+// <-- [修复] 生成带时间戳的文件/目录名
+std::wstring GetTimestampedName(const std::wstring& originalName) {
     SYSTEMTIME st;
     GetLocalTime(&st);
 
@@ -2021,35 +2021,50 @@ std::wstring GetTimestampedName(const std::wstring& originalPath) {
         << std::setw(2) << std::setfill(L'0') << st.wHour << L":"
         << std::setw(2) << std::setfill(L'0') << st.wMinute << L":"
         << std::setw(2) << std::setfill(L'0') << st.wSecond
-        << L"]" << PathFindFileNameW(originalPath.c_str());
+        << L"]" << originalName;
 
     return wss.str();
 }
 
-// <-- [新增] 非覆盖模式的目录备份
+// <-- [修复] 非覆盖模式的目录备份
 void PerformTimestampedDirectoryBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.sourcePath.c_str())) return;
 
-    // 确保目标容器目录存在
+    // 目标路径本身就是容器目录，确保它存在
     SHCreateDirectoryExW(NULL, entry.destPath.c_str(), NULL);
 
-    std::wstring timestampedDirName = GetTimestampedName(entry.sourcePath);
-    std::wstring finalDestPath = entry.destPath + L"\\" + timestampedDirName;
+    // 从源路径获取要备份的目录名
+    const wchar_t* sourceDirName = PathFindFileNameW(entry.sourcePath.c_str());
+    std::wstring timestampedDirName = GetTimestampedName(sourceDirName);
+    
+    // 构造最终的完整目标路径
+    wchar_t finalDestPath[MAX_PATH];
+    PathCombineW(finalDestPath, entry.destPath.c_str(), timestampedDirName.c_str());
 
     PerformFileSystemOperation(FO_COPY, entry.sourcePath, finalDestPath);
 }
 
-// <-- [新增] 非覆盖模式的文件备份
+// <-- [修复] 非覆盖模式的文件备份
 void PerformTimestampedFileBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.sourcePath.c_str())) return;
 
-    // 确保目标容器目录存在
-    SHCreateDirectoryExW(NULL, entry.destPath.c_str(), NULL);
+    // 从目标文件路径中提取容器目录
+    wchar_t destContainerDir[MAX_PATH];
+    wcscpy_s(destContainerDir, MAX_PATH, entry.destPath.c_str());
+    PathRemoveFileSpecW(destContainerDir);
 
-    std::wstring timestampedFileName = GetTimestampedName(entry.sourcePath);
-    std::wstring finalDestPath = entry.destPath + L"\\" + timestampedFileName;
+    // 确保容器目录存在
+    SHCreateDirectoryExW(NULL, destContainerDir, NULL);
 
-    CopyFileW(entry.sourcePath.c_str(), finalDestPath.c_str(), FALSE);
+    // 从目标文件路径中提取文件名
+    const wchar_t* destFileName = PathFindFileNameW(entry.destPath.c_str());
+    std::wstring timestampedFileName = GetTimestampedName(destFileName);
+
+    // 构造最终的完整目标路径
+    wchar_t finalDestPath[MAX_PATH];
+    PathCombineW(finalDestPath, destContainerDir, timestampedFileName.c_str());
+
+    CopyFileW(entry.sourcePath.c_str(), finalDestPath, FALSE);
 }
 
 
@@ -2057,7 +2072,6 @@ struct BackupThreadData {
     std::atomic<bool>* shouldStop;
     std::atomic<bool>* isWorking;
     int backupInterval;
-    // <-- [修改] 使用新的结构体
     std::vector<BackupEntry> backupDirs;
     std::vector<BackupEntry> backupFiles;
 };
