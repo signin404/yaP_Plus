@@ -20,6 +20,8 @@
 #include <iomanip>
 #include <atlbase.h>
 #include <psapi.h>
+#include <locale>
+#include <codecvt>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -29,6 +31,7 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "OleAut32.lib")
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Userenv.lib")
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -221,7 +224,7 @@ using ActionOpData = std::variant<
     RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
     CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp,
-    EnvVarOp 
+    EnvVarOp
 >;
 struct ActionOperation {
     ActionOpData data;
@@ -244,6 +247,13 @@ using BeforeOperationData = std::variant<
 >;
 struct BeforeOperation {
     BeforeOperationData data;
+};
+
+// <-- [新增] 备份条目的结构体
+struct BackupEntry {
+    std::wstring sourcePath;
+    std::wstring destPath;
+    bool overwrite = true; // 默认为覆盖 保持向后兼容
 };
 
 // Forward declarations for thread data structures
@@ -526,32 +536,36 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // --- Registry Helpers ---
 
-bool RunSimpleCommand(const std::wstring& command) {
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
+    const wchar_t* star_text = nullptr;
+    const wchar_t* star_pattern = nullptr;
 
-    std::vector<wchar_t> cmdBuffer(command.begin(), command.end());
-    cmdBuffer.push_back(0);
-
-    if (!CreateProcessW(NULL, cmdBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        return false;
+    while (*text) {
+        if (*pattern == L'*') {
+            star_pattern = pattern++;
+            star_text = text;
+        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+            pattern++;
+            text++;
+        } else if (star_pattern) {
+            pattern = star_pattern + 1;
+            text = ++star_text;
+        } else {
+            return false;
+        }
     }
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    while (*pattern == L'*') {
+        pattern++;
+    }
 
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return exitCode == 0;
+    return !*pattern;
 }
 
-// <-- [修改] 增强的注册表路径解析函数
+namespace ActionHelpers {
+    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
+}
+
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -560,7 +574,6 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
     std::wstring restOfPath = fullPath.substr(firstSlash + 1);
 
-    // 同时检查缩写和完整名称
     if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
     else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
     else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
@@ -592,20 +605,65 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
     return true;
 }
 
-bool RenameRegistryKey(const std::wstring& rootKeyStr, HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
-    std::wstring fullSourcePath = rootKeyStr + L"\\" + subKey;
-    std::wstring fullDestPath = rootKeyStr + L"\\" + newSubKey;
+LSTATUS RecursiveRegCopyKey(HKEY hSrcKey, HKEY hDestKey) {
+    DWORD dwSubKeys, dwValues, dwMaxSubKeyLen, maxValueNameLen, maxValueDataSize;
 
-    HKEY hKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+    LSTATUS status = RegQueryInfoKeyW(hSrcKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL);
+    if (status != ERROR_SUCCESS) {
+        return status;
+    }
+
+    std::vector<wchar_t> valueName(maxValueNameLen + 1);
+    std::vector<BYTE> data(maxValueDataSize);
+
+    for (DWORD i = 0; i < dwValues; i++) {
+        DWORD valueNameSize = (DWORD)valueName.size();
+        DWORD dataSize = (DWORD)data.size();
+        DWORD type;
+
+        status = RegEnumValueW(hSrcKey, i, valueName.data(), &valueNameSize, NULL, &type, data.data(), &dataSize);
+        if (status == ERROR_SUCCESS) {
+            RegSetValueExW(hDestKey, valueName.data(), 0, type, data.data(), dataSize);
+        }
+    }
+
+    if (dwSubKeys > 0) {
+        std::vector<wchar_t> subKeyName(dwMaxSubKeyLen + 1);
+        for (DWORD i = 0; i < dwSubKeys; i++) {
+            DWORD subKeyNameSize = (DWORD)subKeyName.size();
+            if (RegEnumKeyExW(hSrcKey, i, subKeyName.data(), &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSrcSubKey, hDestSubKey;
+                if (RegOpenKeyExW(hSrcKey, subKeyName.data(), 0, KEY_READ, &hSrcSubKey) == ERROR_SUCCESS) {
+                    if (RegCreateKeyExW(hDestKey, subKeyName.data(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestSubKey, NULL) == ERROR_SUCCESS) {
+                        RecursiveRegCopyKey(hSrcSubKey, hDestSubKey);
+                        RegCloseKey(hDestSubKey);
+                    }
+                    RegCloseKey(hSrcSubKey);
+                }
+            }
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
+bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
+    HKEY hSrcKey, hDestKey;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey) != ERROR_SUCCESS) {
         return false;
     }
-    RegCloseKey(hKey);
-
-    if (!RunSimpleCommand(L"reg copy \"" + fullSourcePath + L"\" \"" + fullDestPath + L"\" /s /f")) {
+    LSTATUS createStatus = RegCreateKeyExW(hRootKey, newSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestKey, NULL);
+    if (createStatus != ERROR_SUCCESS) {
+        RegCloseKey(hSrcKey);
         return false;
     }
-    return SHDeleteKeyW(hRootKey, subKey.c_str()) == ERROR_SUCCESS;
+
+    RecursiveRegCopyKey(hSrcKey, hDestKey);
+
+    RegCloseKey(hSrcKey);
+    RegCloseKey(hDestKey);
+
+    ActionHelpers::DeleteRegistryKeyTree(hRootKey, subKey);
+    return true;
 }
 
 bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName) {
@@ -634,7 +692,121 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
+void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+
+    write_wstring(L"[" + currentPath + L"]\r\n");
+
+    DWORD dwSubKeys, dwValues, dwMaxSubKeyLen, maxValueNameLen, maxValueDataSize;
+    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, &dwValues, &maxValueNameLen, &maxValueDataSize, NULL, NULL) != ERROR_SUCCESS) {
+        return;
+    }
+
+    std::vector<wchar_t> valueNameBuffer(maxValueNameLen + 1);
+    std::vector<BYTE> data(maxValueDataSize);
+
+    for (DWORD i = 0; i < dwValues; i++) {
+        DWORD valueNameSize = (DWORD)valueNameBuffer.size();
+        DWORD dataSize = (DWORD)data.size();
+        DWORD type;
+
+        if (RegEnumValueW(hKey, i, valueNameBuffer.data(), &valueNameSize, NULL, &type, data.data(), &dataSize) == ERROR_SUCCESS) {
+            std::wstring valueName(valueNameBuffer.data());
+            std::wstring displayName;
+            if (valueName.empty()) {
+                displayName = L"@";
+            } else {
+                std::wstring escapedValueName;
+                for (wchar_t c : valueName) {
+                    if (c == L'\\') escapedValueName += L"\\\\";
+                    else if (c == L'"') escapedValueName += L"\\\"";
+                    else escapedValueName += c;
+                }
+                displayName = L"\"" + escapedValueName + L"\"";
+            }
+
+            std::wstringstream wss;
+            wss << displayName << L"=";
+
+            if (type == REG_SZ) {
+                std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), dataSize / sizeof(wchar_t));
+                if (!strValue.empty() && strValue.back() == L'\0') {
+                    strValue.pop_back();
+                }
+
+                std::wstring escapedStr;
+                for (wchar_t c : strValue) {
+                    if (c == L'\\') escapedStr += L"\\\\";
+                    else if (c == L'"') escapedStr += L"\\\"";
+                    else escapedStr += c;
+                }
+                wss << L"\"" << escapedStr << L"\"";
+            } else if (type == REG_DWORD) {
+                DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
+                wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
+            } else {
+                wss << L"hex";
+                if (type == REG_EXPAND_SZ) wss << L"(2)";
+                else if (type == REG_MULTI_SZ) wss << L"(7)";
+                else if (type == REG_QWORD) wss << L"(b)";
+                else if (type != REG_BINARY) wss << L"(" << type << L")";
+                wss << L":";
+
+                const size_t lineCharLimit = 78;
+                size_t currentLineLength = wss.str().length();
+
+                for (DWORD j = 0; j < dataSize; ++j) {
+                    if (currentLineLength + 3 > lineCharLimit) {
+                        wss << L"\\\r\n  ";
+                        currentLineLength = 2;
+                    }
+
+                    wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[j]);
+                    currentLineLength += 2;
+
+                    if (j < dataSize - 1) {
+                        wss << L",";
+                        currentLineLength += 1;
+                    }
+                }
+            }
+            wss << L"\r\n";
+            write_wstring(wss.str());
+        }
+    }
+    write_wstring(L"\r\n");
+
+    if (dwSubKeys > 0) {
+        std::vector<wchar_t> subKeyName(dwMaxSubKeyLen + 1);
+        for (DWORD i = 0; i < dwSubKeys; i++) {
+            DWORD subKeyNameSize = (DWORD)subKeyName.size();
+            if (RegEnumKeyExW(hKey, i, subKeyName.data(), &subKeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSubKey;
+                if (RegOpenKeyExW(hKey, subKeyName.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
+                    RecursiveRegExport(hSubKey, currentPath + L"\\" + subKeyName.data(), regFile);
+                    RegCloseKey(hSubKey);
+                }
+            }
+        }
+    }
+}
+
 bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKey, const std::wstring& filePath) {
+    HKEY hRootKey;
+    std::wstring fullRootKeyStr;
+    if (_wcsicmp(rootKeyStr.c_str(), L"HKCU") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; fullRootKeyStr = L"HKEY_CURRENT_USER"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKLM") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; fullRootKeyStr = L"HKEY_LOCAL_MACHINE"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKCR") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; fullRootKeyStr = L"HKEY_CLASSES_ROOT"; }
+    else if (_wcsicmp(rootKeyStr.c_str(), L"HKU") == 0 || _wcsicmp(rootKeyStr.c_str(), L"HKEY_USERS") == 0) { hRootKey = HKEY_USERS; fullRootKeyStr = L"HKEY_USERS"; }
+    else return false;
+
+    HKEY hKeyToExport;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKeyToExport) != ERROR_SUCCESS) {
+        return false;
+    }
+
     wchar_t dirPath[MAX_PATH];
     wcscpy_s(dirPath, MAX_PATH, filePath.c_str());
     PathRemoveFileSpecW(dirPath);
@@ -642,8 +814,25 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
         SHCreateDirectoryExW(NULL, dirPath, NULL);
     }
 
-    std::wstring fullKeyPath = rootKeyStr + L"\\" + subKey;
-    return RunSimpleCommand(L"reg export \"" + fullKeyPath + L"\" \"" + filePath + L"\" /y");
+    std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
+    if (!regFile.is_open()) {
+        RegCloseKey(hKeyToExport);
+        return false;
+    }
+
+    regFile.put((char)0xFF);
+    regFile.put((char)0xFE);
+
+    auto write_wstring = [&](const std::wstring& s) {
+        regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
+    };
+
+    write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
+    RecursiveRegExport(hKeyToExport, fullRootKeyStr + L"\\" + subKey, regFile);
+
+    RegCloseKey(hKeyToExport);
+    regFile.close();
+    return true;
 }
 
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
@@ -672,22 +861,37 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     std::ofstream regFile(filePath, std::ios::binary | std::ios::trunc);
     if (!regFile.is_open()) return false;
 
+    regFile.put((char)0xFF);
+    regFile.put((char)0xFE);
+
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
     };
 
-    regFile.put((char)0xFF);
-    regFile.put((char)0xFE);
-
     write_wstring(L"Windows Registry Editor Version 5.00\r\n\r\n");
     write_wstring(L"[" + rootKeyStr + L"\\" + subKey + L"]\r\n");
 
-    std::wstring displayName = valueName.empty() ? L"@" : L"\"" + valueName + L"\"";
-    write_wstring(displayName + L"=");
+    std::wstring displayName;
+    if (valueName.empty()) {
+        displayName = L"@";
+    } else {
+        std::wstring escapedValueName;
+        for (wchar_t c : valueName) {
+            if (c == L'\\') escapedValueName += L"\\\\";
+            else if (c == L'"') escapedValueName += L"\\\"";
+            else escapedValueName += c;
+        }
+        displayName = L"\"" + escapedValueName + L"\"";
+    }
 
     std::wstringstream wss;
+    wss << displayName << L"=";
+
     if (type == REG_SZ) {
-        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()));
+        std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
+        if (!strValue.empty() && strValue.back() == L'\0') {
+            strValue.pop_back();
+        }
         std::wstring escapedStr;
         for (wchar_t c : strValue) {
             if (c == L'\\') escapedStr += L"\\\\";
@@ -698,33 +902,34 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     } else if (type == REG_DWORD) {
         DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
         wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
-    } else if (type == REG_QWORD) {
-        ULONGLONG qwordValue = *reinterpret_cast<ULONGLONG*>(data.data());
-        const BYTE* qwordBytes = reinterpret_cast<const BYTE*>(&qwordValue);
-        wss << L"hex(b):";
-        for (int i = 0; i < 8; ++i) {
-            wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(qwordBytes[i]);
-            if (i < 7) wss << L",";
-        }
     } else {
         wss << L"hex";
         if (type == REG_EXPAND_SZ) wss << L"(2)";
         else if (type == REG_MULTI_SZ) wss << L"(7)";
+        else if (type == REG_QWORD) wss << L"(b)";
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
 
+        const size_t lineCharLimit = 78;
+        size_t currentLineLength = wss.str().length();
+
         for (DWORD i = 0; i < size; ++i) {
+            if (currentLineLength + 3 > lineCharLimit) {
+                wss << L"\\\r\n  ";
+                currentLineLength = 2;
+            }
+
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
+            currentLineLength += 2;
+
             if (i < size - 1) {
                 wss << L",";
-                if ((i + 1) % 38 == 0) {
-                    wss << L"\\\r\n  ";
-                }
+                currentLineLength += 1;
             }
         }
     }
+    wss << L"\r\n";
     write_wstring(wss.str());
-    write_wstring(L"\r\n");
     regFile.close();
     return true;
 }
@@ -790,16 +995,16 @@ namespace ActionHelpers {
                 continue;
             }
 
-            if (PathMatchSpecW(findData.cFileName, filePattern)) {
+            if (WildcardMatch(findData.cFileName, filePattern)) {
                 std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
-                
+
                 DWORD attributes = GetFileAttributesW(fullPathToDelete.c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES) {
                     if (attributes & FILE_ATTRIBUTE_READONLY) {
                         SetFileAttributesW(fullPathToDelete.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
                     }
                 }
-                
+
                 DeleteFileW(fullPathToDelete.c_str());
             }
         } while (FindNextFileW(hFind, &findData));
@@ -825,7 +1030,7 @@ namespace ActionHelpers {
         }
         do {
             if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
-                if (PathMatchSpecW(findData.cFileName, patternPart.c_str())) {
+                if (WildcardMatch(findData.cFileName, patternPart.c_str())) {
                     std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
                     if (ifEmpty) {
                         if (PathIsDirectoryEmptyW(fullPath.c_str())) {
@@ -870,7 +1075,7 @@ namespace ActionHelpers {
             RecursiveRegDeleteKey_Internal(hRootKey, subKey, 0);
         }
     }
-    
+
     bool IsKeyEmptyInView(HKEY hRootKey, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_QUERY_VALUE | samAccess, &hKey) != ERROR_SUCCESS) {
@@ -923,16 +1128,22 @@ namespace ActionHelpers {
                     if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
                         continue;
                     }
-                    wchar_t keyName[256];
-                    DWORD keyNameSize = 256;
-                    for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
-                        if (PathMatchSpecW(keyName, patternSegment.c_str())) {
-                            foundSubKeys.insert(keyName);
+
+                    DWORD dwSubKeys, dwMaxSubKeyLen;
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
+                        for (DWORD i = 0; i < dwSubKeys; i++) {
+                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
+                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
+                                    foundSubKeys.insert(keyNameBuffer.data());
+                                }
+                            }
                         }
                     }
                     RegCloseKey(hKey);
                 }
-                
+
                 for(const auto& subKey : foundSubKeys) {
                     nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
                 }
@@ -990,16 +1201,20 @@ namespace ActionHelpers {
             for (REGSAM view : viewsToSearch) {
                 HKEY hKey;
                 if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey) == ERROR_SUCCESS) {
-                    wchar_t valName[16383];
-                    DWORD valNameSize = 16383;
-                    DWORD i = 0;
-                    while (RegEnumValueW(hKey, i, valName, &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        if (PathMatchSpecW(valName, valuePattern.c_str())) {
-                            RegDeleteValueW(hKey, valName);
-                            valNameSize = 16383;
-                        } else {
-                            i++;
-                            valNameSize = 16383;
+                    DWORD dwValues, maxValueNameLen;
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &maxValueNameLen, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        std::vector<wchar_t> valNameBuffer(maxValueNameLen + 1);
+                        for (DWORD i = 0; i < dwValues; ) {
+                            DWORD valNameSize = (DWORD)valNameBuffer.size();
+                            if (RegEnumValueW(hKey, i, valNameBuffer.data(), &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                if (WildcardMatch(valNameBuffer.data(), valuePattern.c_str())) {
+                                    RegDeleteValueW(hKey, valNameBuffer.data());
+                                } else {
+                                    i++;
+                                }
+                            } else {
+                                i++;
+                            }
                         }
                     }
                     RegCloseKey(hKey);
@@ -1434,7 +1649,7 @@ namespace ActionHelpers {
             std::wstring trimmed_line = trim(l);
 
             if (!trimmed_line.empty() && trimmed_line.front() == L'[' && trimmed_line.back() == L']') {
-                if (is_null_section) { 
+                if (is_null_section) {
                     in_target_section = false;
                 } else {
                     in_target_section = (_wcsicmp(trimmed_line.c_str(), search_section_header.c_str()) == 0);
@@ -1459,7 +1674,7 @@ namespace ActionHelpers {
                             --i;
                         }
                         key_found_and_handled = true;
-                        if (is_null_section) break; 
+                        if (is_null_section) break;
                     }
                 }
             }
@@ -1478,9 +1693,9 @@ namespace ActionHelpers {
                 }
                 if (section_line != -1) {
                     lines.insert(lines.begin() + section_line + 1, op.key + L"=" + op.value);
-                } else { 
+                } else {
                     if (!lines.empty() && !trim(lines.back()).empty()) {
-                        lines.push_back(L""); 
+                        lines.push_back(L"");
                     }
                     lines.push_back(search_section_header);
                     lines.push_back(op.key + L"=" + op.value);
@@ -1628,7 +1843,7 @@ std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<std::wstring>& p
                     if (hProcess) {
                         handles.push_back(hProcess);
                     }
-                    break; 
+                    break;
                 }
             }
         } while (Process32NextW(hSnapshot, &pe32));
@@ -1685,7 +1900,7 @@ struct MonitorThreadData {
 
 static std::vector<std::wstring>* g_suspendProcesses = nullptr;
 static std::wstring g_foregroundAppName;
-static bool g_areProcessesSuspended = false;
+static std::atomic<bool> g_areProcessesSuspended = false;
 
 VOID CALLBACK WinEventProc(
     HWINEVENTHOOK hWinEventHook,
@@ -1701,16 +1916,15 @@ VOID CALLBACK WinEventProc(
         GetWindowThreadProcessId(hwnd, &foregroundPid);
         if (foregroundPid > 0) {
             std::wstring foregroundProcessName = GetProcessNameByPid(foregroundPid);
-            
+
             if (_wcsicmp(foregroundProcessName.c_str(), g_foregroundAppName.c_str()) == 0) {
                 if (!g_areProcessesSuspended) {
                     SetAllProcessesState(*g_suspendProcesses, true);
                     g_areProcessesSuspended = true;
                 }
             } else {
-                if (g_areProcessesSuspended) {
+                if (g_areProcessesSuspended.exchange(false)) {
                     SetAllProcessesState(*g_suspendProcesses, false);
-                    g_areProcessesSuspended = false;
                 }
             }
         }
@@ -1719,7 +1933,7 @@ VOID CALLBACK WinEventProc(
 
 DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
     MonitorThreadData* data = static_cast<MonitorThreadData*>(lpParam);
-    
+
     g_suspendProcesses = &(data->suspendProcesses);
     g_foregroundAppName = data->foregroundAppName;
     g_areProcessesSuspended = false;
@@ -1734,28 +1948,40 @@ DWORD WINAPI ForegroundMonitorThread(LPVOID lpParam) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        
+
         UnhookWinEvent(hHook);
     }
 
-    if (g_areProcessesSuspended) {
+    if (g_areProcessesSuspended.exchange(false)) {
         SetAllProcessesState(*g_suspendProcesses, false);
-        g_areProcessesSuspended = false;
     }
 
     return 0;
 }
 
-std::pair<std::wstring, std::wstring> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
-    const std::wstring delimiter = L" :: ";
-    size_t separatorPos = entry.find(delimiter);
-    if (separatorPos == std::wstring::npos) return {};
-    std::wstring src = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(0, separatorPos)), variables), variables);
-    std::wstring dest = ResolveToAbsolutePath(ExpandVariables(trim(entry.substr(separatorPos + delimiter.length())), variables), variables);
-    if (dest.empty() || src.empty()) return {};
-    return {dest, src};
+// <-- [修改] 解析新的备份格式
+std::optional<BackupEntry> ParseBackupEntry(const std::wstring& entry, const std::map<std::wstring, std::wstring>& variables) {
+    auto parts = split_string(entry, L" :: ");
+    if (parts.size() < 2) {
+        return std::nullopt;
+    }
+
+    BackupEntry be;
+    be.sourcePath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
+    be.destPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
+
+    if (be.sourcePath.empty() || be.destPath.empty()) {
+        return std::nullopt;
+    }
+
+    if (parts.size() >= 3 && _wcsicmp(parts[2].c_str(), L"no overwrite") == 0) {
+        be.overwrite = false;
+    }
+
+    return be;
 }
 
+// 覆盖模式的备份 (旧行为)
 void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
     if (!PathFileExistsW(src.c_str())) return;
     std::wstring backupDest = dest + L"_Backup";
@@ -1768,6 +1994,7 @@ void PerformDirectoryBackup(const std::wstring& dest, const std::wstring& src) {
     }
 }
 
+// 覆盖模式的备份 (旧行为)
 void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
     if (!PathFileExistsW(src.c_str())) return;
     std::wstring backupDest = dest + L"_Backup";
@@ -1781,25 +2008,81 @@ void PerformFileBackup(const std::wstring& dest, const std::wstring& src) {
     }
 }
 
+// <-- [新增] 生成带时间戳的文件/目录名
+std::wstring GetTimestampedName(const std::wstring& originalPath) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    std::wstringstream wss;
+    wss << L"["
+        << std::setw(2) << std::setfill(L'0') << (st.wYear % 100) << L"."
+        << std::setw(2) << std::setfill(L'0') << st.wMonth << L"."
+        << std::setw(2) << std::setfill(L'0') << st.wDay << L"-"
+        << std::setw(2) << std::setfill(L'0') << st.wHour << L":"
+        << std::setw(2) << std::setfill(L'0') << st.wMinute << L":"
+        << std::setw(2) << std::setfill(L'0') << st.wSecond
+        << L"]" << PathFindFileNameW(originalPath.c_str());
+
+    return wss.str();
+}
+
+// <-- [新增] 非覆盖模式的目录备份
+void PerformTimestampedDirectoryBackup(const BackupEntry& entry) {
+    if (!PathFileExistsW(entry.sourcePath.c_str())) return;
+
+    // 确保目标容器目录存在
+    SHCreateDirectoryExW(NULL, entry.destPath.c_str(), NULL);
+
+    std::wstring timestampedDirName = GetTimestampedName(entry.sourcePath);
+    std::wstring finalDestPath = entry.destPath + L"\\" + timestampedDirName;
+
+    PerformFileSystemOperation(FO_COPY, entry.sourcePath, finalDestPath);
+}
+
+// <-- [新增] 非覆盖模式的文件备份
+void PerformTimestampedFileBackup(const BackupEntry& entry) {
+    if (!PathFileExistsW(entry.sourcePath.c_str())) return;
+
+    // 确保目标容器目录存在
+    SHCreateDirectoryExW(NULL, entry.destPath.c_str(), NULL);
+
+    std::wstring timestampedFileName = GetTimestampedName(entry.sourcePath);
+    std::wstring finalDestPath = entry.destPath + L"\\" + timestampedFileName;
+
+    CopyFileW(entry.sourcePath.c_str(), finalDestPath.c_str(), FALSE);
+}
+
+
 struct BackupThreadData {
     std::atomic<bool>* shouldStop;
     std::atomic<bool>* isWorking;
     int backupInterval;
-    std::vector<std::pair<std::wstring, std::wstring>> backupDirs;
-    std::vector<std::pair<std::wstring, std::wstring>> backupFiles;
+    // <-- [修改] 使用新的结构体
+    std::vector<BackupEntry> backupDirs;
+    std::vector<BackupEntry> backupFiles;
 };
 
+// <-- [修改] 更新工作线程以处理两种备份模式
 DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     BackupThreadData* data = static_cast<BackupThreadData*>(lpParam);
     while (!*(data->shouldStop)) {
         Sleep(data->backupInterval);
         if (*(data->shouldStop)) break;
         *(data->isWorking) = true;
-        for (const auto& pair : data->backupDirs) {
-            PerformDirectoryBackup(pair.first, pair.second);
+
+        for (const auto& entry : data->backupDirs) {
+            if (entry.overwrite) {
+                PerformDirectoryBackup(entry.destPath, entry.sourcePath);
+            } else {
+                PerformTimestampedDirectoryBackup(entry);
+            }
         }
-        for (const auto& pair : data->backupFiles) {
-            PerformFileBackup(pair.first, pair.second);
+        for (const auto& entry : data->backupFiles) {
+            if (entry.overwrite) {
+                PerformFileBackup(entry.destPath, entry.sourcePath);
+            } else {
+                PerformTimestampedFileBackup(entry);
+            }
         }
         *(data->isWorking) = false;
     }
@@ -1908,7 +2191,7 @@ void DeleteFirewallRule(const std::wstring& ruleName) {
         }
         VariantClear(&var);
     }
-    
+
     if (rulesToDelete > 0) {
         BSTR bstrRuleName = SysAllocString(ruleName.c_str());
         if (bstrRuleName) {
@@ -1961,9 +2244,8 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RegistryOp>) {
             bool renamed = false;
             if (arg.isKey) {
-                renamed = RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.subKey, arg.backupName);
+                renamed = RenameRegistryKey(arg.hRootKey, arg.subKey, arg.backupName);
             } else {
-                // <-- [修改] 修正了注册表值备份的逻辑
                 renamed = RenameRegistryValue(arg.hRootKey, arg.subKey, arg.valueName, arg.backupName);
             }
             if (renamed) {
@@ -1987,7 +2269,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         if (_wcsicmp(arg.traversalMode.c_str(), L"all") == 0) shouldLink = true;
                         else if (_wcsicmp(arg.traversalMode.c_str(), L"dir") == 0) shouldLink = isItemDirectory;
                         else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
-                        
+
                         if (arg.isHardlink && isItemDirectory) shouldLink = false;
 
                         if (shouldLink) {
@@ -2100,8 +2382,12 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 }
             }
             if (arg.backupCreated) {
-                if (arg.isKey) RenameRegistryKey(arg.rootKeyStr, arg.hRootKey, arg.backupName, arg.subKey);
-                else RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
+                if (arg.isKey) {
+                    RenameRegistryKey(arg.hRootKey, arg.backupName, arg.subKey);
+                }
+                else {
+                    RenameRegistryValue(arg.hRootKey, arg.subKey, arg.backupName, arg.valueName);
+                }
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
             if (arg.performMoveOnCleanup) {
@@ -2207,7 +2493,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             return DelayOp{_wtoi(value.c_str())};
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
             return KillProcessOp{value};
-        } 
+        }
         else if (_wcsicmp(key.c_str(), L"+file") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.empty() || parts[0].empty()) {
@@ -2217,7 +2503,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             CreateFileOp op;
             op.path = parts[0];
             op.overwrite = (parts.size() > 1) ? (_wcsicmp(parts[1].c_str(), L"overwrite") == 0) : false;
-            
+
             std::wstring formatStr = (parts.size() > 2) ? parts[2] : L"win";
             if (_wcsicmp(formatStr.c_str(), L"unix") == 0) op.format = TextFormat::Unix;
             else if (_wcsicmp(formatStr.c_str(), L"mac") == 0) op.format = TextFormat::Mac;
@@ -2231,12 +2517,12 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             else op.encoding = TextEncoding::UTF8;
 
             op.content = (parts.size() > 4) ? parts[4] : L"";
-            
+
             return op;
         }
         else if (_wcsicmp(key.c_str(), L"+regkey") == 0) {
             return CreateRegKeyOp{value};
-        } 
+        }
         else if (_wcsicmp(key.c_str(), L"+regvalue") == 0) {
             auto parts = split_string(value, delimiter);
             if (parts.size() >= 3) {
@@ -2280,10 +2566,10 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
                 return op;
             }
-        } 
+        }
         else if (_wcsicmp(key.c_str(), L"iniwrite") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() >= 2) { 
+            if (parts.size() >= 2) {
                 IniWriteOp op;
                 op.path = parts[0];
                 op.section = parts[1];
@@ -2299,7 +2585,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 if (parts.size() >= 3) {
                     op.deleteSection = false;
                     op.key = parts[2];
-                    op.value = (parts.size() > 3) ? parts[3] : L"null"; 
+                    op.value = (parts.size() > 3) ? parts[3] : L"null";
                     return op;
                 }
             }
@@ -2399,7 +2685,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     } else {
                         l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
                     }
-                    
+
                     if (l_op.isDirectory) {
                         if (l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
                         if (l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
@@ -2412,7 +2698,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                             l_op.performMoveOnCleanup = true;
                         }
                     }
-                    
+
                     beforeOp.data = l_op;
                     op_created = true;
                 }
@@ -2449,7 +2735,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 ro_op.targetPath = ResolveToAbsolutePath(ExpandVariables(value, variables), variables);
                 ro_op.backupPath = ro_op.targetPath + L"_Backup";
                 beforeOp.data = ro_op; op_created = true;
-            } 
+            }
             else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
                 FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
                 auto parts = split_string(value, delimiter);
@@ -2468,9 +2754,15 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     beforeOp.data = f_op; op_created = true;
                 }
             } else if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
-                backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
+                // <-- [修改] 使用新的解析函数
+                if (auto be = ParseBackupEntry(value, variables)) {
+                    backupData.backupDirs.push_back(*be);
+                }
             } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
-                backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
+                // <-- [修改] 使用新的解析函数
+                if (auto be = ParseBackupEntry(value, variables)) {
+                    backupData.backupFiles.push_back(*be);
+                }
             } else {
                 auto action_op = parse_action_op(key, value);
                 if (action_op) {
@@ -2647,18 +2939,17 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         return 1;
     }
 
-    // <-- [修改] 为工作线程初始化COM
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    STARTUPINFOW si; 
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si)); 
-    si.cb = sizeof(si); 
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
-    
+
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
     std::wstring fullCommandLine = L"\"" + data->absoluteAppPath + L"\" " + commandLine;
-    wchar_t commandLineBuffer[4096]; 
+    wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
     if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
@@ -2740,15 +3031,15 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         }
                         Sleep(50);
                     }
-                    
+
                     DWORD waitResult = WaitForMultipleObjects((DWORD)handlesToWaitOn.size(), handlesToWaitOn.data(), FALSE, INFINITE);
-                    
+
                     if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + handlesToWaitOn.size()) {
                         int index = waitResult - WAIT_OBJECT_0;
-                        
+
                         CloseHandle(handlesToWaitOn[index]);
                         handlesToWaitOn.erase(handlesToWaitOn.begin() + index);
-                        
+
                         if (handlesToWaitOn.empty()) {
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
@@ -2771,7 +3062,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 }
             }
         }
-        
+
         if (pi.hProcess) CloseHandle(pi.hProcess);
         if (pi.hThread) CloseHandle(pi.hThread);
     }
@@ -2780,7 +3071,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (data->hMonitorThreadId != 0) {
             PostThreadMessageW(data->hMonitorThreadId, WM_QUIT, 0, 0);
         }
-        WaitForSingleObject(data->hMonitorThread, 2000); 
+        WaitForSingleObject(data->hMonitorThread, 2000);
         CloseHandle(data->hMonitorThread);
         SetAllProcessesState(data->monitorData->suspendProcesses, false);
     }
@@ -2794,8 +3085,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables);
 
     DeleteFileW(data->tempFilePath.c_str());
-    
-    // <-- [修改] 释放工作线程的COM资源
+
     CoUninitialize();
     return 0;
 }
@@ -2864,14 +3154,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CoUninitialize();
             return 1;
         }
-        
+
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
         variables[L"EXEPATH"] = appDir;
-        
+
         const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
         if (appFilename) {
             variables[L"EXENAME"] = appFilename;
@@ -2995,7 +3285,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
                     ExecuteActionOperation(arg, variables);
-                } else { 
+                } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
                     shutdownOps.push_back(ssOp);
@@ -3046,7 +3336,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     }
                 }
             }
-            
+
             if (!monitorData.suspendProcesses.empty()) {
                 DWORD monitorThreadId = 0;
                 threadData.hMonitorThread = CreateThread(NULL, 0, ForegroundMonitorThread, &monitorData, 0, &monitorThreadId);
