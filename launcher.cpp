@@ -20,8 +20,8 @@
 #include <iomanip>
 #include <atlbase.h>
 #include <psapi.h>
-#include <locale>   // <-- 新增
-#include <codecvt>  // <-- 新增
+#include <locale>
+#include <codecvt>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -38,6 +38,7 @@ typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
+std::wstring g_originalPath;
 
 // --- Data Structures ---
 
@@ -2887,10 +2888,29 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         else if constexpr (std::is_same_v<T, EnvVarOp>) {
             std::wstring finalName = ExpandVariables(arg.name, variables);
             std::wstring finalValue = ExpandVariables(arg.value, variables);
-            if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
-                SetEnvironmentVariableW(finalName.c_str(), NULL);
+
+            // 检查变量名是否为 "Path"
+            if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+                // 特殊处理 Path 变量
+                if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
+                    // 如果设置为 "null" 则恢复为程序启动时的原始 Path
+                    SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
+                } else {
+                    // 否则 将新值追加到原始 Path 后面
+                    std::wstring newPath = g_originalPath;
+                    if (!newPath.empty() && newPath.back() != L';') {
+                        newPath += L';';
+                    }
+                    newPath += finalValue;
+                    SetEnvironmentVariableW(L"Path", newPath.c_str());
+                }
             } else {
-                SetEnvironmentVariableW(finalName.c_str(), finalValue.c_str());
+                // 对所有其他环境变量 保持原始的覆盖行为
+                if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
+                    SetEnvironmentVariableW(finalName.c_str(), NULL);
+                } else {
+                    SetEnvironmentVariableW(finalName.c_str(), finalValue.c_str());
+                }
             }
         }
     }, opData);
@@ -3106,6 +3126,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (hNtdll) {
         g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
         g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
+
+    // <-- [新增] 在程序开始时获取并存储原始的Path环境变量
+    DWORD pathSize = GetEnvironmentVariableW(L"Path", NULL, 0);
+    if (pathSize > 0) {
+        std::vector<wchar_t> pathBuffer(pathSize);
+        if (GetEnvironmentVariableW(L"Path", pathBuffer.data(), pathSize) > 0) {
+            g_originalPath = pathBuffer.data();
+        }
     }
 
     wchar_t launcherFullPath[MAX_PATH];
