@@ -1101,7 +1101,6 @@ namespace ActionHelpers {
         return (subKeyCount == 0 && valueCount == 0);
     }
 
-    // <-- [修改] 使用动态缓冲区并替换为 WildcardMatch
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
         std::vector<std::wstring> pathSegments;
         std::wstringstream ss(subKeyPattern);
@@ -1145,13 +1144,13 @@ namespace ActionHelpers {
                     wchar_t keyName[256];
                     DWORD keyNameSize = 256;
                     for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
-                        if (WildcardMatch(keyName, patternSegment.c_str())) { // <-- 修改点
+                        if (WildcardMatch(keyName, patternSegment.c_str())) {
                             foundSubKeys.insert(keyName);
                         }
                     }
                     RegCloseKey(hKey);
                 }
-                
+
                 for(const auto& subKey : foundSubKeys) {
                     nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
                 }
