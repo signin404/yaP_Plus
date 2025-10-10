@@ -1142,28 +1142,16 @@ namespace ActionHelpers {
                     if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
                         continue;
                     }
-
-                    DWORD dwMaxSubKeyLen;
-                    // 首先，获取最大子键长度以安全地创建动态缓冲区
-                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
-                        
-                        // 然后，使用旧版本中更可靠的循环方式，直接检查 RegEnumKeyExW 的返回值
-                        // 只要枚举成功就继续，而不是依赖预先获取的计数值
-                        for (DWORD i = 0; ; ++i) {
-                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
-                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
-                                break; // 当函数返回任何错误 (包括 ERROR_NO_MORE_ITEMS) 时，正确退出循环
-                            }
-                            
-                            if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
-                                foundSubKeys.insert(keyNameBuffer.data());
-                            }
+                    wchar_t keyName[256];
+                    DWORD keyNameSize = 256;
+                    for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyName, &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++, keyNameSize = 256) {
+                        if (WildcardMatch(keyName, patternSegment.c_str())) { // <-- 修改点
+                            foundSubKeys.insert(keyName);
                         }
                     }
                     RegCloseKey(hKey);
                 }
-
+                
                 for(const auto& subKey : foundSubKeys) {
                     nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
                 }
