@@ -691,7 +691,7 @@ bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     return true;
 }
 
-// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑并统一了换行格式
+// <-- [修改] 修正了 hex 值的导出换行逻辑 以精确匹配 reg.exe 的行为
 void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstream& regFile) {
     auto write_wstring = [&](const std::wstring& s) {
         regFile.write(reinterpret_cast<const char*>(s.c_str()), s.length() * sizeof(wchar_t));
@@ -754,16 +754,16 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                 else if (type != REG_BINARY) wss << L"(" << type << L")";
                 wss << L":";
 
-                // <-- [最终修正] 基于总行长进行换行 与 reg.exe 行为一致
-                const size_t lineCharLimit = 78; // reg.exe 倾向于在80字符内换行
-                size_t currentLineLength = wss.str().length(); // 获取前缀长度
+                // --- [核心修改] ---
+                const size_t MAX_LINE_LEN = 80;
+                size_t currentLineLength = wss.str().length();
 
                 for (DWORD j = 0; j < dataSize; ++j) {
-                    // 检查在添加下一个字节前是否需要换行
-                    // 每个字节占用3个字符 "XX," (最后一个字节占2个)
-                    if (currentLineLength + 3 > lineCharLimit) {
+                    size_t chars_for_this_byte = (j < dataSize - 1) ? 3 : 2; // "XX," or "XX"
+
+                    if (j > 0 && currentLineLength + chars_for_this_byte + 1 > MAX_LINE_LEN) {
                         wss << L"\\\r\n  ";
-                        currentLineLength = 2; // 重置为新行的缩进长度
+                        currentLineLength = 2;
                     }
 
                     wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[j]);
@@ -774,6 +774,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                         currentLineLength += 1;
                     }
                 }
+                // --- [核心修改结束] ---
             }
             wss << L"\r\n";
             write_wstring(wss.str());
@@ -840,7 +841,7 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     return true;
 }
 
-// <-- [修改] 修正了 REG_EXPAND_SZ 的导出逻辑并统一了换行格式
+// <-- [修改] 修正了 hex 值的导出换行逻辑 以精确匹配 reg.exe 的行为
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
     if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
@@ -916,15 +917,16 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         else if (type != REG_BINARY) wss << L"(" << type << L")";
         wss << L":";
 
-        // <-- [最终修正] 基于总行长进行换行 与 reg.exe 行为一致
-        const size_t lineCharLimit = 78; // reg.exe 倾向于在80字符内换行
-        size_t currentLineLength = wss.str().length(); // 获取前缀长度
+        // --- [核心修改] ---
+        const size_t MAX_LINE_LEN = 80;
+        size_t currentLineLength = wss.str().length();
 
         for (DWORD i = 0; i < size; ++i) {
-            // 检查在添加下一个字节前是否需要换行
-            if (currentLineLength + 3 > lineCharLimit) {
+            size_t chars_for_this_byte = (i < size - 1) ? 3 : 2; // "XX," or "XX"
+
+            if (i > 0 && currentLineLength + chars_for_this_byte + 1 > MAX_LINE_LEN) {
                 wss << L"\\\r\n  ";
-                currentLineLength = 2; // 重置为新行的缩进长度
+                currentLineLength = 2;
             }
 
             wss << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<int>(data[i]);
@@ -935,6 +937,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
                 currentLineLength += 1;
             }
         }
+        // --- [核心修改结束] ---
     }
     wss << L"\r\n";
     write_wstring(wss.str());
