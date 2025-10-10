@@ -2026,64 +2026,89 @@ std::wstring GetTimestampedName(const std::wstring& originalName) {
     return wss.str();
 }
 
-// <-- [修复] 非覆盖模式的目录备份
+// <-- [修复] 非覆盖模式的目录备份 (遵循 "复制再重命名" 逻辑)
 void PerformTimestampedDirectoryBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.sourcePath.c_str())) return;
 
-    // 1. 从源路径获取原始目录名 (例如 "Portable")
-    const wchar_t* sourceDirName = PathFindFileNameW(entry.sourcePath.c_str());
-    if (!sourceDirName || !*sourceDirName) {
-        sourceDirName = L"BackupDir"; // 提供一个备用名称
+    // --- 路径解析 ---
+    // 1. 源目录名 (例如 "Portable")
+    const wchar_t* sourceBaseName = PathFindFileNameW(entry.sourcePath.c_str());
+    if (!sourceBaseName || !*sourceBaseName) return;
+
+    // 2. 目标基础名 (例如 "Portable" 或 "123")
+    const wchar_t* destBaseName = PathFindFileNameW(entry.destPath.c_str());
+    if (!destBaseName || !*destBaseName) return;
+
+    // 3. 目标容器目录 (例如 "Data\#Backup")
+    wchar_t destContainerDir[MAX_PATH];
+    wcscpy_s(destContainerDir, MAX_PATH, entry.destPath.c_str());
+    PathRemoveFileSpecW(destContainerDir);
+    SHCreateDirectoryExW(NULL, destContainerDir, NULL);
+
+    // --- 步骤 1: 复制 ---
+    // 4. 构建一个临时的目标路径，使用源目录名 (例如 "Data\#Backup\Portable")
+    wchar_t intermediateDestPath[MAX_PATH];
+    PathCombineW(intermediateDestPath, destContainerDir, sourceBaseName);
+
+    // 如果上次操作失败留下了临时目录，先删除它
+    if (PathFileExistsW(intermediateDestPath)) {
+        PerformFileSystemOperation(FO_DELETE, intermediateDestPath);
     }
 
-    // 2. 创建带时间戳的目录名 (例如 "[25.04.08-06:16:44]Portable")
-    std::wstring timestampedDirName = GetTimestampedName(sourceDirName);
+    // 5. 将源目录完整复制到临时目标路径
+    PerformFileSystemOperation(FO_COPY, entry.sourcePath, intermediateDestPath);
 
-    // 3. 将时间戳目录名与目标容器路径结合 得到最终备份目录的完整路径
-    //    (例如 "Data\#Backup\Portable" + "\" + "[...]Portable")
-    wchar_t finalDestDir[MAX_PATH];
-    PathCombineW(finalDestDir, entry.destPath.c_str(), timestampedDirName.c_str());
+    // --- 步骤 2: 重命名 ---
+    // 6. 使用目标基础名创建带时间戳的最终名称 (例如 "[...时间...]123")
+    std::wstring timestampedFinalName = GetTimestampedName(destBaseName);
 
-    // 4. 创建这个最终的、带时间戳的目标目录
-    SHCreateDirectoryExW(NULL, finalDestDir, NULL);
+    // 7. 构建最终的目标路径 (例如 "Data\#Backup\[...时间...]123")
+    wchar_t finalDestPath[MAX_PATH];
+    PathCombineW(finalDestPath, destContainerDir, timestampedFinalName.c_str());
 
-    // 5. 准备源路径以复制其 *内容* (例如 "C:\Users\...\Portable\*")
-    std::wstring sourcePathContents = entry.sourcePath + L"\\*";
-    
-    // 6. 将源目录的内容复制到新创建的带时间戳的目录中
-    PerformFileSystemOperation(FO_COPY, sourcePathContents, finalDestDir);
+    // 8. 将临时目录重命名为最终的带时间戳的名称
+    MoveFileW(intermediateDestPath, finalDestPath);
 }
 
-// <-- [修复] 非覆盖模式的文件备份
+// <-- [修复] 非覆盖模式的文件备份 (遵循 "复制再重命名" 逻辑)
 void PerformTimestampedFileBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.sourcePath.c_str())) return;
 
-    // 1. 从源路径获取原始文件名 (例如 "Portable.ini")
-    const wchar_t* sourceFileName = PathFindFileNameW(entry.sourcePath.c_str());
-    if (!sourceFileName || !*sourceFileName) {
-        return; // 如果源没有文件名 则无法备份
-    }
+    // --- 路径解析 ---
+    // 1. 源文件名 (例如 "Portable.ini")
+    const wchar_t* sourceBaseName = PathFindFileNameW(entry.sourcePath.c_str());
+    if (!sourceBaseName || !*sourceBaseName) return;
 
-    // 2. 将目标路径视为容器目录如果它看起来像一个文件路径 则取其父目录
-    //    (例如 从 "Data\#Backup\Portable.ini" 获取 "Data\#Backup")
+    // 2. 目标基础名 (例如 "Portable.ini" 或 "qwe.ini")
+    const wchar_t* destBaseName = PathFindFileNameW(entry.destPath.c_str());
+    if (!destBaseName || !*destBaseName) return;
+
+    // 3. 目标容器目录 (例如 "Data\#Backup")
     wchar_t destContainerDir[MAX_PATH];
     wcscpy_s(destContainerDir, MAX_PATH, entry.destPath.c_str());
-    if (!PathIsDirectoryW(destContainerDir)) {
-        PathRemoveFileSpecW(destContainerDir);
-    }
-
-    // 3. 确保容器目录存在
+    PathRemoveFileSpecW(destContainerDir);
     SHCreateDirectoryExW(NULL, destContainerDir, NULL);
 
-    // 4. 使用源文件名创建带时间戳的文件名 (例如 "[25.04.08-06:16:44]Portable.ini")
-    std::wstring timestampedFileName = GetTimestampedName(sourceFileName);
+    // --- 步骤 1: 复制 ---
+    // 4. 构建一个临时的目标路径，使用源文件名 (例如 "Data\#Backup\Portable.ini")
+    wchar_t intermediateDestPath[MAX_PATH];
+    PathCombineW(intermediateDestPath, destContainerDir, sourceBaseName);
 
-    // 5. 将容器目录与带时间戳的文件名结合 得到最终备份文件的完整路径
-    wchar_t finalDestFile[MAX_PATH];
-    PathCombineW(finalDestFile, destContainerDir, timestampedFileName.c_str());
+    // 5. 将源文件复制到临时目标路径 (CopyFileW 会自动覆盖，这对于临时文件是OK的)
+    if (!CopyFileW(entry.sourcePath.c_str(), intermediateDestPath, FALSE)) {
+        return; // 如果复制失败，则中止
+    }
 
-    // 6. 复制文件
-    CopyFileW(entry.sourcePath.c_str(), finalDestFile, FALSE);
+    // --- 步骤 2: 重命名 ---
+    // 6. 使用目标基础名创建带时间戳的最终名称 (例如 "[...时间...]qwe.ini")
+    std::wstring timestampedFinalName = GetTimestampedName(destBaseName);
+
+    // 7. 构建最终的目标路径 (例如 "Data\#Backup\[...时间...]qwe.ini")
+    wchar_t finalDestPath[MAX_PATH];
+    PathCombineW(finalDestPath, destContainerDir, timestampedFinalName.c_str());
+
+    // 8. 将临时文件重命名为最终的带时间戳的名称
+    MoveFileW(intermediateDestPath, finalDestPath);
 }
 
 
