@@ -1920,10 +1920,9 @@ std::wstring GetTimestampString() {
     GetLocalTime(&st);
     std::wstringstream wss;
     wss << L"["
-        << std::setw(2) << std::setfill(L'0') << (st.wYear % 100) << L"."
-        << std::setw(2) << std::setfill(L'0') << st.wMonth << L"."
-        << std::setw(2) << std::setfill(L'0') << st.wDay
-        << L"]["
+        << st.wYear << L"-" // 使用4位数年份和连字符
+        << std::setw(2) << std::setfill(L'0') << st.wMonth << L"-"
+        << std::setw(2) << std::setfill(L'0') << st.wDay << L" " // 使用空格分隔日期和时间
         << std::setw(2) << std::setfill(L'0') << st.wHour << L"."
         << std::setw(2) << std::setfill(L'0') << st.wMinute
         << L"]";
