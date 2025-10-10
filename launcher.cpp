@@ -1103,11 +1103,12 @@ namespace ActionHelpers {
 
     // <-- [新增] FindMatchingRegKeys 的递归辅助函数
     void FindMatchingRegKeys_Recursive(
-        HKEY hParentKey,
+        HKEY hRoot,
         const std::vector<std::wstring>& segments,
         size_t segment_index,
         const std::wstring& current_path,
-        std::vector<std::wstring>& foundKeys
+        std::vector<std::wstring>& foundKeys,
+        REGSAM samAccess
     ) {
         if (segment_index >= segments.size()) {
             if (!current_path.empty()) {
@@ -1116,16 +1117,17 @@ namespace ActionHelpers {
             return;
         }
 
+        HKEY hParentKey;
+        if (RegOpenKeyExW(hRoot, current_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hParentKey) != ERROR_SUCCESS) {
+            return;
+        }
+
         const std::wstring& patternSegment = segments[segment_index];
         bool hasWildcard = (patternSegment.find(L'*') != std::wstring::npos || patternSegment.find(L'?') != std::wstring::npos);
 
         if (!hasWildcard) {
-            HKEY hNextKey;
-            if (RegOpenKeyExW(hParentKey, patternSegment.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, &hNextKey) == ERROR_SUCCESS) {
-                std::wstring next_path = current_path.empty() ? patternSegment : current_path + L"\\" + patternSegment;
-                FindMatchingRegKeys_Recursive(hNextKey, segments, segment_index + 1, next_path, foundKeys);
-                RegCloseKey(hNextKey);
-            }
+            std::wstring next_path = current_path.empty() ? patternSegment : current_path + L"\\" + patternSegment;
+            FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys, samAccess);
         } else {
             DWORD dwSubKeys = 0;
             DWORD dwMaxSubKeyLen = 0;
@@ -1135,73 +1137,57 @@ namespace ActionHelpers {
                     DWORD keyNameSize = (DWORD)keyNameBuffer.size();
                     if (RegEnumKeyExW(hParentKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
                         if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
-                            HKEY hNextKey;
-                            if (RegOpenKeyExW(hParentKey, keyNameBuffer.data(), 0, KEY_ENUMERATE_SUB_KEYS, &hNextKey) == ERROR_SUCCESS) {
-                                std::wstring matchedKeyName(keyNameBuffer.data());
-                                std::wstring next_path = current_path.empty() ? matchedKeyName : current_path + L"\\" + matchedKeyName;
-                                FindMatchingRegKeys_Recursive(hNextKey, segments, segment_index + 1, next_path, foundKeys);
-                                RegCloseKey(hNextKey);
-                            }
+                            std::wstring matchedKeyName(keyNameBuffer.data());
+                            std::wstring next_path = current_path.empty() ? matchedKeyName : current_path + L"\\" + matchedKeyName;
+                            FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys, samAccess);
                         }
                     }
                 }
             }
         }
+        RegCloseKey(hParentKey);
     }
 
     // <-- [修改] 重写 FindMatchingRegKeys 以使用新的递归实现
-    void FindMatchingRegKeys(const std::wstring& fullKeyPattern, std::vector<std::wstring>& foundKeys) {
-    HKEY hRootKey;
-    std::wstring rootKeyStr, subKeyPattern, valueName;
-    // 使用 ParseRegistryPath 仅用于安全地分离出根键
-    if (!ParseRegistryPath(fullKeyPattern, true, hRootKey, rootKeyStr, subKeyPattern, valueName)) {
-        return;
-    }
-
-    std::vector<std::wstring> pathSegments;
-    std::wstringstream ss(subKeyPattern);
-    std::wstring segment;
-    while(std::getline(ss, segment, L'\\')) {
-        if (!segment.empty()) {
-            pathSegments.push_back(segment);
+    void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
+        std::vector<std::wstring> pathSegments;
+        std::wstringstream ss(subKeyPattern);
+        std::wstring segment;
+        while(std::getline(ss, segment, L'\\')) {
+            if (!segment.empty()) {
+                pathSegments.push_back(segment);
+            }
         }
-    }
 
-    if (pathSegments.empty()) {
-        return;
-    }
+        if (pathSegments.empty()) {
+            return;
+        }
 
-    std::vector<REGSAM> viewsToSearch;
-    if (hRootKey == HKEY_LOCAL_MACHINE) {
-        viewsToSearch.push_back(KEY_WOW64_64KEY);
-        viewsToSearch.push_back(KEY_WOW64_32KEY);
-    } else {
-        viewsToSearch.push_back(0);
-    }
+        std::vector<REGSAM> viewsToSearch;
+        if (hRoot == HKEY_LOCAL_MACHINE) {
+            viewsToSearch.push_back(KEY_WOW64_64KEY);
+            viewsToSearch.push_back(KEY_WOW64_32KEY);
+        } else {
+            viewsToSearch.push_back(0);
+        }
 
-    std::set<std::wstring> uniqueKeys;
-    for (REGSAM view : viewsToSearch) {
-        HKEY hRootKeyWithView;
-        if (RegOpenKeyExW(hRootKey, L"", 0, KEY_ENUMERATE_SUB_KEYS | view, &hRootKeyWithView) == ERROR_SUCCESS) {
+        std::set<std::wstring> uniqueKeys;
+        for (REGSAM view : viewsToSearch) {
             std::vector<std::wstring> keysInView;
-            FindMatchingRegKeys_Recursive(hRootKeyWithView, pathSegments, 0, L"", keysInView);
+            FindMatchingRegKeys_Recursive(hRoot, pathSegments, 0, L"", keysInView, view);
             uniqueKeys.insert(keysInView.begin(), keysInView.end());
-            RegCloseKey(hRootKeyWithView);
         }
-    }
 
-    foundKeys.assign(uniqueKeys.begin(), uniqueKeys.end());
-	}
+        foundKeys.assign(uniqueKeys.begin(), uniqueKeys.end());
+    }
 
     void HandleDeleteRegKey(const std::wstring& keyPattern, bool ifEmpty) {
         HKEY hRootKey;
-        std::wstring rootKeyStr, subKey, valueName;
-        // 这一步现在仅用于获取根键 subKey 实际上不会被正确使用
-        if (!ParseRegistryPath(keyPattern, true, hRootKey, rootKeyStr, subKey, valueName)) return;
+        std::wstring rootKeyStr, subKeyPattern, valueName;
+        if (!ParseRegistryPath(keyPattern, true, hRootKey, rootKeyStr, subKeyPattern, valueName)) return;
 
         std::vector<std::wstring> keysToDelete;
-        // 直接将完整的模式传递给新的 FindMatchingRegKeys
-        FindMatchingRegKeys(keyPattern, keysToDelete);
+        FindMatchingRegKeys(hRootKey, subKeyPattern, keysToDelete);
 
         for (const auto& key : keysToDelete) {
             if (ifEmpty) {
@@ -1212,23 +1198,21 @@ namespace ActionHelpers {
                     if (IsKeyEmptyInView(hRootKey, key, 0)) RegDeleteKeyW(hRootKey, key.c_str());
                 }
             } else {
-                DeleteRegistryKeyTree(hRootKey, key.c_str());
+                DeleteRegistryKeyTree(hRootKey, key);
             }
         }
     }
 
     // <-- [修改] 使用新的 WildcardMatch 函数
     void HandleDeleteRegValue(const std::wstring& keyPattern, const std::wstring& valuePattern) {
-        std::vector<std::wstring> keysToSearch;
-        // 直接将完整的键模式传递给新的 FindMatchingRegKeys
-        FindMatchingRegKeys(keyPattern, keysToSearch);
-
         HKEY hRootKey;
-        std::wstring rootKeyStr, subKey, valueName;
-        if (!ParseRegistryPath(keyPattern, true, hRootKey, rootKeyStr, subKey, valueName)) return;
+        std::wstring rootKeyStr, subKeyPattern, valueName;
+        if (!ParseRegistryPath(keyPattern, true, hRootKey, rootKeyStr, subKeyPattern, valueName)) return;
+
+        std::vector<std::wstring> keysToSearch;
+        FindMatchingRegKeys(hRootKey, subKeyPattern, keysToSearch);
 
         for (const auto& keyPath : keysToSearch) {
-            // ... (此函数的其余部分保持不变)
             std::vector<REGSAM> viewsToSearch;
             if (hRootKey == HKEY_LOCAL_MACHINE) {
                 viewsToSearch.push_back(KEY_WOW64_64KEY);
@@ -1248,11 +1232,12 @@ namespace ActionHelpers {
                             if (RegEnumValueW(hKey, i, valNameBuffer.data(), &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
                                 if (WildcardMatch(valNameBuffer.data(), valuePattern.c_str())) {
                                     RegDeleteValueW(hKey, valNameBuffer.data());
+                                    // 删除后不递增i，因为列表会变化
                                 } else {
                                     i++;
                                 }
                             } else {
-                                i++;
+                                i++; // 如果枚举失败，继续下一个
                             }
                         }
                     }
