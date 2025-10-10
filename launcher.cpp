@@ -1143,16 +1143,19 @@ namespace ActionHelpers {
                         continue;
                     }
 
-                    DWORD dwSubKeys, dwMaxSubKeyLen;
-                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                    DWORD dwMaxSubKeyLen;
+                    // 首先 获取最大子键长度以安全地创建动态缓冲区
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
                         std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
-                        for (DWORD i = 0; i < dwSubKeys; i++) {
-                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
-                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                                if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
-                                    foundSubKeys.insert(keyNameBuffer.data());
-                                }
+                        DWORD keyNameSize = (DWORD)keyNameBuffer.size();
+
+                        // 然后 使用旧版本中更可靠的循环方式 直接检查 RegEnumKeyExW 的返回值
+                        for (DWORD i = 0; RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS; i++) {
+                            if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
+                                foundSubKeys.insert(keyNameBuffer.data());
                             }
+                            // 每次循环后重置缓冲区大小 因为 RegEnumKeyExW 会修改它
+                            keyNameSize = (DWORD)keyNameBuffer.size();
                         }
                     }
                     RegCloseKey(hKey);
