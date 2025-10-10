@@ -531,29 +531,30 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
 bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-    const wchar_t* star_text = nullptr;
-    const wchar_t* star_pattern = nullptr;
+    // 模式串走完了，当且仅当文本串也走完时，匹配成功
+    if (*pattern == L'\0') {
+        return *text == L'\0';
+    }
 
-    while (*text) {
-        if (*pattern == L'*') {
-            star_pattern = pattern++;
-            star_text = text;
-        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
-            pattern++;
-            text++;
-        } else if (star_pattern) {
-            pattern = star_pattern + 1;
-            text = ++star_text;
-        } else {
-            return false;
+    // 如果是星号，则进行两种尝试：
+    // 1. 星号匹配空字符串，模式串向后移动一位
+    // 2. 星号匹配一个字符，文本串向后移动一位，模式串不动
+    if (*pattern == L'*') {
+        // 如果星号是最后一个字符，则直接成功
+        if (*(pattern + 1) == L'\0') {
+            return true;
         }
+        // 尝试匹配 (text, pattern+1) 或 (text+1, pattern)
+        return (*text != L'\0' && WildcardMatch(text + 1, pattern)) || WildcardMatch(text, pattern + 1);
     }
 
-    while (*pattern == L'*') {
-        pattern++;
+    // 如果是问号或字符匹配，则文本串和模式串都向后移动一位
+    if (*text != L'\0' && (*pattern == L'?' || towlower(*pattern) == towlower(*text))) {
+        return WildcardMatch(text + 1, pattern + 1);
     }
 
-    return !*pattern;
+    // 其他所有情况均为不匹配
+    return false;
 }
 
 // Forward declaration for recursive delete
