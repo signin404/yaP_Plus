@@ -531,30 +531,29 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
 bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-    // 模式串走完了，当且仅当文本串也走完时，匹配成功
-    if (*pattern == L'\0') {
-        return *text == L'\0';
-    }
+    const wchar_t* star_text = nullptr;
+    const wchar_t* star_pattern = nullptr;
 
-    // 如果是星号，则进行两种尝试：
-    // 1. 星号匹配空字符串，模式串向后移动一位
-    // 2. 星号匹配一个字符，文本串向后移动一位，模式串不动
-    if (*pattern == L'*') {
-        // 如果星号是最后一个字符，则直接成功
-        if (*(pattern + 1) == L'\0') {
-            return true;
+    while (*text) {
+        if (*pattern == L'*') {
+            star_pattern = pattern++;
+            star_text = text;
+        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+            pattern++;
+            text++;
+        } else if (star_pattern) {
+            pattern = star_pattern + 1;
+            text = ++star_text;
+        } else {
+            return false;
         }
-        // 尝试匹配 (text, pattern+1) 或 (text+1, pattern)
-        return (*text != L'\0' && WildcardMatch(text + 1, pattern)) || WildcardMatch(text, pattern + 1);
     }
 
-    // 如果是问号或字符匹配，则文本串和模式串都向后移动一位
-    if (*text != L'\0' && (*pattern == L'?' || towlower(*pattern) == towlower(*text))) {
-        return WildcardMatch(text + 1, pattern + 1);
+    while (*pattern == L'*') {
+        pattern++;
     }
 
-    // 其他所有情况均为不匹配
-    return false;
+    return !*pattern;
 }
 
 // Forward declaration for recursive delete
@@ -1102,70 +1101,99 @@ namespace ActionHelpers {
         return (subKeyCount == 0 && valueCount == 0);
     }
 
-    // <-- [修改] 使用动态缓冲区并替换为 WildcardMatch
+    // <-- [新增] FindMatchingRegKeys 的递归辅助函数
+    void FindMatchingRegKeys_Recursive(
+        HKEY hRoot,
+        const std::vector<std::wstring>& segments,
+        size_t segment_index,
+        const std::wstring& current_path,
+        std::vector<std::wstring>& foundKeys
+    ) {
+        if (segment_index >= segments.size()) {
+            // 所有部分都已匹配 将当前路径添加到结果中
+            if (!current_path.empty()) {
+                foundKeys.push_back(current_path);
+            }
+            return;
+        }
+
+        const std::wstring& patternSegment = segments[segment_index];
+        bool hasWildcard = (patternSegment.find(L'*') != std::wstring::npos || patternSegment.find(L'?') != std::wstring::npos);
+
+        // 打开当前级别的父键以进行搜索
+        HKEY hParentKey;
+        if (RegOpenKeyExW(hRoot, current_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, &hParentKey) != ERROR_SUCCESS) {
+            return; // 父路径不存在或无法访问
+        }
+
+        if (!hasWildcard) {
+            // 如果没有通配符 只需验证路径是否存在并继续递归
+            HKEY hNextKey;
+            if (RegOpenKeyExW(hParentKey, patternSegment.c_str(), 0, KEY_READ, &hNextKey) == ERROR_SUCCESS) {
+                RegCloseKey(hNextKey);
+                std::wstring next_path = current_path.empty() ? patternSegment : current_path + L"\\" + patternSegment;
+                FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys);
+            }
+        } else {
+            // 如果有通配符 则枚举当前级别的所有子键
+            DWORD dwSubKeys, dwMaxSubKeyLen;
+            if (RegQueryInfoKeyW(hParentKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
+                for (DWORD i = 0; i < dwSubKeys; i++) {
+                    DWORD keyNameSize = (DWORD)keyNameBuffer.size();
+                    if (RegEnumKeyExW(hParentKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
+                            std::wstring matchedKeyName(keyNameBuffer.data());
+                            std::wstring next_path = current_path.empty() ? matchedKeyName : current_path + L"\\" + matchedKeyName;
+                            FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys);
+                        }
+                    }
+                }
+            }
+        }
+
+        RegCloseKey(hParentKey);
+    }
+
+    // <-- [修改] 重写 FindMatchingRegKeys 以使用新的递归实现
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
         std::vector<std::wstring> pathSegments;
         std::wstringstream ss(subKeyPattern);
         std::wstring segment;
         while(std::getline(ss, segment, L'\\')) {
-            pathSegments.push_back(segment);
-        }
-
-        std::vector<std::wstring> pathsToSearch;
-        pathsToSearch.push_back(L"");
-
-        for (const auto& patternSegment : pathSegments) {
-            std::vector<std::wstring> nextPathsToSearch;
-            bool hasWildcard = (patternSegment.find(L'*') != std::wstring::npos || patternSegment.find(L'?') != std::wstring::npos);
-
-            for (const auto& currentPath : pathsToSearch) {
-                if (!hasWildcard) {
-                    std::wstring nextPath = currentPath.empty() ? patternSegment : currentPath + L"\\" + patternSegment;
-                    HKEY hTempKey;
-                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
-                        nextPathsToSearch.push_back(nextPath);
-                        RegCloseKey(hTempKey);
-                    }
-                    continue;
-                }
-
-                std::set<std::wstring> foundSubKeys;
-                std::vector<REGSAM> viewsToSearch;
-                if (hRoot == HKEY_LOCAL_MACHINE) {
-                    viewsToSearch.push_back(KEY_WOW64_64KEY);
-                    viewsToSearch.push_back(KEY_WOW64_32KEY);
-                } else {
-                    viewsToSearch.push_back(0);
-                }
-
-                for (REGSAM view : viewsToSearch) {
-                    HKEY hKey;
-                    if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
-                        continue;
-                    }
-
-                    DWORD dwSubKeys, dwMaxSubKeyLen;
-                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
-                        for (DWORD i = 0; i < dwSubKeys; i++) {
-                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
-                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                                if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
-                                    foundSubKeys.insert(keyNameBuffer.data());
-                                }
-                            }
-                        }
-                    }
-                    RegCloseKey(hKey);
-                }
-
-                for(const auto& subKey : foundSubKeys) {
-                    nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
-                }
+            if (!segment.empty()) {
+                pathSegments.push_back(segment);
             }
-            pathsToSearch = nextPathsToSearch;
         }
-        foundKeys = pathsToSearch;
+
+        if (pathSegments.empty()) {
+            return;
+        }
+
+        // 同时为 64 位和 32 位视图查找（仅对 HKLM 有意义）
+        // 注意：递归函数本身不处理视图 我们在顶层调用它两次
+        if (hRoot == HKEY_LOCAL_MACHINE) {
+            std::vector<std::wstring> keys64, keys32;
+
+            // 查找 64 位视图 (这也会在 32 位系统上找到默认键)
+            FindMatchingRegKeys_Recursive(hRoot, pathSegments, 0, L"", keys64);
+
+            // 在 64 位系统上 额外查找 32 位视图
+            // (此代码段在新版 SDK 中可能需要调整 但逻辑上是为兼容性)
+            HKEY hRoot32;
+            if (RegOpenKeyExW(hRoot, L"", 0, KEY_READ | KEY_WOW64_32KEY, &hRoot32) == ERROR_SUCCESS) {
+                FindMatchingRegKeys_Recursive(hRoot32, pathSegments, 0, L"", keys32);
+                RegCloseKey(hRoot32);
+            }
+
+            // 合并并去重结果
+            std::set<std::wstring> uniqueKeys(keys64.begin(), keys64.end());
+            uniqueKeys.insert(keys32.begin(), keys32.end());
+            foundKeys.assign(uniqueKeys.begin(), uniqueKeys.end());
+
+        } else {
+            FindMatchingRegKeys_Recursive(hRoot, pathSegments, 0, L"", foundKeys);
+        }
     }
 
     void HandleDeleteRegKey(const std::wstring& keyPattern, bool ifEmpty) {
