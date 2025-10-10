@@ -1101,84 +1101,70 @@ namespace ActionHelpers {
         return (subKeyCount == 0 && valueCount == 0);
     }
 
-    // <-- [新增] FindMatchingRegKeys 的递归辅助函数
-    void FindMatchingRegKeys_Recursive(
-        HKEY hRoot,
-        const std::vector<std::wstring>& segments,
-        size_t segment_index,
-        const std::wstring& current_path,
-        std::vector<std::wstring>& foundKeys,
-        REGSAM samAccess
-    ) {
-        if (segment_index >= segments.size()) {
-            if (!current_path.empty()) {
-                foundKeys.push_back(current_path);
-            }
-            return;
-        }
-
-        HKEY hParentKey;
-        if (RegOpenKeyExW(hRoot, current_path.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hParentKey) != ERROR_SUCCESS) {
-            return;
-        }
-
-        const std::wstring& patternSegment = segments[segment_index];
-        bool hasWildcard = (patternSegment.find(L'*') != std::wstring::npos || patternSegment.find(L'?') != std::wstring::npos);
-
-        if (!hasWildcard) {
-            std::wstring next_path = current_path.empty() ? patternSegment : current_path + L"\\" + patternSegment;
-            FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys, samAccess);
-        } else {
-            DWORD dwSubKeys = 0;
-            DWORD dwMaxSubKeyLen = 0;
-            if (RegQueryInfoKeyW(hParentKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
-                for (DWORD i = 0; i < dwSubKeys; i++) {
-                    DWORD keyNameSize = (DWORD)keyNameBuffer.size();
-                    if (RegEnumKeyExW(hParentKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-                        if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
-                            std::wstring matchedKeyName(keyNameBuffer.data());
-                            std::wstring next_path = current_path.empty() ? matchedKeyName : current_path + L"\\" + matchedKeyName;
-                            FindMatchingRegKeys_Recursive(hRoot, segments, segment_index + 1, next_path, foundKeys, samAccess);
-                        }
-                    }
-                }
-            }
-        }
-        RegCloseKey(hParentKey);
-    }
-
-    // <-- [修改] 重写 FindMatchingRegKeys 以使用新的递归实现
+    // <-- [修改] 使用动态缓冲区并替换为 WildcardMatch
     void FindMatchingRegKeys(HKEY hRoot, const std::wstring& subKeyPattern, std::vector<std::wstring>& foundKeys) {
         std::vector<std::wstring> pathSegments;
         std::wstringstream ss(subKeyPattern);
         std::wstring segment;
         while(std::getline(ss, segment, L'\\')) {
-            if (!segment.empty()) {
-                pathSegments.push_back(segment);
+            pathSegments.push_back(segment);
+        }
+
+        std::vector<std::wstring> pathsToSearch;
+        pathsToSearch.push_back(L"");
+
+        for (const auto& patternSegment : pathSegments) {
+            std::vector<std::wstring> nextPathsToSearch;
+            bool hasWildcard = (patternSegment.find(L'*') != std::wstring::npos || patternSegment.find(L'?') != std::wstring::npos);
+
+            for (const auto& currentPath : pathsToSearch) {
+                if (!hasWildcard) {
+                    std::wstring nextPath = currentPath.empty() ? patternSegment : currentPath + L"\\" + patternSegment;
+                    HKEY hTempKey;
+                    if (RegOpenKeyExW(hRoot, nextPath.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
+                        nextPathsToSearch.push_back(nextPath);
+                        RegCloseKey(hTempKey);
+                    }
+                    continue;
+                }
+
+                std::set<std::wstring> foundSubKeys;
+                std::vector<REGSAM> viewsToSearch;
+                if (hRoot == HKEY_LOCAL_MACHINE) {
+                    viewsToSearch.push_back(KEY_WOW64_64KEY);
+                    viewsToSearch.push_back(KEY_WOW64_32KEY);
+                } else {
+                    viewsToSearch.push_back(0);
+                }
+
+                for (REGSAM view : viewsToSearch) {
+                    HKEY hKey;
+                    if (RegOpenKeyExW(hRoot, currentPath.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | view, &hKey) != ERROR_SUCCESS) {
+                        continue;
+                    }
+
+                    DWORD dwSubKeys, dwMaxSubKeyLen;
+                    if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, &dwSubKeys, &dwMaxSubKeyLen, NULL, NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                        std::vector<wchar_t> keyNameBuffer(dwMaxSubKeyLen + 1);
+                        for (DWORD i = 0; i < dwSubKeys; i++) {
+                            DWORD keyNameSize = (DWORD)keyNameBuffer.size();
+                            if (RegEnumKeyExW(hKey, i, keyNameBuffer.data(), &keyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                                if (WildcardMatch(keyNameBuffer.data(), patternSegment.c_str())) {
+                                    foundSubKeys.insert(keyNameBuffer.data());
+                                }
+                            }
+                        }
+                    }
+                    RegCloseKey(hKey);
+                }
+
+                for(const auto& subKey : foundSubKeys) {
+                    nextPathsToSearch.push_back(currentPath.empty() ? subKey : currentPath + L"\\" + subKey);
+                }
             }
+            pathsToSearch = nextPathsToSearch;
         }
-
-        if (pathSegments.empty()) {
-            return;
-        }
-
-        std::vector<REGSAM> viewsToSearch;
-        if (hRoot == HKEY_LOCAL_MACHINE) {
-            viewsToSearch.push_back(KEY_WOW64_64KEY);
-            viewsToSearch.push_back(KEY_WOW64_32KEY);
-        } else {
-            viewsToSearch.push_back(0);
-        }
-
-        std::set<std::wstring> uniqueKeys;
-        for (REGSAM view : viewsToSearch) {
-            std::vector<std::wstring> keysInView;
-            FindMatchingRegKeys_Recursive(hRoot, pathSegments, 0, L"", keysInView, view);
-            uniqueKeys.insert(keysInView.begin(), keysInView.end());
-        }
-
-        foundKeys.assign(uniqueKeys.begin(), uniqueKeys.end());
+        foundKeys = pathsToSearch;
     }
 
     void HandleDeleteRegKey(const std::wstring& keyPattern, bool ifEmpty) {
@@ -1192,13 +1178,19 @@ namespace ActionHelpers {
         for (const auto& key : keysToDelete) {
             if (ifEmpty) {
                 if (hRootKey == HKEY_LOCAL_MACHINE) {
-                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_64KEY)) RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
-                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_32KEY)) RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_64KEY)) {
+                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
+                    }
+                    if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_32KEY)) {
+                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                    }
                 } else {
-                    if (IsKeyEmptyInView(hRootKey, key, 0)) RegDeleteKeyW(hRootKey, key.c_str());
+                    if (IsKeyEmptyInView(hRootKey, key, 0)) {
+                        RegDeleteKeyW(hRootKey, key.c_str());
+                    }
                 }
             } else {
-                DeleteRegistryKeyTree(hRootKey, key);
+                DeleteRegistryKeyTree(hRootKey, key.c_str());
             }
         }
     }
@@ -1232,12 +1224,12 @@ namespace ActionHelpers {
                             if (RegEnumValueW(hKey, i, valNameBuffer.data(), &valNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
                                 if (WildcardMatch(valNameBuffer.data(), valuePattern.c_str())) {
                                     RegDeleteValueW(hKey, valNameBuffer.data());
-                                    // 删除后不递增i，因为列表会变化
+                                    // 删除后不递增i 因为列表会变化
                                 } else {
                                     i++;
                                 }
                             } else {
-                                i++; // 如果枚举失败，继续下一个
+                                i++; // 如果枚举失败 继续下一个
                             }
                         }
                     }
