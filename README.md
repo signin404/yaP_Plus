@@ -6,25 +6,16 @@ English | [中文](./README_zh-CN.md)
 Just copy and paste to create portable software.
 
 ## Feature
-- [x] Save directory  
-- [x] Delete directory  
-- [x] Restore directory  
-- [x] Copy/move directory  
-- [x] Save file  
-- [x] Delete file  
-- [x] Restore file  
-- [x] Copy/move file  
-- [x] Save registry key  
-- [x] Delete registry key  
-- [x] Restore registry key  
-- [x] Save registry value  
-- [x] Delete registry value  
-- [x] Restore registry value  
-- [x] Create directory  
-- [x] Create file  
-- [x] Create symbolic link  
-- [x] Create registry key  
-- [x] Create registry value  
+- [x] Save directory/file  
+- [x] Delete directory/file  
+- [x] Restore directory/file  
+- [x] Copy or move directory/file  
+- [x] Save registry key/value  
+- [x] Delete registry key/value  
+- [x] Restore registry key/value  
+- [x] Create directory/file  
+- [x] Create registry key/value  
+- [x] Create symbolic link
 - [x] Write INI  
 - [x] Text replacement  
 - [x] Line text replacement  
@@ -36,9 +27,8 @@ Just copy and paste to create portable software.
 - [x] Set directory/file attributes  
 - [x] Set command line  
 - [x] Set working directory  
-- [x] Set environment variables  
-- [x] Set user variables  
-- [x] String replacement for user/environment variables  
+- [x] Set up environment/user variables  
+- [x] Environment/user variable string replacement
 - [x] Delayed execution  
 - [x] Delayed automatic cleanup
 
