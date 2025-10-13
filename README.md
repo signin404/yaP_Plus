@@ -5,16 +5,55 @@ English | [中文](./README_zh-CN.md)
 
 Just copy and paste to create portable software.
 
-## New Feature
-* Unicode support
-* Wait for process
-* Scheduled backup
-* Create hard links
-* Create firewall rules
-* Hide console program window
-* Detect foreground and suspend background processes
-* File write format encoding detection
-* Exception exit solutions
+## Feature
+- [x] Save directory  
+- [x] Delete directory  
+- [x] Restore directory  
+- [x] Copy/move directory  
+- [x] Save file  
+- [x] Delete file  
+- [x] Restore file  
+- [x] Copy/move file  
+- [x] Save registry key  
+- [x] Delete registry key  
+- [x] Restore registry key  
+- [x] Save registry value  
+- [x] Delete registry value  
+- [x] Restore registry value  
+- [x] Create directory  
+- [x] Create file  
+- [x] Create symbolic link  
+- [x] Create registry key  
+- [x] Create registry value  
+- [x] Write INI  
+- [x] Text replacement  
+- [x] Line text replacement  
+- [x] Run file  
+- [x] Terminate process  
+- [x] Run multiple instances  
+- [x] Import registry  
+- [x] Register or unregister DLL  
+- [x] Set directory/file attributes  
+- [x] Set command line  
+- [x] Set working directory  
+- [x] Set environment variables  
+- [x] Set user variables  
+- [x] String replacement for user/environment variables  
+- [x] Delayed execution  
+- [x] Delayed automatic cleanup
+
+* Plus
+- [x] Unicode support
+- [x] Wait for process
+- [x] Scheduled backup
+- [x] Create hard links
+- [x] Create firewall rules
+- [x] Hide console program window
+- [x] Detect foreground and suspend background processes
+- [x] File write format encoding detection
+- [x] Exception exit solutions
+- [x] Full directory traversal with hard links
+- [x] Hard/Symbolic Link Single-Level Directory Traversal
 
 ## Unported Features
 * !admin
