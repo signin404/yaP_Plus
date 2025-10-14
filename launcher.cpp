@@ -147,6 +147,7 @@ struct DelayOp {
 
 struct KillProcessOp {
     std::wstring processPattern;
+	bool checkParentProcess = false;
 };
 
 enum class TextFormat { Win, Unix, Mac };
@@ -961,7 +962,7 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
-    void HandleKillProcess(const std::wstring& processPattern) {
+    void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
@@ -970,11 +971,24 @@ namespace ActionHelpers {
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (PathMatchSpecW(pe32.szExeFile, processPattern.c_str())) {
-                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                    if (hProcess) {
-                        TerminateProcess(hProcess, 0);
-                        CloseHandle(hProcess);
+                if (WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
+                    bool shouldTerminate = false;
+                    if (!op.checkParentProcess) {
+                        // 旧行为：不检查父进程 直接终止
+                        shouldTerminate = true;
+                    } else {
+                        // 新行为：检查父进程ID是否在受信任列表中
+                        if (trustedPids.count(pe32.th32ParentProcessID)) {
+                            shouldTerminate = true;
+                        }
+                    }
+
+                    if (shouldTerminate) {
+                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                        if (hProcess) {
+                            TerminateProcess(hProcess, 0);
+                            CloseHandle(hProcess);
+                        }
                     }
                 }
             } while (Process32NextW(hSnapshot, &pe32));
@@ -2508,7 +2522,15 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
             return DelayOp{_wtoi(value.c_str())};
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
-            return KillProcessOp{value};
+            auto parts = split_string(value, delimiter);
+            KillProcessOp op;
+            if (!parts.empty()) {
+                op.processPattern = parts[0];
+                if (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ppid") == 0) {
+                    op.checkParentProcess = true;
+                }
+            }
+            return op;
         }
         else if (_wcsicmp(key.c_str(), L"+file") == 0) {
             auto parts = split_string(value, delimiter);
@@ -2805,7 +2827,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables) {
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
@@ -2843,7 +2865,8 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
-            ActionHelpers::HandleKillProcess(ExpandVariables(arg.processPattern, variables));
+            // <-- [修改] 调用 HandleKillProcess 时传递 op 对象和 trustedPids
+            ActionHelpers::HandleKillProcess(arg, trustedPids);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
@@ -2919,7 +2942,8 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
 void PerformFullCleanup(
     std::vector<AfterOperation>& afterOps,
     std::vector<StartupShutdownOperation>& shutdownOps,
-    std::map<std::wstring, std::wstring>& variables
+    std::map<std::wstring, std::wstring>& variables,
+    const std::set<DWORD>& trustedPids
 ) {
     bool restoreMarkerFound = false;
     for (const auto& op : afterOps) {
@@ -2937,7 +2961,8 @@ void PerformFullCleanup(
                 }
             } else {
                 ActionOperation actionOp = std::get<ActionOperation>(op.data);
-                ExecuteActionOperation(actionOp.data, variables);
+                // <-- [修改] 调用 ExecuteActionOperation 时传递 trustedPids
+                ExecuteActionOperation(actionOp.data, variables, trustedPids);
             }
         }
     } else {
@@ -2946,7 +2971,8 @@ void PerformFullCleanup(
         }
         for (auto& op : afterOps) {
             ActionOperation actionOp = std::get<ActionOperation>(op.data);
-            ExecuteActionOperation(actionOp.data, variables);
+            // <-- [修改] 调用 ExecuteActionOperation 时传递 trustedPids
+            ExecuteActionOperation(actionOp.data, variables, trustedPids);
         }
     }
 }
@@ -2981,8 +3007,13 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
+    // <-- [新增] 声明用于存储最终受信任PID列表的集合
+    std::set<DWORD> finalTrustedPids;
+
     if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, 0, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
         MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+        // 即使启动失败 也要将启动器自身视为受信任进程以执行清理
+        finalTrustedPids.insert(GetCurrentProcessId());
     } else {
         std::vector<std::wstring> waitProcesses;
         std::wstringstream waitStream(data->iniContent);
@@ -3039,9 +3070,16 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                     Sleep(3000);
                 }
             }
+            // <-- [新增] 为多实例模式填充受信任PID列表
+            finalTrustedPids.insert(GetCurrentProcessId());
+            finalTrustedPids.insert(pi.dwProcessId);
+
         } else { // 单实例逻辑
             if (waitProcesses.empty()) {
                 WaitForSingleObject(pi.hProcess, INFINITE);
+                // <-- [新增] 为单实例（无等待）模式填充受信任PID列表
+                finalTrustedPids.insert(GetCurrentProcessId());
+                finalTrustedPids.insert(pi.dwProcessId);
             } else {
                 std::set<DWORD> trustedPids;
                 std::set<DWORD> pidsWeHaveWaitedFor;
@@ -3089,6 +3127,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         break;
                     }
                 }
+                // <-- [新增] 等待循环结束后 将其累积的PID列表赋给最终列表
+                finalTrustedPids = trustedPids;
             }
         }
 
@@ -3111,7 +3151,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         CloseHandle(data->hBackupThread);
     }
 
-    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables);
+    // <-- [修改] 调用 PerformFullCleanup 时传递 finalTrustedPids
+    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids);
 
     DeleteFileW(data->tempFilePath.c_str());
 
@@ -3288,7 +3329,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 }, op.data);
             }
 
-            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables);
+            // <-- [新增] 为崩溃恢复场景定义受信任的PID（仅限启动器自身）
+            std::set<DWORD> crashTrustedPids;
+            crashTrustedPids.insert(GetCurrentProcessId());
+
+            // <-- [修改] 调用 PerformFullCleanup 时传递 crashTrustedPids
+            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables, crashTrustedPids);
 
             std::wstring crashWaitStr = GetValueFromIniContent(iniContent, L"General", L"crashwait");
             int crashWaitTime = crashWaitStr.empty() ? 1000 : _wtoi(crashWaitStr.c_str());
@@ -3318,11 +3364,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             tempFile.close();
         }
 
+        // <-- [新增] 为 [Before] 阶段的操作定义受信任的PID（仅限启动器自身）
+        std::set<DWORD> beforeTrustedPids;
+        beforeTrustedPids.insert(GetCurrentProcessId());
+
         for (auto& op : beforeOps) {
             std::visit([&](auto& arg) {
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
-                    ExecuteActionOperation(arg, variables);
+                    // <-- [修改] 调用 ExecuteActionOperation 时传递 beforeTrustedPids
+                    ExecuteActionOperation(arg, variables, beforeTrustedPids);
                 } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
