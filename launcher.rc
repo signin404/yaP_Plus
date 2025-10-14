@@ -15,7 +15,7 @@ IDI_MAINICON ICON "icon.ico"
 // '1' 是这个版本信息资源的ID，通常设为1
 VS_VERSION_INFO VERSIONINFO
 // 文件版本（数字格式），供操作系统使用。格式：主版本, 次版本, 修订号, 内部版本号
-FILEVERSION     1, 4, 0, 0
+FILEVERSION     1, 4, 1, 0
 // 产品版本（数字格式），供操作系统使用。
 // PRODUCTVERSION  1, 0, 0, 0
 // 文件标志掩码，通常设置为 0x3f 表示所有标志都有效
@@ -47,7 +47,7 @@ BEGIN
             // VALUE "LegalCopyright",   "Copyright (C) 2025. All rights reserved." // 版权信息
             // VALUE "OriginalFilename", "yaP_Plus.exe"                      // 原始文件名
             VALUE "ProductName",      "yaP Plus"          // 产品名称
-            VALUE "ProductVersion",   "1.4"                               // 产品版本（字符串格式）
+            VALUE "ProductVersion",   "1.4.1"                               // 产品版本（字符串格式）
         END
     END
     // 变量信息块的开始，用于指定语言和代码页
