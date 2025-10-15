@@ -2619,7 +2619,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
             return DelayOp{_wtoi(value.c_str())};
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
-            // <-- [修改] 增强 killprocess 的解析逻辑以支持 "path" 关键字
             auto parts = split_string(value, delimiter);
             KillProcessOp op;
             if (parts.empty()) {
@@ -2633,13 +2632,15 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     op.checkParentProcess = true;
                 } else if (_wcsicmp(parts[1].c_str(), L"path") == 0) {
                     op.checkProcessPath = true;
+                    std::wstring rawPath;
                     if (parts.size() > 2 && !parts[2].empty()) {
-                        // 用户提供了路径 直接使用
-                        op.basePath = parts[2];
+                        rawPath = parts[2];
                     } else {
-                        // 用户未提供路径 使用默认的 {YAPROOT}
-                        op.basePath = L"{YAPROOT}";
+                        rawPath = L"{YAPROOT}";
                     }
+                    // --- [最终修正：在解析时立即展开变量] ---
+                    op.basePath = ExpandVariables(rawPath, variables);
+                    // --- [修正结束] ---
                 }
             }
             return op;
@@ -2977,16 +2978,14 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
-            // <-- [修改] 在调用前展开和解析 KillProcessOp 中的路径
-            // 创建一个可修改的副本
+            // --- [最终修正：移除冗余的变量展开] ---
+            // 变量已在解析时展开完毕 此处只需确保路径是绝对路径
             KillProcessOp final_op = arg;
-            // 仅当需要检查路径时 才展开变量
             if (final_op.checkProcessPath) {
-                // 确保 basePath 被正确地展开和解析为绝对路径
-                final_op.basePath = ResolveToAbsolutePath(ExpandVariables(final_op.basePath, variables), variables);
+                final_op.basePath = ResolveToAbsolutePath(final_op.basePath, variables);
             }
-            // 使用修正后的 final_op 调用处理函数
             ActionHelpers::HandleKillProcess(final_op, trustedPids);
+            // --- [修正结束] ---
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
