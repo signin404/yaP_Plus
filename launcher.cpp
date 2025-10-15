@@ -1011,11 +1011,10 @@ namespace ActionHelpers {
                             shouldTerminate = true;
                         }
                     } else if (op.checkProcessPath) {
-                        // 模式3: 检查进程路径 (使用纯 C++ 逻辑重写)
-                        // --- [核心修正逻辑] ---
+                        // 模式3: 检查进程路径
+                        // --- [核心修正] ---
                         std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         if (!processPath.empty() && !op.basePath.empty()) {
-                            // 方案: 使用更可靠的路径前缀匹配方法
                             // 1. 首先检查路径是否完全相同 (不区分大小写)
                             if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) == 0) {
                                 shouldTerminate = true;
@@ -1028,13 +1027,13 @@ namespace ActionHelpers {
                                 }
 
                                 // 检查进程路径是否以 "基础路径\" 开头 (不区分大小写)
-                                if (processPath.length() > basePathWithSlash.length() &&
+                                if (processPath.length() >= basePathWithSlash.length() &&
                                     _wcsnicmp(processPath.c_str(), basePathWithSlash.c_str(), basePathWithSlash.length()) == 0) {
                                     shouldTerminate = true;
                                 }
                             }
                         }
-                        // --- [核心修正逻辑结束] ---
+                        // --- [核心修正结束] ---
                     }
 
                     if (shouldTerminate) {
@@ -2935,12 +2934,15 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             // <-- [修改] 在调用前展开和解析 KillProcessOp 中的路径
-            KillProcessOp mutable_op = arg;
-            if (mutable_op.checkProcessPath) {
-                std::wstring expandedPath = ExpandVariables(mutable_op.basePath, variables);
-                mutable_op.basePath = ResolveToAbsolutePath(expandedPath, variables);
+            // 创建一个可修改的副本
+            KillProcessOp final_op = arg;
+            // 仅当需要检查路径时 才展开变量
+            if (final_op.checkProcessPath) {
+                // 确保 basePath 被正确地展开和解析为绝对路径
+                final_op.basePath = ResolveToAbsolutePath(ExpandVariables(final_op.basePath, variables), variables);
             }
-            ActionHelpers::HandleKillProcess(mutable_op, trustedPids);
+            // 使用修正后的 final_op 调用处理函数
+            ActionHelpers::HandleKillProcess(final_op, trustedPids);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
