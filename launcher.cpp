@@ -962,21 +962,21 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 
 // <-- [新增] 最终的、可靠的路径转换函数
 std::wstring ConvertDevicePathToDosPath(const std::wstring& path) {
-    // 如果路径不是以 "\Device\" 开头，则假定它已经是Win32路径或无法转换，直接返回
+    // 如果路径不是以 "\Device\" 开头 则假定它已经是Win32路径或无法转换 直接返回
     if (path.rfind(L"\\Device\\", 0) != 0) {
         return path;
     }
 
-    // 获取所有逻辑驱动器的字符串，格式为 "C:\<null>D:\<null>..."
+    // 获取所有逻辑驱动器的字符串 格式为 "C:\<null>D:\<null>..."
     wchar_t driveStrings[MAX_PATH];
     if (GetLogicalDriveStringsW(MAX_PATH, driveStrings) == 0) {
-        return path; // 获取失败，返回原始路径
+        return path; // 获取失败 返回原始路径
     }
 
     // 遍历每个驱动器
     wchar_t* pDrive = driveStrings;
     while (*pDrive) {
-        // 提取驱动器号，例如 "C:"
+        // 提取驱动器号 例如 "C:"
         std::wstring driveLetter = pDrive;
         driveLetter.pop_back(); // 移除末尾的 '\'
 
@@ -986,7 +986,7 @@ std::wstring ConvertDevicePathToDosPath(const std::wstring& path) {
             std::wstring ntDeviceName = deviceName;
             // 检查输入路径是否以这个NT设备名开头
             if (path.rfind(ntDeviceName, 0) == 0) {
-                // 如果是，则用驱动器号替换掉NT设备名部分，构造出Win32路径
+                // 如果是 则用驱动器号替换掉NT设备名部分 构造出Win32路径
                 return driveLetter + path.substr(ntDeviceName.length());
             }
         }
@@ -994,7 +994,7 @@ std::wstring ConvertDevicePathToDosPath(const std::wstring& path) {
         pDrive += wcslen(pDrive) + 1;
     }
 
-    // 如果遍历完所有驱动器都找不到匹配项，则返回原始路径
+    // 如果遍历完所有驱动器都找不到匹配项 则返回原始路径
     return path;
 }
 
@@ -1066,8 +1066,7 @@ namespace ActionHelpers {
                         // --- [最终修正：使用万能转换器确保路径格式统一] ---
                         std::wstring rawProcessPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         std::wstring processWin32Path = ConvertDevicePathToDosPath(rawProcessPath);
-                        // --- [修正结束] ---
-                        
+
                         if (processWin32Path.empty()) {
                             shouldTerminate = false;
                         }
@@ -2648,7 +2647,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     }
                     // --- [最终修正：在解析时立即展开变量] ---
                     op.basePath = ExpandVariables(rawPath, variables);
-                    // --- [修正结束] ---
                 }
             }
             return op;
@@ -2986,14 +2984,12 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
-            // --- [最终修正：移除冗余的变量展开] ---
             // 变量已在解析时展开完毕 此处只需确保路径是绝对路径
             KillProcessOp final_op = arg;
             if (final_op.checkProcessPath) {
                 final_op.basePath = ResolveToAbsolutePath(final_op.basePath, variables);
             }
             ActionHelpers::HandleKillProcess(final_op, trustedPids);
-            // --- [修正结束] ---
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
