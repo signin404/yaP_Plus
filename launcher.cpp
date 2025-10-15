@@ -960,31 +960,57 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
-// <-- [修改] 替换整个函数 使用 GetModuleFileNameExW 来获取 Win32 格式的路径
+// <-- [新增] 将Win32路径转换为NT设备路径的辅助函数
+std::wstring GetNtPath(const std::wstring& path) {
+    // 以非独占方式打开文件句柄
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return L""; // 如果文件不存在或无法打开 则返回空
+    }
+
+    // 准备一个缓冲区来接收路径
+    std::vector<wchar_t> buffer(MAX_PATH);
+    // 调用API获取NT格式的卷名路径
+    DWORD size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
+
+    // 如果缓冲区太小 则调整大小后重试
+    if (size > buffer.size()) {
+        buffer.resize(size);
+        size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
+    }
+
+    CloseHandle(hFile);
+
+    // 如果成功获取路径 则返回
+    if (size > 0 && size < buffer.size()) {
+        return std::wstring(buffer.data());
+    }
+
+    // 失败则返回空
+    return L"";
+}
+
+// <-- [新增] 获取进程完整路径的辅助函数 支持长路径
 std::wstring GetProcessFullPathByPid(DWORD pid) {
     if (pid == 0) return L"";
-    // GetModuleFileNameEx 需要 PROCESS_QUERY_INFORMATION 和 PROCESS_VM_READ
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (hProcess) {
         std::vector<wchar_t> buffer(MAX_PATH);
+        DWORD size = (DWORD)buffer.size();
+        // 循环以处理可能超过MAX_PATH的路径
         while (true) {
-            DWORD copied = GetModuleFileNameExW(hProcess, NULL, buffer.data(), (DWORD)buffer.size());
-            if (copied > 0) {
-                // 成功获取路径
-                if (copied < buffer.size()) {
-                    CloseHandle(hProcess);
-                    return std::wstring(buffer.data());
-                }
-                // 如果返回的大小等于缓冲区大小 可能路径被截断 需要扩大缓冲区
-                buffer.resize(buffer.size() * 2);
+            if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+                CloseHandle(hProcess);
+                return std::wstring(buffer.data());
             } else {
-                // 如果 GetLastError() 是 ERROR_INSUFFICIENT_BUFFER 循环会继续并扩大缓冲区
-                // 如果是其他错误 则失败
-                if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    size *= 2; // 如果缓冲区太小 则加倍
+                    buffer.resize(size);
+                } else {
+                    // 因其他错误失败
                     CloseHandle(hProcess);
                     return L"";
                 }
-                buffer.resize(buffer.size() * 2);
             }
         }
     }
@@ -998,43 +1024,66 @@ namespace ActionHelpers {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
+        // 在循环开始前 将INI中的Win32路径转换为NT设备路径
+        std::wstring ntBasePath;
+        if (op.checkProcessPath && !op.basePath.empty()) {
+            ntBasePath = GetNtPath(op.basePath);
+        }
+
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
-                    bool shouldTerminate = false;
+                // 1. 基础过滤器: 进程名必须匹配
+                if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
+                    continue;
+                }
 
-                    if (!op.checkParentProcess && !op.checkProcessPath) {
-                        // 模式1: 默认行为 仅按名称终止
-                        shouldTerminate = true;
-                    } else if (op.checkParentProcess) {
-                        // 模式2: 检查父进程ID
-                        if (trustedPids.count(pe32.th32ParentProcessID)) {
-                            shouldTerminate = true;
-                        }
-                    } else if (op.checkProcessPath) {
-                        // 模式3: 检查进程路径
-                        std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-                        if (!processPath.empty() && !op.basePath.empty()) {
-                            // 执行不区分大小写的 "starts with" 检查
-                            if (processPath.length() >= op.basePath.length()) {
-                                if (_wcsnicmp(processPath.c_str(), op.basePath.c_str(), op.basePath.length()) == 0) {
-                                    shouldTerminate = true;
-                                }
-                            }
-                        }
-                    }
+                // 2. 默认应该终止 除非有过滤器阻止
+                bool shouldTerminate = true;
 
-                    if (shouldTerminate) {
-                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                        if (hProcess) {
-                            TerminateProcess(hProcess, 0);
-                            CloseHandle(hProcess);
-                        }
+                // 3. 附加过滤器: 检查父进程ID (如果启用)
+                if (op.checkParentProcess) {
+                    if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
+                        shouldTerminate = false;
                     }
                 }
+
+                // 4. 附加过滤器: 检查进程路径 (如果启用且上一过滤器未否决)
+                if (shouldTerminate && op.checkProcessPath) {
+                    // --- [最终修改：恢复为子目录前缀匹配模式] ---
+                    if (ntBasePath.empty()) {
+                        shouldTerminate = false;
+                    } else {
+                        // 获取进程的NT路径
+                        std::wstring processNtPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                        
+                        // 规范化基础路径 确保以'\'结尾 以正确匹配子目录
+                        std::wstring normalizedNtBasePath = ntBasePath;
+                        if (normalizedNtBasePath.back() != L'\\') {
+                            normalizedNtBasePath += L'\\';
+                        }
+
+                        // 检查进程路径是否足够长 并且是否以规范化的基础路径开头 (不区分大小写)
+                        if (processNtPath.length() < normalizedNtBasePath.length() ||
+                            _wcsnicmp(processNtPath.c_str(), normalizedNtBasePath.c_str(), normalizedNtBasePath.length()) != 0) {
+                            // 如果不是 则不终止
+                            shouldTerminate = false;
+                        }
+                    }
+                    // --- [修改结束] ---
+                }
+
+                // 5. 如果所有检查都通过了 则执行终止操作
+                if (shouldTerminate) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                    }
+                }
+
             } while (Process32NextW(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
@@ -2572,7 +2621,9 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             if (parts.empty()) {
                 return std::nullopt;
             }
+
             op.processPattern = parts[0];
+
             if (parts.size() > 1) {
                 if (_wcsicmp(parts[1].c_str(), L"ppid") == 0) {
                     op.checkParentProcess = true;
@@ -2923,12 +2974,15 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
             // <-- [修改] 在调用前展开和解析 KillProcessOp 中的路径
-            KillProcessOp mutable_op = arg;
-            if (mutable_op.checkProcessPath) {
-                std::wstring expandedPath = ExpandVariables(mutable_op.basePath, variables);
-                mutable_op.basePath = ResolveToAbsolutePath(expandedPath, variables);
+            // 创建一个可修改的副本
+            KillProcessOp final_op = arg;
+            // 仅当需要检查路径时 才展开变量
+            if (final_op.checkProcessPath) {
+                // 确保 basePath 被正确地展开和解析为绝对路径
+                final_op.basePath = ResolveToAbsolutePath(ExpandVariables(final_op.basePath, variables), variables);
             }
-            ActionHelpers::HandleKillProcess(mutable_op, trustedPids);
+            // 使用修正后的 final_op 调用处理函数
+            ActionHelpers::HandleKillProcess(final_op, trustedPids);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
