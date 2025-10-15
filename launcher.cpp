@@ -963,7 +963,7 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 // <-- [新增] 将Win32路径转换为NT设备路径的辅助函数
 std::wstring GetNtPath(const std::wstring& path) {
     // 以非独占方式打开文件句柄
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
         return L""; // 如果文件不存在或无法打开 则返回空
     }
