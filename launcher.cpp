@@ -999,12 +999,9 @@ namespace ActionHelpers {
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                // --- [核心修正逻辑] ---
-                // 筛选逻辑重构: 先匹配进程名 再应用其他过滤器
-
                 // 1. 基础过滤器: 进程名必须匹配
                 if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
-                    continue; // 如果名字不匹配 直接跳过这个进程
+                    continue;
                 }
 
                 // 2. 默认应该终止 除非有过滤器阻止
@@ -1012,7 +1009,6 @@ namespace ActionHelpers {
 
                 // 3. 附加过滤器: 检查父进程ID (如果启用)
                 if (op.checkParentProcess) {
-                    // 如果启用了ppid检查 但父进程不是自己人 则不终止
                     if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
                         shouldTerminate = false;
                     }
@@ -1021,21 +1017,18 @@ namespace ActionHelpers {
                 // 4. 附加过滤器: 检查进程路径 (如果启用且上一过滤器未否决)
                 if (shouldTerminate && op.checkProcessPath) {
                     std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-                    // 如果路径为空 或 basePath为空 则认为路径不匹配
+                    
                     if (processPath.empty() || op.basePath.empty()) {
                         shouldTerminate = false;
                     } else {
-                        // 规范化基础路径 确保以'\'结尾
-                        std::wstring normalizedBasePath = op.basePath;
-                        if (normalizedBasePath.back() != L'\\' && normalizedBasePath.back() != L'/') {
-                            normalizedBasePath += L'\\';
-                        }
-
-                        // 如果进程路径不是以规范化基础路径开头 则不终止
-                        if (processPath.length() < normalizedBasePath.length() ||
-                            _wcsnicmp(processPath.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) != 0) {
+                        // --- [验证性修改：改为完整路径精确匹配] ---
+                        // 使用不区分大小写的字符串比较函数 (_wcsicmp)
+                        // 判断获取到的进程路径是否与INI中提供的路径完全相同
+                        if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) != 0) {
+                            // 如果不完全相同 则不终止
                             shouldTerminate = false;
                         }
+                        // --- [修改结束] ---
                     }
                 }
 
@@ -1047,7 +1040,6 @@ namespace ActionHelpers {
                         CloseHandle(hProcess);
                     }
                 }
-                // --- [核心修正逻辑结束] ---
 
             } while (Process32NextW(hSnapshot, &pe32));
         }
