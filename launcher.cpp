@@ -960,36 +960,6 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
-// <-- [新增] 将Win32路径转换为NT设备路径的辅助函数
-std::wstring GetNtPath(const std::wstring& path) {
-    // 以非独占方式打开文件句柄
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return L""; // 如果文件不存在或无法打开 则返回空
-    }
-
-    // 准备一个缓冲区来接收路径
-    std::vector<wchar_t> buffer(MAX_PATH);
-    // 调用API获取NT格式的卷名路径
-    DWORD size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
-
-    // 如果缓冲区太小 则调整大小后重试
-    if (size > buffer.size()) {
-        buffer.resize(size);
-        size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
-    }
-
-    CloseHandle(hFile);
-
-    // 如果成功获取路径 则返回
-    if (size > 0 && size < buffer.size()) {
-        return std::wstring(buffer.data());
-    }
-
-    // 失败则返回空
-    return L"";
-}
-
 // <-- [新增] 获取进程完整路径的辅助函数 支持长路径
 std::wstring GetProcessFullPathByPid(DWORD pid) {
     if (pid == 0) return L"";
@@ -997,17 +967,17 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
     if (hProcess) {
         std::vector<wchar_t> buffer(MAX_PATH);
         DWORD size = (DWORD)buffer.size();
-        // 循环以处理可能超过MAX_PATH的路径
         while (true) {
-            if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+            // --- [最终修正：强制API返回标准的Win32路径] ---
+            // 添加 QUERY_FULL_PROCESS_IMAGE_NAME_WIN32_PATH 标志 (值为 1)
+            if (QueryFullProcessImageNameW(hProcess, 1, buffer.data(), &size)) {
                 CloseHandle(hProcess);
                 return std::wstring(buffer.data());
             } else {
                 if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-                    size *= 2; // 如果缓冲区太小 则加倍
+                    size *= 2;
                     buffer.resize(size);
                 } else {
-                    // 因其他错误失败
                     CloseHandle(hProcess);
                     return L"";
                 }
@@ -1024,17 +994,15 @@ namespace ActionHelpers {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
-        std::wstring ntBasePath;
-        bool isBasePathDirectory = false; // 新增标志 用于区分路径是文件还是目录
+        std::wstring win32BasePath;
+        bool isBasePathDirectory = false;
 
         if (op.checkProcessPath && !op.basePath.empty()) {
-            // 在转换前 先判断原始Win32路径的类型
-            DWORD attrs = GetFileAttributesW(op.basePath.c_str());
+            win32BasePath = op.basePath; // 路径已经由ExecuteActionOperation处理过
+            DWORD attrs = GetFileAttributesW(win32BasePath.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 isBasePathDirectory = true;
             }
-            // 然后再转换为NT路径
-            ntBasePath = GetNtPath(op.basePath);
         }
 
         PROCESSENTRY32W pe32;
@@ -1055,25 +1023,25 @@ namespace ActionHelpers {
                 }
 
                 if (shouldTerminate && op.checkProcessPath) {
-                    if (ntBasePath.empty()) {
+                    if (win32BasePath.empty()) {
                         shouldTerminate = false;
                     } else {
-                        std::wstring processNtPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                        // 现在我们比较的是两个可靠的Win32路径
+                        std::wstring processWin32Path = GetProcessFullPathByPid(pe32.th32ProcessID);
                         
-                        // 根据路径类型选择不同的匹配策略
                         if (isBasePathDirectory) {
-                            // --- 目录模式：前缀匹配 ---
-                            std::wstring normalizedNtBasePath = ntBasePath;
-                            if (normalizedNtBasePath.back() != L'\\') {
-                                normalizedNtBasePath += L'\\';
+                            // 目录模式：前缀匹配
+                            std::wstring normalizedBasePath = win32BasePath;
+                            if (normalizedBasePath.back() != L'\\') {
+                                normalizedBasePath += L'\\';
                             }
-                            if (processNtPath.length() < normalizedNtBasePath.length() ||
-                                _wcsnicmp(processNtPath.c_str(), normalizedNtBasePath.c_str(), normalizedNtBasePath.length()) != 0) {
+                            if (processWin32Path.length() < normalizedBasePath.length() ||
+                                _wcsnicmp(processWin32Path.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) != 0) {
                                 shouldTerminate = false;
                             }
                         } else {
-                            // --- 文件模式：精确匹配 ---
-                            if (_wcsicmp(processNtPath.c_str(), ntBasePath.c_str()) != 0) {
+                            // 文件模式：精确匹配
+                            if (_wcsicmp(processWin32Path.c_str(), win32BasePath.c_str()) != 0) {
                                 shouldTerminate = false;
                             }
                         }
