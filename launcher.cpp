@@ -1011,29 +1011,32 @@ namespace ActionHelpers {
                             shouldTerminate = true;
                         }
                     } else if (op.checkProcessPath) {
-                        // 模式3: 检查进程路径 (已修正)
+                        // 模式3: 检查进程路径 (使用纯 C++ 逻辑重写)
                         std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         if (!processPath.empty() && !op.basePath.empty()) {
 
                             // --- [核心修正逻辑] ---
-                            std::vector<wchar_t> cleanBasePath(op.basePath.begin(), op.basePath.end());
-                            cleanBasePath.push_back(0);
-                            PathRemoveBackslashW(cleanBasePath.data()); // 移除末尾的反斜杠以进行标准比较
+                            std::wstring cleanBasePath = op.basePath;
+                            // 1. 标准化基础路径：移除末尾的斜杠
+                            if (cleanBasePath.back() == L'\\' || cleanBasePath.back() == L'/') {
+                                cleanBasePath.pop_back();
+                            }
 
-                            size_t basePathLen = wcslen(cleanBasePath.data());
+                            size_t basePathLen = cleanBasePath.length();
 
-                            if (processPath.length() >= basePathLen) {
-                                if (_wcsnicmp(processPath.c_str(), cleanBasePath.data(), basePathLen) == 0) {
-                                    // 前缀匹配成功 现在检查边界条件
-                                    if (processPath.length() == basePathLen) {
-                                        // 完全匹配 (例如 进程本身就是 Z:\Portable)
+                            // 2. 比较路径前缀
+                            if (processPath.length() >= basePathLen &&
+                                _wcsnicmp(processPath.c_str(), cleanBasePath.c_str(), basePathLen) == 0) {
+
+                                // 3. 检查边界条件
+                                if (processPath.length() == basePathLen) {
+                                    // 路径完全相同
+                                    shouldTerminate = true;
+                                } else {
+                                    // 检查 basePath 后面的字符是否为路径分隔符
+                                    wchar_t nextChar = processPath[basePathLen];
+                                    if (nextChar == L'\\' || nextChar == L'/') {
                                         shouldTerminate = true;
-                                    } else {
-                                        // 检查下一个字符是否为路径分隔符
-                                        wchar_t nextChar = processPath[basePathLen];
-                                        if (nextChar == L'\\' || nextChar == L'/') {
-                                            shouldTerminate = true;
-                                        }
                                     }
                                 }
                             }
