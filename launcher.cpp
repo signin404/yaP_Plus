@@ -960,6 +960,36 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
+// <-- [新增] 将Win32路径转换为NT设备路径的辅助函数
+std::wstring GetNtPath(const std::wstring& path) {
+    // 以非独占方式打开文件句柄
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return L""; // 如果文件不存在或无法打开 则返回空
+    }
+
+    // 准备一个缓冲区来接收路径
+    std::vector<wchar_t> buffer(MAX_PATH);
+    // 调用API获取NT格式的卷名路径
+    DWORD size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
+
+    // 如果缓冲区太小 则调整大小后重试
+    if (size > buffer.size()) {
+        buffer.resize(size);
+        size = GetFinalPathNameByHandleW(hFile, buffer.data(), (DWORD)buffer.size(), VOLUME_NAME_NT);
+    }
+
+    CloseHandle(hFile);
+
+    // 如果成功获取路径 则返回
+    if (size > 0 && size < buffer.size()) {
+        return std::wstring(buffer.data());
+    }
+
+    // 失败则返回空
+    return L"";
+}
+
 // <-- [新增] 获取进程完整路径的辅助函数 支持长路径
 std::wstring GetProcessFullPathByPid(DWORD pid) {
     if (pid == 0) return L"";
@@ -994,45 +1024,47 @@ namespace ActionHelpers {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
+        // --- [最终修正] ---
+        // 在循环开始前 将INI中的Win32路径转换为NT设备路径
+        std::wstring ntBasePath;
+        if (op.checkProcessPath && !op.basePath.empty()) {
+            ntBasePath = GetNtPath(op.basePath);
+        }
+        // --- [修正结束] ---
+
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                // 1. 基础过滤器: 进程名必须匹配
                 if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
                     continue;
                 }
 
-                // 2. 默认应该终止 除非有过滤器阻止
                 bool shouldTerminate = true;
 
-                // 3. 附加过滤器: 检查父进程ID (如果启用)
                 if (op.checkParentProcess) {
                     if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
                         shouldTerminate = false;
                     }
                 }
 
-                // 4. 附加过滤器: 检查进程路径 (如果启用且上一过滤器未否决)
                 if (shouldTerminate && op.checkProcessPath) {
-                    std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-                    
-                    if (processPath.empty() || op.basePath.empty()) {
+                    // --- [最终修正] ---
+                    // 仅当成功转换NT路径后才进行比较
+                    if (ntBasePath.empty()) {
                         shouldTerminate = false;
                     } else {
-                        // --- [验证性修改：改为完整路径精确匹配] ---
-                        // 使用不区分大小写的字符串比较函数 (_wcsicmp)
-                        // 判断获取到的进程路径是否与INI中提供的路径完全相同
-                        if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) != 0) {
-                            // 如果不完全相同 则不终止
+                        // 获取进程的NT路径
+                        std::wstring processNtPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                        // 比较两个NT路径
+                        if (_wcsicmp(processNtPath.c_str(), ntBasePath.c_str()) != 0) {
                             shouldTerminate = false;
                         }
-                        // --- [修改结束] ---
                     }
+                    // --- [修正结束] ---
                 }
 
-                // 5. 如果所有检查都通过了 则执行终止操作
                 if (shouldTerminate) {
                     HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
                     if (hProcess) {
