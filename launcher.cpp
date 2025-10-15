@@ -999,51 +999,56 @@ namespace ActionHelpers {
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
-                    bool shouldTerminate = false;
+                // --- [核心修正逻辑] ---
+                // 筛选逻辑重构: 先匹配进程名 再应用其他过滤器
 
-                    if (!op.checkParentProcess && !op.checkProcessPath) {
-                        // 模式1: 默认行为 仅按名称终止
-                        shouldTerminate = true;
-                    } else if (op.checkParentProcess) {
-                        // 模式2: 检查父进程ID
-                        if (trustedPids.count(pe32.th32ParentProcessID)) {
-                            shouldTerminate = true;
-                        }
-                    } else if (op.checkProcessPath) {
-                        // 模式3: 检查进程路径
-                        // --- [核心修正] ---
-                        std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-                        if (!processPath.empty() && !op.basePath.empty()) {
-                            // 1. 首先检查路径是否完全相同 (不区分大小写)
-                            if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) == 0) {
-                                shouldTerminate = true;
-                            } else {
-                                // 2. 如果不相同 则检查是否为子目录或子文件
-                                std::wstring basePathWithSlash = op.basePath;
-                                // 确保基础路径以 '\' 结尾 以正确匹配子目录
-                                if (basePathWithSlash.back() != L'\\' && basePathWithSlash.back() != L'/') {
-                                    basePathWithSlash += L'\\';
-                                }
+                // 1. 基础过滤器: 进程名必须匹配
+                if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
+                    continue; // 如果名字不匹配 直接跳过这个进程
+                }
 
-                                // 检查进程路径是否以 "基础路径\" 开头 (不区分大小写)
-                                if (processPath.length() >= basePathWithSlash.length() &&
-                                    _wcsnicmp(processPath.c_str(), basePathWithSlash.c_str(), basePathWithSlash.length()) == 0) {
-                                    shouldTerminate = true;
-                                }
-                            }
-                        }
-                        // --- [核心修正结束] ---
+                // 2. 默认应该终止 除非有过滤器阻止
+                bool shouldTerminate = true;
+
+                // 3. 附加过滤器: 检查父进程ID (如果启用)
+                if (op.checkParentProcess) {
+                    // 如果启用了ppid检查 但父进程不是自己人 则不终止
+                    if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
+                        shouldTerminate = false;
                     }
+                }
 
-                    if (shouldTerminate) {
-                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                        if (hProcess) {
-                            TerminateProcess(hProcess, 0);
-                            CloseHandle(hProcess);
+                // 4. 附加过滤器: 检查进程路径 (如果启用且上一过滤器未否决)
+                if (shouldTerminate && op.checkProcessPath) {
+                    std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                    // 如果路径为空 或 basePath为空 则认为路径不匹配
+                    if (processPath.empty() || op.basePath.empty()) {
+                        shouldTerminate = false;
+                    } else {
+                        // 规范化基础路径 确保以'\'结尾
+                        std::wstring normalizedBasePath = op.basePath;
+                        if (normalizedBasePath.back() != L'\\' && normalizedBasePath.back() != L'/') {
+                            normalizedBasePath += L'\\';
+                        }
+
+                        // 如果进程路径不是以规范化基础路径开头 则不终止
+                        if (processPath.length() < normalizedBasePath.length() ||
+                            _wcsnicmp(processPath.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) != 0) {
+                            shouldTerminate = false;
                         }
                     }
                 }
+
+                // 5. 如果所有检查都通过了 则执行终止操作
+                if (shouldTerminate) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                    }
+                }
+                // --- [核心修正逻辑结束] ---
+
             } while (Process32NextW(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
