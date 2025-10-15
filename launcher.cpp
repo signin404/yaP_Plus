@@ -147,7 +147,9 @@ struct DelayOp {
 
 struct KillProcessOp {
     std::wstring processPattern;
-	bool checkParentProcess = false;
+    bool checkParentProcess = false;
+    bool checkProcessPath = false;
+    std::wstring basePath;
 };
 
 enum class TextFormat { Win, Unix, Mac };
@@ -958,6 +960,32 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
+// <-- [新增] 获取进程完整路径的辅助函数 支持长路径
+std::wstring GetProcessFullPathByPid(DWORD pid) {
+    if (pid == 0) return L"";
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess) {
+        std::vector<wchar_t> buffer(MAX_PATH);
+        DWORD size = (DWORD)buffer.size();
+        // 循环以处理可能超过MAX_PATH的路径
+        while (true) {
+            if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+                CloseHandle(hProcess);
+                return std::wstring(buffer.data());
+            } else {
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    size *= 2; // 如果缓冲区太小 则加倍
+                    buffer.resize(size);
+                } else {
+                    // 因其他错误失败
+                    CloseHandle(hProcess);
+                    return L"";
+                }
+            }
+        }
+    }
+    return L"";
+}
 
 // Deletion and Action Helpers
 namespace ActionHelpers {
@@ -973,13 +1001,25 @@ namespace ActionHelpers {
             do {
                 if (WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
                     bool shouldTerminate = false;
-                    if (!op.checkParentProcess) {
-                        // 旧行为：不检查父进程 直接终止
+
+                    if (!op.checkParentProcess && !op.checkProcessPath) {
+                        // 模式1: 默认行为 仅按名称终止
                         shouldTerminate = true;
-                    } else {
-                        // 新行为：检查父进程ID是否在受信任列表中
+                    } else if (op.checkParentProcess) {
+                        // 模式2: 检查父进程ID
                         if (trustedPids.count(pe32.th32ParentProcessID)) {
                             shouldTerminate = true;
+                        }
+                    } else if (op.checkProcessPath) {
+                        // 模式3: 检查进程路径
+                        std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                        if (!processPath.empty() && !op.basePath.empty()) {
+                            // 执行不区分大小写的 "starts with" 检查
+                            if (processPath.length() >= op.basePath.length()) {
+                                if (_wcsnicmp(processPath.c_str(), op.basePath.c_str(), op.basePath.length()) == 0) {
+                                    shouldTerminate = true;
+                                }
+                            }
                         }
                     }
 
@@ -2522,12 +2562,27 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } else if (_wcsicmp(key.c_str(), L"delay") == 0) {
             return DelayOp{_wtoi(value.c_str())};
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
+            // <-- [修改] 增强 killprocess 的解析逻辑以支持 "path" 关键字
             auto parts = split_string(value, delimiter);
             KillProcessOp op;
-            if (!parts.empty()) {
-                op.processPattern = parts[0];
-                if (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ppid") == 0) {
+            if (parts.empty()) {
+                return std::nullopt;
+            }
+
+            op.processPattern = parts[0];
+
+            if (parts.size() > 1) {
+                if (_wcsicmp(parts[1].c_str(), L"ppid") == 0) {
                     op.checkParentProcess = true;
+                } else if (_wcsicmp(parts[1].c_str(), L"path") == 0) {
+                    op.checkProcessPath = true;
+                    if (parts.size() > 2 && !parts[2].empty()) {
+                        // 用户提供了路径 直接使用
+                        op.basePath = parts[2];
+                    } else {
+                        // 用户未提供路径 使用默认的 {YAPROOT}
+                        op.basePath = L"{YAPROOT}";
+                    }
                 }
             }
             return op;
@@ -2865,8 +2920,13 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
-            // <-- [修改] 调用 HandleKillProcess 时传递 op 对象和 trustedPids
-            ActionHelpers::HandleKillProcess(arg, trustedPids);
+            // <-- [修改] 在调用前展开和解析 KillProcessOp 中的路径
+            KillProcessOp mutable_op = arg;
+            if (mutable_op.checkProcessPath) {
+                std::wstring expandedPath = ExpandVariables(mutable_op.basePath, variables);
+                mutable_op.basePath = ResolveToAbsolutePath(expandedPath, variables);
+            }
+            ActionHelpers::HandleKillProcess(mutable_op, trustedPids);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
