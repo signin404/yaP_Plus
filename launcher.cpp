@@ -1015,29 +1015,26 @@ namespace ActionHelpers {
                         std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         if (!processPath.empty() && !op.basePath.empty()) {
 
-                            // --- [核心修正逻辑] ---
-                            std::wstring cleanBasePath = op.basePath;
-                            // 1. 标准化基础路径：移除末尾的斜杠
-                            if (cleanBasePath.back() == L'\\' || cleanBasePath.back() == L'/') {
-                                cleanBasePath.pop_back();
-                            }
+							// --- [核心修正逻辑] ---
+							td::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+							if (!processPath.empty() && !op.basePath.empty()) {
+								// 方案: 使用更可靠的路径前缀匹配方法
+								// 1. 首先检查路径是否完全相同 (不区分大小写)
+								if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) == 0) {
+									shouldTerminate = true;
+								} else {
+									// 2. 如果不相同 则检查是否为子目录或子文件
+									std::wstring basePathWithSlash = op.basePath;
+									// 确保基础路径以 '\' 结尾 以正确匹配子目录
+									if (basePathWithSlash.back() != L'\\' && basePathWithSlash.back() != L'/') {
+										basePathWithSlash += L'\\';
+									}
 
-                            size_t basePathLen = cleanBasePath.length();
-
-                            // 2. 比较路径前缀
-                            if (processPath.length() >= basePathLen &&
-                                _wcsnicmp(processPath.c_str(), cleanBasePath.c_str(), basePathLen) == 0) {
-
-                                // 3. 检查边界条件
-                                if (processPath.length() == basePathLen) {
-                                    // 路径完全相同
-                                    shouldTerminate = true;
-                                } else {
-                                    // 检查 basePath 后面的字符是否为路径分隔符
-                                    wchar_t nextChar = processPath[basePathLen];
-                                    if (nextChar == L'\\' || nextChar == L'/') {
-                                        shouldTerminate = true;
-                                    }
+									// 检查进程路径是否以 "基础路径\" 开头 (不区分大小写)
+									if (processPath.length() > basePathWithSlash.length() &&
+										_wcsnicmp(processPath.c_str(), basePathWithSlash.c_str(), basePathWithSlash.length()) == 0) {
+										shouldTerminate = true;
+									}
                                 }
                             }
                         }
