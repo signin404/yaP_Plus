@@ -1012,32 +1012,29 @@ namespace ActionHelpers {
                         }
                     } else if (op.checkProcessPath) {
                         // 模式3: 检查进程路径 (使用纯 C++ 逻辑重写)
+                        // --- [核心修正逻辑] ---
                         std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         if (!processPath.empty() && !op.basePath.empty()) {
+                            // 方案: 使用更可靠的路径前缀匹配方法
+                            // 1. 首先检查路径是否完全相同 (不区分大小写)
+                            if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) == 0) {
+                                shouldTerminate = true;
+                            } else {
+                                // 2. 如果不相同 则检查是否为子目录或子文件
+                                std::wstring basePathWithSlash = op.basePath;
+                                // 确保基础路径以 '\' 结尾 以正确匹配子目录
+                                if (basePathWithSlash.back() != L'\\' && basePathWithSlash.back() != L'/') {
+                                    basePathWithSlash += L'\\';
+                                }
 
-							// --- [核心修正逻辑] ---
-							td::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-							if (!processPath.empty() && !op.basePath.empty()) {
-								// 方案: 使用更可靠的路径前缀匹配方法
-								// 1. 首先检查路径是否完全相同 (不区分大小写)
-								if (_wcsicmp(processPath.c_str(), op.basePath.c_str()) == 0) {
-									shouldTerminate = true;
-								} else {
-									// 2. 如果不相同 则检查是否为子目录或子文件
-									std::wstring basePathWithSlash = op.basePath;
-									// 确保基础路径以 '\' 结尾 以正确匹配子目录
-									if (basePathWithSlash.back() != L'\\' && basePathWithSlash.back() != L'/') {
-										basePathWithSlash += L'\\';
-									}
-
-									// 检查进程路径是否以 "基础路径\" 开头 (不区分大小写)
-									if (processPath.length() > basePathWithSlash.length() &&
-										_wcsnicmp(processPath.c_str(), basePathWithSlash.c_str(), basePathWithSlash.length()) == 0) {
-										shouldTerminate = true;
-									}
+                                // 检查进程路径是否以 "基础路径\" 开头 (不区分大小写)
+                                if (processPath.length() > basePathWithSlash.length() &&
+                                    _wcsnicmp(processPath.c_str(), basePathWithSlash.c_str(), basePathWithSlash.length()) == 0) {
+                                    shouldTerminate = true;
                                 }
                             }
                         }
+                        // --- [核心修正逻辑结束] ---
                     }
 
                     if (shouldTerminate) {
