@@ -147,7 +147,9 @@ struct DelayOp {
 
 struct KillProcessOp {
     std::wstring processPattern;
-	bool checkParentProcess = false;
+    bool checkParentProcess = false;
+    bool checkProcessPath = false;
+    std::wstring basePath;
 };
 
 enum class TextFormat { Win, Unix, Mac };
@@ -958,6 +960,69 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
+// <-- [新增] 最终的、可靠的路径转换函数
+std::wstring ConvertDevicePathToDosPath(const std::wstring& path) {
+    // 如果路径不是以 "\Device\" 开头 则假定它已经是Win32路径或无法转换 直接返回
+    if (path.rfind(L"\\Device\\", 0) != 0) {
+        return path;
+    }
+
+    // 获取所有逻辑驱动器的字符串 格式为 "C:\<null>D:\<null>..."
+    wchar_t driveStrings[MAX_PATH];
+    if (GetLogicalDriveStringsW(MAX_PATH, driveStrings) == 0) {
+        return path; // 获取失败 返回原始路径
+    }
+
+    // 遍历每个驱动器
+    wchar_t* pDrive = driveStrings;
+    while (*pDrive) {
+        // 提取驱动器号 例如 "C:"
+        std::wstring driveLetter = pDrive;
+        driveLetter.pop_back(); // 移除末尾的 '\'
+
+        // 查询该驱动器号对应的NT设备名
+        wchar_t deviceName[MAX_PATH];
+        if (QueryDosDeviceW(driveLetter.c_str(), deviceName, MAX_PATH) != 0) {
+            std::wstring ntDeviceName = deviceName;
+            // 检查输入路径是否以这个NT设备名开头
+            if (path.rfind(ntDeviceName, 0) == 0) {
+                // 如果是 则用驱动器号替换掉NT设备名部分 构造出Win32路径
+                return driveLetter + path.substr(ntDeviceName.length());
+            }
+        }
+        // 移动到下一个驱动器字符串
+        pDrive += wcslen(pDrive) + 1;
+    }
+
+    // 如果遍历完所有驱动器都找不到匹配项 则返回原始路径
+    return path;
+}
+
+// <-- [新增] 获取进程完整路径的辅助函数 支持长路径
+std::wstring GetProcessFullPathByPid(DWORD pid) {
+    if (pid == 0) return L"";
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess) {
+        std::vector<wchar_t> buffer(MAX_PATH);
+        DWORD size = (DWORD)buffer.size();
+        while (true) {
+            // --- [最终修正：恢复为最原始、兼容性最好的调用方式] ---
+            if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+                CloseHandle(hProcess);
+                return std::wstring(buffer.data());
+            } else {
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    size *= 2;
+                    buffer.resize(size);
+                } else {
+                    CloseHandle(hProcess);
+                    return L"";
+                }
+            }
+        }
+    }
+    return L"";
+}
 
 // Deletion and Action Helpers
 namespace ActionHelpers {
@@ -966,31 +1031,70 @@ namespace ActionHelpers {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
+        std::wstring win32BasePath;
+        bool isBasePathDirectory = false;
+
+        if (op.checkProcessPath && !op.basePath.empty()) {
+            win32BasePath = op.basePath;
+            DWORD attrs = GetFileAttributesW(win32BasePath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                isBasePathDirectory = true;
+            }
+        }
+
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
-                    bool shouldTerminate = false;
-                    if (!op.checkParentProcess) {
-                        // 旧行为：不检查父进程 直接终止
-                        shouldTerminate = true;
-                    } else {
-                        // 新行为：检查父进程ID是否在受信任列表中
-                        if (trustedPids.count(pe32.th32ParentProcessID)) {
-                            shouldTerminate = true;
-                        }
-                    }
+                if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
+                    continue;
+                }
 
-                    if (shouldTerminate) {
-                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-                        if (hProcess) {
-                            TerminateProcess(hProcess, 0);
-                            CloseHandle(hProcess);
+                bool shouldTerminate = true;
+
+                if (op.checkParentProcess) {
+                    if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
+                        shouldTerminate = false;
+                    }
+                }
+
+                if (shouldTerminate && op.checkProcessPath) {
+                    if (win32BasePath.empty()) {
+                        shouldTerminate = false;
+                    } else {
+                        // --- [最终修正：使用万能转换器确保路径格式统一] ---
+                        std::wstring rawProcessPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                        std::wstring processWin32Path = ConvertDevicePathToDosPath(rawProcessPath);
+
+                        if (processWin32Path.empty()) {
+                            shouldTerminate = false;
+                        }
+                        else if (isBasePathDirectory) {
+                            std::wstring normalizedBasePath = win32BasePath;
+                            if (normalizedBasePath.back() != L'\\') {
+                                normalizedBasePath += L'\\';
+                            }
+                            if (processWin32Path.length() < normalizedBasePath.length() ||
+                                _wcsnicmp(processWin32Path.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) != 0) {
+                                shouldTerminate = false;
+                            }
+                        } else {
+                            if (_wcsicmp(processWin32Path.c_str(), win32BasePath.c_str()) != 0) {
+                                shouldTerminate = false;
+                            }
                         }
                     }
                 }
+
+                if (shouldTerminate) {
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                    }
+                }
+
             } while (Process32NextW(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
@@ -2524,10 +2628,25 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         } else if (_wcsicmp(key.c_str(), L"killprocess") == 0) {
             auto parts = split_string(value, delimiter);
             KillProcessOp op;
-            if (!parts.empty()) {
-                op.processPattern = parts[0];
-                if (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"ppid") == 0) {
+            if (parts.empty()) {
+                return std::nullopt;
+            }
+
+            op.processPattern = parts[0];
+
+            if (parts.size() > 1) {
+                if (_wcsicmp(parts[1].c_str(), L"ppid") == 0) {
                     op.checkParentProcess = true;
+                } else if (_wcsicmp(parts[1].c_str(), L"path") == 0) {
+                    op.checkProcessPath = true;
+                    std::wstring rawPath;
+                    if (parts.size() > 2 && !parts[2].empty()) {
+                        rawPath = parts[2];
+                    } else {
+                        rawPath = L"{YAPROOT}";
+                    }
+                    // --- [最终修正：在解析时立即展开变量] ---
+                    op.basePath = ExpandVariables(rawPath, variables);
                 }
             }
             return op;
@@ -2865,8 +2984,12 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         } else if constexpr (std::is_same_v<T, DelayOp>) {
             Sleep(arg.milliseconds);
         } else if constexpr (std::is_same_v<T, KillProcessOp>) {
-            // <-- [修改] 调用 HandleKillProcess 时传递 op 对象和 trustedPids
-            ActionHelpers::HandleKillProcess(arg, trustedPids);
+            // 变量已在解析时展开完毕 此处只需确保路径是绝对路径
+            KillProcessOp final_op = arg;
+            if (final_op.checkProcessPath) {
+                final_op.basePath = ResolveToAbsolutePath(final_op.basePath, variables);
+            }
+            ActionHelpers::HandleKillProcess(final_op, trustedPids);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);

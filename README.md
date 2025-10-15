@@ -6,30 +6,30 @@ English | [中文](./README_zh-CN.md)
 Just copy and paste to create portable software.
 
 ## Feature
-- [x] Save directory/file  
-- [x] Delete directory/file  
-- [x] Restore directory/file  
-- [x] Copy or move directory/file  
-- [x] Save registry key/value  
-- [x] Delete registry key/value  
-- [x] Restore registry key/value  
-- [x] Create directory/file  
-- [x] Create registry key/value  
+- [x] Save directory/file
+- [x] Delete directory/file
+- [x] Restore directory/file
+- [x] Copy or move directory/file
+- [x] Save registry key/value
+- [x] Delete registry key/value
+- [x] Restore registry key/value
+- [x] Create directory/file
+- [x] Create registry key/value
 - [x] Create symbolic link
-- [x] Write INI  
-- [x] Text replacement  
-- [x] Line text replacement  
-- [x] Run file  
-- [x] Terminate process  
-- [x] Run multiple instances  
-- [x] Import registry  
-- [x] Register or unregister DLL  
-- [x] Set directory/file attributes  
-- [x] Set command line  
-- [x] Set working directory  
-- [x] Set up environment/user variables  
+- [x] Write INI
+- [x] Text replacement
+- [x] Line text replacement
+- [x] Run file
+- [x] Terminate process
+- [x] Run multiple instances
+- [x] Import registry
+- [x] Register or unregister DLL
+- [x] Set directory/file attributes
+- [x] Set command line
+- [x] Set working directory
+- [x] Set up environment/user variables
 - [x] Environment/user variable string replacement
-- [x] Delayed execution  
+- [x] Delayed execution
 - [x] Delayed automatic cleanup
 
 * Plus
@@ -44,6 +44,7 @@ Just copy and paste to create portable software.
 - [x] Exception exit solutions
 - [x] Full directory traversal with hard links
 - [x] Hard/Symbolic Link Single-Level Directory Traversal
+- [x] Check the parent process or path and terminate the process
 
 ## Unported Features
 * !admin
