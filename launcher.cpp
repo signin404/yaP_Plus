@@ -1024,9 +1024,16 @@ namespace ActionHelpers {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
-        // 在循环开始前 将INI中的Win32路径转换为NT设备路径
         std::wstring ntBasePath;
+        bool isBasePathDirectory = false; // 新增标志 用于区分路径是文件还是目录
+
         if (op.checkProcessPath && !op.basePath.empty()) {
+            // 在转换前 先判断原始Win32路径的类型
+            DWORD attrs = GetFileAttributesW(op.basePath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                isBasePathDirectory = true;
+            }
+            // 然后再转换为NT路径
             ntBasePath = GetNtPath(op.basePath);
         }
 
@@ -1035,47 +1042,44 @@ namespace ActionHelpers {
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                // 1. 基础过滤器: 进程名必须匹配
                 if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
                     continue;
                 }
 
-                // 2. 默认应该终止 除非有过滤器阻止
                 bool shouldTerminate = true;
 
-                // 3. 附加过滤器: 检查父进程ID (如果启用)
                 if (op.checkParentProcess) {
                     if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
                         shouldTerminate = false;
                     }
                 }
 
-                // 4. 附加过滤器: 检查进程路径 (如果启用且上一过滤器未否决)
                 if (shouldTerminate && op.checkProcessPath) {
-                    // --- [最终修改：恢复为子目录前缀匹配模式] ---
                     if (ntBasePath.empty()) {
                         shouldTerminate = false;
                     } else {
-                        // 获取进程的NT路径
                         std::wstring processNtPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         
-                        // 规范化基础路径 确保以'\'结尾 以正确匹配子目录
-                        std::wstring normalizedNtBasePath = ntBasePath;
-                        if (normalizedNtBasePath.back() != L'\\') {
-                            normalizedNtBasePath += L'\\';
-                        }
-
-                        // 检查进程路径是否足够长 并且是否以规范化的基础路径开头 (不区分大小写)
-                        if (processNtPath.length() < normalizedNtBasePath.length() ||
-                            _wcsnicmp(processNtPath.c_str(), normalizedNtBasePath.c_str(), normalizedNtBasePath.length()) != 0) {
-                            // 如果不是 则不终止
-                            shouldTerminate = false;
+                        // 根据路径类型选择不同的匹配策略
+                        if (isBasePathDirectory) {
+                            // --- 目录模式：前缀匹配 ---
+                            std::wstring normalizedNtBasePath = ntBasePath;
+                            if (normalizedNtBasePath.back() != L'\\') {
+                                normalizedNtBasePath += L'\\';
+                            }
+                            if (processNtPath.length() < normalizedNtBasePath.length() ||
+                                _wcsnicmp(processNtPath.c_str(), normalizedNtBasePath.c_str(), normalizedNtBasePath.length()) != 0) {
+                                shouldTerminate = false;
+                            }
+                        } else {
+                            // --- 文件模式：精确匹配 ---
+                            if (_wcsicmp(processNtPath.c_str(), ntBasePath.c_str()) != 0) {
+                                shouldTerminate = false;
+                            }
                         }
                     }
-                    // --- [修改结束] ---
                 }
 
-                // 5. 如果所有检查都通过了 则执行终止操作
                 if (shouldTerminate) {
                     HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
                     if (hProcess) {
