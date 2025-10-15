@@ -1011,13 +1011,30 @@ namespace ActionHelpers {
                             shouldTerminate = true;
                         }
                     } else if (op.checkProcessPath) {
-                        // 模式3: 检查进程路径
+                        // 模式3: 检查进程路径 (已修正)
                         std::wstring processPath = GetProcessFullPathByPid(pe32.th32ProcessID);
                         if (!processPath.empty() && !op.basePath.empty()) {
-                            // 执行不区分大小写的 "starts with" 检查
-                            if (processPath.length() >= op.basePath.length()) {
-                                if (_wcsnicmp(processPath.c_str(), op.basePath.c_str(), op.basePath.length()) == 0) {
-                                    shouldTerminate = true;
+
+                            // --- [核心修正逻辑] ---
+                            std::vector<wchar_t> cleanBasePath(op.basePath.begin(), op.basePath.end());
+                            cleanBasePath.push_back(0);
+                            PathRemoveBackslashW(cleanBasePath.data()); // 移除末尾的反斜杠以进行标准比较
+
+                            size_t basePathLen = wcslen(cleanBasePath.data());
+
+                            if (processPath.length() >= basePathLen) {
+                                if (_wcsnicmp(processPath.c_str(), cleanBasePath.data(), basePathLen) == 0) {
+                                    // 前缀匹配成功 现在检查边界条件
+                                    if (processPath.length() == basePathLen) {
+                                        // 完全匹配 (例如 进程本身就是 Z:\Portable)
+                                        shouldTerminate = true;
+                                    } else {
+                                        // 检查下一个字符是否为路径分隔符
+                                        wchar_t nextChar = processPath[basePathLen];
+                                        if (nextChar == L'\\' || nextChar == L'/') {
+                                            shouldTerminate = true;
+                                        }
+                                    }
                                 }
                             }
                         }
