@@ -961,12 +961,12 @@ bool ImportRegistryFile(const std::wstring& filePath) {
 }
 
 // <-- [修改] 替换整个函数 使用 GetModuleFileNameExW 来获取 Win32 格式的路径
-std.wstring GetProcessFullPathByPid(DWORD pid) {
+std::wstring GetProcessFullPathByPid(DWORD pid) {
     if (pid == 0) return L"";
     // GetModuleFileNameEx 需要 PROCESS_QUERY_INFORMATION 和 PROCESS_VM_READ
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (hProcess) {
-        std.vector<wchar_t> buffer(MAX_PATH);
+        std::vector<wchar_t> buffer(MAX_PATH);
         while (true) {
             DWORD copied = GetModuleFileNameExW(hProcess, NULL, buffer.data(), (DWORD)buffer.size());
             if (copied > 0) {
