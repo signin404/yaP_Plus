@@ -273,6 +273,7 @@ struct LauncherThreadData {
     BackupThreadData* backupData = nullptr;
     std::atomic<bool>* stopMonitor = nullptr;
     std::atomic<bool>* isBackupWorking = nullptr;
+	DWORD launcherPid;
 };
 
 
@@ -1027,7 +1028,7 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
-    void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids) {
+    void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
@@ -1047,6 +1048,10 @@ namespace ActionHelpers {
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
+                 if (pe32.th32ProcessID == launcherPid) {
+                    continue;
+                }
+
                 if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
                     continue;
                 }
@@ -2946,7 +2951,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids) {
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
@@ -2989,7 +2994,7 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             if (final_op.checkProcessPath) {
                 final_op.basePath = ResolveToAbsolutePath(final_op.basePath, variables);
             }
-            ActionHelpers::HandleKillProcess(final_op, trustedPids);
+            ActionHelpers::HandleKillProcess(final_op, trustedPids, launcherPid);
         } else if constexpr (std::is_same_v<T, CreateFileOp>) {
             CreateFileOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
@@ -3066,7 +3071,8 @@ void PerformFullCleanup(
     std::vector<AfterOperation>& afterOps,
     std::vector<StartupShutdownOperation>& shutdownOps,
     std::map<std::wstring, std::wstring>& variables,
-    const std::set<DWORD>& trustedPids
+    const std::set<DWORD>& trustedPids,
+    DWORD launcherPid
 ) {
     bool restoreMarkerFound = false;
     for (const auto& op : afterOps) {
@@ -3084,8 +3090,8 @@ void PerformFullCleanup(
                 }
             } else {
                 ActionOperation actionOp = std::get<ActionOperation>(op.data);
-                // <-- [修改] 调用 ExecuteActionOperation 时传递 trustedPids
-                ExecuteActionOperation(actionOp.data, variables, trustedPids);
+                // <-- [修改] 将 launcherPid 传递给下一层函数
+                ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid);
             }
         }
     } else {
@@ -3094,8 +3100,8 @@ void PerformFullCleanup(
         }
         for (auto& op : afterOps) {
             ActionOperation actionOp = std::get<ActionOperation>(op.data);
-            // <-- [修改] 调用 ExecuteActionOperation 时传递 trustedPids
-            ExecuteActionOperation(actionOp.data, variables, trustedPids);
+            // <-- [修改] 将 launcherPid 传递给下一层函数
+            ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid);
         }
     }
 }
@@ -3275,7 +3281,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // <-- [修改] 调用 PerformFullCleanup 时传递 finalTrustedPids
-    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids);
+    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid);
 
     DeleteFileW(data->tempFilePath.c_str());
 
@@ -3285,6 +3291,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
+	DWORD launcherPid = GetCurrentProcessId();
 
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
@@ -3454,10 +3461,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             // <-- [新增] 为崩溃恢复场景定义受信任的PID（仅限启动器自身）
             std::set<DWORD> crashTrustedPids;
-            crashTrustedPids.insert(GetCurrentProcessId());
+            crashTrustedPids.insert(launcherPid);
 
             // <-- [修改] 调用 PerformFullCleanup 时传递 crashTrustedPids
-            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables, crashTrustedPids);
+            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables, crashTrustedPids, launcherPid);
 
             std::wstring crashWaitStr = GetValueFromIniContent(iniContent, L"General", L"crashwait");
             int crashWaitTime = crashWaitStr.empty() ? 1000 : _wtoi(crashWaitStr.c_str());
@@ -3496,7 +3503,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
                     // <-- [修改] 调用 ExecuteActionOperation 时传递 beforeTrustedPids
-                    ExecuteActionOperation(arg, variables, beforeTrustedPids);
+                    ExecuteActionOperation(arg, variables, beforeTrustedPids, launcherPid);
                 } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
@@ -3521,6 +3528,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         threadData.backupData = &backupData;
         threadData.stopMonitor = &stopMonitor;
         threadData.isBackupWorking = &isBackupWorking;
+		threadData.launcherPid = launcherPid;
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
