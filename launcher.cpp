@@ -1028,7 +1028,7 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
-    void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids) {
+    void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
