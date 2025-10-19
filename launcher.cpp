@@ -961,41 +961,54 @@ bool ImportRegistryFile(const std::wstring& filePath) {
     return ExecuteProcess(regeditPath, args, L"", true, true);
 }
 
-// <-- [新增] 最终的、可靠的路径转换函数
+// <-- [新增] 用于一次性构建NT设备名到驱动器号映射缓存的函数
+void BuildDeviceMapCache(std::map<std::wstring, std::wstring>& cache) {
+    wchar_t driveStrings[MAX_PATH];
+    if (GetLogicalDriveStringsW(MAX_PATH, driveStrings) == 0) {
+        return;
+    }
+
+    wchar_t* pDrive = driveStrings;
+    while (*pDrive) {
+        std::wstring driveLetter = pDrive;
+        driveLetter.pop_back(); // 移除 '\', 得到 "C:"
+
+        wchar_t deviceName[MAX_PATH];
+        if (QueryDosDeviceW(driveLetter.c_str(), deviceName, MAX_PATH) != 0) {
+            // 存入缓存 键是NT设备名 值是驱动器号
+            cache[deviceName] = driveLetter;
+        }
+        pDrive += wcslen(pDrive) + 1;
+    }
+}
+
+// <-- [修改] 最终的、可靠的、且带缓存的路径转换函数
 std::wstring ConvertDevicePathToDosPath(const std::wstring& path) {
-    // 如果路径不是以 "\Device\" 开头 则假定它已经是Win32路径或无法转换 直接返回
+    // 使用静态变量作为缓存 它只会被初始化一次
+    static std::map<std::wstring, std::wstring> deviceMapCache;
+    // 如果缓存为空（即第一次调用此函数时） 则构建缓存
+    if (deviceMapCache.empty()) {
+        BuildDeviceMapCache(deviceMapCache);
+    }
+
+    // 如果路径不是以 "\Device\" 开头 则直接返回
     if (path.rfind(L"\\Device\\", 0) != 0) {
         return path;
     }
 
-    // 获取所有逻辑驱动器的字符串 格式为 "C:\<null>D:\<null>..."
-    wchar_t driveStrings[MAX_PATH];
-    if (GetLogicalDriveStringsW(MAX_PATH, driveStrings) == 0) {
-        return path; // 获取失败 返回原始路径
-    }
+    // 遍历缓存中的所有已知NT设备名
+    for (const auto& entry : deviceMapCache) {
+        const std::wstring& ntDeviceName = entry.first;
+        const std::wstring& driveLetter = entry.second;
 
-    // 遍历每个驱动器
-    wchar_t* pDrive = driveStrings;
-    while (*pDrive) {
-        // 提取驱动器号 例如 "C:"
-        std::wstring driveLetter = pDrive;
-        driveLetter.pop_back(); // 移除末尾的 '\'
-
-        // 查询该驱动器号对应的NT设备名
-        wchar_t deviceName[MAX_PATH];
-        if (QueryDosDeviceW(driveLetter.c_str(), deviceName, MAX_PATH) != 0) {
-            std::wstring ntDeviceName = deviceName;
-            // 检查输入路径是否以这个NT设备名开头
-            if (path.rfind(ntDeviceName, 0) == 0) {
-                // 如果是 则用驱动器号替换掉NT设备名部分 构造出Win32路径
-                return driveLetter + path.substr(ntDeviceName.length());
-            }
+        // 检查输入路径是否以缓存中的NT设备名开头
+        if (path.rfind(ntDeviceName, 0) == 0) {
+            // 如果是 则用驱动器号替换掉NT设备名部分 构造出Win32路径
+            return driveLetter + path.substr(ntDeviceName.length());
         }
-        // 移动到下一个驱动器字符串
-        pDrive += wcslen(pDrive) + 1;
     }
 
-    // 如果遍历完所有驱动器都找不到匹配项 则返回原始路径
+    // 如果找不到匹配项 则返回原始路径
     return path;
 }
 
