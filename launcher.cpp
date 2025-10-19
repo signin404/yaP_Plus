@@ -1938,8 +1938,7 @@ namespace ActionHelpers {
 std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
     std::set<DWORD>& trustedPids,
     const std::vector<WaitProcessInfo>& processInfos,
-    std::set<DWORD>& pidsToIgnore,
-    bool pathBasedWait) // <-- [新增] 参数
+    std::set<DWORD>& pidsToIgnore)
 {
     std::vector<HANDLE> handlesToWaitOn;
     std::set<DWORD> newlyTrustedPids;
@@ -1954,60 +1953,62 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            // --- [核心修正：实现路径检查和条件性PPID检查] ---
+            // --- [最终核心修正：实现按规则区分的PPID检查] ---
             bool parentIsTrusted = trustedPids.count(pe32.th32ParentProcessID) > 0;
 
-            // 如果不是路径等待模式，则必须是子进程；如果是路径等待模式，则检查所有进程
-            if (!parentIsTrusted && !pathBasedWait) {
-                continue;
+            // 步骤1: 无论如何，只要是子进程，就追踪它，以建立完整的进程树
+            if (parentIsTrusted) {
+                newlyTrustedPids.insert(pe32.th32ProcessID);
             }
 
+            // 步骤2: 如果这个进程我们已经等待过了，就跳过匹配逻辑
             if (pidsToIgnore.count(pe32.th32ProcessID)) {
-                if (parentIsTrusted) newlyTrustedPids.insert(pe32.th32ProcessID);
                 continue;
             }
 
+            // 步骤3: 遍历所有等待规则，为当前进程寻找匹配项
             for (const auto& info : processInfos) {
-                if (_wcsicmp(pe32.szExeFile, info.processName.c_str()) == 0) {
-                    bool match = false;
-                    if (!info.checkPath) {
-                        // 模式1：仅按名称匹配
-                        match = true;
-                    } else {
-                        // 模式2：名称和路径双重匹配
-                        std::wstring processWin32Path = ConvertDevicePathToDosPath(GetProcessFullPathByPid(pe32.th32ProcessID));
-                        if (!processWin32Path.empty() && !info.basePath.empty()) {
-                            DWORD attrs = GetFileAttributesW(info.basePath.c_str());
-                            bool isBasePathDirectory = (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
+                // 首先，名字必须匹配
+                if (_wcsicmp(pe32.szExeFile, info.processName.c_str()) != 0) {
+                    continue; // 名字不符，看下一条规则
+                }
 
-                            if (isBasePathDirectory) {
-                                std::wstring normalizedBasePath = info.basePath;
-                                if (normalizedBasePath.back() != L'\\') normalizedBasePath += L'\\';
-                                if (processWin32Path.length() >= normalizedBasePath.length() &&
-                                    _wcsnicmp(processWin32Path.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) == 0) {
-                                    match = true;
-                                }
-                            } else {
-                                if (_wcsicmp(processWin32Path.c_str(), info.basePath.c_str()) == 0) {
-                                    match = true;
-                                }
+                bool match = false;
+                if (info.checkPath) {
+                    // 规则A: 按路径等待 - 不检查PPID，只检查路径
+                    std::wstring processWin32Path = ConvertDevicePathToDosPath(GetProcessFullPathByPid(pe32.th32ProcessID));
+                    if (!processWin32Path.empty() && !info.basePath.empty()) {
+                        DWORD attrs = GetFileAttributesW(info.basePath.c_str());
+                        bool isBasePathDirectory = (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
+
+                        if (isBasePathDirectory) {
+                            std::wstring normalizedBasePath = info.basePath;
+                            if (normalizedBasePath.back() != L'\\') normalizedBasePath += L'\\';
+                            if (processWin32Path.length() >= normalizedBasePath.length() &&
+                                _wcsnicmp(processWin32Path.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) == 0) {
+                                match = true;
+                            }
+                        } else {
+                            if (_wcsicmp(processWin32Path.c_str(), info.basePath.c_str()) == 0) {
+                                match = true;
                             }
                         }
                     }
-
-                    if (match) {
-                        HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
-                        if (hProcess) {
-                            handlesToWaitOn.push_back(hProcess);
-                            pidsToIgnore.insert(pe32.th32ProcessID);
-                        }
-                        break; // 已找到匹配项，无需再检查此进程的其他规则
+                } else {
+                    // 规则B: 按名称等待 - 必须检查PPID
+                    if (parentIsTrusted) {
+                        match = true;
                     }
                 }
-            }
-            // 无论是否匹配，只要是子进程，就应视为可信，以追踪其后代
-            if (parentIsTrusted) {
-                newlyTrustedPids.insert(pe32.th32ProcessID);
+
+                if (match) {
+                    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
+                    if (hProcess) {
+                        handlesToWaitOn.push_back(hProcess);
+                        pidsToIgnore.insert(pe32.th32ProcessID);
+                    }
+                    break; // 已找到匹配规则，无需再检查此进程
+                }
             }
             // --- [修正结束] ---
         } while (Process32NextW(hSnapshot, &pe32));
@@ -3335,7 +3336,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 while (!handlesToWaitOn.empty()) {
                     DWORD startTime = GetTickCount();
                     while (GetTickCount() - startTime < 3000) {
-                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor, isPathBasedWait);
+                         std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
                         if (!foundHandles.empty()) {
                             handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                         }
@@ -3353,7 +3354,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         if (handlesToWaitOn.empty()) {
                             startTime = GetTickCount();
                             while (GetTickCount() - startTime < 3000) {
-                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor, isPathBasedWait);
+                                std::vector<HANDLE> foundHandles = FindNewDescendantsAndWaitTargets(trustedPids, waitProcesses, pidsWeHaveWaitedFor);
                                 if (!foundHandles.empty()) {
                                     handlesToWaitOn.insert(handlesToWaitOn.end(), foundHandles.begin(), foundHandles.end());
                                 }
