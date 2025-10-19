@@ -3282,11 +3282,13 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (multiInstanceEnabled) {
             WaitForSingleObject(pi.hProcess, INFINITE);
 
+            // --- [核心修正：为主程序创建基于完整路径的等待规则] ---
             const wchar_t* appFilename = PathFindFileNameW(data->absoluteAppPath.c_str());
             if (appFilename && wcslen(appFilename) > 0) {
-                // 为主程序自身添加一个简单的等待条目
                 WaitProcessInfo mainAppInfo;
                 mainAppInfo.processName = appFilename;
+                mainAppInfo.checkPath = true;
+                mainAppInfo.basePath = data->absoluteAppPath;
                 waitProcesses.push_back(mainAppInfo);
             }
 
