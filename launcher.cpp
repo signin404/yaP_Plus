@@ -1956,26 +1956,26 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
             // --- [最终核心修正：实现按规则区分的PPID检查] ---
             bool parentIsTrusted = trustedPids.count(pe32.th32ParentProcessID) > 0;
 
-            // 步骤1: 无论如何，只要是子进程，就追踪它，以建立完整的进程树
+            // 步骤1: 无论如何 只要是子进程 就追踪它 以建立完整的进程树
             if (parentIsTrusted) {
                 newlyTrustedPids.insert(pe32.th32ProcessID);
             }
 
-            // 步骤2: 如果这个进程我们已经等待过了，就跳过匹配逻辑
+            // 步骤2: 如果这个进程我们已经等待过了 就跳过匹配逻辑
             if (pidsToIgnore.count(pe32.th32ProcessID)) {
                 continue;
             }
 
-            // 步骤3: 遍历所有等待规则，为当前进程寻找匹配项
+            // 步骤3: 遍历所有等待规则 为当前进程寻找匹配项
             for (const auto& info : processInfos) {
-                // 首先，名字必须匹配
+                // 首先 名字必须匹配
                 if (_wcsicmp(pe32.szExeFile, info.processName.c_str()) != 0) {
-                    continue; // 名字不符，看下一条规则
+                    continue; // 名字不符 看下一条规则
                 }
 
                 bool match = false;
                 if (info.checkPath) {
-                    // 规则A: 按路径等待 - 不检查PPID，只检查路径
+                    // 规则A: 按路径等待 - 不检查PPID 只检查路径
                     std::wstring processWin32Path = ConvertDevicePathToDosPath(GetProcessFullPathByPid(pe32.th32ProcessID));
                     if (!processWin32Path.empty() && !info.basePath.empty()) {
                         DWORD attrs = GetFileAttributesW(info.basePath.c_str());
@@ -2007,7 +2007,7 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
                         handlesToWaitOn.push_back(hProcess);
                         pidsToIgnore.insert(pe32.th32ProcessID);
                     }
-                    break; // 已找到匹配规则，无需再检查此进程
+                    break; // 已找到匹配规则 无需再检查此进程
                 }
             }
             // --- [修正结束] ---
@@ -2059,13 +2059,13 @@ std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<WaitProcessInfo>
                             }
                         }
                     }
-                    
+
                     if (match) {
                         HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
                             handles.push_back(hProcess);
                         }
-                        break; // 已找到匹配项，无需再检查此进程的其他规则
+                        break; // 已找到匹配项 无需再检查此进程的其他规则
                     }
                 }
             }
@@ -3236,7 +3236,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     } else {
         // --- [核心修正：重写 waitprocess 的解析逻辑] ---
         std::vector<WaitProcessInfo> waitProcesses;
-        bool isPathBasedWait = false; // 新标志：只要有一个条目使用路径检查，就为true
+        bool isPathBasedWait = false; // 新标志：只要有一个条目使用路径检查 就为true
 
         std::wstringstream waitStream(data->iniContent);
         std::wstring waitLine;
@@ -3257,7 +3257,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 if (_wcsicmp(key.c_str(), L"waitprocess") == 0) {
                     std::wstring value = trim(waitLine.substr(delimiterPos + 1));
                     auto parts = split_string(value, L" :: ");
-                    
+
                     WaitProcessInfo info;
                     info.processName = parts[0];
 
