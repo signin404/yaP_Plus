@@ -52,6 +52,17 @@ struct FileOp {
     bool wasMoved = false;
 };
 
+// <-- [新增] 用于区分环境变量作用域的枚举
+enum class EnvVarScope { Process, User, System };
+
+// <-- [新增] 用于持久化环境变量操作的结构体
+struct PersistentEnvVarOp {
+    std::wstring name;
+    std::wstring value;
+    EnvVarScope scope;
+    bool backupCreated = false;
+};
+
 struct RestoreOnlyFileOp {
     std::wstring targetPath;
     std::wstring backupPath;
@@ -94,7 +105,7 @@ struct FirewallOp {
 };
 
 // This variant is now only used for the shutdown stack
-using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp>;
+using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, PersistentEnvVarOp>;
 struct StartupShutdownOperation {
     StartupShutdownOperationData data;
 };
@@ -246,7 +257,7 @@ struct AfterOperation {
 
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
-    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, // Startup/Shutdown types
+    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, PersistentEnvVarOp, // Startup/Shutdown types
     ActionOpData // One-shot types (using the variant directly)
 >;
 struct BeforeOperation {
@@ -540,6 +551,43 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 }
 
 // --- Registry Helpers ---
+
+// <-- [新增] 广播环境变量更改的辅助函数
+void BroadcastEnvChange() {
+    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
+}
+
+// <-- [新增] 获取环境变量对应注册表路径的辅助函数
+void GetEnvVarRegistryPath(EnvVarScope scope, HKEY& hRootKey, std::wstring& subKey) {
+    hRootKey = (scope == EnvVarScope::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+    subKey = (scope == EnvVarScope::User) ? L"Environment" : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+}
+
+// <-- [新增] 设置持久化环境变量的辅助函数
+void SetPersistentEnvVar(const std::wstring& name, const std::wstring& value, EnvVarScope scope) {
+    HKEY hRootKey;
+    std::wstring subKey;
+    GetEnvVarRegistryPath(scope, hRootKey, subKey);
+    
+    HKEY hKey;
+    if (RegCreateKeyExW(hRootKey, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, name.c_str(), 0, REG_SZ, (const BYTE*)value.c_str(), (DWORD)(value.length() + 1) * sizeof(wchar_t));
+        RegCloseKey(hKey);
+    }
+}
+
+// <-- [新增] 删除持久化环境变量的辅助函数
+void DeletePersistentEnvVar(const std::wstring& name, EnvVarScope scope) {
+    HKEY hRootKey;
+    std::wstring subKey;
+    GetEnvVarRegistryPath(scope, hRootKey, subKey);
+
+    HKEY hKey;
+    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hKey, name.c_str());
+        RegCloseKey(hKey);
+    }
+}
 
 // <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
 bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
@@ -2554,6 +2602,18 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
+        } else if constexpr (std::is_same_v<T, PersistentEnvVarOp>) {
+            HKEY hRootKey;
+            std::wstring subKey;
+            GetEnvVarRegistryPath(arg.scope, hRootKey, subKey);
+
+            if (RenameRegistryValue(hRootKey, subKey, arg.name, arg.name + L"_Backup")) {
+                arg.backupCreated = true;
+            }
+            
+            std::wstring finalValue = ExpandVariables(arg.value, variables);
+            SetPersistentEnvVar(arg.name, finalValue, arg.scope);
+            BroadcastEnvChange();
         }
     }, opData);
 }
@@ -2660,6 +2720,15 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (arg.ruleCreated) {
                 DeleteFirewallRule(arg.ruleName);
             }
+        } else if constexpr (std::is_same_v<T, PersistentEnvVarOp>) {
+            DeletePersistentEnvVar(arg.name, arg.scope);
+            if (arg.backupCreated) {
+                HKEY hRootKey;
+                std::wstring subKey;
+                GetEnvVarRegistryPath(arg.scope, hRootKey, subKey);
+                RenameRegistryValue(hRootKey, subKey, arg.name + L"_Backup", arg.name);
+            }
+            BroadcastEnvChange();
         }
     }, opData);
 }
@@ -2860,12 +2929,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 }
             }
         }
-        else if (_wcsicmp(key.c_str(), L"envvar") == 0) {
-            auto parts = split_string(value, delimiter);
-            if (parts.size() == 2) {
-                return EnvVarOp{parts[0], parts[1]};
-            }
-        }
         return std::nullopt;
     };
 
@@ -3009,6 +3072,35 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
             } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
                 backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
+            } else if (_wcsicmp(key.c_str(), L"envvar") == 0) { // <-- [新增] 统一处理 envvar
+                auto parts = split_string(value, delimiter);
+                if (parts.size() >= 2) {
+                    EnvVarScope scope = EnvVarScope::Process;
+                    bool isPersistent = false;
+                    if (parts.size() > 2) {
+                        if (_wcsicmp(parts[2].c_str(), L"user") == 0) {
+                            scope = EnvVarScope::User;
+                            isPersistent = true;
+                        } else if (_wcsicmp(parts[2].c_str(), L"system") == 0) {
+                            scope = EnvVarScope::System;
+                            isPersistent = true;
+                        }
+                    }
+
+                    if (isPersistent) {
+                        PersistentEnvVarOp p_op;
+                        p_op.name = parts[0];
+                        p_op.value = parts[1];
+                        p_op.scope = scope;
+                        beforeOp.data = p_op;
+                        op_created = true;
+                    } else {
+                        // 作为一次性操作处理
+                        EnvVarOp op{parts[0], parts[1]};
+                        beforeOp.data = ActionOpData{op};
+                        op_created = true;
+                    }
+                }
             } else {
                 auto action_op = parse_action_op(key, value);
                 if (action_op) {
@@ -3621,7 +3713,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     ExecuteActionOperation(arg, variables, beforeTrustedPids, launcherPid);
                 } else {
                     StartupShutdownOperation ssOp{arg};
-                    PerformStartupOperation(ssOp.data);
+                    PerformStartupOperation(ssOp.data, variables);
                     shutdownOps.push_back(ssOp);
                 }
             }, op.data);
