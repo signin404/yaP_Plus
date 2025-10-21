@@ -2486,7 +2486,7 @@ cleanup:
 
 // --- Unified Operation Handlers ---
 
-void PerformStartupOperation(StartupShutdownOperationData& opData) {
+void PerformStartupOperation(StartupShutdownOperationData& opData, const std::map<std::wstring, std::wstring>& variables) {
     std::visit([&](auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, FileOp>) {
