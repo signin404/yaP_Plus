@@ -1861,60 +1861,45 @@ namespace ActionHelpers {
 
 // <-- [新增] 支持转义字符的通配符匹配函数
 bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
-    while (*pattern != L'\0') {
-        if (*pattern == L'*') {
-            // 遇到星号，记录当前位置
-            const wchar_t* star_pattern = pattern++;
-            const wchar_t* star_text = text;
+    const wchar_t* p = pattern;
+    const wchar_t* t = text;
+    const wchar_t* star_p = nullptr;
+    const wchar_t* star_t = nullptr;
 
-            // 如果星号是模式的最后一个字符，它会匹配到行尾或字符串末尾
-            if (*pattern == L'\0') {
-                while (*text != L'\0' && *text != L'\n') {
-                    text++;
-                }
-                // 此时，text 指向行尾或字符串末尾。
-                // HandleReplace 的外层循环会根据这个 text 的最终位置来确定匹配长度。
-                // 我们只需要返回 true 表示匹配成功即可。
-                return true;
-            }
+    while (*t) {
+        bool is_escaped = (*p == L'\\');
+        const wchar_t* effective_p = is_escaped ? (p + 1) : p;
 
-            // 这是一个更健壮的迭代式回溯，而非递归
-            while (*text != L'\0') {
-                // 尝试用星号后面的模式匹配当前文本
-                if (WildcardMatchForReplace(text, pattern)) {
-                    return true;
-                }
-                // 如果匹配失败，检查星号是否可以多匹配一个字符
-                if (*text == L'\n') {
-                    // 星号不能跨越换行符
-                    return false;
-                }
-                text++;
-            }
-            // 文本已结束，尝试用星号后面的模式匹配空字符串
-            return WildcardMatchForReplace(text, pattern);
-
-        } else if (*pattern == L'\\') { // 处理转义
-            pattern++;
-            if (*pattern == L'\0' || towlower(*text) != towlower(*pattern)) {
-                return false;
-            }
-        } else if (*pattern == L'?') { // 处理问号
-            if (*text == L'\0' || *text == L'\n') {
-                return false;
-            }
-        } else { // 处理普通字符
-            if (towlower(*text) != towlower(*pattern)) {
-                return false;
-            }
+        if (*effective_p == L'*') {
+            star_p = effective_p; // 记录星号位置
+            star_t = t;           // 记录星号开始匹配的文本位置
+            p = effective_p + 1;  // 模式指针前进，星号尝试匹配0个字符
         }
-
-        text++;
-        pattern++;
+        else if (is_escaped ? (*effective_p != L'\0' && towlower(*effective_p) == towlower(*t)) :
+                 (*effective_p == L'?' ? (*t != L'\n') : (towlower(*effective_p) == towlower(*t))))
+        {
+            p = effective_p + 1;
+            t++;
+        }
+        else { // 字符不匹配
+            if (!star_p) {
+                return false; // 没有星号可以回溯，匹配失败
+            }
+            // 回溯：让星号多匹配一个字符
+            p = star_p + 1; // 模式重置到星号之后
+            if (*star_t == L'\n') {
+                return false; // 星号不能跨越换行符
+            }
+            t = ++star_t; // 文本从星号匹配的下一个位置开始
+        }
     }
 
-    // 如果模式和文本都已结束，则匹配成功
-    return *text == L'\0';
+    // 文本已结束，检查模式剩余部分是否只有星号
+    while (*p == L'*') {
+        p++;
+    }
+    // 如果模式也结束了，则匹配成功
+    return *p == L'\0';
 }
 
     void HandleReplace(const ReplaceOp& op) {
@@ -1945,16 +1930,19 @@ bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
         lb_pos_replace += normalizedNewline.length();
     }
 
-    while (true) { // 循环直到无法再进行替换
+    std::wstring new_content;
+    new_content.reserve(content.length());
+    size_t current_pos = 0;
+
+    while (current_pos < content.length()) {
         size_t match_pos = std::wstring::npos;
         size_t match_len = 0;
 
-        // 在当前内容中查找第一个贪婪匹配
-        for (size_t i = 0; i < content.length(); ++i) {
+        // 从 current_pos 开始，查找第一个最长的匹配
+        for (size_t i = current_pos; i < content.length(); ++i) {
             size_t longest_len_at_i = 0;
             bool match_found_at_i = false;
             for (size_t len = 0; i + len <= content.length(); ++len) {
-                // <-- [核心修改] 调用新的、能感知换行符的匹配函数
                 if (WildcardMatchForReplace(content.substr(i, len).c_str(), finalFindText.c_str())) {
                     longest_len_at_i = len;
                     match_found_at_i = true;
@@ -1963,17 +1951,35 @@ bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
             if (match_found_at_i) {
                 match_pos = i;
                 match_len = longest_len_at_i;
-                break; // 找到了第一个起始位置的匹配，完成搜索
+                break; // 找到了第一个匹配，停止搜索
             }
         }
 
         if (match_pos != std::wstring::npos) {
-            content.replace(match_pos, match_len, finalReplaceText);
+            // 将匹配之前的内容追加到新字符串
+            new_content += content.substr(current_pos, match_pos - current_pos);
+            // 追加替换后的文本
+            new_content += finalReplaceText;
+            // [核心] 更新搜索指针，跳过已匹配的部分，确保永远向前推进
+            current_pos = match_pos + match_len;
         } else {
-            // 在整个字符串中未找到匹配项，跳出循环
+            // 从 current_pos 开始再也找不到匹配项，追加剩余内容并结束
+            new_content += content.substr(current_pos);
             break;
         }
     }
+
+    // 将构建好的新内容写回文件
+    std::vector<std::wstring> new_lines;
+    std::wstringstream ss(new_content);
+    std::wstring line;
+    while (std::getline(ss, line, L'\n')) {
+        new_lines.push_back(line);
+    }
+    if (new_content.empty() && !lines.empty()) new_lines.clear();
+
+    WriteFileWithFormat(op.path, new_lines, formatInfo);
+}
 
     std::vector<std::wstring> new_lines;
     std::wstringstream ss(content);
