@@ -1862,45 +1862,59 @@ namespace ActionHelpers {
     // <-- [新增] 支持通配符和转义的字符串匹配函数
     // 返回值: 匹配的长度。如果不匹配，则返回 -1。
     int WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-        const wchar_t* startText = text;
+        // 基本情况1: 模式已结束。只有当文本也结束时，才算成功匹配（长度为0）。
+        if (*pattern == L'\0') {
+            return *text == L'\0' ? 0 : -1;
+        }
 
-        for (;; ++text, ++pattern) {
-            wchar_t p = *pattern;
-            if (p == L'\0') {
-                // 成功匹配到模式末尾
-                return (int)(text - startText);
+        // 情况1: 模式为 '*'
+        if (*pattern == L'*') {
+            // 尝试让 '*' 匹配0个字符
+            int res = WildcardMatch(text, pattern + 1);
+            if (res != -1) {
+                return res; // 成功
             }
+            // 如果文本已结束，则无法继续匹配
+            if (*text == L'\0') {
+                return -1;
+            }
+            // 尝试让 '*' 匹配1个字符，然后用相同的 '*' 模式匹配文本的剩余部分
+            res = WildcardMatch(text + 1, pattern);
+            if (res != -1) {
+                return res + 1; // 成功，长度加1
+            }
+            return -1; // 所有尝试都失败
+        }
 
-            if (p == L'*') {
-                // 遇到通配符 '*'
-                // 尝试将模式的剩余部分与文本的剩余部分进行匹配
-                const wchar_t* restOfPattern = pattern + 1;
-                for (const wchar_t* pText = text; ; ++pText) {
-                    int result = WildcardMatch(pText, restOfPattern);
-                    if (result != -1) {
-                        // 找到了一个成功的匹配
-                        return (int)(pText - text) + result;
-                    }
-                    if (*pText == L'\0') {
-                        // 到达文本末尾，无法匹配
-                        return -1;
-                    }
+        // 情况2: 模式为转义符 '\'
+        if (*pattern == L'\\') {
+            pattern++; // 查看下一个字符
+            if (*pattern == L'\0') return -1; // 模式以悬空的转义符结尾
+            // 文本必须未结束，且转义后的字符必须匹配
+            if (*text != L'\0' && towlower(*text) == towlower(*pattern)) {
+                int res = WildcardMatch(text + 1, pattern + 1);
+                if (res != -1) {
+                    return res + 1;
                 }
             }
+            return -1;
+        }
 
-            if (p == L'\\') {
-                // 遇到转义符 '\'
-                ++pattern; // 查看下一个字符
-                p = *pattern;
-                if (p == L'\0') return -1; // 模式以悬空的转义符结尾
-            }
-
-            // 对于 '?' 或普通/转义字符的匹配
-            if (*text == L'\0') return -1; // 文本已结束，但模式还未结束
-            if (p != L'?' && towlower(p) != towlower(*text)) {
-                return -1; // 字符不匹配
+        // 情况3: 模式为 '?' 或普通字符
+        // 文本必须未结束
+        if (*text == L'\0') {
+            return -1;
+        }
+        // 字符必须匹配 ('?' 匹配任何字符)
+        if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+            int res = WildcardMatch(text + 1, pattern + 1);
+            if (res != -1) {
+                return res + 1;
             }
         }
+
+        // 所有情况都不匹配
+        return -1;
     }
 
     void HandleReplace(const ReplaceOp& op) {
