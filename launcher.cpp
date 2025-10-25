@@ -1859,139 +1859,123 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
-    // <-- [新增] 支持通配符和转义的字符串匹配函数
-    // 返回值: 匹配的长度。如果不匹配，则返回 -1。
-    int WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-        // --- [最终核心修正：修正成功匹配的条件] ---
-        // 基本情况1: 模式已结束。这意味着我们已经成功匹配了所有模式字符。
-        // 立即返回0，表示剩余部分的匹配长度为0。
-        if (*pattern == L'\0') {
-            return 0;
-        }
-        // --- [修正结束] ---
+// <-- [新增] 支持转义字符的通配符匹配函数
+bool WildcardMatchWithEscapes(const wchar_t* text, const wchar_t* pattern) {
+    const wchar_t* star_text = nullptr;
+    const wchar_t* star_pattern = nullptr;
 
-        // 情况1: 模式为 '*'
-        if (*pattern == L'*') {
-            // 尝试让 '*' 匹配0个字符
-            int res = WildcardMatch(text, pattern + 1);
-            if (res != -1) {
-                return res;
-            }
-            // 如果文本已结束，则无法继续匹配
-            if (*text == L'\0') {
-                return -1;
-            }
-            // 尝试让 '*' 匹配1个字符，然后用相同的 '*' 模式匹配文本的剩余部分
-            res = WildcardMatch(text + 1, pattern);
-            if (res != -1) {
-                return res + 1;
-            }
-            return -1;
-        }
-
-        // 情况2: 模式为转义符 '\'
+    while (*text) {
         if (*pattern == L'\\') {
+            pattern++; // 查看需要转义的字符
+            if (*pattern == L'\0') return false; // 无效的模式：以'\'结尾
+            // 现在进行字面值匹配
+            if (towlower(*pattern) == towlower(*text)) {
+                pattern++;
+                text++;
+            } else if (star_pattern) { // 不匹配，回溯
+                pattern = star_pattern + 1;
+                text = ++star_text;
+            } else {
+                return false;
+            }
+        }
+        else if (*pattern == L'*') {
+            star_pattern = pattern++;
+            star_text = text;
+        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
             pattern++;
-            if (*pattern == L'\0') return -1;
-            if (*text != L'\0' && towlower(*text) == towlower(*pattern)) {
-                int res = WildcardMatch(text + 1, pattern + 1);
-                if (res != -1) {
-                    return res + 1;
-                }
-            }
-            return -1;
+            text++;
+        } else if (star_pattern) { // 不匹配，回溯
+            pattern = star_pattern + 1;
+            text = ++star_text;
+        } else {
+            return false;
         }
-
-        // 情况3: 模式为 '?' 或普通字符
-        if (*text == L'\0') {
-            return -1;
-        }
-        if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
-            int res = WildcardMatch(text + 1, pattern + 1);
-            if (res != -1) {
-                return res + 1;
-            }
-        }
-
-        return -1;
     }
+
+    // 文本已结束，消耗掉模式中所有尾随的 '*'
+    while (*pattern == L'*') {
+        pattern++;
+    }
+    
+    // 尾随的转义符 (例如 "pattern\") 是无效的，无法匹配字符串末尾
+    if (*pattern == L'\\') {
+        return false;
+    }
+
+    return !*pattern;
+}
 
     void HandleReplace(const ReplaceOp& op) {
-        if (op.path.empty() || op.findText.empty()) return;
+    FileContentInfo formatInfo;
+    if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
-        std::wifstream inFile(op.path);
-        if (!inFile.is_open()) return;
+    std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
+    std::wstring content;
+    for(size_t i = 0; i < lines.size(); ++i) {
+        content += lines[i];
+        if (i < lines.size() - 1) content += L"\n";
+    }
 
-        std::wstringstream buffer;
-        buffer << inFile.rdbuf();
-        inFile.close();
-        std::wstring content = buffer.str();
+    const std::wstring toFindToken = L"{LINEBREAK}";
+    const std::wstring normalizedNewline = L"\n";
 
-        std::wstringstream newContent;
-        std::wstringstream lineStream(content);
-        std::wstring line;
-        bool fileModified = false;
+    std::wstring finalFindText = op.findText;
+    size_t lb_pos_find = 0;
+    while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
+        finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
+        lb_pos_find += normalizedNewline.length();
+    }
 
-        while (std::getline(lineStream, line)) {
-            std::wstring newLine;
-            size_t currentIndex = 0;
-            bool lineModifiedThisIteration = false;
+    std::wstring finalReplaceText = op.replaceText;
+    size_t lb_pos_replace = 0;
+    while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
+        finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
+        lb_pos_replace += normalizedNewline.length();
+    }
 
-            // --- [最终核心修正：实现正确的行内分段替换逻辑] ---
-            while (currentIndex < line.length()) {
-                int matchLength = -1;
-                size_t matchIndex = std::wstring::npos;
+    // <-- [核心修改] 使用新的通配符搜索和替换逻辑
+    while (true) { // 循环直到无法再进行替换
+        size_t match_pos = std::wstring::npos;
+        size_t match_len = 0;
 
-                // 从当前位置开始，查找第一个匹配项
-                for (size_t i = currentIndex; i < line.length(); ++i) {
-                    matchLength = WildcardMatch(line.c_str() + i, op.findText.c_str());
-                    if (matchLength != -1) {
-                        matchIndex = i;
-                        break;
-                    }
-                }
-
-                if (matchIndex != std::wstring::npos) {
-                    // 找到了一个匹配项
-                    // 1. 将从当前位置到匹配开始前的内容，附加到新行
-                    newLine += line.substr(currentIndex, matchIndex - currentIndex);
-                    // 2. 将替换文本附加到新行
-                    newLine += op.replaceText;
-                    // 3. 将当前索引移动到被匹配部分的末尾之后
-                    currentIndex = matchIndex + matchLength;
-                    
-                    lineModifiedThisIteration = true;
-                    fileModified = true;
-                } else {
-                    // 从当前位置开始，行内再也找不到匹配项了
-                    break;
+        // 在当前内容中查找第一个贪婪匹配
+        for (size_t i = 0; i < content.length(); ++i) {
+            // 查找从位置 i 开始的最长可能匹配
+            size_t longest_len_at_i = 0;
+            bool match_found_at_i = false;
+            for (size_t len = 0; i + len <= content.length(); ++len) {
+                if (WildcardMatchWithEscapes(content.substr(i, len).c_str(), finalFindText.c_str())) {
+                    longest_len_at_i = len;
+                    match_found_at_i = true;
                 }
             }
-
-            // 将最后一个匹配项之后的所有剩余内容，附加到新行
-            if (currentIndex < line.length()) {
-                newLine += line.substr(currentIndex);
+            if (match_found_at_i) {
+                match_pos = i;
+                match_len = longest_len_at_i;
+                break; // 找到了第一个起始位置的匹配，完成搜索
             }
-
-            // 如果是空行且发生了修改（例如，原始内容被完全替换为空），
-            // 也要确保写入一个换行符，以保持行结构。
-            // 否则，直接写入新构建的行。
-            if (lineModifiedThisIteration) {
-                 newContent << newLine << L"\n";
-            } else {
-                 newContent << line << L"\n";
-            }
-            // --- [修正结束] ---
         }
 
-        if (fileModified) {
-            std::wofstream outFile(op.path, std::ios::trunc);
-            if (outFile.is_open()) {
-                outFile << newContent.str();
-                outFile.close();
-            }
+        if (match_pos != std::wstring::npos) {
+            content.replace(match_pos, match_len, finalReplaceText);
+        } else {
+            // 在整个字符串中未找到匹配项，跳出循环
+            break;
         }
     }
+    // --- [核心修改结束] ---
+
+    std::vector<std::wstring> new_lines;
+    std::wstringstream ss(content);
+    std::wstring line;
+    while (std::getline(ss, line, L'\n')) {
+        new_lines.push_back(line);
+    }
+    if (content.empty() && !lines.empty()) new_lines.clear();
+
+    WriteFileWithFormat(op.path, new_lines, formatInfo);
+}
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
         FileContentInfo formatInfo;
