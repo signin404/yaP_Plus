@@ -1862,26 +1862,18 @@ namespace ActionHelpers {
     // <-- [新增] 支持通配符和转义的字符串匹配函数
     // 返回值: 匹配的长度。如果不匹配，则返回 -1。
     int WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-        // --- [最终核心修正：修正成功匹配的条件] ---
-        // 基本情况1: 模式已结束。这意味着我们已经成功匹配了所有模式字符。
-        // 立即返回0，表示剩余部分的匹配长度为0。
         if (*pattern == L'\0') {
             return 0;
         }
-        // --- [修正结束] ---
 
-        // 情况1: 模式为 '*'
         if (*pattern == L'*') {
-            // 尝试让 '*' 匹配0个字符
             int res = WildcardMatch(text, pattern + 1);
             if (res != -1) {
                 return res;
             }
-            // 如果文本已结束，则无法继续匹配
             if (*text == L'\0') {
                 return -1;
             }
-            // 尝试让 '*' 匹配1个字符，然后用相同的 '*' 模式匹配文本的剩余部分
             res = WildcardMatch(text + 1, pattern);
             if (res != -1) {
                 return res + 1;
@@ -1889,11 +1881,11 @@ namespace ActionHelpers {
             return -1;
         }
 
-        // 情况2: 模式为转义符 '\'
         if (*pattern == L'\\') {
             pattern++;
             if (*pattern == L'\0') return -1;
-            if (*text != L'\0' && towlower(*text) == towlower(*pattern)) {
+            // 对于转义字符，必须精确匹配
+            if (*text != L'\0' && *text == *pattern) {
                 int res = WildcardMatch(text + 1, pattern + 1);
                 if (res != -1) {
                     return res + 1;
@@ -1902,16 +1894,36 @@ namespace ActionHelpers {
             return -1;
         }
 
-        // 情况3: 模式为 '?' 或普通字符
         if (*text == L'\0') {
             return -1;
         }
-        if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+
+        // --- [最终核心修正：实现正确的字符比较逻辑] ---
+        bool charsMatch = false;
+        // 规则1: '?' 匹配任何单个字符
+        if (*pattern == L'?') {
+            charsMatch = true;
+        } 
+        // 规则2: 对于非字母字符 (如 \n, ], {, 1, 等)，进行精确的、区分大小写的比较
+        else if (!iswalpha(*pattern)) {
+            if (*pattern == *text) {
+                charsMatch = true;
+            }
+        }
+        // 规则3: 对于字母字符，进行不区分大小写的比较
+        else {
+            if (towlower(*pattern) == towlower(*text)) {
+                charsMatch = true;
+            }
+        }
+
+        if (charsMatch) {
             int res = WildcardMatch(text + 1, pattern + 1);
             if (res != -1) {
                 return res + 1;
             }
         }
+        // --- [修正结束] ---
 
         return -1;
     }
@@ -2917,14 +2929,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"replace") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() != 3) return std::nullopt;
-            ReplaceOp op;
-            // --- [最终核心修正：在解析时立即展开所有变量] ---
-            op.path = ExpandVariables(parts[0], variables);
-            op.findText = ExpandVariables(parts[1], variables);
-            op.replaceText = ExpandVariables(parts[2], variables);
-            // --- [修正结束] ---
-            return op;
+            if (parts.size() == 3) {
+                return ReplaceOp{parts[0], parts[1], parts[2]};
             }
         } else if (_wcsicmp(key.c_str(), L"replaceline") == 0) {
             const std::wstring local_delimiter = L" :: ";
@@ -3193,13 +3199,11 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.value = ExpandVariables(arg.value, variables);
             ActionHelpers::HandleIniWrite(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceOp>) {
-            // --- [最终核心修正：移除冗余的变量展开] ---
             ReplaceOp mutable_op = arg;
-            // 路径变量已展开，此处只需确保其为绝对路径
-            mutable_op.path = ResolveToAbsolutePath(mutable_op.path, variables);
-            // findText 和 replaceText 已在解析时展开，无需任何操作
+            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
+            mutable_op.findText = ExpandVariables(arg.findText, variables);
+            mutable_op.replaceText = ExpandVariables(arg.replaceText, variables);
             ActionHelpers::HandleReplace(mutable_op);
-            // --- [修正结束] ---
         } else if constexpr (std::is_same_v<T, ReplaceLineOp>) {
             ReplaceLineOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
