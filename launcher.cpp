@@ -1868,8 +1868,13 @@ bool WildcardMatchWithEscapes(const wchar_t* text, const wchar_t* pattern) {
         if (*pattern == L'\\') {
             pattern++; // 查看需要转义的字符
             if (*pattern == L'\0') return false; // 无效的模式：以'\'结尾
-            // 现在进行字面值匹配
-            if (towlower(*pattern) == towlower(*text)) {
+            
+            // --- [核心修改] ---
+            // 对转义字符进行更可靠的比较
+            bool escaped_match = (*pattern == *text) || (iswalpha(*pattern) && (towlower(*pattern) == towlower(*text)));
+            // --- [核心修改结束] ---
+
+            if (escaped_match) {
                 pattern++;
                 text++;
             } else if (star_pattern) { // 不匹配，回溯
@@ -1882,7 +1887,11 @@ bool WildcardMatchWithEscapes(const wchar_t* text, const wchar_t* pattern) {
         else if (*pattern == L'*') {
             star_pattern = pattern++;
             star_text = text;
-        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+        } 
+        // --- [核心修改] ---
+        // 对普通字符进行更可靠的比较
+        else if (*pattern == L'?' || (*pattern == *text) || (iswalpha(*pattern) && (towlower(*pattern) == towlower(*text)))) {
+        // --- [核心修改结束] ---
             pattern++;
             text++;
         } else if (star_pattern) { // 不匹配，回溯
