@@ -1859,127 +1859,127 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
-// <-- [新增] 支持转义字符的通配符匹配函数
-bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
-    const wchar_t* p = pattern;
-    const wchar_t* t = text;
-    const wchar_t* star_p = nullptr;
-    const wchar_t* star_t = nullptr;
+    // <-- [最终解决方案] 采用标准非递归算法，健壮、高效且无循环/崩溃风险
+    bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
+        const wchar_t* p = pattern;
+        const wchar_t* t = text;
+        const wchar_t* star_p = nullptr;
+        const wchar_t* star_t = nullptr;
 
-    while (*t) {
-        bool is_escaped = (*p == L'\\');
-        const wchar_t* effective_p = is_escaped ? (p + 1) : p;
+        while (*t) {
+            bool is_escaped = (*p == L'\\');
+            const wchar_t* effective_p = is_escaped ? (p + 1) : p;
 
-        if (*effective_p == L'*') {
-            star_p = effective_p; // 记录星号位置
-            star_t = t;           // 记录星号开始匹配的文本位置
-            p = effective_p + 1;  // 模式指针前进，星号尝试匹配0个字符
-        }
-        else if (is_escaped ? (*effective_p != L'\0' && towlower(*effective_p) == towlower(*t)) :
-                 (*effective_p == L'?' ? (*t != L'\n') : (towlower(*effective_p) == towlower(*t))))
-        {
-            p = effective_p + 1;
-            t++;
-        }
-        else { // 字符不匹配
-            if (!star_p) {
-                return false; // 没有星号可以回溯，匹配失败
+            if (*effective_p == L'*') {
+                star_p = effective_p; // 记录星号位置
+                star_t = t;           // 记录星号开始匹配的文本位置
+                p = effective_p + 1;  // 模式指针前进，星号尝试匹配0个字符
             }
-            // 回溯：让星号多匹配一个字符
-            p = star_p + 1; // 模式重置到星号之后
-            if (*star_t == L'\n') {
-                return false; // 星号不能跨越换行符
+            else if (is_escaped ? (*effective_p != L'\0' && towlower(*effective_p) == towlower(*t)) :
+                    (*effective_p == L'?' ? (*t != L'\n') : (towlower(*effective_p) == towlower(*t))))
+            {
+                p = effective_p + 1;
+                t++;
             }
-            t = ++star_t; // 文本从星号匹配的下一个位置开始
+            else { // 字符不匹配
+                if (!star_p) {
+                    return false; // 没有星号可以回溯，匹配失败
+                }
+                // 回溯：让星号多匹配一个字符
+                p = star_p + 1; // 模式重置到星号之后
+                if (*star_t == L'\n') {
+                    return false; // 星号不能跨越换行符
+                }
+                t = ++star_t; // 文本从星号匹配的下一个位置开始
+            }
         }
-    }
 
-    // 文本已结束，检查模式剩余部分是否只有星号
-    while (*p == L'*') {
-        p++;
+        // 文本已结束，检查模式剩余部分是否只有星号
+        while (*p == L'*') {
+            p++;
+        }
+        // 如果模式也结束了，则匹配成功
+        return *p == L'\0';
     }
-    // 如果模式也结束了，则匹配成功
-    return *p == L'\0';
-}
 
     void HandleReplace(const ReplaceOp& op) {
-    FileContentInfo formatInfo;
-    if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
+        FileContentInfo formatInfo;
+        if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
-    std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
-    std::wstring content;
-    for(size_t i = 0; i < lines.size(); ++i) {
-        content += lines[i];
-        if (i < lines.size() - 1) content += L"\n";
-    }
+        std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
+        std::wstring content;
+        for(size_t i = 0; i < lines.size(); ++i) {
+            content += lines[i];
+            if (i < lines.size() - 1) content += L"\n";
+        }
 
-    const std::wstring toFindToken = L"{LINEBREAK}";
-    const std::wstring normalizedNewline = L"\n";
+        const std::wstring toFindToken = L"{LINEBREAK}";
+        const std::wstring normalizedNewline = L"\n";
 
-    std::wstring finalFindText = op.findText;
-    size_t lb_pos_find = 0;
-    while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
-        finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
-        lb_pos_find += normalizedNewline.length();
-    }
+        std::wstring finalFindText = op.findText;
+        size_t lb_pos_find = 0;
+        while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
+            finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
+            lb_pos_find += normalizedNewline.length();
+        }
 
-    std::wstring finalReplaceText = op.replaceText;
-    size_t lb_pos_replace = 0;
-    while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
-        finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
-        lb_pos_replace += normalizedNewline.length();
-    }
+        std::wstring finalReplaceText = op.replaceText;
+        size_t lb_pos_replace = 0;
+        while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
+            finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
+            lb_pos_replace += normalizedNewline.length();
+        }
 
-    std::wstring new_content;
-    new_content.reserve(content.length());
-    size_t current_pos = 0;
+        std::wstring new_content;
+        new_content.reserve(content.length());
+        size_t current_pos = 0;
 
-    while (current_pos < content.length()) {
-        size_t match_pos = std::wstring::npos;
-        size_t match_len = 0;
+        while (current_pos < content.length()) {
+            size_t match_pos = std::wstring::npos;
+            size_t match_len = 0;
 
-        // 从 current_pos 开始，查找第一个最长的匹配
-        for (size_t i = current_pos; i < content.length(); ++i) {
-            size_t longest_len_at_i = 0;
-            bool match_found_at_i = false;
-            for (size_t len = 0; i + len <= content.length(); ++len) {
-                if (WildcardMatchForReplace(content.substr(i, len).c_str(), finalFindText.c_str())) {
-                    longest_len_at_i = len;
-                    match_found_at_i = true;
+            // 从 current_pos 开始，查找第一个最长的匹配
+            for (size_t i = current_pos; i < content.length(); ++i) {
+                size_t longest_len_at_i = 0;
+                bool match_found_at_i = false;
+                for (size_t len = 0; i + len <= content.length(); ++len) {
+                    if (WildcardMatchForReplace(content.substr(i, len).c_str(), finalFindText.c_str())) {
+                        longest_len_at_i = len;
+                        match_found_at_i = true;
+                    }
+                }
+                if (match_found_at_i) {
+                    match_pos = i;
+                    match_len = longest_len_at_i;
+                    break; // 找到了第一个匹配，停止搜索
                 }
             }
-            if (match_found_at_i) {
-                match_pos = i;
-                match_len = longest_len_at_i;
-                break; // 找到了第一个匹配，停止搜索
+
+            if (match_pos != std::wstring::npos) {
+                // 将匹配之前的内容追加到新字符串
+                new_content += content.substr(current_pos, match_pos - current_pos);
+                // 追加替换后的文本
+                new_content += finalReplaceText;
+                // [核心] 更新搜索指针，跳过已匹配的部分，确保永远向前推进
+                current_pos = match_pos + match_len;
+            } else {
+                // 从 current_pos 开始再也找不到匹配项，追加剩余内容并结束
+                new_content += content.substr(current_pos);
+                break;
             }
         }
 
-        if (match_pos != std::wstring::npos) {
-            // 将匹配之前的内容追加到新字符串
-            new_content += content.substr(current_pos, match_pos - current_pos);
-            // 追加替换后的文本
-            new_content += finalReplaceText;
-            // [核心] 更新搜索指针，跳过已匹配的部分，确保永远向前推进
-            current_pos = match_pos + match_len;
-        } else {
-            // 从 current_pos 开始再也找不到匹配项，追加剩余内容并结束
-            new_content += content.substr(current_pos);
-            break;
+        // 将构建好的新内容写回文件
+        std::vector<std::wstring> new_lines;
+        std::wstringstream ss(new_content);
+        std::wstring line;
+        while (std::getline(ss, line, L'\n')) {
+            new_lines.push_back(line);
         }
-    }
+        if (new_content.empty() && !lines.empty()) new_lines.clear();
 
-    // 将构建好的新内容写回文件
-    std::vector<std::wstring> new_lines;
-    std::wstringstream ss(new_content);
-    std::wstring line;
-    while (std::getline(ss, line, L'\n')) {
-        new_lines.push_back(line);
+        WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
-    if (new_content.empty() && !lines.empty()) new_lines.clear();
-
-    WriteFileWithFormat(op.path, new_lines, formatInfo);
-}
 
     std::vector<std::wstring> new_lines;
     std::wstringstream ss(content);
