@@ -2917,8 +2917,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"replace") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() == 3) {
-                return ReplaceOp{parts[0], parts[1], parts[2]};
+            if (parts.size() != 3) return std::nullopt;
+            ReplaceOp op;
+            // --- [最终核心修正：在解析时立即展开所有变量] ---
+            op.path = ExpandVariables(parts[0], variables);
+            op.findText = ExpandVariables(parts[1], variables);
+            op.replaceText = ExpandVariables(parts[2], variables);
+            // --- [修正结束] ---
+            return op;
             }
         } else if (_wcsicmp(key.c_str(), L"replaceline") == 0) {
             const std::wstring local_delimiter = L" :: ";
@@ -3187,11 +3193,13 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             mutable_op.value = ExpandVariables(arg.value, variables);
             ActionHelpers::HandleIniWrite(mutable_op);
         } else if constexpr (std::is_same_v<T, ReplaceOp>) {
+            // --- [最终核心修正：移除冗余的变量展开] ---
             ReplaceOp mutable_op = arg;
-            mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
-            mutable_op.findText = ExpandVariables(arg.findText, variables);
-            mutable_op.replaceText = ExpandVariables(arg.replaceText, variables);
+            // 路径变量已展开，此处只需确保其为绝对路径
+            mutable_op.path = ResolveToAbsolutePath(mutable_op.path, variables);
+            // findText 和 replaceText 已在解析时展开，无需任何操作
             ActionHelpers::HandleReplace(mutable_op);
+            // --- [修正结束] ---
         } else if constexpr (std::is_same_v<T, ReplaceLineOp>) {
             ReplaceLineOp mutable_op = arg;
             mutable_op.path = ResolveToAbsolutePath(ExpandVariables(arg.path, variables), variables);
