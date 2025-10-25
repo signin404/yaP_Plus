@@ -1862,17 +1862,20 @@ namespace ActionHelpers {
     // <-- [新增] 支持通配符和转义的字符串匹配函数
     // 返回值: 匹配的长度。如果不匹配，则返回 -1。
     int WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-        // 基本情况1: 模式已结束。只有当文本也结束时，才算成功匹配（长度为0）。
+        // --- [最终核心修正：修正成功匹配的条件] ---
+        // 基本情况1: 模式已结束。这意味着我们已经成功匹配了所有模式字符。
+        // 立即返回0，表示剩余部分的匹配长度为0。
         if (*pattern == L'\0') {
-            return *text == L'\0' ? 0 : -1;
+            return 0;
         }
+        // --- [修正结束] ---
 
         // 情况1: 模式为 '*'
         if (*pattern == L'*') {
             // 尝试让 '*' 匹配0个字符
             int res = WildcardMatch(text, pattern + 1);
             if (res != -1) {
-                return res; // 成功
+                return res;
             }
             // 如果文本已结束，则无法继续匹配
             if (*text == L'\0') {
@@ -1881,16 +1884,15 @@ namespace ActionHelpers {
             // 尝试让 '*' 匹配1个字符，然后用相同的 '*' 模式匹配文本的剩余部分
             res = WildcardMatch(text + 1, pattern);
             if (res != -1) {
-                return res + 1; // 成功，长度加1
+                return res + 1;
             }
-            return -1; // 所有尝试都失败
+            return -1;
         }
 
         // 情况2: 模式为转义符 '\'
         if (*pattern == L'\\') {
-            pattern++; // 查看下一个字符
-            if (*pattern == L'\0') return -1; // 模式以悬空的转义符结尾
-            // 文本必须未结束，且转义后的字符必须匹配
+            pattern++;
+            if (*pattern == L'\0') return -1;
             if (*text != L'\0' && towlower(*text) == towlower(*pattern)) {
                 int res = WildcardMatch(text + 1, pattern + 1);
                 if (res != -1) {
@@ -1901,11 +1903,9 @@ namespace ActionHelpers {
         }
 
         // 情况3: 模式为 '?' 或普通字符
-        // 文本必须未结束
         if (*text == L'\0') {
             return -1;
         }
-        // 字符必须匹配 ('?' 匹配任何字符)
         if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
             int res = WildcardMatch(text + 1, pattern + 1);
             if (res != -1) {
@@ -1913,7 +1913,6 @@ namespace ActionHelpers {
             }
         }
 
-        // 所有情况都不匹配
         return -1;
     }
 
