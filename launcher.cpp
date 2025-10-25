@@ -1860,49 +1860,52 @@ namespace ActionHelpers {
     }
 
 // <-- [新增] 支持转义字符的通配符匹配函数
-bool WildcardMatchWithEscapes(const wchar_t* text, const wchar_t* pattern) {
+bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
     const wchar_t* star_text = nullptr;
     const wchar_t* star_pattern = nullptr;
 
-    while (*text) {
-        if (*pattern == L'\\') {
-            pattern++;
-            if (*pattern == L'\0') return false;
-            if (towlower(*pattern) == towlower(*text)) {
-                pattern++;
-                text++;
-            } else if (star_pattern) {
+    while (true) {
+        if (*pattern == L'\\') { // 处理转义字符
+            pattern++; // 查看需要转义的字符
+            if (*pattern == L'\0') return false; // 模式以'\'结尾，无效
+            if (*text == L'\0' || towlower(*pattern) != towlower(*text)) {
+                 // 文本已结束或字面值不匹配
+                if (!star_pattern) return false;
                 pattern = star_pattern + 1;
                 text = ++star_text;
-            } else {
-                return false;
+                continue;
             }
         } else if (*pattern == L'*') {
-            star_pattern = pattern++;
+            star_pattern = pattern;
             star_text = text;
-        } else if ((*pattern == L'?' && *text != L'\n') || (towlower(*pattern) == towlower(*text))) {
-            // '?' 匹配任何非换行符的字符
-            // 或者字面值匹配 (包括换行符)
             pattern++;
-            text++;
-        } else if (star_pattern) {
-            // 回溯时，'*' 不能扩展匹配换行符
-            if (*star_text == L'\n') {
-                return false;
+            continue;
+        } else if (*pattern == L'?') {
+            if (*text == L'\0' || *text == L'\n') { // '?' 不能匹配字符串末尾或换行符
+                if (!star_pattern) return false;
+                pattern = star_pattern + 1;
+                text = ++star_text;
+                continue;
             }
-            pattern = star_pattern + 1;
-            text = ++star_text;
-        } else {
-            return false;
+        } else { // 普通字符匹配
+            if (towlower(*pattern) != towlower(*text)) {
+                if (*text == L'\0' && *pattern == L'\0') break; // 成功匹配到末尾
+                if (!star_pattern) return false;
+                pattern = star_pattern + 1;
+                text = ++star_text;
+                continue;
+            }
+            if (*text == L'\0') break; // 成功匹配到末尾
         }
+
+        // 匹配成功，两个指针都前进
+        pattern++;
+        text++;
     }
 
+    // 文本已结束，消耗掉模式中所有尾随的 '*'
     while (*pattern == L'*') {
         pattern++;
-    }
-
-    if (*pattern == L'\\') {
-        return false;
     }
 
     return !*pattern;
@@ -1913,107 +1916,68 @@ bool WildcardMatchWithEscapes(const wchar_t* text, const wchar_t* pattern) {
     if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
     std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
+    std::wstring content;
+    for(size_t i = 0; i < lines.size(); ++i) {
+        content += lines[i];
+        if (i < lines.size() - 1) content += L"\n";
+    }
+
     const std::wstring toFindToken = L"{LINEBREAK}";
     const std::wstring normalizedNewline = L"\n";
 
-    bool is_multiline_search = (op.findText.find(toFindToken) != std::wstring::npos);
-
-    if (is_multiline_search) {
-        // --- 多行模式：在整个文件内容上进行匹配 ---
-        std::wstring content;
-        for(size_t i = 0; i < lines.size(); ++i) {
-            content += lines[i];
-            if (i < lines.size() - 1) content += normalizedNewline;
-        }
-
-        std::wstring finalFindText = op.findText;
-        size_t lb_pos_find = 0;
-        while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
-            finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
-            lb_pos_find += normalizedNewline.length();
-        }
-
-        std::wstring finalReplaceText = op.replaceText;
-        size_t lb_pos_replace = 0;
-        while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
-            finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
-            lb_pos_replace += normalizedNewline.length();
-        }
-
-        while (true) {
-            size_t match_pos = std::wstring::npos;
-            size_t match_len = 0;
-
-            for (size_t i = 0; i < content.length(); ++i) {
-                size_t longest_len_at_i = 0;
-                bool match_found_at_i = false;
-                for (size_t len = 0; i + len <= content.length(); ++len) {
-                    if (WildcardMatchWithEscapes(content.substr(i, len).c_str(), finalFindText.c_str())) {
-                        longest_len_at_i = len;
-                        match_found_at_i = true;
-                    }
-                }
-                if (match_found_at_i) {
-                    match_pos = i;
-                    match_len = longest_len_at_i;
-                    break;
-                }
-            }
-
-            if (match_pos != std::wstring::npos) {
-                content.replace(match_pos, match_len, finalReplaceText);
-            } else {
-                break;
-            }
-        }
-
-        std::vector<std::wstring> new_lines;
-        std::wstringstream ss(content);
-        std::wstring line;
-        while (std::getline(ss, line, L'\n')) {
-            new_lines.push_back(line);
-        }
-        if (content.empty() && !lines.empty()) new_lines.clear();
-        WriteFileWithFormat(op.path, new_lines, formatInfo);
-
-    } else {
-        // --- 单行模式：在每一行上独立进行匹配 ---
-        std::vector<std::wstring> new_lines;
-        std::wstring finalFindText = op.findText; // 没有 {LINEBREAK}
-        std::wstring finalReplaceText = op.replaceText; // 没有 {LINEBREAK}
-
-        for (const auto& original_line : lines) {
-            std::wstring current_line = original_line;
-            while (true) {
-                size_t match_pos = std::wstring::npos;
-                size_t match_len = 0;
-
-                for (size_t i = 0; i < current_line.length(); ++i) {
-                    size_t longest_len_at_i = 0;
-                    bool match_found_at_i = false;
-                    for (size_t len = 0; i + len <= current_line.length(); ++len) {
-                        if (WildcardMatchWithEscapes(current_line.substr(i, len).c_str(), finalFindText.c_str())) {
-                            longest_len_at_i = len;
-                            match_found_at_i = true;
-                        }
-                    }
-                    if (match_found_at_i) {
-                        match_pos = i;
-                        match_len = longest_len_at_i;
-                        break;
-                    }
-                }
-
-                if (match_pos != std::wstring::npos) {
-                    current_line.replace(match_pos, match_len, finalReplaceText);
-                } else {
-                    break;
-                }
-            }
-            new_lines.push_back(current_line);
-        }
-        WriteFileWithFormat(op.path, new_lines, formatInfo);
+    std::wstring finalFindText = op.findText;
+    size_t lb_pos_find = 0;
+    while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
+        finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
+        lb_pos_find += normalizedNewline.length();
     }
+
+    std::wstring finalReplaceText = op.replaceText;
+    size_t lb_pos_replace = 0;
+    while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
+        finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
+        lb_pos_replace += normalizedNewline.length();
+    }
+
+    while (true) { // 循环直到无法再进行替换
+        size_t match_pos = std::wstring::npos;
+        size_t match_len = 0;
+
+        // 在当前内容中查找第一个贪婪匹配
+        for (size_t i = 0; i < content.length(); ++i) {
+            size_t longest_len_at_i = 0;
+            bool match_found_at_i = false;
+            for (size_t len = 0; i + len <= content.length(); ++len) {
+                // <-- [核心修改] 调用新的、能感知换行符的匹配函数
+                if (WildcardMatchForReplace(content.substr(i, len).c_str(), finalFindText.c_str())) {
+                    longest_len_at_i = len;
+                    match_found_at_i = true;
+                }
+            }
+            if (match_found_at_i) {
+                match_pos = i;
+                match_len = longest_len_at_i;
+                break; // 找到了第一个起始位置的匹配，完成搜索
+            }
+        }
+
+        if (match_pos != std::wstring::npos) {
+            content.replace(match_pos, match_len, finalReplaceText);
+        } else {
+            // 在整个字符串中未找到匹配项，跳出循环
+            break;
+        }
+    }
+
+    std::vector<std::wstring> new_lines;
+    std::wstringstream ss(content);
+    std::wstring line;
+    while (std::getline(ss, line, L'\n')) {
+        new_lines.push_back(line);
+    }
+    if (content.empty() && !lines.empty()) new_lines.clear();
+
+    WriteFileWithFormat(op.path, new_lines, formatInfo);
 }
 
     void HandleReplaceLine(const ReplaceLineOp& op) {
