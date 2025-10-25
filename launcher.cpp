@@ -1909,7 +1909,6 @@ namespace ActionHelpers {
         std::wifstream inFile(op.path);
         if (!inFile.is_open()) return;
 
-        // 将文件内容读入流，以便处理
         std::wstringstream buffer;
         buffer << inFile.rdbuf();
         inFile.close();
@@ -1921,34 +1920,58 @@ namespace ActionHelpers {
         bool fileModified = false;
 
         while (std::getline(lineStream, line)) {
-            bool lineModified = false;
-            // 遍历行中的每个字符，作为匹配的起始点
-            for (size_t i = 0; i < line.length(); ++i) {
-                // 尝试从当前位置开始进行通配符匹配
-                int matchLength = WildcardMatch(line.c_str() + i, op.findText.c_str());
+            std::wstring newLine;
+            size_t currentIndex = 0;
+            bool lineModifiedThisIteration = false;
 
-                if (matchLength != -1) {
+            // --- [最终核心修正：实现正确的行内分段替换逻辑] ---
+            while (currentIndex < line.length()) {
+                int matchLength = -1;
+                size_t matchIndex = std::wstring::npos;
+
+                // 从当前位置开始，查找第一个匹配项
+                for (size_t i = currentIndex; i < line.length(); ++i) {
+                    matchLength = WildcardMatch(line.c_str() + i, op.findText.c_str());
+                    if (matchLength != -1) {
+                        matchIndex = i;
+                        break;
+                    }
+                }
+
+                if (matchIndex != std::wstring::npos) {
                     // 找到了一个匹配项
-                    // 构造新行：匹配前部分 + 替换文本 + 匹配后部分
-                    std::wstring modifiedLine = line.substr(0, i);
-                    modifiedLine += op.replaceText;
-                    modifiedLine += line.substr(i + matchLength);
+                    // 1. 将从当前位置到匹配开始前的内容，附加到新行
+                    newLine += line.substr(currentIndex, matchIndex - currentIndex);
+                    // 2. 将替换文本附加到新行
+                    newLine += op.replaceText;
+                    // 3. 将当前索引移动到被匹配部分的末尾之后
+                    currentIndex = matchIndex + matchLength;
                     
-                    newContent << modifiedLine << L"\n";
-                    lineModified = true;
+                    lineModifiedThisIteration = true;
                     fileModified = true;
-                    break; // 每行只替换第一个匹配项
+                } else {
+                    // 从当前位置开始，行内再也找不到匹配项了
+                    break;
                 }
             }
 
-            if (!lineModified) {
-                // 如果当前行没有发生替换，则保留原样
-                newContent << line << L"\n";
+            // 将最后一个匹配项之后的所有剩余内容，附加到新行
+            if (currentIndex < line.length()) {
+                newLine += line.substr(currentIndex);
             }
+
+            // 如果是空行且发生了修改（例如，原始内容被完全替换为空），
+            // 也要确保写入一个换行符，以保持行结构。
+            // 否则，直接写入新构建的行。
+            if (lineModifiedThisIteration) {
+                 newContent << newLine << L"\n";
+            } else {
+                 newContent << line << L"\n";
+            }
+            // --- [修正结束] ---
         }
 
         if (fileModified) {
-            // 如果文件内容发生了改变，则写回文件
             std::wofstream outFile(op.path, std::ios::trunc);
             if (outFile.is_open()) {
                 outFile << newContent.str();
