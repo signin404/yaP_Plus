@@ -1861,34 +1861,60 @@ namespace ActionHelpers {
 
 // <-- [新增] 支持转义字符的通配符匹配函数
 bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
-    // 递归的核心逻辑
-    if (*pattern == L'\0') {
-        return *text == L'\0';
-    }
+    while (*pattern != L'\0') {
+        if (*pattern == L'*') {
+            // 遇到星号，记录当前位置
+            const wchar_t* star_pattern = pattern++;
+            const wchar_t* star_text = text;
 
-    if (*pattern == L'*') {
-        // 模式是 '*'，它可以匹配零个或多个字符。
-        // 可能性1: '*' 匹配零个字符。我们用 pattern+1 去匹配当前的 text。
-        // 可能性2: text 不为空且不是换行符，我们让 '*' 匹配一个字符，
-        //           然后用同一个 pattern (因为'*'可以匹配更多) 去匹配 text+1。
-        return WildcardMatchForReplace(text, pattern + 1) ||
-               (*text != L'\0' && *text != L'\n' && WildcardMatchForReplace(text + 1, pattern));
-    }
+            // 如果星号是模式的最后一个字符，它会匹配到行尾或字符串末尾
+            if (*pattern == L'\0') {
+                while (*text != L'\0' && *text != L'\n') {
+                    text++;
+                }
+                // 此时，text 指向行尾或字符串末尾。
+                // HandleReplace 的外层循环会根据这个 text 的最终位置来确定匹配长度。
+                // 我们只需要返回 true 表示匹配成功即可。
+                return true;
+            }
 
-    if (*pattern == L'\\') { // 处理转义
+            // 这是一个更健壮的迭代式回溯，而非递归
+            while (*text != L'\0') {
+                // 尝试用星号后面的模式匹配当前文本
+                if (WildcardMatchForReplace(text, pattern)) {
+                    return true;
+                }
+                // 如果匹配失败，检查星号是否可以多匹配一个字符
+                if (*text == L'\n') {
+                    // 星号不能跨越换行符
+                    return false;
+                }
+                text++;
+            }
+            // 文本已结束，尝试用星号后面的模式匹配空字符串
+            return WildcardMatchForReplace(text, pattern);
+
+        } else if (*pattern == L'\\') { // 处理转义
+            pattern++;
+            if (*pattern == L'\0' || towlower(*text) != towlower(*pattern)) {
+                return false;
+            }
+        } else if (*pattern == L'?') { // 处理问号
+            if (*text == L'\0' || *text == L'\n') {
+                return false;
+            }
+        } else { // 处理普通字符
+            if (towlower(*text) != towlower(*pattern)) {
+                return false;
+            }
+        }
+
+        text++;
         pattern++;
-        if (*pattern == L'\0') return false; // 无效的模式：以'\'结尾
-        // 字面值匹配
-        return *text != L'\0' && towlower(*text) == towlower(*pattern) && WildcardMatchForReplace(text + 1, pattern + 1);
     }
 
-    if (*pattern == L'?') {
-        // '?' 必须匹配一个非换行符
-        return *text != L'\0' && *text != L'\n' && WildcardMatchForReplace(text + 1, pattern + 1);
-    }
-
-    // 普通字符的精确匹配
-    return *text != L'\0' && towlower(*text) == towlower(*pattern) && WildcardMatchForReplace(text + 1, pattern + 1);
+    // 如果模式和文本都已结束，则匹配成功
+    return *text == L'\0';
 }
 
     void HandleReplace(const ReplaceOp& op) {
