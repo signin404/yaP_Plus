@@ -1862,58 +1862,55 @@ namespace ActionHelpers {
     // <-- [新增] 支持通配符和转义的字符串匹配函数
     // 返回值: 匹配的长度。如果不匹配，则返回 -1。
     int WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-        // --- [最终核心修正：修正成功匹配的条件] ---
-        // 基本情况1: 模式已结束。这意味着我们已经成功匹配了所有模式字符。
-        // 立即返回0，表示剩余部分的匹配长度为0。
-        if (*pattern == L'\0') {
-            return 0;
-        }
-        // --- [修正结束] ---
+        const wchar_t* pText = text;
+        const wchar_t* pPattern = pattern;
+        const wchar_t* pStar = nullptr;
+        const wchar_t* pTextStar = nullptr;
 
-        // 情况1: 模式为 '*'
-        if (*pattern == L'*') {
-            // 尝试让 '*' 匹配0个字符
-            int res = WildcardMatch(text, pattern + 1);
-            if (res != -1) {
-                return res;
-            }
-            // 如果文本已结束，则无法继续匹配
-            if (*text == L'\0') {
-                return -1;
-            }
-            // 尝试让 '*' 匹配1个字符，然后用相同的 '*' 模式匹配文本的剩余部分
-            res = WildcardMatch(text + 1, pattern);
-            if (res != -1) {
-                return res + 1;
-            }
-            return -1;
-        }
-
-        // 情况2: 模式为转义符 '\'
-        if (*pattern == L'\\') {
-            pattern++;
-            if (*pattern == L'\0') return -1;
-            if (*text != L'\0' && towlower(*text) == towlower(*pattern)) {
-                int res = WildcardMatch(text + 1, pattern + 1);
-                if (res != -1) {
-                    return res + 1;
+        while (*pText) {
+            wchar_t patChar = *pPattern;
+            if (patChar == L'\\') { // 处理转义
+                pPattern++;
+                patChar = *pPattern;
+                if (patChar == L'\0') return -1; // 模式以悬空转义符结尾
+                if (towlower(*pText) == towlower(patChar)) {
+                    pText++;
+                    pPattern++;
+                    continue;
                 }
             }
-            return -1;
-        }
-
-        // 情况3: 模式为 '?' 或普通字符
-        if (*text == L'\0') {
-            return -1;
-        }
-        if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
-            int res = WildcardMatch(text + 1, pattern + 1);
-            if (res != -1) {
-                return res + 1;
+            else if (patChar == L'?' || towlower(patChar) == towlower(*pText)) {
+                pText++;
+                pPattern++;
+                continue;
             }
+            
+            if (patChar == L'*') {
+                pStar = pPattern++;
+                pTextStar = pText;
+                continue;
+            }
+
+            if (pStar) {
+                pPattern = pStar + 1;
+                pText = ++pTextStar;
+                continue;
+            }
+
+            return -1; // 不匹配
         }
 
-        return -1;
+        // 文本结束后，跳过模式中所有剩余的 '*'
+        while (*pPattern == L'*') {
+            pPattern++;
+        }
+
+        // 如果模式也结束了，则匹配成功
+        if (*pPattern == L'\0') {
+            return (int)(pText - text);
+        }
+
+        return -1; // 模式还有剩余，不匹配
     }
 
     void HandleReplace(const ReplaceOp& op) {
@@ -1922,13 +1919,11 @@ namespace ActionHelpers {
         std::wifstream inFile(op.path);
         if (!inFile.is_open()) return;
 
-        // 步骤1: 将整个文件（包括所有换行符）读入一个单一的字符串
         std::wstringstream buffer;
         buffer << inFile.rdbuf();
         inFile.close();
         std::wstring content = buffer.str();
 
-        // --- [最终核心修正：在整个文件内容上执行替换，而不是逐行] ---
         std::wstring newContent;
         size_t currentIndex = 0;
         bool fileModified = false;
@@ -1947,30 +1942,25 @@ namespace ActionHelpers {
             }
 
             if (matchIndex != std::wstring::npos) {
-                // 找到了一个匹配项
                 fileModified = true;
-                // 1. 将从当前位置到匹配开始前的内容，附加到新内容
                 newContent += content.substr(currentIndex, matchIndex - currentIndex);
-                // 2. 将替换文本附加到新内容
                 newContent += op.replaceText;
-                // 3. 将当前索引移动到被匹配部分的末尾之后
                 currentIndex = matchIndex + matchLength;
             } else {
-                // 从当前位置开始，再也找不到匹配项了
-                break; // 退出查找循环
+                // --- [最终核心修正：确保剩余内容被附加] ---
+                // 从当前位置开始，再也找不到匹配项了，
+                // 将所有剩余内容附加到新内容，然后退出循环。
+                newContent += content.substr(currentIndex);
+                break; 
+                // --- [修正结束] ---
             }
         }
 
-        // 将最后一个匹配项之后的所有剩余内容，附加到新内容
-        if (currentIndex < content.length()) {
-            newContent += content.substr(currentIndex);
-        }
-        // --- [修正结束] ---
-
+        // 特殊情况：如果文件为空，但替换操作使其不为空（例如，查找空，替换为"abc"）
+        // 或者文件不为空，但所有内容都被替换为空
         if (fileModified) {
-            std::wofstream outFile(op.path, std::ios::trunc);
+             std::wofstream outFile(op.path, std::ios::trunc);
             if (outFile.is_open()) {
-                // 将构建好的、包含所有修改的新内容，一次性写回文件
                 outFile << newContent;
                 outFile.close();
             }
