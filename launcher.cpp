@@ -1981,17 +1981,6 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
 
-    std::vector<std::wstring> new_lines;
-    std::wstringstream ss(content);
-    std::wstring line;
-    while (std::getline(ss, line, L'\n')) {
-        new_lines.push_back(line);
-    }
-    if (content.empty() && !lines.empty()) new_lines.clear();
-
-    WriteFileWithFormat(op.path, new_lines, formatInfo);
-}
-
     void HandleReplaceLine(const ReplaceLineOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
