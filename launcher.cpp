@@ -1861,54 +1861,63 @@ namespace ActionHelpers {
 
 // <-- [新增] 支持转义字符的通配符匹配函数
 bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
-    const wchar_t* star_text = nullptr;
     const wchar_t* star_pattern = nullptr;
+    const wchar_t* star_text = nullptr;
 
     while (true) {
+        // 模式匹配逻辑
         if (*pattern == L'\\') { // 处理转义字符
             pattern++; // 查看需要转义的字符
-            if (*pattern == L'\0') return false; // 模式以'\'结尾，无效
-            if (*text == L'\0' || towlower(*pattern) != towlower(*text)) {
-                 // 文本已结束或字面值不匹配
-                if (!star_pattern) return false;
-                pattern = star_pattern + 1;
-                text = ++star_text;
-                continue;
-            }
-        } else if (*pattern == L'*') {
-            star_pattern = pattern;
-            star_text = text;
-            pattern++;
-            continue;
-        } else if (*pattern == L'?') {
-            if (*text == L'\0' || *text == L'\n') { // '?' 不能匹配字符串末尾或换行符
-                if (!star_pattern) return false;
-                pattern = star_pattern + 1;
-                text = ++star_text;
-                continue;
-            }
-        } else { // 普通字符匹配
             if (towlower(*pattern) != towlower(*text)) {
-                if (*text == L'\0' && *pattern == L'\0') break; // 成功匹配到末尾
-                if (!star_pattern) return false;
-                pattern = star_pattern + 1;
-                text = ++star_text;
-                continue;
+                goto backtrack;
             }
-            if (*text == L'\0') break; // 成功匹配到末尾
+            // 如果文本和模式都已结束，则匹配成功
+            if (*text == L'\0') return *pattern == L'\0';
+
+        } else if (*pattern == L'*') {
+            // 遇到星号，记录回溯点，并尝试匹配零个字符
+            star_pattern = pattern++;
+            star_text = text;
+            continue;
+
+        } else if (*pattern == L'?') {
+            // 问号不能匹配字符串末尾或换行符
+            if (*text == L'\0' || *text == L'\n') {
+                goto backtrack;
+            }
+        } else { // 处理普通字符
+            if (towlower(*pattern) != towlower(*text)) {
+                goto backtrack;
+            }
+            // 如果文本和模式都已结束，则匹配成功
+            if (*text == L'\0') return true;
         }
 
-        // 匹配成功，两个指针都前进
-        pattern++;
+        // 当前字符匹配成功，两个指针都前进
         text++;
-    }
-
-    // 文本已结束，消耗掉模式中所有尾随的 '*'
-    while (*pattern == L'*') {
         pattern++;
-    }
+        continue;
 
-    return !*pattern;
+    backtrack:
+        // 如果没有星号可以回溯，则匹配失败
+        if (!star_pattern) {
+            return false;
+        }
+
+        // --- [核心修正] ---
+        // 星号需要尝试多匹配一个字符。
+        // 在推进 star_text 之前，检查它当前指向的字符。
+        // 如果是换行符，星号无法越过它，因此回溯失败。
+        if (*star_text == L'\n') {
+            return false;
+        }
+        // --- [修正结束] ---
+
+        // 推进文本指针，让星号多匹配一个字符
+        text = ++star_text;
+        // 模式指针重置到星号之后
+        pattern = star_pattern + 1;
+    }
 }
 
     void HandleReplace(const ReplaceOp& op) {
