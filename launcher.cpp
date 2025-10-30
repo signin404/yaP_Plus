@@ -3274,7 +3274,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid, const std::wstring& iniContent) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
@@ -3360,7 +3360,7 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             ActionHelpers::HandleReplaceLine(mutable_op);
         }
         else if constexpr (std::is_same_v<T, EnvVarOp>) {
-            ActionHelpers::HandleEnvVar(arg, variables);
+            ActionHelpers::HandleEnvVar(arg, variables, iniContent);
         }
     }, opData);
 }
