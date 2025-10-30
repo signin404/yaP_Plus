@@ -1064,31 +1064,13 @@ namespace ActionHelpers {
     }
     
     // 核心函数：处理所有环境变量的设置和删除
-    void HandleEnvVar(const EnvVarOp& op, const std::map<std::wstring, std::wstring>& variables) {
+        void HandleEnvVar(const EnvVarOp& op, const std::map<std::wstring, std::wstring>& variables) {
         std::wstring finalName = ExpandVariables(op.name, variables);
         std::wstring finalValue = ExpandVariables(op.value, variables);
         bool isNullValue = (_wcsicmp(finalValue.c_str(), L"null") == 0);
     
-        if (op.type == EnvVarType::Process) {
-            // --- 模式1: 进程专用变量 (旧逻辑) ---
-            if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
-                // 特殊处理 Path 变量
-                if (isNullValue) {
-                    SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
-                } else {
-                    std::wstring newPath = g_originalPath;
-                    if (!newPath.empty() && newPath.back() != L';') {
-                        newPath += L';';
-                    }
-                    newPath += finalValue;
-                    SetEnvironmentVariableW(L"Path", newPath.c_str());
-                }
-            } else {
-                // 其他所有环境变量
-                SetEnvironmentVariableW(finalName.c_str(), isNullValue ? NULL : finalValue.c_str());
-            }
-        } else {
-            // --- 模式2: 全局用户/系统变量 (新逻辑) ---
+        // --- 步骤 1: 如果是全局变量，先修改注册表 ---
+        if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
             HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
             const wchar_t* subKey = (op.type == EnvVarType::User) 
                 ? L"Environment" 
@@ -1100,18 +1082,69 @@ namespace ActionHelpers {
                     // 删除变量
                     RegDeleteValueW(hKey, finalName.c_str());
                 } else {
-                    // 设置变量
-                    // 对Path使用REG_EXPAND_SZ以支持%SystemRoot%等，其他使用REG_SZ
-                    DWORD type = (_wcsicmp(finalName.c_str(), L"Path") == 0) ? REG_EXPAND_SZ : REG_SZ;
+                    std::wstring valueToWrite = finalValue;
+                    DWORD type = REG_SZ;
+    
+                    // --- [核心修改] 对全局 Path 变量执行追加逻辑 ---
+                    if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+                        type = REG_EXPAND_SZ; // Path 变量应使用可扩展类型
+                        std::wstring existingPath;
+                        DWORD existingType = 0;
+                        DWORD bufferSize = 0;
+    
+                        // 第一次调用获取所需缓冲区大小
+                        if (RegQueryValueExW(hKey, finalName.c_str(), NULL, &existingType, NULL, &bufferSize) == ERROR_SUCCESS) {
+                            if (bufferSize > 0) {
+                                std::vector<wchar_t> buffer(bufferSize / sizeof(wchar_t));
+                                // 第二次调用获取数据
+                                if (RegQueryValueExW(hKey, finalName.c_str(), NULL, &existingType, (LPBYTE)buffer.data(), &bufferSize) == ERROR_SUCCESS) {
+                                    existingPath = buffer.data();
+                                }
+                            }
+                        }
+                        
+                        // 构建新的 Path 字符串
+                        if (!existingPath.empty()) {
+                            if (existingPath.back() != L';') {
+                                existingPath += L';';
+                            }
+                            valueToWrite = existingPath + finalValue;
+                        }
+                    }
+                    // --- [修改结束] ---
+    
+                    // 将最终值写入注册表
                     RegSetValueExW(hKey, finalName.c_str(), 0, type, 
-                                   (const BYTE*)finalValue.c_str(), 
-                                   (DWORD)(finalValue.length() + 1) * sizeof(wchar_t));
+                                   (const BYTE*)valueToWrite.c_str(), 
+                                   (DWORD)(valueToWrite.length() + 1) * sizeof(wchar_t));
                 }
                 RegCloseKey(hKey);
                 
                 // 通知系统环境变量已发生变化
                 BroadcastEnvironmentUpdate();
             }
+        }
+    
+        // --- 步骤 2: 总是将变更同步到当前进程的环境变量 ---
+        // 对于 User/System 类型，这使得更改立即生效
+        // 对于 Process 类型，这是唯一的操作
+        if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+            // 特殊处理 Path 变量
+            if (isNullValue) {
+                // 恢复为程序启动时的原始 Path
+                SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
+            } else {
+                // 将新值追加到原始 Path 后面
+                std::wstring newPath = g_originalPath;
+                if (!newPath.empty() && newPath.back() != L';') {
+                    newPath += L';';
+                }
+                newPath += finalValue;
+                SetEnvironmentVariableW(L"Path", newPath.c_str());
+            }
+        } else {
+            // 对所有其他环境变量，直接设置或删除
+            SetEnvironmentVariableW(finalName.c_str(), isNullValue ? NULL : finalValue.c_str());
         }
     }
 
