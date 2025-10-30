@@ -22,6 +22,7 @@
 #include <psapi.h>
 #include <locale>
 #include <codecvt>
+#include <regex>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -209,6 +210,7 @@ struct ReplaceOp {
     std::wstring path;
     std::wstring findText;
     std::wstring replaceText;
+    bool useRegex = false;
 };
 
 struct ReplaceLineOp {
@@ -1859,117 +1861,58 @@ namespace ActionHelpers {
         WriteFileWithFormat(op.path, lines, formatInfo);
     }
 
-    // <-- [最终解决方案] 采用标准非递归算法，健壮、高效且无循环/崩溃风险
-    bool WildcardMatchForReplace(const wchar_t* text, const wchar_t* pattern) {
-        const wchar_t* p = pattern;
-        const wchar_t* t = text;
-        const wchar_t* star_p = nullptr;
-        const wchar_t* star_t = nullptr;
-
-        while (*t) {
-            bool is_escaped = (*p == L'\\');
-            const wchar_t* effective_p = is_escaped ? (p + 1) : p;
-
-            if (*effective_p == L'*') {
-                star_p = effective_p; // 记录星号位置
-                star_t = t;           // 记录星号开始匹配的文本位置
-                p = effective_p + 1;  // 模式指针前进，星号尝试匹配0个字符
-            }
-            else if (is_escaped ? (*effective_p != L'\0' && towlower(*effective_p) == towlower(*t)) :
-                    (*effective_p == L'?' ? (*t != L'\n') : (towlower(*effective_p) == towlower(*t))))
-            {
-                p = effective_p + 1;
-                t++;
-            }
-            else { // 字符不匹配
-                if (!star_p) {
-                    return false; // 没有星号可以回溯，匹配失败
-                }
-                // 回溯：让星号多匹配一个字符
-                p = star_p + 1; // 模式重置到星号之后
-                if (*star_t == L'\n') {
-                    return false; // 星号不能跨越换行符
-                }
-                t = ++star_t; // 文本从星号匹配的下一个位置开始
-            }
-        }
-
-        // 文本已结束，检查模式剩余部分是否只有星号
-        while (*p == L'*') {
-            p++;
-        }
-        // 如果模式也结束了，则匹配成功
-        return *p == L'\0';
-    }
-
+    // [完全替换] 使用新的双模式（正则/字面量）重写 HandleReplace 函数
     void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
-
+    
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::wstring content;
         for(size_t i = 0; i < lines.size(); ++i) {
             content += lines[i];
             if (i < lines.size() - 1) content += L"\n";
         }
-
+    
+        // 统一处理 {LINEBREAK} 标记
         const std::wstring toFindToken = L"{LINEBREAK}";
         const std::wstring normalizedNewline = L"\n";
-
+    
         std::wstring finalFindText = op.findText;
         size_t lb_pos_find = 0;
         while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
             finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
             lb_pos_find += normalizedNewline.length();
         }
-
+    
         std::wstring finalReplaceText = op.replaceText;
         size_t lb_pos_replace = 0;
         while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
             finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
             lb_pos_replace += normalizedNewline.length();
         }
-
+    
         std::wstring new_content;
-        new_content.reserve(content.length());
-        size_t current_pos = 0;
-
-        while (current_pos < content.length()) {
-            size_t match_pos = std::wstring::npos;
-            size_t match_len = 0;
-
-            // 从 current_pos 开始，查找第一个最长的匹配
-            for (size_t i = current_pos; i < content.length(); ++i) {
-                size_t longest_len_at_i = 0;
-                bool match_found_at_i = false;
-                for (size_t len = 0; i + len <= content.length(); ++len) {
-                    if (WildcardMatchForReplace(content.substr(i, len).c_str(), finalFindText.c_str())) {
-                        longest_len_at_i = len;
-                        match_found_at_i = true;
-                    }
-                }
-                if (match_found_at_i) {
-                    match_pos = i;
-                    match_len = longest_len_at_i;
-                    break; // 找到了第一个匹配，停止搜索
-                }
+    
+        if (op.useRegex) {
+            // --- 正则表达式替换模式 ---
+            try {
+                std::wregex re(finalFindText);
+                new_content = std::regex_replace(content, re, finalReplaceText);
+            } catch (const std::regex_error& e) {
+                // 正则表达式无效，保持内容不变以防崩溃
+                new_content = content;
             }
-
-            if (match_pos != std::wstring::npos) {
-                // 将匹配之前的内容追加到新字符串
-                new_content += content.substr(current_pos, match_pos - current_pos);
-                // 追加替换后的文本
-                new_content += finalReplaceText;
-                // [核心] 更新搜索指针，跳过已匹配的部分，确保永远向前推进
-                current_pos = match_pos + match_len;
-            } else {
-                // 从 current_pos 开始再也找不到匹配项，追加剩余内容并结束
-                new_content += content.substr(current_pos);
-                break;
+        } else {
+            // --- 字面量（精确）替换模式 ---
+            new_content = content;
+            size_t pos = 0;
+            while ((pos = new_content.find(finalFindText, pos)) != std::wstring::npos) {
+                new_content.replace(pos, finalFindText.length(), finalReplaceText);
+                pos += finalReplaceText.length(); // 移动到替换后文本的末尾继续查找
             }
         }
-
-        // 将构建好的新内容写回文件
+    
+        // 将新内容写回文件
         std::vector<std::wstring> new_lines;
         std::wstringstream ss(new_content);
         std::wstring line;
@@ -1977,7 +1920,7 @@ namespace ActionHelpers {
             new_lines.push_back(line);
         }
         if (new_content.empty() && !lines.empty()) new_lines.clear();
-
+    
         WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
 
@@ -2920,9 +2863,36 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             }
         }
         else if (_wcsicmp(key.c_str(), L"replace") == 0) {
-            auto parts = split_string(value, delimiter);
-            if (parts.size() == 3) {
-                return ReplaceOp{parts[0], parts[1], parts[2]};
+            const std::wstring local_delimiter = L" :: ";
+            size_t first_delim = value.find(local_delimiter);
+            if (first_delim != std::wstring::npos) {
+                size_t second_delim = value.find(local_delimiter, first_delim + local_delimiter.length());
+                if (second_delim != std::wstring::npos) {
+                    ReplaceOp op;
+                    // 路径可以被 trim
+                    op.path = trim(value.substr(0, first_delim));
+                    
+                    // 查找和替换字符串不使用 trim，以保留空格和缩进
+                    size_t third_delim = value.find(local_delimiter, second_delim + local_delimiter.length());
+                    
+                    if (third_delim != std::wstring::npos) {
+                        // 找到4个部分 (路径 :: 查找 :: 替换 :: 模式)
+                        op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
+                        op.replaceText = value.substr(second_delim + local_delimiter.length(), third_delim - (second_delim + local_delimiter.length()));
+                        
+                        // 模式标志可以被 trim
+                        std::wstring mode = trim(value.substr(third_delim + local_delimiter.length()));
+                        if (_wcsicmp(mode.c_str(), L"regex") == 0) {
+                            op.useRegex = true;
+                        }
+                    } else {
+                        // 只找到3个部分 (路径 :: 查找 :: 替换)，默认为字面量替换
+                        op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
+                        op.replaceText = value.substr(second_delim + local_delimiter.length());
+                        op.useRegex = false;
+                    }
+                    return op;
+                }
             }
         } else if (_wcsicmp(key.c_str(), L"replaceline") == 0) {
             const std::wstring local_delimiter = L" :: ";
