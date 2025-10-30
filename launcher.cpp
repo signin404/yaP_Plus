@@ -220,9 +220,16 @@ struct ReplaceLineOp {
     std::wstring replaceLine;
 };
 
+enum class EnvVarType {
+    Process, // 进程专用 (默认)
+    User,    // 当前用户 (全局)
+    System   // 系统 (全局)
+};
+
 struct EnvVarOp {
     std::wstring name;
     std::wstring value;
+    EnvVarType type = EnvVarType::Process;
 };
 
 
@@ -1050,6 +1057,63 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 
 // Deletion and Action Helpers
 namespace ActionHelpers {
+
+    // 辅助函数：在修改注册表后，通知系统环境变量已更改
+    void BroadcastEnvironmentUpdate() {
+        SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
+    }
+    
+    // 核心函数：处理所有环境变量的设置和删除
+    void HandleEnvVar(const EnvVarOp& op, const std::map<std::wstring, std::wstring>& variables) {
+        std::wstring finalName = ExpandVariables(op.name, variables);
+        std::wstring finalValue = ExpandVariables(op.value, variables);
+        bool isNullValue = (_wcsicmp(finalValue.c_str(), L"null") == 0);
+    
+        if (op.type == EnvVarType::Process) {
+            // --- 模式1: 进程专用变量 (旧逻辑) ---
+            if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+                // 特殊处理 Path 变量
+                if (isNullValue) {
+                    SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
+                } else {
+                    std::wstring newPath = g_originalPath;
+                    if (!newPath.empty() && newPath.back() != L';') {
+                        newPath += L';';
+                    }
+                    newPath += finalValue;
+                    SetEnvironmentVariableW(L"Path", newPath.c_str());
+                }
+            } else {
+                // 其他所有环境变量
+                SetEnvironmentVariableW(finalName.c_str(), isNullValue ? NULL : finalValue.c_str());
+            }
+        } else {
+            // --- 模式2: 全局用户/系统变量 (新逻辑) ---
+            HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+            const wchar_t* subKey = (op.type == EnvVarType::User) 
+                ? L"Environment" 
+                : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+            
+            HKEY hKey;
+            if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE | KEY_READ, &hKey) == ERROR_SUCCESS) {
+                if (isNullValue) {
+                    // 删除变量
+                    RegDeleteValueW(hKey, finalName.c_str());
+                } else {
+                    // 设置变量
+                    // 对Path使用REG_EXPAND_SZ以支持%SystemRoot%等，其他使用REG_SZ
+                    DWORD type = (_wcsicmp(finalName.c_str(), L"Path") == 0) ? REG_EXPAND_SZ : REG_SZ;
+                    RegSetValueExW(hKey, finalName.c_str(), 0, type, 
+                                   (const BYTE*)finalValue.c_str(), 
+                                   (DWORD)(finalValue.length() + 1) * sizeof(wchar_t));
+                }
+                RegCloseKey(hKey);
+                
+                // 通知系统环境变量已发生变化
+                BroadcastEnvironmentUpdate();
+            }
+        }
+    }
 
     void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -2939,8 +3003,21 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"envvar") == 0) {
             auto parts = split_string(value, delimiter);
-            if (parts.size() == 2) {
-                return EnvVarOp{parts[0], parts[1]};
+            if (parts.size() >= 2) { // 至少需要 变量名 和 变量值
+                EnvVarOp op;
+                op.name = parts[0];
+                op.value = parts[1];
+                
+                // 检查是否指定了类型
+                if (parts.size() > 2) {
+                    if (_wcsicmp(parts[2].c_str(), L"user") == 0) {
+                        op.type = EnvVarType::User;
+                    } else if (_wcsicmp(parts[2].c_str(), L"system") == 0) {
+                        op.type = EnvVarType::System;
+                    }
+                    // 如果是其他无法识别的类型，则保持默认的 EnvVarType::Process
+                }
+                return op;
             }
         }
         return std::nullopt;
@@ -3204,32 +3281,7 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             ActionHelpers::HandleReplaceLine(mutable_op);
         }
         else if constexpr (std::is_same_v<T, EnvVarOp>) {
-            std::wstring finalName = ExpandVariables(arg.name, variables);
-            std::wstring finalValue = ExpandVariables(arg.value, variables);
-
-            // 检查变量名是否为 "Path"
-            if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
-                // 特殊处理 Path 变量
-                if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
-                    // 如果设置为 "null" 则恢复为程序启动时的原始 Path
-                    SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
-                } else {
-                    // 否则 将新值追加到原始 Path 后面
-                    std::wstring newPath = g_originalPath;
-                    if (!newPath.empty() && newPath.back() != L';') {
-                        newPath += L';';
-                    }
-                    newPath += finalValue;
-                    SetEnvironmentVariableW(L"Path", newPath.c_str());
-                }
-            } else {
-                // 对所有其他环境变量 保持原始的覆盖行为
-                if (_wcsicmp(finalValue.c_str(), L"null") == 0) {
-                    SetEnvironmentVariableW(finalName.c_str(), NULL);
-                } else {
-                    SetEnvironmentVariableW(finalName.c_str(), finalValue.c_str());
-                }
-            }
+            ActionHelpers::HandleEnvVar(arg, variables);
         }
     }, opData);
 }
