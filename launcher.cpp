@@ -3390,7 +3390,7 @@ void PerformFullCleanup(
             } else {
                 ActionOperation actionOp = std::get<ActionOperation>(op.data);
                 // <-- [修改] 将 launcherPid 传递给下一层函数
-                ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid, iniContent);
+                ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid, shutdownOps[0].iniContent);
             }
         }
     } else {
@@ -3400,7 +3400,7 @@ void PerformFullCleanup(
         for (auto& op : afterOps) {
             ActionOperation actionOp = std::get<ActionOperation>(op.data);
             // <-- [修改] 将 launcherPid 传递给下一层函数
-            ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid);
+            ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid, shutdownOps[0].iniContent);
         }
     }
 }
