@@ -211,6 +211,7 @@ struct ReplaceOp {
     std::wstring findText;
     std::wstring replaceText;
     bool useRegex = false;
+    bool ignoreCase = false;
 };
 
 struct ReplaceLineOp {
@@ -1873,7 +1874,6 @@ namespace ActionHelpers {
             if (i < lines.size() - 1) content += L"\n";
         }
     
-        // 统一处理 {LINEBREAK} 标记
         const std::wstring toFindToken = L"{LINEBREAK}";
         const std::wstring normalizedNewline = L"\n";
     
@@ -1896,19 +1896,30 @@ namespace ActionHelpers {
         if (op.useRegex) {
             // --- 正则表达式替换模式 ---
             try {
-                std::wregex re(finalFindText);
+                // --- [核心修改] ---
+                // 默认使用ECMAScript语法
+                auto flags = std::regex_constants::ECMAScript;
+                if (op.ignoreCase) {
+                    // 如果设置了icase标志，则通过位或操作添加它
+                    flags |= std::regex_constants::icase;
+                }
+                
+                // 使用构造好的标志创建正则表达式对象
+                std::wregex re(finalFindText, flags);
+                // --- [修改结束] ---
+    
                 new_content = std::regex_replace(content, re, finalReplaceText);
             } catch (const std::regex_error& e) {
-                // 正则表达式无效，保持内容不变以防崩溃
                 new_content = content;
             }
         } else {
             // --- 字面量（精确）替换模式 ---
+            // 如果不是正则模式，icase标志将被忽略
             new_content = content;
             size_t pos = 0;
             while ((pos = new_content.find(finalFindText, pos)) != std::wstring::npos) {
                 new_content.replace(pos, finalFindText.length(), finalReplaceText);
-                pos += finalReplaceText.length(); // 移动到替换后文本的末尾继续查找
+                pos += finalReplaceText.length();
             }
         }
     
@@ -2869,10 +2880,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 size_t second_delim = value.find(local_delimiter, first_delim + local_delimiter.length());
                 if (second_delim != std::wstring::npos) {
                     ReplaceOp op;
-                    // 路径可以被 trim
                     op.path = trim(value.substr(0, first_delim));
                     
-                    // 查找和替换字符串不使用 trim，以保留空格和缩进
                     size_t third_delim = value.find(local_delimiter, second_delim + local_delimiter.length());
                     
                     if (third_delim != std::wstring::npos) {
@@ -2880,16 +2889,31 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
                         op.replaceText = value.substr(second_delim + local_delimiter.length(), third_delim - (second_delim + local_delimiter.length()));
                         
-                        // 模式标志可以被 trim
-                        std::wstring mode = trim(value.substr(third_delim + local_delimiter.length()));
-                        if (_wcsicmp(mode.c_str(), L"regex") == 0) {
+                        // --- [核心修改] 解析 "regex/i" 格式 ---
+                        std::wstring modeStr = trim(value.substr(third_delim + local_delimiter.length()));
+
+                        // 查找标志分隔符 '/'
+                        size_t slash_pos = modeStr.find(L'/');
+                        // 提取基础模式 (例如 "regex")
+                        std::wstring base_mode = (slash_pos == std::wstring::npos) ? modeStr : modeStr.substr(0, slash_pos);
+
+                        if (_wcsicmp(base_mode.c_str(), L"regex") == 0) {
                             op.useRegex = true;
+                            // 如果是正则模式，并且找到了'/'，则检查后面的标志
+                            if (slash_pos != std::wstring::npos) {
+                                std::wstring flags_str = modeStr.substr(slash_pos + 1);
+                                // 检查是否存在 'i' 标志
+                                if (flags_str.find(L'i') != std::wstring::npos) {
+                                    op.ignoreCase = true;
+                                }
+                            }
                         }
+                        // --- [修改结束] ---
+
                     } else {
                         // 只找到3个部分 (路径 :: 查找 :: 替换)，默认为字面量替换
                         op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
                         op.replaceText = value.substr(second_delim + local_delimiter.length());
-                        op.useRegex = false;
                     }
                     return op;
                 }
