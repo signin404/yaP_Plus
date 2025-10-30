@@ -1866,31 +1866,31 @@ namespace ActionHelpers {
     void HandleReplace(const ReplaceOp& op) {
         FileContentInfo formatInfo;
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
-    
+
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::wstring content;
         for(size_t i = 0; i < lines.size(); ++i) {
             content += lines[i];
             if (i < lines.size() - 1) content += L"\n";
         }
-    
+
         const std::wstring toFindToken = L"{LINEBREAK}";
         const std::wstring normalizedNewline = L"\n";
-    
+
         std::wstring finalFindText = op.findText;
         size_t lb_pos_find = 0;
         while ((lb_pos_find = finalFindText.find(toFindToken, lb_pos_find)) != std::wstring::npos) {
             finalFindText.replace(lb_pos_find, toFindToken.length(), normalizedNewline);
             lb_pos_find += normalizedNewline.length();
         }
-    
+
         std::wstring finalReplaceText = op.replaceText;
-    
+
         // --- [核心修改] 处理 {DELETE} 标记 ---
         if (finalReplaceText == L"{DELETE}") {
             finalReplaceText = L"";
         } else {
-            // 只有不是删除标记时，才需要处理换行符
+            // 只有不是删除标记时 才需要处理换行符
             size_t lb_pos_replace = 0;
             while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
                 finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
@@ -1898,9 +1898,9 @@ namespace ActionHelpers {
             }
         }
         // --- [修改结束] ---
-    
+
         std::wstring new_content;
-    
+
         if (op.useRegex) {
             // --- 正则表达式替换模式 ---
             try {
@@ -1919,16 +1919,16 @@ namespace ActionHelpers {
             size_t pos = 0;
             while ((pos = new_content.find(finalFindText, pos)) != std::wstring::npos) {
                 new_content.replace(pos, finalFindText.length(), finalReplaceText);
-                // 如果是删除操作(finalReplaceText为空)，pos 不需要前进，
-                // 但为了避免死循环（例如查找空字符串），标准做法是前进替换后的长度。
-                // 如果替换为空，长度为0，下一次查找会从同一位置开始，
-                // 但由于 find 找到了内容，下一次 find 应该从 pos 开始（如果内容被删除了，pos现在指向原来内容的下一个字符）
-                // 修正：std::wstring::replace 删除后，后面的字符会前移。
-                // 下一次查找应该从当前 pos 开始。
+                // 如果是删除操作(finalReplaceText为空) pos 不需要前进
+                // 但为了避免死循环（例如查找空字符串） 标准做法是前进替换后的长度
+                // 如果替换为空 长度为0 下一次查找会从同一位置开始
+                // 但由于 find 找到了内容 下一次 find 应该从 pos 开始（如果内容被删除了 pos现在指向原来内容的下一个字符）
+                // 修正：std::wstring::replace 删除后 后面的字符会前移
+                // 下一次查找应该从当前 pos 开始
                 pos += finalReplaceText.length();
             }
         }
-    
+
         // 将新内容写回文件
         std::vector<std::wstring> new_lines;
         std::wstringstream ss(new_content);
@@ -1937,7 +1937,7 @@ namespace ActionHelpers {
             new_lines.push_back(line);
         }
         if (new_content.empty() && !lines.empty()) new_lines.clear();
-    
+
         WriteFileWithFormat(op.path, new_lines, formatInfo);
     }
 
@@ -2887,14 +2887,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 if (second_delim != std::wstring::npos) {
                     ReplaceOp op;
                     op.path = trim(value.substr(0, first_delim));
-                    
+
                     size_t third_delim = value.find(local_delimiter, second_delim + local_delimiter.length());
-                    
+
                     if (third_delim != std::wstring::npos) {
                         // 找到4个部分 (路径 :: 查找 :: 替换 :: 模式)
                         op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
                         op.replaceText = value.substr(second_delim + local_delimiter.length(), third_delim - (second_delim + local_delimiter.length()));
-                        
+
                         // --- [核心修改] 解析 "regex/i" 格式 ---
                         std::wstring modeStr = trim(value.substr(third_delim + local_delimiter.length()));
 
@@ -2905,7 +2905,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
                         if (_wcsicmp(base_mode.c_str(), L"regex") == 0) {
                             op.useRegex = true;
-                            // 如果是正则模式，并且找到了'/'，则检查后面的标志
+                            // 如果是正则模式 并且找到了'/' 则检查后面的标志
                             if (slash_pos != std::wstring::npos) {
                                 std::wstring flags_str = modeStr.substr(slash_pos + 1);
                                 // 检查是否存在 'i' 标志
@@ -2917,7 +2917,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         // --- [修改结束] ---
 
                     } else {
-                        // 只找到3个部分 (路径 :: 查找 :: 替换)，默认为字面量替换
+                        // 只找到3个部分 (路径 :: 查找 :: 替换) 默认为字面量替换
                         op.findText = value.substr(first_delim + local_delimiter.length(), second_delim - (first_delim + local_delimiter.length()));
                         op.replaceText = value.substr(second_delim + local_delimiter.length());
                     }
