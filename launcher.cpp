@@ -1885,40 +1885,46 @@ namespace ActionHelpers {
         }
     
         std::wstring finalReplaceText = op.replaceText;
-        size_t lb_pos_replace = 0;
-        while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
-            finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
-            lb_pos_replace += normalizedNewline.length();
+    
+        // --- [核心修改] 处理 {DELETE} 标记 ---
+        if (finalReplaceText == L"{DELETE}") {
+            finalReplaceText = L"";
+        } else {
+            // 只有不是删除标记时，才需要处理换行符
+            size_t lb_pos_replace = 0;
+            while ((lb_pos_replace = finalReplaceText.find(toFindToken, lb_pos_replace)) != std::wstring::npos) {
+                finalReplaceText.replace(lb_pos_replace, toFindToken.length(), normalizedNewline);
+                lb_pos_replace += normalizedNewline.length();
+            }
         }
+        // --- [修改结束] ---
     
         std::wstring new_content;
     
         if (op.useRegex) {
             // --- 正则表达式替换模式 ---
             try {
-                // --- [核心修改] ---
-                // 默认使用ECMAScript语法
                 auto flags = std::regex_constants::ECMAScript;
                 if (op.ignoreCase) {
-                    // 如果设置了icase标志，则通过位或操作添加它
                     flags |= std::regex_constants::icase;
                 }
-                
-                // 使用构造好的标志创建正则表达式对象
                 std::wregex re(finalFindText, flags);
-                // --- [修改结束] ---
-    
                 new_content = std::regex_replace(content, re, finalReplaceText);
             } catch (const std::regex_error& e) {
                 new_content = content;
             }
         } else {
             // --- 字面量（精确）替换模式 ---
-            // 如果不是正则模式，icase标志将被忽略
             new_content = content;
             size_t pos = 0;
             while ((pos = new_content.find(finalFindText, pos)) != std::wstring::npos) {
                 new_content.replace(pos, finalFindText.length(), finalReplaceText);
+                // 如果是删除操作(finalReplaceText为空)，pos 不需要前进，
+                // 但为了避免死循环（例如查找空字符串），标准做法是前进替换后的长度。
+                // 如果替换为空，长度为0，下一次查找会从同一位置开始，
+                // 但由于 find 找到了内容，下一次 find 应该从 pos 开始（如果内容被删除了，pos现在指向原来内容的下一个字符）
+                // 修正：std::wstring::replace 删除后，后面的字符会前移。
+                // 下一次查找应该从当前 pos 开始。
                 pos += finalReplaceText.length();
             }
         }
