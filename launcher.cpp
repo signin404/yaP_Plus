@@ -3320,7 +3320,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid, const std::wstring& iniContent)
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid, const std::wstring& iniContent) {
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
@@ -3461,6 +3461,16 @@ void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, st
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
 }
+
+// --- [新增] 在此处添加 PerformFullCleanup 的前向声明 ---
+void PerformFullCleanup(
+    std::vector<AfterOperation>& afterOps,
+    std::vector<StartupShutdownOperation>& shutdownOps,
+    std::map<std::wstring, std::wstring>& variables,
+    const std::set<DWORD>& trustedPids,
+    DWORD launcherPid,
+    const std::wstring& iniContent
+);
 
 DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     LauncherThreadData* data = static_cast<LauncherThreadData*>(lpParam);
