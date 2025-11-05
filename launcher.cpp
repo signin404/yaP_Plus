@@ -1058,92 +1058,184 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
-    // 辅助函数：在修改注册表后，通知系统环境变量已更改
+    // Helper to collect all 'path' values from the INI for a specific scope
+    std::vector<std::wstring> CollectPathValuesFromIni(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables, EnvVarType type) {
+        std::vector<std::wstring> paths;
+        std::wstringstream stream(iniContent);
+        std::wstring line;
+        enum class Section { None, Before, After };
+        Section currentSection = Section::None;
+
+        const std::wstring delimiter = L" :: ";
+
+        while (std::getline(stream, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+
+            if (line[0] == L'[' && line.back() == L']') {
+                if (_wcsicmp(line.c_str(), L"[Before]") == 0) currentSection = Section::Before;
+                else if (_wcsicmp(line.c_str(), L"[After]") == 0) currentSection = Section::After;
+                else currentSection = Section::None;
+                continue;
+            }
+
+            if (currentSection == Section::None) continue;
+
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos == std::wstring::npos) continue;
+
+            std::wstring key = trim(line.substr(0, delimiterPos));
+            if (_wcsicmp(key.c_str(), L"envvar") != 0) continue;
+
+            std::wstring value = trim(line.substr(delimiterPos + 1));
+            auto parts = split_string(value, delimiter);
+
+            if (parts.size() >= 2 && _wcsicmp(parts[0].c_str(), L"path") == 0) {
+                EnvVarType currentType = EnvVarType::Process;
+                if (parts.size() > 2) {
+                    if (_wcsicmp(parts[2].c_str(), L"user") == 0) currentType = EnvVarType::User;
+                    else if (_wcsicmp(parts[2].c_str(), L"system") == 0) currentType = EnvVarType::System;
+                }
+
+                if (currentType == type && _wcsicmp(parts[1].c_str(), L"null") != 0) {
+                    paths.push_back(ExpandVariables(parts[1], variables));
+                }
+            }
+        }
+        return paths;
+    }
+
+    // Helper to split a path string into a vector of segments
+    std::vector<std::wstring> SplitPathString(const std::wstring& path) {
+        std::vector<std::wstring> segments;
+        std::wstringstream ss(path);
+        std::wstring segment;
+        while (std::getline(ss, segment, L';')) {
+            if (!segment.empty()) {
+                segments.push_back(segment);
+            }
+        }
+        return segments;
+    }
+
+    // Helper to join a vector of segments back into a path string
+    std::wstring JoinPathSegments(const std::vector<std::wstring>& segments) {
+        std::wstring result;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            result += segments[i];
+            if (i < segments.size() - 1) {
+                result += L';';
+            }
+        }
+        return result;
+    }
+
+    // 辅助函数：在修改注册表后 通知系统环境变量已更改
     void BroadcastEnvironmentUpdate() {
         SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
     }
-    
+
     // 核心函数：处理所有环境变量的设置和删除
-    void HandleEnvVar(const EnvVarOp& op, const std::map<std::wstring, std::wstring>& variables) {
+    void HandleEnvVar(const EnvVarOp& op, std::map<std::wstring, std::wstring>& variables, const std::wstring& iniContent) {
         std::wstring finalName = ExpandVariables(op.name, variables);
         std::wstring finalValue = ExpandVariables(op.value, variables);
         bool isNullValue = (_wcsicmp(finalValue.c_str(), L"null") == 0);
-    
-        // --- 步骤 1: 如果是全局变量，先修改注册表 ---
-        if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
-            HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
-            const wchar_t* subKey = (op.type == EnvVarType::User) 
-                ? L"Environment" 
-                : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
-            
-            HKEY hKey;
-            if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE | KEY_READ, &hKey) == ERROR_SUCCESS) {
-                if (isNullValue) {
-                    // 删除变量
-                    RegDeleteValueW(hKey, finalName.c_str());
-                } else {
-                    std::wstring valueToWrite = finalValue;
-                    DWORD type = REG_SZ;
-    
-                    // --- [核心修改] 对全局 Path 变量执行追加逻辑 ---
-                    if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
-                        type = REG_EXPAND_SZ; // Path 变量应使用可扩展类型
-                        std::wstring existingPath;
-                        DWORD existingType = 0;
-                        DWORD bufferSize = 0;
-    
-                        // 第一次调用获取所需缓冲区大小
-                        if (RegQueryValueExW(hKey, finalName.c_str(), NULL, &existingType, NULL, &bufferSize) == ERROR_SUCCESS) {
-                            if (bufferSize > 0) {
-                                std::vector<wchar_t> buffer(bufferSize / sizeof(wchar_t));
-                                // 第二次调用获取数据
-                                if (RegQueryValueExW(hKey, finalName.c_str(), NULL, &existingType, (LPBYTE)buffer.data(), &bufferSize) == ERROR_SUCCESS) {
-                                    existingPath = buffer.data();
+
+        // --- Dispatcher: Is this a Path variable or something else? ---
+        if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+            // --- ADVANCED PATH HANDLING ---
+            if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
+                HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+                const wchar_t* subKey = (op.type == EnvVarType::User)
+                    ? L"Environment"
+                    : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+
+                HKEY hKey;
+                if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE | KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    // 1. Read current registry value
+                    std::wstring currentRegPath;
+                    DWORD bufferSize = 0;
+                    if (RegQueryValueExW(hKey, finalName.c_str(), NULL, NULL, NULL, &bufferSize) == ERROR_SUCCESS && bufferSize > 0) {
+                        std::vector<wchar_t> buffer(bufferSize / sizeof(wchar_t));
+                        RegQueryValueExW(hKey, finalName.c_str(), NULL, NULL, (LPBYTE)buffer.data(), &bufferSize);
+                        currentRegPath = buffer.data();
+                    }
+
+                    auto pathSegments = SplitPathString(currentRegPath);
+
+                    if (isNullValue) {
+                        // --- Deletion Logic ---
+                        auto pathsToRemove = CollectPathValuesFromIni(iniContent, variables, op.type);
+                        pathSegments.erase(std::remove_if(pathSegments.begin(), pathSegments.end(),
+                            [&](const std::wstring& segment) {
+                                for (const auto& toRemove : pathsToRemove) {
+                                    if (_wcsicmp(segment.c_str(), toRemove.c_str()) == 0) {
+                                        return true;
+                                    }
                                 }
+                                return false;
+                            }), pathSegments.end());
+                    } else {
+                        // --- Addition Logic (with deduplication) ---
+                        bool alreadyExists = false;
+                        for (const auto& segment : pathSegments) {
+                            if (_wcsicmp(segment.c_str(), finalValue.c_str()) == 0) {
+                                alreadyExists = true;
+                                break;
                             }
                         }
-                        
-                        // 构建新的 Path 字符串
-                        if (!existingPath.empty()) {
-                            if (existingPath.back() != L';') {
-                                existingPath += L';';
-                            }
-                            valueToWrite = existingPath + finalValue;
+                        if (!alreadyExists) {
+                            pathSegments.push_back(finalValue);
                         }
                     }
-                    // --- [修改结束] ---
-    
-                    // 将最终值写入注册表
-                    RegSetValueExW(hKey, finalName.c_str(), 0, type, 
-                                   (const BYTE*)valueToWrite.c_str(), 
-                                   (DWORD)(valueToWrite.length() + 1) * sizeof(wchar_t));
+
+                    std::wstring newRegPath = JoinPathSegments(pathSegments);
+                    RegSetValueExW(hKey, finalName.c_str(), 0, REG_EXPAND_SZ,
+                                   (const BYTE*)newRegPath.c_str(),
+                                   (DWORD)(newRegPath.length() + 1) * sizeof(wchar_t));
+
+                    RegCloseKey(hKey);
+                    BroadcastEnvironmentUpdate();
                 }
-                RegCloseKey(hKey);
-                
-                // 通知系统环境变量已发生变化
-                BroadcastEnvironmentUpdate();
-            }
-        }
-    
-        // --- 步骤 2: 总是将变更同步到当前进程的环境变量 ---
-        // 对于 User/System 类型，这使得更改立即生效
-        // 对于 Process 类型，这是唯一的操作
-        if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
-            // 特殊处理 Path 变量
-            if (isNullValue) {
-                // 恢复为程序启动时的原始 Path
-                SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
-            } else {
-                // 将新值追加到原始 Path 后面
-                std::wstring newPath = g_originalPath;
-                if (!newPath.empty() && newPath.back() != L';') {
-                    newPath += L';';
-                }
-                newPath += finalValue;
-                SetEnvironmentVariableW(L"Path", newPath.c_str());
             }
         } else {
-            // 对所有其他环境变量，直接设置或删除
+            // --- SIMPLE HANDLING FOR ALL OTHER VARIABLES ---
+            if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
+                 HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+                 const wchar_t* subKey = (op.type == EnvVarType::User)
+                    ? L"Environment"
+                    : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+
+                HKEY hKey;
+                if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+                    if (isNullValue) {
+                        RegDeleteValueW(hKey, finalName.c_str());
+                    } else {
+                        RegSetValueExW(hKey, finalName.c_str(), 0, REG_SZ,
+                                       (const BYTE*)finalValue.c_str(),
+                                       (DWORD)(finalValue.length() + 1) * sizeof(wchar_t));
+                    }
+                    RegCloseKey(hKey);
+                    BroadcastEnvironmentUpdate();
+                }
+            }
+        }
+
+        // --- Always synchronize the change to the current process ---
+        if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+            if (isNullValue) {
+                // For deletion, simply restore the original process path
+                SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
+            } else {
+                // For addition, append to the original process path
+                std::wstring newProcessPath = g_originalPath;
+                if (!newProcessPath.empty() && newProcessPath.back() != L';') {
+                    newProcessPath += L';';
+                }
+                newProcessPath += finalValue;
+                SetEnvironmentVariableW(L"Path", newProcessPath.c_str());
+            }
+        } else {
             SetEnvironmentVariableW(finalName.c_str(), isNullValue ? NULL : finalValue.c_str());
         }
     }
@@ -3040,7 +3132,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 EnvVarOp op;
                 op.name = parts[0];
                 op.value = parts[1];
-                
+
                 // 检查是否指定了类型
                 if (parts.size() > 2) {
                     if (_wcsicmp(parts[2].c_str(), L"user") == 0) {
@@ -3048,7 +3140,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     } else if (_wcsicmp(parts[2].c_str(), L"system") == 0) {
                         op.type = EnvVarType::System;
                     }
-                    // 如果是其他无法识别的类型，则保持默认的 EnvVarType::Process
+                    // 如果是其他无法识别的类型 则保持默认的 EnvVarType::Process
                 }
                 return op;
             }
@@ -3228,7 +3320,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
     }
 }
 
-void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
+void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, std::wstring>& variables, const std::set<DWORD>& trustedPids, DWORD launcherPid, const std::wstring& iniContent)
     std::visit([&](const auto& arg) {
         using T = std::decay_t<decltype(arg)>;
         if constexpr (std::is_same_v<T, RunOp>) {
@@ -3314,7 +3406,7 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
             ActionHelpers::HandleReplaceLine(mutable_op);
         }
         else if constexpr (std::is_same_v<T, EnvVarOp>) {
-            ActionHelpers::HandleEnvVar(arg, variables);
+            ActionHelpers::HandleEnvVar(arg, variables, iniContent);
         }
     }, opData);
 }
@@ -3324,7 +3416,8 @@ void PerformFullCleanup(
     std::vector<StartupShutdownOperation>& shutdownOps,
     std::map<std::wstring, std::wstring>& variables,
     const std::set<DWORD>& trustedPids,
-    DWORD launcherPid
+    DWORD launcherPid,
+    const std::wstring& iniContent
 ) {
     bool restoreMarkerFound = false;
     for (const auto& op : afterOps) {
@@ -3343,7 +3436,7 @@ void PerformFullCleanup(
             } else {
                 ActionOperation actionOp = std::get<ActionOperation>(op.data);
                 // <-- [修改] 将 launcherPid 传递给下一层函数
-                ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid);
+                ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid, iniContent);
             }
         }
     } else {
@@ -3353,7 +3446,7 @@ void PerformFullCleanup(
         for (auto& op : afterOps) {
             ActionOperation actionOp = std::get<ActionOperation>(op.data);
             // <-- [修改] 将 launcherPid 传递给下一层函数
-            ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid);
+            ExecuteActionOperation(actionOp.data, variables, trustedPids, launcherPid, iniContent);
         }
     }
 }
@@ -3558,7 +3651,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // <-- [修改] 调用 PerformFullCleanup 时传递 finalTrustedPids
-    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid);
+    PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid, data->iniContent);
 
     DeleteFileW(data->tempFilePath.c_str());
 
@@ -3741,7 +3834,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             crashTrustedPids.insert(launcherPid);
 
             // <-- [修改] 调用 PerformFullCleanup 时传递 crashTrustedPids
-            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables, crashTrustedPids, launcherPid);
+            PerformFullCleanup(afterOps, shutdownOpsForCrash, variables, crashTrustedPids, launcherPid, iniContent);
 
             std::wstring crashWaitStr = GetValueFromIniContent(iniContent, L"General", L"crashwait");
             int crashWaitTime = crashWaitStr.empty() ? 1000 : _wtoi(crashWaitStr.c_str());
@@ -3780,7 +3873,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, ActionOpData>) {
                     // <-- [修改] 调用 ExecuteActionOperation 时传递 beforeTrustedPids
-                    ExecuteActionOperation(arg, variables, beforeTrustedPids, launcherPid);
+                    ExecuteActionOperation(arg, variables, beforeTrustedPids, launcherPid, iniContent);
                 } else {
                     StartupShutdownOperation ssOp{arg};
                     PerformStartupOperation(ssOp.data);
