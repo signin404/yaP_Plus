@@ -1141,18 +1141,19 @@ namespace ActionHelpers {
         std::wstring finalValue = ExpandVariables(op.value, variables);
         bool isNullValue = (_wcsicmp(finalValue.c_str(), L"null") == 0);
 
-        // --- Dispatcher: Is this a Path variable or something else? ---
-        if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
-            // --- ADVANCED PATH HANDLING ---
-            if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
-                HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
-                const wchar_t* subKey = (op.type == EnvVarType::User)
-                    ? L"Environment"
-                    : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+        // --- 步骤 1: 如果是全局变量 先修改注册表 ---
+        if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
+            bool registryWasModified = false; // <-- [新增] 状态标志
 
-                HKEY hKey;
-                if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE | KEY_READ, &hKey) == ERROR_SUCCESS) {
-                    // 1. Read current registry value
+            HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+            const wchar_t* subKey = (op.type == EnvVarType::User)
+                ? L"Environment"
+                : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+
+            HKEY hKey;
+            if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE | KEY_READ, &hKey) == ERROR_SUCCESS) {
+                if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
+                    // --- 高级 Path 变量处理 ---
                     std::wstring currentRegPath;
                     DWORD bufferSize = 0;
                     if (RegQueryValueExW(hKey, finalName.c_str(), NULL, NULL, NULL, &bufferSize) == ERROR_SUCCESS && bufferSize > 0) {
@@ -1164,19 +1165,22 @@ namespace ActionHelpers {
                     auto pathSegments = SplitPathString(currentRegPath);
 
                     if (isNullValue) {
-                        // --- Deletion Logic ---
+                        // --- 删除逻辑 ---
                         auto pathsToRemove = CollectPathValuesFromIni(iniContent, variables, op.type);
+                        size_t originalSize = pathSegments.size();
                         pathSegments.erase(std::remove_if(pathSegments.begin(), pathSegments.end(),
                             [&](const std::wstring& segment) {
                                 for (const auto& toRemove : pathsToRemove) {
-                                    if (_wcsicmp(segment.c_str(), toRemove.c_str()) == 0) {
-                                        return true;
-                                    }
+                                    if (_wcsicmp(segment.c_str(), toRemove.c_str()) == 0) return true;
                                 }
                                 return false;
                             }), pathSegments.end());
+
+                        if (pathSegments.size() != originalSize) {
+                            registryWasModified = true; // <-- [修改] 仅当删除了内容时才设置标志
+                        }
                     } else {
-                        // --- Addition Logic (with deduplication) ---
+                        // --- 添加逻辑 ---
                         bool alreadyExists = false;
                         for (const auto& segment : pathSegments) {
                             if (_wcsicmp(segment.c_str(), finalValue.c_str()) == 0) {
@@ -1186,48 +1190,45 @@ namespace ActionHelpers {
                         }
                         if (!alreadyExists) {
                             pathSegments.push_back(finalValue);
+                            registryWasModified = true; // <-- [修改] 仅当添加了新内容时才设置标志
                         }
                     }
 
-                    std::wstring newRegPath = JoinPathSegments(pathSegments);
-                    RegSetValueExW(hKey, finalName.c_str(), 0, REG_EXPAND_SZ,
-                                   (const BYTE*)newRegPath.c_str(),
-                                   (DWORD)(newRegPath.length() + 1) * sizeof(wchar_t));
-
-                    RegCloseKey(hKey);
-                    BroadcastEnvironmentUpdate();
-                }
-            }
-        } else {
-            // --- SIMPLE HANDLING FOR ALL OTHER VARIABLES ---
-            if (op.type == EnvVarType::User || op.type == EnvVarType::System) {
-                 HKEY hRootKey = (op.type == EnvVarType::User) ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
-                 const wchar_t* subKey = (op.type == EnvVarType::User)
-                    ? L"Environment"
-                    : L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
-
-                HKEY hKey;
-                if (RegOpenKeyExW(hRootKey, subKey, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-                    if (isNullValue) {
-                        RegDeleteValueW(hKey, finalName.c_str());
-                    } else {
-                        RegSetValueExW(hKey, finalName.c_str(), 0, REG_SZ,
-                                       (const BYTE*)finalValue.c_str(),
-                                       (DWORD)(finalValue.length() + 1) * sizeof(wchar_t));
+                    if (registryWasModified) {
+                        std::wstring newRegPath = JoinPathSegments(pathSegments);
+                        RegSetValueExW(hKey, finalName.c_str(), 0, REG_EXPAND_SZ,
+                                       (const BYTE*)newRegPath.c_str(),
+                                       (DWORD)(newRegPath.length() + 1) * sizeof(wchar_t));
                     }
-                    RegCloseKey(hKey);
+                } else {
+                    // --- 其他所有变量的简单处理 ---
+                    if (isNullValue) {
+                        if (RegDeleteValueW(hKey, finalName.c_str()) == ERROR_SUCCESS) {
+                            registryWasModified = true;
+                        }
+                    } else {
+                        if (RegSetValueExW(hKey, finalName.c_str(), 0, REG_SZ,
+                                           (const BYTE*)finalValue.c_str(),
+                                           (DWORD)(finalValue.length() + 1) * sizeof(wchar_t)) == ERROR_SUCCESS) {
+                            registryWasModified = true;
+                        }
+                    }
+                }
+
+                RegCloseKey(hKey);
+
+                // --- [核心修改] 仅在注册表实际被修改后才发送通知 ---
+                if (registryWasModified) {
                     BroadcastEnvironmentUpdate();
                 }
             }
         }
 
-        // --- Always synchronize the change to the current process ---
+        // --- 步骤 2: 总是将变更同步到当前进程的环境变量 (这部分逻辑不变) ---
         if (_wcsicmp(finalName.c_str(), L"Path") == 0) {
             if (isNullValue) {
-                // For deletion, simply restore the original process path
                 SetEnvironmentVariableW(L"Path", g_originalPath.c_str());
             } else {
-                // For addition, append to the original process path
                 std::wstring newProcessPath = g_originalPath;
                 if (!newProcessPath.empty() && newProcessPath.back() != L';') {
                     newProcessPath += L';';
