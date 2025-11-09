@@ -2531,6 +2531,14 @@ struct BackupThreadData {
     // --- [新增] ---
     std::mutex mtx;
     std::condition_variable cv;
+
+    void Reset() {
+        shouldStop = false;
+        isWorking = false;
+        backupInterval = 0;
+        backupDirs.clear();
+        backupFiles.clear();
+    }
 };
 
 // [完全替换] 使用 std::condition_variable 重写备份工作线程
@@ -3898,7 +3906,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             beforeOps.clear();
             afterOps.clear();
-            backupData = {};
+            backupData.Reset();
         }
 
         ParseIniSections(iniContent, variables, beforeOps, afterOps, backupData);
