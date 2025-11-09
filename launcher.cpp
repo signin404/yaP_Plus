@@ -23,6 +23,8 @@
 #include <locale>
 #include <codecvt>
 #include <regex>
+#include <mutex>
+#include <condition_variable>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -2518,28 +2520,58 @@ void PerformFileBackup(const BackupEntry& entry) {
 
 // <-- [修改] BackupThreadData 结构体以使用新的 BackupEntry
 struct BackupThreadData {
-    std::atomic<bool>* shouldStop;
-    std::atomic<bool>* isWorking;
+    // std::atomic<bool>* shouldStop; // 不再需要原子类型
+    // std::atomic<bool>* isWorking;
+    bool shouldStop = false;
+    bool isWorking = false;
     int backupInterval;
-    std::vector<BackupEntry> backupDirs;  // <-- 修改点
-    std::vector<BackupEntry> backupFiles; // <-- 修改点
+    std::vector<BackupEntry> backupDirs;
+    std::vector<BackupEntry> backupFiles;
+
+    // --- [新增] ---
+    std::mutex mtx;
+    std::condition_variable cv;
 };
 
-// <-- [修改] 备份工作线程 以调用新的备份函数
+// [完全替换] 使用 std::condition_variable 重写备份工作线程
 DWORD WINAPI BackupWorkerThread(LPVOID lpParam) {
     BackupThreadData* data = static_cast<BackupThreadData*>(lpParam);
-    while (!*(data->shouldStop)) {
-        Sleep(data->backupInterval);
-        if (*(data->shouldStop)) break;
-        *(data->isWorking) = true;
+
+    // 使用 unique_lock 来管理互斥锁 这是与 condition_variable 配合使用的标准做法
+    std::unique_lock<std::mutex> lock(data->mtx);
+
+    while (!data->shouldStop) {
+        // 使用 wait_for 等待它会等待 backupInterval 时间
+        // 或者在被 notify() 时提前唤醒
+        // 第三个参数是一个 lambda 表达式（谓词） 用于处理“伪唤醒” (spurious wakeups)
+        // 只有当 shouldStop 为 true 时 它才会提前返回 true
+        if (data->cv.wait_for(lock, std::chrono::milliseconds(data->backupInterval), [&]{ return data->shouldStop; })) {
+            // 如果 wait_for 是因为 shouldStop 变为 true 而返回 则直接跳出循环
+            break;
+        }
+
+        // 如果是超时唤醒 则执行备份
+        // 1. 标记正在工作
+        data->isWorking = true;
+
+        // 2. 临时解锁 允许主线程在备份期间也能发出停止信号
+        lock.unlock();
+
+        // --- 执行备份任务 ---
         for (const auto& entry : data->backupDirs) {
             PerformDirectoryBackup(entry);
         }
         for (const auto& entry : data->backupFiles) {
             PerformFileBackup(entry);
         }
-        *(data->isWorking) = false;
+
+        // 3. 重新加锁 为下一次循环的 wait_for 做准备
+        lock.lock();
+
+        // 4. 标记工作完成
+        data->isWorking = false;
     }
+
     return 0;
 }
 
@@ -3655,9 +3687,18 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetAllProcessesState(data->monitorData->suspendProcesses, false);
     }
     if (data->hBackupThread) {
-        *(data->stopMonitor) = true;
-        while (*(data->isBackupWorking)) Sleep(100);
-        WaitForSingleObject(data->hBackupThread, 1500);
+        // --- [修改] 使用条件变量来优雅地停止线程 ---
+        {
+            // 1. 加锁以安全地修改共享状态
+            std::lock_guard<std::mutex> lock(data->backupData->mtx);
+            // 2. 设置停止标志
+            data->backupData->shouldStop = true;
+        }
+        // 3. 通知备份线程 让它从 wait_for 中立即醒来
+        data->backupData->cv.notify_one();
+
+        // 等待线程句柄结束
+        WaitForSingleObject(data->hBackupThread, INFINITE); // 可以设置一个超时
         CloseHandle(data->hBackupThread);
     }
 
