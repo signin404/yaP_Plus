@@ -1058,6 +1058,21 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
+    // 辅助函数：强制删除文件 即使它有只读属性
+    void ForceDeleteFile(const std::wstring& path) {
+        // 1. 获取文件属性
+        DWORD attributes = GetFileAttributesW(path.c_str());
+
+        // 2. 检查文件是否存在且为只读
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
+            // 3. 移除只读属性 (保留其他属性)
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        // 4. 现在可以安全地删除文件了
+        DeleteFileW(path.c_str());
+    }
+
     // Helper to collect all 'path' values from the INI for a specific scope
     std::vector<std::wstring> CollectPathValuesFromIni(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables, EnvVarType type) {
         std::vector<std::wstring> paths;
@@ -2862,18 +2877,22 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     if (PathIsDirectoryW(pathToDelete.c_str())) {
                         RemoveDirectoryW(pathToDelete.c_str());
                     } else {
-                        DeleteFileW(pathToDelete.c_str());
+                        ActionHelpers::ForceDeleteFile(pathToDelete.c_str());
                     }
                 }
             } else {
                 if (arg.isHardlink && arg.isDirectory) {
                     for (auto it = arg.createdLinks.rbegin(); it != arg.createdLinks.rend(); ++it) {
-                        DeleteFileW(it->first.c_str());
+                        ActionHelpers::ForceDeleteFile(it->first.c_str());
                     }
                     PerformFileSystemOperation(FO_DELETE, arg.linkPath);
                 } else {
-                    if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.linkPath);
-                    else DeleteFileW(arg.linkPath.c_str());
+                    if (arg.isDirectory) {
+                        PerformFileSystemOperation(FO_DELETE, arg.linkPath);
+                    }
+                    else {
+                        ActionHelpers::ForceDeleteFile(arg.linkPath.c_str());
+                    }
                 }
             }
             if (arg.backupCreated) {
