@@ -2808,7 +2808,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 if (PathFileExistsW(arg.destPath.c_str())) {
                     if (PathFileExistsW(arg.sourcePath.c_str())) {
                          if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.sourcePath);
-                         else DeleteFileW(arg.sourcePath.c_str());
+                         else ActionHelpers::ForceDeleteFile(arg.sourcePath.c_str());
                     }
                     if (arg.isDirectory) PerformFileSystemOperation(FO_MOVE, arg.destPath, arg.sourcePath);
                     else MoveFileW(arg.destPath.c_str(), arg.sourcePath.c_str());
@@ -2821,11 +2821,11 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     else CopyFileW(arg.destPath.c_str(), arg.sourcePath.c_str(), FALSE);
                     if (PathFileExistsW(sourceBackupPath.c_str())) {
                         if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, sourceBackupPath);
-                        else DeleteFileW(sourceBackupPath.c_str());
+                        else ActionHelpers::ForceDeleteFile(sourceBackupPath.c_str());
                     }
                 }
                 if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.destPath);
-                else DeleteFileW(arg.destPath.c_str());
+                else ActionHelpers::ForceDeleteFile(arg.destPath.c_str());
             }
             if (arg.destBackupCreated && PathFileExistsW(arg.destBackupPath.c_str())) {
                 MoveFileW(arg.destBackupPath.c_str(), arg.destPath.c_str());
@@ -2833,7 +2833,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, RestoreOnlyFileOp>) {
             if (PathFileExistsW(arg.targetPath.c_str())) {
                 if (arg.isDirectory) PerformFileSystemOperation(FO_DELETE, arg.targetPath);
-                else DeleteFileW(arg.targetPath.c_str());
+                else ActionHelpers::ForceDeleteFile(arg.targetPath.c_str());
             }
             if (arg.backupCreated && PathFileExistsW(arg.backupPath.c_str())) {
                 MoveFileW(arg.backupPath.c_str(), arg.targetPath.c_str());
@@ -2853,7 +2853,6 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             }
             if (arg.backupCreated) {
                 if (arg.isKey) {
-                    // <-- [修改] 修正了函数调用 移除了多余的第一个参数
                     RenameRegistryKey(arg.hRootKey, arg.backupName, arg.subKey);
                 }
                 else {
