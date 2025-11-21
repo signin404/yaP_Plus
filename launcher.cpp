@@ -1256,18 +1256,55 @@ namespace ActionHelpers {
         }
     }
 
+    // [新增] 诊断日志写入函数
+    void WriteDiagnosticLog(const std::wstring& message) {
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        std::wstring logPath = exePath;
+        PathRemoveFileSpecW(&exePath[0]);
+        logPath = std::wstring(exePath) + L"\\launcher_debug.log";
+
+        std::ofstream logFile(logPath, std::ios::app | std::ios::binary);
+        if (logFile.is_open()) {
+            // 获取当前时间
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            std::wstringstream wss;
+            wss << L"[" << std::setw(2) << std::setfill(L'0') << st.wHour << L":"
+                << std::setw(2) << std::setfill(L'0') << st.wMinute << L":"
+                << std::setw(2) << std::setfill(L'0') << st.wSecond << L"."
+                << std::setw(3) << std::setfill(L'0') << st.wMilliseconds << L"] "
+                << message << L"\r\n";
+            
+            std::wstring logLine = wss.str();
+            
+            // 转换为 UTF-8 写入
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, logLine.c_str(), (int)logLine.length(), NULL, 0, NULL, NULL);
+            std::string utf8_str(size_needed, 0);
+            WideCharToMultiByte(CP_UTF8, 0, logLine.c_str(), (int)logLine.length(), &utf8_str[0], size_needed, NULL, NULL);
+            
+            logFile.write(utf8_str.c_str(), utf8_str.length());
+            logFile.close();
+        }
+    }
+
     void HandleKillProcess(const KillProcessOp& op, const std::set<DWORD>& trustedPids, DWORD launcherPid) {
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
         std::wstring win32BasePath;
         bool isBasePathDirectory = false;
+        std::wstring normalizedBasePath;
 
         if (op.checkProcessPath && !op.basePath.empty()) {
             win32BasePath = op.basePath;
             DWORD attrs = GetFileAttributesW(win32BasePath.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 isBasePathDirectory = true;
+                normalizedBasePath = win32BasePath;
+                if (normalizedBasePath.back() != L'\\') {
+                    normalizedBasePath += L'\\';
+                }
             }
         }
 
@@ -1280,44 +1317,63 @@ namespace ActionHelpers {
                     continue;
                 }
 
+                // 仅处理名称匹配的进程，避免日志过于庞大
                 if (!WildcardMatch(pe32.szExeFile, op.processPattern.c_str())) {
                     continue;
                 }
 
-                bool shouldTerminate = true;
+                // --- 诊断信息收集 ---
+                std::wstring processWin32Path = L"Access Denied/Not Found";
+                std::wstring rawProcessPath = GetProcessFullPathByPid(pe32.th32ProcessID);
+                if (!rawProcessPath.empty()) {
+                    processWin32Path = ConvertDevicePathToDosPath(rawProcessPath);
+                }
 
+                std::wstringstream logMsg;
+                logMsg << L"Found: " << pe32.szExeFile 
+                       << L" (PID: " << pe32.th32ProcessID << L")";
+
+                bool shouldTerminate = true;
+                std::wstring skipReason = L"";
+
+                // 检查父进程
                 if (op.checkParentProcess) {
                     if (trustedPids.count(pe32.th32ParentProcessID) == 0) {
                         shouldTerminate = false;
+                        skipReason = L"Parent PID not trusted";
                     }
                 }
 
+                // 检查路径
                 if (shouldTerminate && op.checkProcessPath) {
                     if (win32BasePath.empty()) {
                         shouldTerminate = false;
+                        skipReason = L"Configured base path is empty";
+                    } else if (processWin32Path == L"Access Denied/Not Found") {
+                        shouldTerminate = false;
+                        skipReason = L"Could not retrieve process path";
                     } else {
-                        // --- [最终修正：使用万能转换器确保路径格式统一] ---
-                        std::wstring rawProcessPath = GetProcessFullPathByPid(pe32.th32ProcessID);
-                        std::wstring processWin32Path = ConvertDevicePathToDosPath(rawProcessPath);
-
-                        if (processWin32Path.empty()) {
-                            shouldTerminate = false;
-                        }
-                        else if (isBasePathDirectory) {
-                            std::wstring normalizedBasePath = win32BasePath;
-                            if (normalizedBasePath.back() != L'\\') {
-                                normalizedBasePath += L'\\';
-                            }
+                        if (isBasePathDirectory) {
+                            // 目录匹配模式
                             if (processWin32Path.length() < normalizedBasePath.length() ||
                                 _wcsnicmp(processWin32Path.c_str(), normalizedBasePath.c_str(), normalizedBasePath.length()) != 0) {
                                 shouldTerminate = false;
+                                skipReason = L"Path mismatch (Directory)";
                             }
                         } else {
+                            // 文件完全匹配模式
                             if (_wcsicmp(processWin32Path.c_str(), win32BasePath.c_str()) != 0) {
                                 shouldTerminate = false;
+                                skipReason = L"Path mismatch (Exact File)";
                             }
                         }
                     }
+                }
+
+                // 记录路径对比详情
+                logMsg << L" | ProcessPath: [" << processWin32Path << L"]";
+                if (op.checkProcessPath) {
+                    logMsg << L" | TargetPath: [" << win32BasePath << L"]";
                 }
 
                 if (shouldTerminate) {
@@ -1325,8 +1381,16 @@ namespace ActionHelpers {
                     if (hProcess) {
                         TerminateProcess(hProcess, 0);
                         CloseHandle(hProcess);
+                        logMsg << L" | Action: TERMINATED";
+                    } else {
+                        logMsg << L" | Action: FAILED (OpenProcess error)";
                     }
+                } else {
+                    logMsg << L" | Action: SKIPPED (" << skipReason << L")";
                 }
+
+                // 写入日志文件
+                WriteDiagnosticLog(logMsg.str());
 
             } while (Process32NextW(hSnapshot, &pe32));
         }
