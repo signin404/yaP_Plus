@@ -20,15 +20,20 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
 
     # --- 构建不打包 INI 的版本 ---
+    # 建议统一加上 shell: cmd 以避免潜在的路径或参数解析问题
     - name: Build Standard Version (No INI)
+      shell: cmd
       run: |
-        echo "Building Standard Version..."
+        echo Building Standard Version...
         rc.exe launcher.rc
         cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
 
     # --- 构建打包 INI 的版本 ---
+    # [关键修改] 添加 shell: cmd 以正确处理 rc.exe 的宏定义引号转义
     - name: Build Full Version (With Embedded INI)
+      shell: cmd
       run: |
+        echo Building Full Version...
         rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /fo launcher_full.res launcher.rc
         cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher_full.res /Fe:launcher_full.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
 
