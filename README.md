@@ -5,6 +5,8 @@ English | [中文](./README_zh-CN.md)
 
 Just copy and paste to create portable software.
 
+[Quick Guide](https://github.com/signin404/yaP_Plus/discussions/50)
+
 ## Feature
 - [x] Save directory/file
 - [x] Delete directory/file

@@ -5,6 +5,8 @@
 
 复制粘贴即可制作便携软件
 
+[快速教程](https://github.com/signin404/yaP_Plus/discussions/50)
+
 ## 功能
 - [x] 目录/文件保存
 - [x] 目录/文件删除
