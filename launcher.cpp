@@ -34,6 +34,8 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 
+#define IDR_INI_FILE 102
+
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
@@ -293,6 +295,33 @@ struct LauncherThreadData {
 	DWORD launcherPid;
 };
 
+// --- 提取嵌入资源的辅助函数 ---
+bool ExtractResourceToFile(int resourceId, const std::wstring& outputPath) {
+    // 1. 查找资源
+    // NULL 表示查找当前模块(EXE)
+    // MAKEINTRESOURCE(resourceId) 是资源的数字 ID
+    // RT_RCDATA 是资源类型 (Raw Data)
+    HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    if (!hRes) return false; // 资源不存在
+
+    // 2. 加载资源
+    HGLOBAL hData = LoadResource(NULL, hRes);
+    if (!hData) return false;
+
+    // 3. 获取资源大小和指针
+    DWORD dataSize = SizeofResource(NULL, hRes);
+    void* pData = LockResource(hData);
+    if (!pData || dataSize == 0) return false;
+
+    // 4. 写入文件
+    std::ofstream out(outputPath, std::ios::binary);
+    if (!out.is_open()) return false;
+
+    out.write(static_cast<const char*>(pData), dataSize);
+    out.close();
+
+    return true;
+}
 
 // --- Privilege Elevation Functions ---
 bool EnablePrivilege(LPCWSTR privilegeName) {
@@ -3712,6 +3741,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::wstring iniPath = launcherFullPath;
     size_t pos = iniPath.find_last_of(L".");
     if (pos != std::wstring::npos) iniPath.replace(pos, std::wstring::npos, L".ini");
+
+    // --- 检查 INI 是否存在 如果不存在则尝试从资源释放 ---
+    if (!PathFileExistsW(iniPath.c_str())) {
+        if (ExtractResourceToFile(IDR_INI_FILE, iniPath)) {
+        } else {
+        }
+    }
+
     std::wstring iniContent;
     if (!ReadFileToWString(iniPath, iniContent)) {
         MessageBoxW(NULL, L"无法读取INI文件", L"错误", MB_ICONERROR);
