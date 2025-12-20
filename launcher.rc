@@ -1,39 +1,46 @@
 // launcher.rc
 
-// 引入 Windows 定义，这对于 VERSIONINFO 块是必需的
+// 引入 Windows 定义 这对于 VERSIONINFO 块是必需的
 #include <windows.h>
 
 // --- 图标资源 ---
 // 定义一个唯一的ID给我们的图标资源
 #define IDI_MAINICON 101
+#define IDR_INI_FILE 102
+
+// 检查是否在命令行定义了 EMBED_INI_FILE 宏
+// 如果定义了 则将其作为 RCDATA (原始数据) 包含进来
+#ifdef EMBED_INI_FILE
+IDR_INI_FILE RCDATA EMBED_INI_FILE
+#endif
 
 // 将 icon.ico 文件作为图标资源嵌入
 IDI_MAINICON ICON "icon.ico"
 
 
 // --- 版本信息资源 ---
-// '1' 是这个版本信息资源的ID，通常设为1
+// '1' 是这个版本信息资源的ID 通常设为1
 VS_VERSION_INFO VERSIONINFO
-// 文件版本（数字格式），供操作系统使用。格式：主版本, 次版本, 修订号, 内部版本号
+// 文件版本（数字格式） 供操作系统使用 格式：主版本, 次版本, 修订号, 内部版本号
 FILEVERSION     1, 5, 1, 0
-// 产品版本（数字格式），供操作系统使用。
+// 产品版本（数字格式） 供操作系统使用
 // PRODUCTVERSION  1, 0, 0, 0
-// 文件标志掩码，通常设置为 0x3f 表示所有标志都有效
+// 文件标志掩码 通常设置为 0x3f 表示所有标志都有效
 FILEFLAGSMASK   0x3fL
-// 文件标志，0L 表示这是一个标准的发布版本
+// 文件标志 0L 表示这是一个标准的发布版本
 FILEFLAGS       0x0L
-// 文件操作系统类型，VOS__WINDOWS32 表示为 Win32 应用程序
+// 文件操作系统类型 VOS__WINDOWS32 表示为 Win32 应用程序
 FILEOS          VOS__WINDOWS32
-// 文件类型，VFT_APP 表示这是一个应用程序 (.exe)
+// 文件类型 VFT_APP 表示这是一个应用程序 (.exe)
 FILETYPE        VFT_APP
-// 文件子类型，VFT2_UNKNOWN 表示没有特定的子类型
+// 文件子类型 VFT2_UNKNOWN 表示没有特定的子类型
 FILESUBTYPE     VFT2_UNKNOWN
 BEGIN
     // 字符串信息块的开始
     BLOCK "StringFileInfo"
     BEGIN
-        // 语言和代码页块。
-        // "040904b0" 表示 "美国英语, Unicode"。这是最常用的组合。
+        // 语言和代码页块
+        // "040904b0" 表示 "美国英语, Unicode" 这是最常用的组合
         // 0409 = LangID for U.S. English
         // 04b0 = CodePage for Unicode
         BLOCK "000004b0"
@@ -50,7 +57,7 @@ BEGIN
             VALUE "ProductVersion",   "1.5.1"                               // 产品版本（字符串格式）
         END
     END
-    // 变量信息块的开始，用于指定语言和代码页
+    // 变量信息块的开始 用于指定语言和代码页
     BLOCK "VarFileInfo"
     BEGIN
         VALUE "Translation", 0x0000, 1200 // 0x0409 = U.S. English, 1200 = Unicode
