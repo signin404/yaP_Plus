@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # 新增: 允许手动触发工作流
+  # 允许手动触发工作流
   workflow_dispatch:
 
 jobs:
@@ -19,23 +19,24 @@ jobs:
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Compile resource script
-      run: rc.exe launcher.rc
-
-    # MODIFIED: Added /std:c++17 to enable modern C++ features like std::variant
-    - name: Compile C++ code and link resources
-      run: cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
-
-    - name: Find executable
-      id: find_exe
+    # --- 构建不打包 INI 的版本 ---
+    - name: Build Standard Version (No INI)
       run: |
-        $filePath = (Get-ChildItem -Recurse -Filter launcher.exe).FullName
-        echo "Found executable at: $filePath"
-        echo "exe-path=$filePath" >> $env:GITHUB_OUTPUT
-      shell: pwsh
+        echo "Building Standard Version..."
+        rc.exe launcher.rc
+        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:launcher.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
 
-    - name: Upload artifact
+    # --- 构建打包 INI 的版本 ---
+    - name: Build Full Version (With Embedded INI)
+      run: |
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /fo launcher_full.res launcher.rc
+        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher_full.res /Fe:launcher_full.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
+
+    # --- 上传两个 EXE 文件 ---
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: launcher-executable
-        path: ${{ steps.find_exe.outputs.exe-path }}
+        name: launcher_Binaries
+        path: |
+          launcher.exe
+          launcher_full.exe
