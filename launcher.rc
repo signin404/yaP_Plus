@@ -54,7 +54,7 @@ BEGIN
             // VALUE "LegalCopyright",   "Copyright (C) 2025. All rights reserved." // 版权信息
             // VALUE "OriginalFilename", "yaP_Plus.exe"                      // 原始文件名
             VALUE "ProductName",      "yaP Plus"          // 产品名称
-            VALUE "ProductVersion",   "1.5.1"                               // 产品版本（字符串格式）
+            VALUE "ProductVersion",   "1.5.2"                               // 产品版本（字符串格式）
         END
     END
     // 变量信息块的开始 用于指定语言和代码页
