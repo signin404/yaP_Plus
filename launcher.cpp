@@ -24,7 +24,6 @@
 #include <codecvt>
 #include <regex>
 #include "IpcCommon.h"
-#include <fstream>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -46,6 +45,7 @@ typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 std::wstring g_originalPath;
+std::wstring g_LauncherDir;
 
 // --- Data Structures ---
 
@@ -3699,8 +3699,9 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
 
 // --- [新增] Launcher 日志 ---
 void LauncherLog(const std::wstring& msg) {
-    std::wofstream log(L"C:\\yap_launcher_debug.txt", std::ios::app);
-    if (!log.is_open()) log.open(L"yap_launcher_debug.txt", std::ios::app);
+    if (g_LauncherDir.empty()) return;
+    std::wstring logPath = g_LauncherDir + L"\\yap_launcher_debug.txt";
+    std::wofstream log(logPath, std::ios::app);
     if (log.is_open()) {
         SYSTEMTIME st; GetLocalTime(&st);
         log << L"[" << st.wHour << L":" << st.wMinute << L":" << st.wSecond << L"] " << msg << std::endl;
@@ -3712,7 +3713,7 @@ bool InjectAndWait(HANDLE hProcess, DWORD pid, const std::wstring& dllPath, cons
     std::wstring eventName = GetReadyEventName(pid);
     HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
 
-    // --- [新增] 创建共享内存以传递配置 (防止子进程环境变量丢失) ---
+    // 创建共享内存以传递配置
     std::wstring mapName = GetConfigMapName(pid);
     HANDLE hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(HookConfig), mapName.c_str());
     if (hMap) {
@@ -3721,6 +3722,7 @@ bool InjectAndWait(HANDLE hProcess, DWORD pid, const std::wstring& dllPath, cons
             HookConfig* config = (HookConfig*)pBuf;
             wcscpy_s(config->hookPath, MAX_PATH, hookPath.c_str());
             wcscpy_s(config->pipeName, MAX_PATH, pipeName.c_str());
+            wcscpy_s(config->launcherDir, MAX_PATH, g_LauncherDir.c_str()); // [新增] 传递目录
             UnmapViewOfFile(pBuf);
         }
     }
@@ -3734,7 +3736,6 @@ bool InjectAndWait(HANDLE hProcess, DWORD pid, const std::wstring& dllPath, cons
         return false;
     }
 
-    // [关键修改] 同时等待 Event 和 进程句柄
     HANDLE handles[] = { hEvent, hProcess };
     DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000); // 3秒超时
 
@@ -3750,7 +3751,7 @@ bool InjectAndWait(HANDLE hProcess, DWORD pid, const std::wstring& dllPath, cons
         success = false;
     }
 
-    if (hMap) CloseHandle(hMap); // 关闭共享内存句柄
+    if (hMap) CloseHandle(hMap);
     CloseHandle(hEvent);
     return success;
 }
@@ -3784,7 +3785,6 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
             continue;
         }
 
-        // 等待连接
         bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
 
         if (connected) {
@@ -3793,11 +3793,9 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
             if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
                 LauncherLog(L"IPC Received Request: Inject PID " + std::to_wstring(msg.targetPid));
 
-                // --- 处理注入 ---
                 bool success = false;
                 HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
                 if (hTarget) {
-                    // 判断架构
                     BOOL isWow64 = FALSE;
                     IsWow64Process(hTarget, &isWow64);
                     SYSTEM_INFO si;
@@ -3807,14 +3805,13 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
 
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
-                    // [修改] 传递 hookPath 和 pipeName
+                    // 调用修改后的 InjectAndWait
                     success = InjectAndWait(hTarget, msg.targetPid, targetDll, param->hookPath, param->pipeName);
                     CloseHandle(hTarget);
                 } else {
                     LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
                 }
 
-                // 发送响应
                 IpcResponse resp = { success, 0 };
                 DWORD bytesWritten;
                 WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
@@ -4111,6 +4108,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
 	DWORD launcherPid = GetCurrentProcessId();
+
+    // [新增] 获取启动器目录
+    wchar_t pathBuffer[MAX_PATH];
+    GetModuleFileNameW(NULL, pathBuffer, MAX_PATH);
+    PathRemoveFileSpecW(pathBuffer);
+    g_LauncherDir = pathBuffer;
 
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {

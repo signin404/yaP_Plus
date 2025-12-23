@@ -27,6 +27,7 @@ struct IpcResponse {
 struct HookConfig {
     wchar_t hookPath[MAX_PATH];
     wchar_t pipeName[MAX_PATH];
+    wchar_t launcherDir[MAX_PATH]; // [新增] 传递启动器目录用于日志
 };
 
 // 辅助：生成事件名称
