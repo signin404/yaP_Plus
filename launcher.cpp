@@ -3752,7 +3752,8 @@ struct IpcThreadParam {
 // --- [新增] IPC 服务端线程 ---
 DWORD WINAPI IpcServerThread(LPVOID lpParam) {
     IpcThreadParam* param = (IpcThreadParam*)lpParam;
-
+    LauncherLog(L"IPC Server started: " + param->pipeName);
+    
     while (!*(param->shouldStop)) {
         HANDLE hPipe = CreateNamedPipeW(
             param->pipeName.c_str(),
@@ -3763,19 +3764,23 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            Sleep(100);
+            LauncherLog(L"IPC CreateNamedPipe failed: " + std::to_wstring(GetLastError()));
+            Sleep(1000);
             continue;
         }
 
-        if (ConnectNamedPipe(hPipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
+        // 等待连接
+        bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
+
+        if (connected) {
             IpcMessage msg;
             DWORD bytesRead;
             if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
-
-                // --- 处理注入请求 ---
+                LauncherLog(L"IPC Received Request: Inject PID " + std::to_wstring(msg.targetPid));
+                
+                // --- 处理注入 ---
                 bool success = false;
                 HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
-
                 if (hTarget) {
                     // 判断架构
                     BOOL isWow64 = FALSE;
@@ -3787,19 +3792,21 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
 
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
-                    // [关键] 注入并等待子进程初始化完成
-                    // 这样父进程收到回复时，子进程的 Hook 已经就绪
+                    // 注入并等待
                     success = InjectAndWait(hTarget, msg.targetPid, targetDll);
-
                     CloseHandle(hTarget);
+                } else {
+                    LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
                 }
 
                 // 发送响应
                 IpcResponse resp = { success, 0 };
                 DWORD bytesWritten;
                 WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
+                LauncherLog(L"IPC Response sent: " + std::wstring(success ? L"OK" : L"FAIL"));
             }
         }
+        
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
     }
