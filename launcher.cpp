@@ -1445,38 +1445,98 @@ namespace ActionHelpers {
         }
     }
 
-    // <-- [修改] 使用新的 WildcardMatch 函数
-    void HandleDeleteDir(const std::wstring& pathPattern, bool ifEmpty) {
-        wchar_t dirPart_w[MAX_PATH];
-        wcscpy_s(dirPart_w, pathPattern.c_str());
-        PathRemoveFileSpecW(dirPart_w);
-        std::wstring dirPart = dirPart_w;
-        std::wstring patternPart = PathFindFileNameW(pathPattern.c_str());
-
-        if (dirPart == pathPattern) {
-            dirPart = L".";
-        }
-
+    // [新增] 递归遍历并删除匹配目录的辅助函数
+    void DeleteDirsRecursive(const std::wstring& dirPath, const std::wstring& dirPattern, bool ifEmpty) {
+        std::wstring searchPath = dirPath + L"\\*";
         WIN32_FIND_DATAW findData;
-        HANDLE hFind = FindFirstFileW((dirPart + L"\\*").c_str(), &findData);
-        if (hFind == INVALID_HANDLE_VALUE) {
-            return;
-        }
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
         do {
-            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
-                if (WildcardMatch(findData.cFileName, patternPart.c_str())) { // <-- 修改点
-                    std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
+            const std::wstring fileName = findData.cFileName;
+            if (fileName == L"." || fileName == L"..") continue;
+
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                std::wstring fullPath = dirPath + L"\\" + fileName;
+                bool matched = WildcardMatch(fileName.c_str(), dirPattern.c_str());
+
+                if (matched) {
                     if (ifEmpty) {
+                        // --- 空目录模式 (后序遍历) ---
+                        // 先递归处理子目录 这样如果子目录被删空了 父目录也有机会被删除
+                        DeleteDirsRecursive(fullPath, dirPattern, ifEmpty);
+
+                        // 子目录处理完后 检查当前目录是否为空并删除
                         if (PathIsDirectoryEmptyW(fullPath.c_str())) {
                             RemoveDirectoryW(fullPath.c_str());
                         }
                     } else {
+                        // --- 强制删除模式 ---
+                        // 匹配到了直接删除整个树 无需再进入子目录
                         PerformFileSystemOperation(FO_DELETE, fullPath);
                     }
+                } else {
+                    // --- 不匹配 ---
+                    // 继续深入递归查找
+                    DeleteDirsRecursive(fullPath, dirPattern, ifEmpty);
                 }
             }
         } while (FindNextFileW(hFind, &findData));
+
         FindClose(hFind);
+    }
+
+    // [完全替换] 支持递归遍历的删除目录函数
+    void HandleDeleteDir(const std::wstring& pathPattern, bool ifEmpty) {
+        // 检查是否存在递归标记 "\*\"
+        const std::wstring recursiveToken = L"\\*\\";
+        size_t tokenPos = pathPattern.find(recursiveToken);
+
+        if (tokenPos != std::wstring::npos) {
+            // --- 递归模式 ---
+            // 提取根目录: "Data\*\cache*" -> "Data"
+            std::wstring rootDir = pathPattern.substr(0, tokenPos);
+            // 提取目录模式: "Data\*\cache*" -> "cache*"
+            std::wstring dirPattern = pathPattern.substr(tokenPos + recursiveToken.length());
+
+            // 如果根目录为空 默认为当前目录
+            if (rootDir.empty()) rootDir = L".";
+
+            DeleteDirsRecursive(rootDir, dirPattern, ifEmpty);
+        } else {
+            // --- 原有扁平模式 (仅当前目录) ---
+            wchar_t dirPart_w[MAX_PATH];
+            wcscpy_s(dirPart_w, pathPattern.c_str());
+            PathRemoveFileSpecW(dirPart_w);
+            std::wstring dirPart = dirPart_w;
+            std::wstring patternPart = PathFindFileNameW(pathPattern.c_str());
+
+            if (dirPart == pathPattern) {
+                dirPart = L".";
+            }
+
+            WIN32_FIND_DATAW findData;
+            HANDLE hFind = FindFirstFileW((dirPart + L"\\*").c_str(), &findData);
+            if (hFind == INVALID_HANDLE_VALUE) {
+                return;
+            }
+            do {
+                if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
+                    if (WildcardMatch(findData.cFileName, patternPart.c_str())) {
+                        std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
+                        if (ifEmpty) {
+                            if (PathIsDirectoryEmptyW(fullPath.c_str())) {
+                                RemoveDirectoryW(fullPath.c_str());
+                            }
+                        } else {
+                            PerformFileSystemOperation(FO_DELETE, fullPath);
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &findData));
+            FindClose(hFind);
+        }
     }
 
     LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
