@@ -24,6 +24,7 @@
 #include <codecvt>
 #include <regex>
 #include "IpcCommon.h"
+#include <fstream>
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
@@ -3695,24 +3696,47 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
 }
 
 // --- IPC 服务端逻辑 ---
-// --- [新增] 注入并等待同步的函数 ---
-// 返回值: true 表示注入且初始化成功
+
+// --- [新增] Launcher 日志 ---
+void LauncherLog(const std::wstring& msg) {
+    std::wofstream log(L"C:\\yap_launcher_debug.txt", std::ios::app);
+    if (!log.is_open()) log.open(L"yap_launcher_debug.txt", std::ios::app);
+    if (log.is_open()) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        log << L"[" << st.wHour << L":" << st.wMinute << L":" << st.wSecond << L"] " << msg << std::endl;
+    }
+}
+
+// --- [修改] 注入并智能等待 ---
 bool InjectAndWait(HANDLE hProcess, DWORD pid, const std::wstring& dllPath) {
-    // 1. 创建同步事件 (手动重置)
     std::wstring eventName = GetReadyEventName(pid);
     HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+    
+    LauncherLog(L"Injecting PID " + std::to_wstring(pid) + L" with " + dllPath);
 
-    // 2. 执行注入
-    if (!InjectDll(hProcess, dllPath)) { // 使用你之前的 InjectDll
+    if (!InjectDll(hProcess, dllPath)) {
+        LauncherLog(L"Injection failed for PID " + std::to_wstring(pid));
         CloseHandle(hEvent);
         return false;
     }
 
-    // 3. 等待 DLL 发出“就绪”信号
-    // 设置超时，防止 DLL 加载失败导致死锁 (例如 3秒)
-    DWORD waitResult = WaitForSingleObject(hEvent, 3000);
+    // [关键修改] 同时等待 Event 和 进程句柄
+    // 如果进程崩溃/退出，hProcess 会变为有信号状态，我们立即停止等待
+    HANDLE handles[] = { hEvent, hProcess };
+    DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000); // 3秒超时
 
-    bool success = (waitResult == WAIT_OBJECT_0);
+    bool success = false;
+    if (waitResult == WAIT_OBJECT_0) {
+        LauncherLog(L"PID " + std::to_wstring(pid) + L" Hook Ready.");
+        success = true;
+    } else if (waitResult == WAIT_OBJECT_0 + 1) {
+        LauncherLog(L"PID " + std::to_wstring(pid) + L" exited prematurely.");
+        success = false;
+    } else {
+        LauncherLog(L"PID " + std::to_wstring(pid) + L" wait timed out.");
+        success = false;
+    }
+
     CloseHandle(hEvent);
     return success;
 }
