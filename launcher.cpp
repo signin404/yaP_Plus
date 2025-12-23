@@ -3771,7 +3771,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
         // 恢复进程运行
         ResumeThread(pi.hThread);
-    } else {
+
         // --- [核心修正：重写 waitprocess 的解析逻辑] ---
         std::vector<WaitProcessInfo> waitProcesses;
         bool isPathBasedWait = false; // 新标志：只要有一个条目使用路径检查 就为true
