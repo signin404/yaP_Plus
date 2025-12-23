@@ -26,7 +26,7 @@ jobs:
       run: |
         echo Building Full Version...
         REM 编译资源文件 传入 INI 文件路径宏
-        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /fo launcher.res launcher.rc
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc
 
         REM 编译 C++ 代码并链接资源
         cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
