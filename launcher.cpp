@@ -34,7 +34,9 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 
-#define IDR_INI_FILE 102
+#define IDR_INI_FILE 101
+#define IDR_HOOK_DLL_32 102
+#define IDR_HOOK_DLL_64 103
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -3741,10 +3743,10 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             std::wstring dllName;
 
             if (arch == 32) {
-                resourceId = 102; // IDR_HOOK_DLL_32
+                resourceId = IDR_HOOK_DLL_32;
                 dllName = L"Hook32.dll";
             } else if (arch == 64) {
-                resourceId = 103; // IDR_HOOK_DLL_64
+                resourceId = IDR_HOOK_DLL_64;
                 dllName = L"Hook64.dll";
             }
 
