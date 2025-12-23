@@ -3659,38 +3659,37 @@ int GetPeArchitecture(const std::wstring& path) {
 // 如果 Launcher 是 x64，注入 x86 进程通常需要 "Heaven's Gate" 技术或使用 32位 辅助进程。
 // 为简化代码，这里假设 Launcher 架构与目标一致，或者使用通用注入库。
 bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
-    // 1. 在目标进程分配内存
     size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
     void* pRemotePath = VirtualAllocEx(hProcess, NULL, pathSize, MEM_COMMIT, PAGE_READWRITE);
     if (!pRemotePath) return false;
 
-    // 2. 写入 DLL 路径
     if (!WriteProcessMemory(hProcess, pRemotePath, dllPath.c_str(), pathSize, NULL)) {
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
         return false;
     }
 
-    // 3. 获取 LoadLibraryW 地址
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    LPTHREAD_START_ROUTINE pLoadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!hKernel32) return false; // 防御性检查
 
-    // 4. 创建远程线程
+    LPTHREAD_START_ROUTINE pLoadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!pLoadLibrary) return false; // 防御性检查
+
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, pLoadLibrary, pRemotePath, 0, NULL);
     if (!hThread) {
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
         return false;
     }
 
-    // 5. 等待注入完成
+    // 等待注入线程完成
     WaitForSingleObject(hThread, INFINITE);
-
-    // 检查返回值
+    
     DWORD exitCode = 0;
     GetExitCodeThread(hThread, &exitCode);
-
+    
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
 
+    // LoadLibraryW 成功返回模块句柄 (非0)，失败返回 0
     return (exitCode != 0);
 }
 
@@ -3713,32 +3712,32 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
-    // --- [新增] Hook 配置解析 ---
+    // --- Hook 配置 ---
     bool enableHook = (GetValueFromIniContent(data->iniContent, L"General", L"hook") == L"1");
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
-    // 如果启用了 Hook，通过环境变量将重定向路径传递给 DLL
     if (enableHook && !finalHookPath.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
-        // 也可以设置一个标志告诉 DLL 启用 Hook
         SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
     }
-    // ---------------------------
 
     std::set<DWORD> finalTrustedPids;
 
-    // [修改] 始终以挂起状态启动，以便有机会注入
-    DWORD creationFlags = CREATE_SUSPENDED;
-
-    if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, creationFlags, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
-        MessageBoxW(NULL, (L"启动程序失败: \n" + data->absoluteAppPath).c_str(), L"启动错误", MB_ICONERROR);
+    // 始终挂起启动
+    if (!CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, data->finalWorkDir.c_str(), &si, &pi)) {
+        MessageBoxW(NULL, (L"启动失败: " + data->absoluteAppPath).c_str(), L"错误", MB_ICONERROR);
         finalTrustedPids.insert(GetCurrentProcessId());
     } else {
-        // --- [新增] DLL 注入逻辑 ---
+        // --- 注入逻辑 ---
         if (enableHook) {
-            // 1. 检测目标架构
+            // 1. 检测架构
             int arch = GetPeArchitecture(data->absoluteAppPath);
+            
+            // [调试] 弹窗显示架构检测结果
+            std::wstring debugMsg = L"检测到目标架构: " + std::to_wstring(arch) + L" 位";
+            MessageBoxW(NULL, debugMsg.c_str(), L"调试", MB_OK);
+
             int resourceId = 0;
             std::wstring dllName;
 
@@ -3748,30 +3747,30 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             } else if (arch == 64) {
                 resourceId = IDR_HOOK_DLL_64;
                 dllName = L"Hook64.dll";
+            } else {
+                MessageBoxW(NULL, L"无法识别目标程序架构 (非 PE32/PE64)，将不执行注入。", L"错误", MB_ICONWARNING);
             }
 
             if (resourceId != 0) {
-                // 2. 释放对应的 DLL 到临时目录或 App 目录
-                // 这里为了简单，释放到与 EXE 同级目录，或者使用 tempFilePath 所在的目录
-                wchar_t tempPath[MAX_PATH];
-                GetTempPathW(MAX_PATH, tempPath);
-                std::wstring targetDllPath = std::wstring(tempPath) + dllName;
+                // 2. 释放路径：改为 EXE 同级目录，方便查看
+                std::wstring targetDllPath = data->variables[L"YAPROOT"] + L"\\" + dllName;
 
-                // 使用之前的 ExtractResourceToFile (需要确保该函数可见或复制一份逻辑)
-                // 假设 ExtractResourceToFile 已经定义在 wWinMain 之前，这里可以直接调用
-                // 如果没有定义，请将 wWinMain 中的定义移到全局作用域
+                // 3. 释放资源
                 if (ExtractResourceToFile(resourceId, targetDllPath)) {
-                    // 3. 执行注入
+                    // 4. 注入
                     if (!InjectDll(pi.hProcess, targetDllPath)) {
-                        // 注入失败可以选择记录日志或弹窗，但不一定阻断程序运行
-                        MessageBoxW(NULL, L"DLL 注入失败", L"警告", MB_ICONWARNING);
+                        MessageBoxW(NULL, (L"DLL 注入失败: " + targetDllPath).c_str(), L"错误", MB_ICONERROR);
                     }
+                    // 注入后删除临时DLL (可选，调试时可注释掉)
+                    // DeleteFileW(targetDllPath.c_str()); 
+                } else {
+                    // [关键] 如果这里弹出，说明资源没打包进去
+                    MessageBoxW(NULL, L"无法释放 Hook DLL！\n请检查 rc.exe 编译命令是否包含 /d \"EMBED_HOOK_DLLS\"", L"致命错误", MB_ICONERROR);
                 }
             }
         }
-        // ---------------------------
 
-        // 恢复进程运行
+        // [关键] 无论注入成功与否，必须恢复线程，否则窗口永远不会显示
         ResumeThread(pi.hThread);
 
         // --- [核心修正：重写 waitprocess 的解析逻辑] ---
