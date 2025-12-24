@@ -69,7 +69,7 @@ namespace yapi {
 		#define _W2T(str) std::wstring(str)
 	#endif
 
-	#define REPEAT_0(macro) 
+	#define REPEAT_0(macro)
 	#define REPEAT_1(macro) REPEAT_0(macro)
 	#define REPEAT_2(macro) REPEAT_1(macro) macro(1)
 	#define REPEAT_3(macro) REPEAT_2(macro) macro(2)
@@ -91,7 +91,7 @@ namespace yapi {
 	#define REPEAT_19(macro) REPEAT_18(macro) macro(18)
 	#define REPEAT_20(macro) REPEAT_19(macro) macro(19)
 
-	#define END_MACRO_0(macro) 
+	#define END_MACRO_0(macro)
 	#define END_MACRO_1(macro) macro(1)
 	#define END_MACRO_2(macro) macro(2)
 	#define END_MACRO_3(macro) macro(3)
@@ -319,32 +319,52 @@ namespace yapi {
 
 		PROCESS_BASIC_INFORMATION64 pbi = { 0 };
 		const int ProcessBasicInformation = 0;
+
+		// [修复] 统一状态检查逻辑
+		#ifdef _WIN64
+			#define CHECK_STATUS(s) (s)
+		#else
+			#define CHECK_STATUS(s) NT_SUCCESS(s)
+		#endif
+
 		NTSTATUS status = NtWow64QueryInformationProcess64(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		PEB64 peb;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)pbi.PebBaseAddress, &peb, sizeof(peb), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		PEB_LDR_DATA64 ldr;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)peb.Ldr, (PVOID)&ldr, sizeof(ldr), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		DWORD64 LastEntry = peb.Ldr + offsetof(PEB_LDR_DATA64, InLoadOrderModuleList);
 
 		LDR_DATA_TABLE_ENTRY64 head;
 		head.InLoadOrderLinks.Flink = ldr.InLoadOrderModuleList.Flink;
+
+		// 防止死循环的安全计数器
+		int safeLoop = 0;
+
 		do {
+			if (safeLoop++ > 1000) break; // [修复] 强制防死循环
+
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)head.InLoadOrderLinks.Flink, (PVOID)&head, sizeof(head), NULL);
-			if (!NT_SUCCESS(status)) continue;
+			// [修复] 失败时直接返回 而不是 continue (否则会导致死循环)
+			if (!CHECK_STATUS(status)) return 0;
 
 			std::wstring modName((size_t)head.BaseDllName.MaximumLength, 0);
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)head.BaseDllName.Buffer, (PVOID)&modName[0], head.BaseDllName.MaximumLength, NULL);
-			if (!NT_SUCCESS(status)) continue;
 
-			if (!_tcsicmp(moduleName, _W2T(modName).c_str()))
-				return head.DllBase;
-		} while (head.InLoadOrderLinks.Flink != LastEntry);
+			// 只有读取名称成功才进行比较
+			if (CHECK_STATUS(status)) {
+				if (!_tcsicmp(moduleName, _W2T(modName).c_str()))
+					return head.DllBase;
+			}
+
+		} while (head.InLoadOrderLinks.Flink != LastEntry && head.InLoadOrderLinks.Flink != 0);
+
+		#undef CHECK_STATUS
 		return 0;
 	}
 
@@ -356,43 +376,51 @@ namespace yapi {
 #ifndef _WIN64
 		if (!NtWow64ReadVirtualMemory64) return 0;
 #endif
+		// [修复] 统一状态检查逻辑
+		#ifdef _WIN64
+			#define CHECK_STATUS(s) (s)
+		#else
+			#define CHECK_STATUS(s) NT_SUCCESS(s)
+		#endif
 
 		IMAGE_DOS_HEADER idh;
 		NTSTATUS status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)hModule, (PVOID)&idh, sizeof(idh), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		IMAGE_NT_HEADERS64 inh;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + idh.e_lfanew), (PVOID)&inh, sizeof(inh), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		IMAGE_DATA_DIRECTORY& idd = inh.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
 		if (!idd.VirtualAddress)return 0;
 
 		IMAGE_EXPORT_DIRECTORY ied;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + idd.VirtualAddress), (PVOID)&ied, sizeof(ied), NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		std::vector<DWORD> nameTable(ied.NumberOfNames);
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfNames), (PVOID)&nameTable[0], sizeof(DWORD) * ied.NumberOfNames, NULL);
-		if (!NT_SUCCESS(status)) return 0;
+		if (!CHECK_STATUS(status)) return 0;
 
 		for (DWORD i = 0; i < ied.NumberOfNames; ++i) {
 			std::string func(strlen(funcName), 0);
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + nameTable[i]), (PVOID)&func[0], strlen(funcName), NULL);
-			if (!NT_SUCCESS(status)) continue;
+			if (!CHECK_STATUS(status)) continue;
 
 			if (func == funcName) {
 				WORD ord = 0;
 				status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfNameOrdinals + i * sizeof(WORD)), (PVOID)&ord, sizeof(WORD), NULL);
-				if (!NT_SUCCESS(status)) continue;
+				if (!CHECK_STATUS(status)) continue;
 
 				DWORD rva = 0;
 				status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfFunctions + ord * sizeof(DWORD)), (PVOID)&rva, sizeof(DWORD), NULL);
-				if (!NT_SUCCESS(status)) continue;
+				if (!CHECK_STATUS(status)) continue;
 
+				#undef CHECK_STATUS
 				return hModule + rva;
 			}
 		}
+		#undef CHECK_STATUS
 		return 0;
 	}
 
@@ -504,7 +532,7 @@ namespace yapi {
 
 			static RTL_NTSTATUS_TO_DOS_ERROR RtlNtStatusToDosError = (RTL_NTSTATUS_TO_DOS_ERROR)GetProcAddress(detail::hNtDll, "RtlNtStatusToDosError");
 			static RTL_SET_LAST_WIN32_ERROR RtlSetLastWin32Error = (RTL_SET_LAST_WIN32_ERROR)GetProcAddress(detail::hNtDll, "RtlSetLastWin32Error");
-	    
+
 			if (RtlNtStatusToDosError && RtlSetLastWin32Error)
 				RtlSetLastWin32Error(RtlNtStatusToDosError((DWORD)status));
 		}
@@ -671,9 +699,9 @@ namespace yapi {
 		{
 			if(is64Bit) {
 				// see X64Delegator_disassemble for details
-				static const unsigned char kTmpl_x64[] = { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9, 0x74, 0x1d, 0x48, 0x83, 
-														   0x39, 0x00, 0x48, 0x8b, 0x41, 0x08, 0x74, 0x0b, 0xff, 0xd0, 0x48, 0x89, 0x03, 0x48, 0x83, 0xc4, 
-														   0x20, 0x5b, 0xc3, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0xe0, 0x33, 0xc0, 0x48, 0x83, 0xc4, 
+				static const unsigned char kTmpl_x64[] = { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9, 0x74, 0x1d, 0x48, 0x83,
+														   0x39, 0x00, 0x48, 0x8b, 0x41, 0x08, 0x74, 0x0b, 0xff, 0xd0, 0x48, 0x89, 0x03, 0x48, 0x83, 0xc4,
+														   0x20, 0x5b, 0xc3, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0xe0, 0x33, 0xc0, 0x48, 0x83, 0xc4,
 														   0x20, 0x5b, 0xc3 };
 
 				std::string templ_x64((const char*)kTmpl_x64, sizeof(kTmpl_x64));
@@ -715,7 +743,7 @@ namespace yapi {
 				return templ_x64;
 			}
 			// see X86Delegator_disassemble for details
-			static const unsigned char kTmpl_x86[] = { 0x55, 0x8b, 0xec, 0x51, 0x83, 0x7d, 0x08, 0x00, 0x74, 0x0c, 0x8b ,0x45, 0x08, 0x8b, 0x08, 0xff, 
+			static const unsigned char kTmpl_x86[] = { 0x55, 0x8b, 0xec, 0x51, 0x83, 0x7d, 0x08, 0x00, 0x74, 0x0c, 0x8b ,0x45, 0x08, 0x8b, 0x08, 0xff,
 													   0xd0, 0x89, 0x45, 0xfc, 0xeb, 0x07, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x45, 0xfc,
 													   0x8b, 0xe5, 0x5d, 0xc3 };
 			std::string templ_x86((const char*)kTmpl_x86, sizeof(kTmpl_x86));
@@ -808,9 +836,9 @@ namespace yapi {
 			else {
 #ifdef _WIN64
 				// see X64toX86_disassemble for details
-				static const unsigned char kTmpl_x64_to_x86[] = { 0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x44, 0x24, 0x30, 0x8b, 0x48, 
-																  0x08, 0x48, 0x8b, 0x44, 0x24, 0x30, 0x6a, 0x33, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x83, 0x04, 0x24, 
-																  0x05, 0xcb, 0xff, 0xd0, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x04, 0x23, 0x00, 0x00, 
+				static const unsigned char kTmpl_x64_to_x86[] = { 0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x44, 0x24, 0x30, 0x8b, 0x48,
+																  0x08, 0x48, 0x8b, 0x44, 0x24, 0x30, 0x6a, 0x33, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x83, 0x04, 0x24,
+																  0x05, 0xcb, 0xff, 0xd0, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x44, 0x24, 0x04, 0x23, 0x00, 0x00,
 																  0x00, 0x83, 0x04, 0x24, 0x0d, 0xcb, 0x48, 0x83, 0xc4, 0x28, 0xc3 };
 				std::string x86_shellcode((char*)kTmpl_x64_to_x86, sizeof(kTmpl_x64_to_x86));
 				ProcessWriter* sc = new ProcessWriter(_hProcess, x86_shellcode.data(), x86_shellcode.size() + 1, PAGE_EXECUTE_READWRITE);
