@@ -5,7 +5,7 @@
 #include <string>
 #include <tlhelp32.h>
 
-// 简单的日志输出，方便调试（实际使用可去除）
+// 简单的日志输出 方便调试（实际使用可去除）
 void Log(const wchar_t* msg) {
     // OutputDebugStringW(msg);
 }
@@ -16,7 +16,7 @@ bool Inject(DWORD pid, const std::wstring& dllPath) {
     if (!hProcess) return false;
 
     // 获取 LoadLibraryW 地址
-    // 因为这是 32位 进程，GetModuleHandle 获取的是 32位 kernel32
+    // 因为这是 32位 进程 GetModuleHandle 获取的是 32位 kernel32
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32) {
         CloseHandle(hProcess);
@@ -45,7 +45,7 @@ bool Inject(DWORD pid, const std::wstring& dllPath) {
 
     // 创建远程线程
     Log(L"Injector32: Creating remote thread...");
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
 
     if (!hThread) {
@@ -56,10 +56,10 @@ bool Inject(DWORD pid, const std::wstring& dllPath) {
 
     // 等待注入完成
     WaitForSingleObject(hThread, INFINITE);
-    
+
     DWORD exitCode = 0;
     GetExitCodeThread(hThread, &exitCode);
-    
+
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
     CloseHandle(hProcess);

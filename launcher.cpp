@@ -26,46 +26,6 @@
 #include <regex>
 #include "IpcCommon.h"
 
-// --- [新增] 32位 PEB 结构定义 (用于手动查找 Kernel32) ---
-// 必须确保字节对齐正确
-#pragma pack(push, 1)
-
-struct YAP_UNICODE_STRING32 {
-    USHORT Length;
-    USHORT MaximumLength;
-    ULONG  Buffer;
-};
-
-struct YAP_PEB_LDR_DATA32 {
-    ULONG Length;
-    BOOLEAN Initialized;
-    ULONG SsHandle;
-    LIST_ENTRY32 InLoadOrderModuleList;
-    LIST_ENTRY32 InMemoryOrderModuleList;
-    LIST_ENTRY32 InInitializationOrderModuleList;
-    ULONG EntryInProgress;
-    BOOLEAN ShutdownInProgress;
-    ULONG ShutdownThreadId;
-};
-
-struct YAP_LDR_DATA_TABLE_ENTRY32 {
-    LIST_ENTRY32 InLoadOrderLinks;
-    LIST_ENTRY32 InMemoryOrderLinks;
-    LIST_ENTRY32 InInitializationOrderLinks;
-    ULONG DllBase;
-    ULONG EntryPoint;
-    ULONG SizeOfImage;
-    YAP_UNICODE_STRING32 FullDllName; // 使用自定义类型
-    YAP_UNICODE_STRING32 BaseDllName; // 使用自定义类型
-    ULONG Flags;
-    USHORT LoadCount;
-    USHORT TlsIndex;
-    LIST_ENTRY32 HashLinks;
-    ULONG TimeDateStamp;
-};
-
-#pragma pack(pop)
-
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -3753,129 +3713,16 @@ LPVOID GetEntryPoint(HANDLE hProcess) {
     }
 }
 
-// --- [新增] 手动遍历远程 32位 PEB 查找模块基址 ---
-HMODULE GetRemoteModuleHandle32_Manual(HANDLE hProcess, LPCWSTR lpModuleName) {
-    PROCESS_BASIC_INFORMATION pbi;
-    ULONG len;
-    if (g_NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &len) != 0) return NULL;
-
-    BOOL isWow64 = FALSE;
-    IsWow64Process(hProcess, &isWow64);
-    if (!isWow64) return NULL; // 仅用于 32位 目标
-
-    // 获取 32位 PEB 地址
-    ULONG_PTR peb32 = 0;
-    if (g_NtQueryInformationProcess(hProcess, (PROCESSINFOCLASS)26, &peb32, sizeof(peb32), &len) != 0 || peb32 == 0) return NULL;
-
-    // 读取 PEB_LDR_DATA32 地址 (PEB + 0x0C)
-    ULONG ldrDataAddr = 0;
-    if (!ReadProcessMemory(hProcess, (PVOID)(peb32 + 0x0C), &ldrDataAddr, sizeof(ldrDataAddr), NULL) || ldrDataAddr == 0) return NULL;
-
-    // 读取 InLoadOrderModuleList 头 (PEB_LDR_DATA + 0x0C)
-    LIST_ENTRY32 listHead;
-    if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)(ldrDataAddr + 0x0C), &listHead, sizeof(listHead), NULL)) return NULL;
-
-    ULONG currentAddr = listHead.Flink;
-    int maxCount = 100;
-
-    while (currentAddr != (ldrDataAddr + 0x0C) && maxCount-- > 0) {
-        YAP_LDR_DATA_TABLE_ENTRY32 entry;
-        if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)currentAddr, &entry, sizeof(entry), NULL)) break;
-
-        // 读取 BaseDllName
-        wchar_t buffer[MAX_PATH];
-        SIZE_T bytesRead = 0;
-        if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Length < sizeof(buffer)) {
-            // entry.BaseDllName.Buffer 是 ULONG (32位地址)，需转换为 PVOID
-            if (ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)entry.BaseDllName.Buffer, buffer, entry.BaseDllName.Length, &bytesRead)) {
-                buffer[bytesRead / 2] = L'\0';
-                if (_wcsicmp(buffer, lpModuleName) == 0) {
-                    return (HMODULE)(ULONG_PTR)entry.DllBase;
-                }
-            }
-        }
-
-        currentAddr = entry.InLoadOrderLinks.Flink;
-    }
-
-    return NULL;
-}
-
-// --- [修改] 增强的远程模块获取 ---
-HMODULE GetRemoteModuleHandle(HANDLE hProcess, LPCWSTR lpModuleName, bool targetIs32Bit) {
-    // 1. 如果是 32位目标，优先尝试手动遍历 PEB (最可靠)
-    if (targetIs32Bit) {
-        HMODULE hMod = GetRemoteModuleHandle32_Manual(hProcess, lpModuleName);
-        if (hMod) return hMod;
-    }
-
-    // 2. 回退到 API 枚举 (适用于 x64 或 PEB 尚未初始化的情况)
-    HMODULE hMods[1024];
-    DWORD cbNeeded;
-    DWORD filterFlag = targetIs32Bit ? LIST_MODULES_32BIT : LIST_MODULES_ALL;
-
-    if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, filterFlag)) {
-        for (unsigned int j = 0; j < (cbNeeded / sizeof(HMODULE)); j++) {
-            wchar_t szModName[MAX_PATH];
-            if (GetModuleBaseNameW(hProcess, hMods[j], szModName, sizeof(szModName) / sizeof(wchar_t))) {
-                if (_wcsicmp(szModName, lpModuleName) == 0) return hMods[j];
-            }
-        }
-    }
-    return NULL;
-}
-
 // --- [修改] 获取 LoadLibraryW 地址 ---
 LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
-#ifdef _WIN64
-    if (!targetIs32Bit) return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-#else
+    // 如果目标是 32 位 Launcher (x64) 无法直接获取其地址
+    // 但我们现在使用 Injector32.exe 所以这里直接返回 NULL 即可
+    if (targetIs32Bit) return NULL;
+
+    // 如果目标是 64 位 Kernel32 在所有 64 位进程中的加载地址通常是相同的
+    // 直接返回当前进程的 LoadLibraryW 地址即可
     return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-#endif
-
-    // x64 Launcher -> x86 Target
-    HMODULE hRemoteKernel32 = GetRemoteModuleHandle(hProcess, L"kernel32.dll", true);
-    if (!hRemoteKernel32) return NULL;
-
-    wchar_t sysWow64Path[MAX_PATH];
-    GetWindowsDirectoryW(sysWow64Path, MAX_PATH);
-    wcscat_s(sysWow64Path, L"\\SysWOW64\\kernel32.dll");
-
-    HMODULE hLocalKernel32 = LoadLibraryExW(sysWow64Path, NULL, DONT_RESOLVE_DLL_REFERENCES);
-    if (!hLocalKernel32) return NULL;
-
-    LPVOID pLoadLibrary = NULL;
-    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hLocalKernel32;
-    if (pDos->e_magic == IMAGE_DOS_SIGNATURE) {
-        PIMAGE_NT_HEADERS32 pNt = (PIMAGE_NT_HEADERS32)((BYTE*)pDos + pDos->e_lfanew);
-        if (pNt->Signature == IMAGE_NT_SIGNATURE) {
-            PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)pDos +
-                pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-            DWORD* pNames = (DWORD*)((BYTE*)pDos + pExport->AddressOfNames);
-            DWORD* pFuncs = (DWORD*)((BYTE*)pDos + pExport->AddressOfFunctions);
-            WORD* pOrds = (WORD*)((BYTE*)pDos + pExport->AddressOfNameOrdinals);
-
-            for (DWORD i = 0; i < pExport->NumberOfNames; i++) {
-                char* szName = (char*)((BYTE*)pDos + pNames[i]);
-                if (strcmp(szName, "LoadLibraryW") == 0) {
-                    DWORD rva = pFuncs[pOrds[i]];
-                    pLoadLibrary = (LPVOID)((BYTE*)hRemoteKernel32 + rva);
-                    break;
-                }
-            }
-        }
-    }
-    FreeLibrary(hLocalKernel32);
-    return pLoadLibrary;
 }
-
-// --- [新增] x86 Shellcode 结构 ---
-#pragma pack(push, 1)
-struct ShellcodeData {
-    wchar_t dllPath[MAX_PATH];
-    unsigned char code[256]; // 加大缓冲区
-};
-#pragma pack(pop)
 
 // --- [修改] 核心注入函数 ---
 bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
@@ -3891,11 +3738,11 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     // 1. 确保 Kernel32 已加载 (自旋锁逻辑)
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
-    
-    // 只有当能获取到入口点时才尝试自旋锁，这有助于让挂起的进程初始化 Kernel32
+
+    // 只有当能获取到入口点时才尝试自旋锁 这有助于让挂起的进程初始化 Kernel32
     if (pEntryPoint) {
-        // 如果第一次没获取到地址，或者为了保险起见，执行自旋等待
-        // 注意：对于 x64->x86，GetLoadLibraryAddress 经常失败，所以这个循环通常会跑满 3 秒
+        // 如果第一次没获取到地址 或者为了保险起见 执行自旋等待
+        // 注意：对于 x64->x86 GetLoadLibraryAddress 经常失败 所以这个循环通常会跑满 3 秒
         // 这是为了确保目标进程有足够时间初始化 Ldr
         if (!pLoadLibrary) {
             BYTE originalBytes[2];
@@ -3904,13 +3751,13 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
             if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
                 if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
                     FlushInstructionCache(hProcess, pEntryPoint, 2);
-                    
-                    if (g_NtResumeProcess) g_NtResumeProcess(hProcess); 
+
+                    if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
                     else ResumeThread(hThread);
 
                     // 等待 Kernel32 加载
-                    // [优化] 对于 32 位目标，我们不需要疯狂查询，因为 Launcher 查不到是正常的
-                    // 直接睡一会，让子进程跑一会初始化逻辑即可
+                    // [优化] 对于 32 位目标 我们不需要疯狂查询 因为 Launcher 查不到是正常的
+                    // 直接睡一会 让子进程跑一会初始化逻辑即可
                     if (targetIs32Bit) {
                         Sleep(1000); // 给 32 位进程 1 秒钟时间初始化
                     } else {
@@ -3923,7 +3770,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
 
                     if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
                     else SuspendThread(hThread);
-                    
+
                     WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
                     FlushInstructionCache(hProcess, pEntryPoint, 2);
                 }
@@ -3931,38 +3778,38 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         }
     }
 
-    // [核心修复]：如果是 32 位目标，即使 Launcher 没找到 LoadLibrary 地址，
-    // 也不能返回 false！因为我们要依赖 Injector32.exe 去做这件事。
-    // 只有当目标是 64 位且没找到地址时，才认为是真正的失败。
-    if (!pLoadLibrary && !targetIs32Bit) return false; 
+    // [核心修复]：如果是 32 位目标 即使 Launcher 没找到 LoadLibrary 地址
+    // 也不能返回 false！因为我们要依赖 Injector32.exe 去做这件事
+    // 只有当目标是 64 位且没找到地址时 才认为是真正的失败
+    if (!pLoadLibrary && !targetIs32Bit) return false;
 
     // 2. 分支处理
     if (targetIs32Bit) {
         // --- 方案：调用外部 32位 Injector ---
-        
+
         // [路径修复] 从 dllPath 推导 Injector32.exe 路径 (假设它们在同一目录)
         wchar_t drive[_MAX_DRIVE];
         wchar_t dir[_MAX_DIR];
         _wsplitpath_s(dllPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
         std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"Injector32.exe";
-        
+
         // C. 构造命令行: Injector32.exe <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
         std::wstring cmdLine = L"\"" + injectorPath + L"\" " + std::to_wstring(pid) + L" \"" + dllPath + L"\"";
-        
+
         STARTUPINFOW si_inj = { 0 };
         si_inj.cb = sizeof(si_inj);
         si_inj.dwFlags = STARTF_USESHOWWINDOW;
         si_inj.wShowWindow = SW_HIDE; // 隐藏窗口
-        
+
         PROCESS_INFORMATION pi_inj = { 0 };
 
         if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE, 0, NULL, NULL, &si_inj, &pi_inj)) {
             WaitForSingleObject(pi_inj.hProcess, 5000);
-            
+
             DWORD exitCode = 1;
             GetExitCodeProcess(pi_inj.hProcess, &exitCode);
-            
+
             CloseHandle(pi_inj.hProcess);
             CloseHandle(pi_inj.hThread);
 
@@ -3982,7 +3829,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
-        
+
         HANDLE hRemoteThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
         if (hRemoteThread) {
             WaitForSingleObject(hRemoteThread, INFINITE);
@@ -4027,8 +3874,8 @@ bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstrin
         return false;
     }
 
-    // 此时，无论是 32位还是 64位，DLL 都应该已经加载并运行了 DllMain
-    // 我们可以放心地等待 Event 信号，确认 Hook 初始化完成
+    // 此时 无论是 32位还是 64位 DLL 都应该已经加载并运行了 DllMain
+    // 我们可以放心地等待 Event 信号 确认 Hook 初始化完成
     HANDLE handles[] = { hEvent, hProcess };
     DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000);
 

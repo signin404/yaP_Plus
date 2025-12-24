@@ -19,7 +19,7 @@ IDR_INI_FILE RCDATA EMBED_INI_FILE
 #endif
 
 // 定义 DLL 资源 (编译时需要确保这两个文件存在)
-// 这里的路径假设 DLL 就在源码目录下，你可以根据实际情况修改
+// 这里的路径假设 DLL 就在源码目录下 你可以根据实际情况修改
 #ifdef EMBED_HOOK_DLLS
 IDR_HOOK_DLL_32 RCDATA "Hook32.dll"
 IDR_HOOK_DLL_64 RCDATA "Hook64.dll"
