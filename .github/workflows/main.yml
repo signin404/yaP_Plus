@@ -1,38 +1,138 @@
-name: Build C++ Launcher for Windows
+name: Build Complete Launcher (DLLs + EXE)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
-  # 允许手动触发工作流
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  build:
+  # ==================================================================
+  # 第一步：构建 Hook DLLs (x86 和 x64)
+  # ==================================================================
+  build-hooks:
+    name: Build Hook DLL (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            name: Hook32.dll
+            lib_minhook: libMinHook.x86.lib
+          - arch: x64
+            name: Hook64.dll
+            lib_minhook: libMinHook.x64.lib
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Checkout MinHook
+      uses: actions/checkout@v4
+      with:
+        repository: TsudaKageyu/minhook
+        path: MinHook
+
+    - name: Setup MSVC (${{ matrix.arch }})
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.arch }}
+
+    - name: Compile MinHook Library
+      shell: cmd
+      run: |
+        echo Compiling MinHook for ${{ matrix.arch }}...
+        mkdir minhook_build
+        cd minhook_build
+        
+        :: 编译 MinHook 源码
+        cl /nologo /c /O2 /MT /MP /DNDEBUG /I ..\MinHook\include ..\MinHook\src\*.c ..\MinHook\src\hde\*.c || exit 1
+        
+        :: 打包成静态库
+        lib /nologo /OUT:..\${{ matrix.lib_minhook }} *.obj || exit 1
+        
+        cd ..
+        echo MinHook library built: ${{ matrix.lib_minhook }}
+
+    - name: Compile Hook DLL
+      shell: cmd
+      run: |
+        echo Compiling ${{ matrix.name }}...
+        
+        :: 编译 HookDll.cpp 并链接 MinHook
+        cl /nologo /LD /O2 /MT /EHsc /DUNICODE /D_UNICODE /I MinHook\include HookDll.cpp ${{ matrix.lib_minhook }} Shlwapi.lib Shell32.lib /Fe:${{ matrix.name }} || exit 1
+        
+        :: 验证 DLL 是否存在
+        if not exist "${{ matrix.name }}" (
+            echo Error: ${{ matrix.name }} was not created!
+            exit 1
+        )
+        
+        :: 清理垃圾文件
+        del *.obj *.exp *.lib
+
+    # 上传 DLL 以便下一个 Job 使用
+    - name: Upload Hook DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.name }}
+        path: ${{ matrix.name }}
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第二步：构建主程序 EXE 并嵌入 DLL
+  # ==================================================================
+  build-launcher:
+    name: Build Launcher EXE
+    needs: build-hooks # 必须等待 DLL 构建完成
     runs-on: windows-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # 下载上一步构建的所有 DLL (Hook32.dll 和 Hook64.dll)
+    # merge-multiple: true 会将它们下载到当前根目录，而不是子文件夹
+    - name: Download Hook DLLs
+      uses: actions/download-artifact@v4
+      with:
+        pattern: Hook*.dll
+        merge-multiple: true
+
+    - name: Verify DLLs Existence
+      shell: cmd
+      run: |
+        if exist Hook32.dll ( echo Hook32.dll found. ) else ( echo Error: Hook32.dll missing! & exit 1 )
+        if exist Hook64.dll ( echo Hook64.dll found. ) else ( echo Error: Hook64.dll missing! & exit 1 )
+
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
+      # 默认使用 x64 主机 x86 目标，或者 x64 目标均可。
+      # 这里不指定 arch，通常默认为 x64，这对于构建 32位/64位 兼容的启动器通常没问题，
+      # 但为了最大兼容性，通常建议启动器编译为 x86 (32位)，这样可以在所有系统运行。
+      # 如果你想强制编译为 32位 EXE，请取消下面注释：
+      # with:
+      #   arch: x86
 
-    # --- 仅构建打包 INI 的版本 ---
-    # 使用 shell: cmd 是为了正确处理 rc.exe 参数中的引号转义
-    - name: Build Full Version (With Embedded INI)
+    - name: Build Full Version (With Embedded INI and DLLs)
       shell: cmd
       run: |
         echo Building Full Version...
-        REM 编译资源文件 传入 INI 文件路径宏
-        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc
+        
+        REM 1. 编译资源文件
+        REM 定义 EMBED_HOOK_DLLS 宏，告诉 rc 文件去包含当前目录下的 Hook32.dll 和 Hook64.dll
+        REM 定义 EMBED_INI_FILE 宏 (假设 launcher.ini 存在于源码中，或者你可以创建一个空的)
+        
+        if not exist "launcher.ini" echo ;Empty INI > launcher.ini
+        
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc || exit 1
 
-        REM 编译 C++ 代码并链接资源
-        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
+        REM 2. 编译 C++ 代码并链接资源
+        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
 
-    # --- 上传 EXE 文件 ---
-    - name: Upload artifacts
+    - name: Upload Final EXE
       uses: actions/upload-artifact@v4
       with:
         name: yaP_Plus
