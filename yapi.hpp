@@ -317,54 +317,56 @@ namespace yapi {
 		if (!NtWow64QueryInformationProcess64 || !NtWow64ReadVirtualMemory64) return 0;
 	#endif
 
+		// [修复] 定义专用宏来检查内存读取函数的返回值
+		#ifdef _WIN64
+			// x64下是 ReadProcessMemory，返回 BOOL (非0即成功)
+			#define MEM_READ_SUCCESS(s) ((s) != 0)
+		#else
+			// x86下是 NtWow64ReadVirtualMemory64，返回 NTSTATUS (>=0 即成功)
+			#define MEM_READ_SUCCESS(s) NT_SUCCESS(s)
+		#endif
+
 		PROCESS_BASIC_INFORMATION64 pbi = { 0 };
 		const int ProcessBasicInformation = 0;
 
-		// [修复] 统一状态检查逻辑
-		#ifdef _WIN64
-			#define CHECK_STATUS(s) (s)
-		#else
-			#define CHECK_STATUS(s) NT_SUCCESS(s)
-		#endif
-
+		// [关键修正] QueryInformationProcess 始终返回 NTSTATUS，必须用 NT_SUCCESS
 		NTSTATUS status = NtWow64QueryInformationProcess64(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!NT_SUCCESS(status)) return 0;
 
 		PEB64 peb;
+		// [关键修正] 内存读取使用专用宏
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)pbi.PebBaseAddress, &peb, sizeof(peb), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		PEB_LDR_DATA64 ldr;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)peb.Ldr, (PVOID)&ldr, sizeof(ldr), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		DWORD64 LastEntry = peb.Ldr + offsetof(PEB_LDR_DATA64, InLoadOrderModuleList);
 
 		LDR_DATA_TABLE_ENTRY64 head;
 		head.InLoadOrderLinks.Flink = ldr.InLoadOrderModuleList.Flink;
 
-		// 防止死循环的安全计数器
 		int safeLoop = 0;
 
 		do {
-			if (safeLoop++ > 1000) break; // [修复] 强制防死循环
+			if (safeLoop++ > 1000) break; // 防死循环
 
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)head.InLoadOrderLinks.Flink, (PVOID)&head, sizeof(head), NULL);
-			// [修复] 失败时直接返回 而不是 continue (否则会导致死循环)
-			if (!CHECK_STATUS(status)) return 0;
+			// [关键修正] 读取失败直接退出，防止死循环
+			if (!MEM_READ_SUCCESS(status)) return 0;
 
 			std::wstring modName((size_t)head.BaseDllName.MaximumLength, 0);
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)head.BaseDllName.Buffer, (PVOID)&modName[0], head.BaseDllName.MaximumLength, NULL);
 
-			// 只有读取名称成功才进行比较
-			if (CHECK_STATUS(status)) {
+			if (MEM_READ_SUCCESS(status)) {
 				if (!_tcsicmp(moduleName, _W2T(modName).c_str()))
 					return head.DllBase;
 			}
 
 		} while (head.InLoadOrderLinks.Flink != LastEntry && head.InLoadOrderLinks.Flink != 0);
 
-		#undef CHECK_STATUS
+		#undef MEM_READ_SUCCESS
 		return 0;
 	}
 
@@ -376,51 +378,51 @@ namespace yapi {
 #ifndef _WIN64
 		if (!NtWow64ReadVirtualMemory64) return 0;
 #endif
-		// [修复] 统一状态检查逻辑
+		// [修复] 定义专用宏
 		#ifdef _WIN64
-			#define CHECK_STATUS(s) (s)
+			#define MEM_READ_SUCCESS(s) ((s) != 0)
 		#else
-			#define CHECK_STATUS(s) NT_SUCCESS(s)
+			#define MEM_READ_SUCCESS(s) NT_SUCCESS(s)
 		#endif
 
 		IMAGE_DOS_HEADER idh;
 		NTSTATUS status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)hModule, (PVOID)&idh, sizeof(idh), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		IMAGE_NT_HEADERS64 inh;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + idh.e_lfanew), (PVOID)&inh, sizeof(inh), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		IMAGE_DATA_DIRECTORY& idd = inh.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
 		if (!idd.VirtualAddress)return 0;
 
 		IMAGE_EXPORT_DIRECTORY ied;
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + idd.VirtualAddress), (PVOID)&ied, sizeof(ied), NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		std::vector<DWORD> nameTable(ied.NumberOfNames);
 		status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfNames), (PVOID)&nameTable[0], sizeof(DWORD) * ied.NumberOfNames, NULL);
-		if (!CHECK_STATUS(status)) return 0;
+		if (!MEM_READ_SUCCESS(status)) return 0;
 
 		for (DWORD i = 0; i < ied.NumberOfNames; ++i) {
 			std::string func(strlen(funcName), 0);
 			status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + nameTable[i]), (PVOID)&func[0], strlen(funcName), NULL);
-			if (!CHECK_STATUS(status)) continue;
+			if (!MEM_READ_SUCCESS(status)) continue;
 
 			if (func == funcName) {
 				WORD ord = 0;
 				status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfNameOrdinals + i * sizeof(WORD)), (PVOID)&ord, sizeof(WORD), NULL);
-				if (!CHECK_STATUS(status)) continue;
+				if (!MEM_READ_SUCCESS(status)) continue;
 
 				DWORD rva = 0;
 				status = NtWow64ReadVirtualMemory64(hProcess, (PVOID64)(hModule + ied.AddressOfFunctions + ord * sizeof(DWORD)), (PVOID)&rva, sizeof(DWORD), NULL);
-				if (!CHECK_STATUS(status)) continue;
+				if (!MEM_READ_SUCCESS(status)) continue;
 
-				#undef CHECK_STATUS
+				#undef MEM_READ_SUCCESS
 				return hModule + rva;
 			}
 		}
-		#undef CHECK_STATUS
+		#undef MEM_READ_SUCCESS
 		return 0;
 	}
 
