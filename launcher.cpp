@@ -26,6 +26,51 @@
 #include <regex>
 #include "IpcCommon.h"
 
+// --- [新增] 32位 PEB 结构定义 (用于手动查找 Kernel32) ---
+// 必须确保字节对齐正确
+#pragma pack(push, 1)
+
+struct UNICODE_STRING32 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG  Buffer;
+};
+
+struct LIST_ENTRY32 {
+    ULONG Flink;
+    ULONG Blink;
+};
+
+struct PEB_LDR_DATA32 {
+    ULONG Length;
+    BOOLEAN Initialized;
+    ULONG SsHandle;
+    LIST_ENTRY32 InLoadOrderModuleList;
+    LIST_ENTRY32 InMemoryOrderModuleList;
+    LIST_ENTRY32 InInitializationOrderModuleList;
+    ULONG EntryInProgress;
+    BOOLEAN ShutdownInProgress;
+    ULONG ShutdownThreadId;
+};
+
+struct LDR_DATA_TABLE_ENTRY32 {
+    LIST_ENTRY32 InLoadOrderLinks;
+    LIST_ENTRY32 InMemoryOrderLinks;
+    LIST_ENTRY32 InInitializationOrderLinks;
+    ULONG DllBase;
+    ULONG EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING32 FullDllName;
+    UNICODE_STRING32 BaseDllName;
+    ULONG Flags;
+    USHORT LoadCount;
+    USHORT TlsIndex;
+    LIST_ENTRY32 HashLinks;
+    ULONG TimeDateStamp;
+};
+
+#pragma pack(pop)
+
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -3712,23 +3757,75 @@ LPVOID GetEntryPoint(HANDLE hProcess) {
     }
 }
 
+// --- [新增] 手动遍历远程 32位 PEB 查找模块基址 ---
+HMODULE GetRemoteModuleHandle32_Manual(HANDLE hProcess, LPCWSTR lpModuleName) {
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG len;
+    if (g_NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &len) != 0) return NULL;
+
+    BOOL isWow64 = FALSE;
+    IsWow64Process(hProcess, &isWow64);
+    if (!isWow64) return NULL; // 仅用于 32位 目标
+
+    // 获取 32位 PEB 地址
+    ULONG_PTR peb32 = 0;
+    if (g_NtQueryInformationProcess(hProcess, (PROCESSINFOCLASS)26, &peb32, sizeof(peb32), &len) != 0 || peb32 == 0) return NULL;
+
+    // 读取 PEB_LDR_DATA32 地址 (PEB + 0x0C)
+    ULONG ldrDataAddr = 0;
+    if (!ReadProcessMemory(hProcess, (PVOID)(peb32 + 0x0C), &ldrDataAddr, sizeof(ldrDataAddr), NULL) || ldrDataAddr == 0) return NULL;
+
+    // 读取 InLoadOrderModuleList 头 (PEB_LDR_DATA + 0x0C)
+    // 注意：PEB_LDR_DATA32 定义中 InLoadOrderModuleList 偏移就是 0x0C
+    LIST_ENTRY32 listHead;
+    if (!ReadProcessMemory(hProcess, (PVOID)(ldrDataAddr + 0x0C), &listHead, sizeof(listHead), NULL)) return NULL;
+
+    ULONG currentAddr = listHead.Flink;
+    // 防止死循环，设置最大遍历次数
+    int maxCount = 100;
+
+    while (currentAddr != (ldrDataAddr + 0x0C) && maxCount-- > 0) {
+        LDR_DATA_TABLE_ENTRY32 entry;
+        if (!ReadProcessMemory(hProcess, (PVOID)currentAddr, &entry, sizeof(entry), NULL)) break;
+
+        // 读取 BaseDllName
+        wchar_t buffer[MAX_PATH];
+        SIZE_T bytesRead = 0;
+        if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Length < sizeof(buffer)) {
+            if (ReadProcessMemory(hProcess, (PVOID)entry.BaseDllName.Buffer, buffer, entry.BaseDllName.Length, &bytesRead)) {
+                buffer[bytesRead / 2] = L'\0';
+                if (_wcsicmp(buffer, lpModuleName) == 0) {
+                    return (HMODULE)entry.DllBase;
+                }
+            }
+        }
+
+        currentAddr = entry.InLoadOrderLinks.Flink;
+    }
+
+    return NULL;
+}
+
 // --- [修改] 增强的远程模块获取 ---
 HMODULE GetRemoteModuleHandle(HANDLE hProcess, LPCWSTR lpModuleName, bool targetIs32Bit) {
+    // 1. 如果是 32位目标，优先尝试手动遍历 PEB (最可靠)
+    if (targetIs32Bit) {
+        HMODULE hMod = GetRemoteModuleHandle32_Manual(hProcess, lpModuleName);
+        if (hMod) return hMod;
+    }
+
+    // 2. 回退到 API 枚举 (适用于 x64 或 PEB 尚未初始化的情况)
     HMODULE hMods[1024];
     DWORD cbNeeded;
     DWORD filterFlag = targetIs32Bit ? LIST_MODULES_32BIT : LIST_MODULES_ALL;
 
-    // 尝试多次，因为模块加载需要时间
-    for (int i = 0; i < 3; i++) {
-        if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, filterFlag)) {
-            for (unsigned int j = 0; j < (cbNeeded / sizeof(HMODULE)); j++) {
-                wchar_t szModName[MAX_PATH];
-                if (GetModuleBaseNameW(hProcess, hMods[j], szModName, sizeof(szModName) / sizeof(wchar_t))) {
-                    if (_wcsicmp(szModName, lpModuleName) == 0) return hMods[j];
-                }
+    if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, filterFlag)) {
+        for (unsigned int j = 0; j < (cbNeeded / sizeof(HMODULE)); j++) {
+            wchar_t szModName[MAX_PATH];
+            if (GetModuleBaseNameW(hProcess, hMods[j], szModName, sizeof(szModName) / sizeof(wchar_t))) {
+                if (_wcsicmp(szModName, lpModuleName) == 0) return hMods[j];
             }
         }
-        Sleep(10);
     }
     return NULL;
 }
@@ -3781,11 +3878,11 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
 #pragma pack(push, 1)
 struct ShellcodeData {
     wchar_t dllPath[MAX_PATH];
-    unsigned char code[128];
+    unsigned char code[256]; // 加大缓冲区
 };
 #pragma pack(pop)
 
-// --- [修改] 核心注入函数：接受 hThread 参数 ---
+// --- [修改] 核心注入函数 ---
 bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     if (dllPath.empty()) return false;
 
@@ -3796,67 +3893,60 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // 1. 获取 LoadLibraryW 地址
+    // 1. 尝试获取 LoadLibraryW 地址
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
 
     // 2. 如果 Kernel32 尚未加载，使用入口点自旋锁等待初始化
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
 
-    // 只有当没找到 LoadLibrary 且能找到入口点时才执行自旋锁
     if (!pLoadLibrary && pEntryPoint) {
         BYTE originalBytes[2];
-        BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $ (死循环指令)
+        BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
 
         if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
             if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
-                // 必须刷新指令缓存
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
 
-                // 临时恢复进程让其运行到入口点并加载核心DLL
+                // 恢复线程让其运行到入口点
                 if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
-                else ResumeThread(hThread); // 注意：这里恢复的是传入的主线程
+                else ResumeThread(hThread);
 
-                // 循环等待 Kernel32 加载 (最多等待 2 秒)
-                for (int i = 0; i < 200; ++i) {
+                // 循环等待 Kernel32 加载 (增加等待时间到 3 秒)
+                for (int i = 0; i < 300; ++i) {
                     Sleep(10);
                     pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
                     if (pLoadLibrary) break;
                 }
 
-                // 再次挂起进程
+                // 再次挂起
                 if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
                 else SuspendThread(hThread);
 
-                // 恢复原始入口点指令
+                // 恢复原始入口点
                 WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
             }
         }
     }
 
-    if (!pLoadLibrary) {
-        // OutputDebugStringW(L"Failed to find LoadLibraryW in target process.");
-        return false;
-    }
+    if (!pLoadLibrary) return false;
 
-    // 3. 准备 Shellcode 内存
+    // 3. 准备内存
     LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, sizeof(ShellcodeData), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!pRemoteMem) return false;
 
     ShellcodeData localData;
-    memset(&localData, 0, sizeof(localData));
+    memset(&localData, 0x90, sizeof(localData.code)); // 用 NOP 填充
     wcscpy_s(localData.dllPath, MAX_PATH, dllPath.c_str());
 
-    // 计算远程地址
     DWORD64 remoteDllPathAddr = (DWORD64)pRemoteMem;
     DWORD64 remoteLoadLibAddr = (DWORD64)pLoadLibrary;
 
-    // 4. 根据架构执行注入
+    // 4. 注入逻辑
     if (targetIs32Bit) {
         // --- x86 (WOW64) 上下文劫持 ---
-
         WOW64_CONTEXT ctx = { 0 };
-        ctx.ContextFlags = WOW64_CONTEXT_CONTROL; // 获取 EIP, ESP, EFLAGS
+        ctx.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER;
         if (!Wow64GetThreadContext(hThread, &ctx)) {
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
@@ -3865,9 +3955,18 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         unsigned char* p = localData.code;
         int idx = 0;
 
-        // Shellcode: 保存环境 -> 调用 LoadLibrary -> 恢复环境 -> 跳回原处
-        p[idx++] = 0x60; // PUSHAD
-        p[idx++] = 0x9C; // PUSHFD
+        // --- 堆栈对齐 Shellcode ---
+        // PUSHAD (保存通用寄存器)
+        p[idx++] = 0x60;
+        // PUSHFD (保存标志位)
+        p[idx++] = 0x9C;
+
+        // 保存当前 ESP 到 EBP，以便稍后恢复
+        // MOV EBP, ESP
+        p[idx++] = 0x8B; p[idx++] = 0xEC;
+
+        // 16字节对齐堆栈 (AND ESP, 0xFFFFFFF0)
+        p[idx++] = 0x83; p[idx++] = 0xE4; p[idx++] = 0xF0;
 
         // PUSH <Address of DLL Path>
         p[idx++] = 0x68;
@@ -3880,13 +3979,18 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         idx += 4;
 
         // CALL EAX
-        p[idx++] = 0xFF;
-        p[idx++] = 0xD0;
+        p[idx++] = 0xFF; p[idx++] = 0xD0;
 
-        p[idx++] = 0x9D; // POPFD
-        p[idx++] = 0x61; // POPAD
+        // 恢复堆栈指针
+        // MOV ESP, EBP
+        p[idx++] = 0x8B; p[idx++] = 0xE5;
 
-        // PUSH <Original EIP> (为了 RET 返回)
+        // POPFD
+        p[idx++] = 0x9D;
+        // POPAD
+        p[idx++] = 0x61;
+
+        // PUSH <Original EIP>
         p[idx++] = 0x68;
         *(DWORD*)&p[idx] = ctx.Eip;
         idx += 4;
@@ -3894,14 +3998,13 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         // RET
         p[idx++] = 0xC3;
 
-        // 写入 Shellcode 和数据
         if (!WriteProcessMemory(hProcess, pRemoteMem, &localData, sizeof(localData), NULL)) {
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
         FlushInstructionCache(hProcess, pRemoteMem, sizeof(localData));
 
-        // 修改 EIP 指向 Shellcode (Shellcode 位于结构体偏移 MAX_PATH * 2 处)
+        // 修改 EIP
         ctx.Eip = (DWORD)((DWORD64)pRemoteMem + sizeof(localData.dllPath));
 
         if (!Wow64SetThreadContext(hThread, &ctx)) {
@@ -3909,11 +4012,10 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
             return false;
         }
 
-        // 成功劫持。注意：此时代码尚未执行，将在 ResumeThread 后执行。
         return true;
 
     } else {
-        // --- x64 注入 (CreateRemoteThread) ---
+        // --- x64 注入 ---
         size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
         if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), pathSize, NULL)) {
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
@@ -3971,13 +4073,9 @@ bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstrin
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) || (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
     if (targetIs32Bit) {
-        // 对于 32位进程，我们使用了上下文劫持。
-        // 代码只有在主线程 Resume 后才会运行。
-        // 因此我们不能在这里 Wait，否则会死锁（因为主线程还没 Resume）。
-        // 直接返回 true，让 LauncherWorkerThread 去 ResumeThread。
         if (hMap) CloseHandle(hMap);
         CloseHandle(hEvent);
-        return true;
+        return true; // 32位劫持成功，等待主线程 Resume 后执行
     }
 
     // 对于 64位进程，CreateRemoteThread 已经执行完毕，可以等待 Event 确认初始化完成
@@ -4142,7 +4240,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
             if (arch == 32) targetDll = ipcParam.dll32Path;
             else if (arch == 64) targetDll = ipcParam.dll64Path;
-            
+
             // [修改] 传递 pi.hThread
             if (!targetDll.empty()) InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
         }
