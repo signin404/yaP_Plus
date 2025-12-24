@@ -351,24 +351,39 @@ struct LauncherThreadData {
 // --- 提取嵌入资源的辅助函数 ---
 bool ExtractResourceToFile(int resourceId, const std::wstring& outputPath) {
     // 1. 查找资源
-    // NULL 表示查找当前模块(EXE)
-    // MAKEINTRESOURCE(resourceId) 是资源的数字 ID
-    // RT_RCDATA 是资源类型 (Raw Data)
+    // 注意：这里假设资源类型是 RT_RCDATA。如果 .rc 里写的不是 RCDATA，这里会失败。
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
-    if (!hRes) return false; // 资源不存在
+    if (!hRes) {
+        DWORD err = GetLastError();
+        wchar_t msg[256];
+        swprintf_s(msg, L"查找资源失败 ID: %d\n错误代码: %d\n(1813=类型不匹配/找不到)", resourceId, err);
+        MessageBoxW(NULL, msg, L"资源错误", MB_ICONERROR);
+        return false;
+    }
 
     // 2. 加载资源
     HGLOBAL hData = LoadResource(NULL, hRes);
-    if (!hData) return false;
+    if (!hData) {
+        MessageBoxW(NULL, L"加载资源失败", L"资源错误", MB_ICONERROR);
+        return false;
+    }
 
-    // 3. 获取资源大小和指针
+    // 3. 获取大小和指针
     DWORD dataSize = SizeofResource(NULL, hRes);
     void* pData = LockResource(hData);
-    if (!pData || dataSize == 0) return false;
+    if (!pData || dataSize == 0) {
+        MessageBoxW(NULL, L"锁定资源失败或大小为0", L"资源错误", MB_ICONERROR);
+        return false;
+    }
 
     // 4. 写入文件
     std::ofstream out(outputPath, std::ios::binary);
-    if (!out.is_open()) return false;
+    if (!out.is_open()) {
+        wchar_t msg[MAX_PATH + 100];
+        swprintf_s(msg, L"无法创建文件:\n%s\n请检查路径或权限。", outputPath.c_str());
+        MessageBoxW(NULL, msg, L"文件IO错误", MB_ICONERROR);
+        return false;
+    }
 
     out.write(static_cast<const char*>(pData), dataSize);
     out.close();
