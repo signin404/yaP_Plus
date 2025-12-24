@@ -1,4 +1,4 @@
-name: Build Complete Launcher (DLLs + EXE)
+name: Build Complete Launcher (DLLs + Injector + EXE)
 
 on:
   push:
@@ -82,54 +82,88 @@ jobs:
         if-no-files-found: error
 
   # ==================================================================
-  # 第二步：构建主程序 EXE 并嵌入 DLL
+  # 第二步：构建 32位 注入器 (Injector32.exe)
+  # ==================================================================
+  build-injector:
+    name: Build Injector32 (x86)
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC (x86)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86 # 必须是 32位 编译器
+
+    - name: Compile Injector32
+      shell: cmd
+      run: |
+        echo Compiling Injector32.exe...
+        
+        :: 编译 Injector32.cpp 为 32位 EXE
+        :: 使用 /MT 静态链接 CRT，确保在无 VC++ 运行库的机器上也能运行
+        cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:Injector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
+        
+        if not exist "Injector32.exe" (
+            echo Error: Injector32.exe was not created!
+            exit 1
+        )
+        
+        del *.obj
+
+    - name: Upload Injector EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: Injector32.exe
+        path: Injector32.exe
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第三步：构建主程序 EXE 并嵌入 DLL 和 Injector
   # ==================================================================
   build-launcher:
     name: Build Launcher EXE
-    needs: build-hooks # 必须等待 DLL 构建完成
+    needs: [build-hooks, build-injector] # 等待 DLL 和 Injector 都构建完成
     runs-on: windows-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 下载上一步构建的所有 DLL (Hook32.dll 和 Hook64.dll)
-    # merge-multiple: true 会将它们下载到当前根目录，而不是子文件夹
-    - name: Download Hook DLLs
+    # 下载所有上游构建的工件 (Hook32.dll, Hook64.dll, Injector32.exe)
+    - name: Download Artifacts
       uses: actions/download-artifact@v4
       with:
-        pattern: Hook*.dll
-        merge-multiple: true
+        merge-multiple: true # 将所有文件下载到同一根目录
 
-    - name: Verify DLLs Existence
+    - name: Verify Dependencies Existence
       shell: cmd
       run: |
         if exist Hook32.dll ( echo Hook32.dll found. ) else ( echo Error: Hook32.dll missing! & exit 1 )
         if exist Hook64.dll ( echo Hook64.dll found. ) else ( echo Error: Hook64.dll missing! & exit 1 )
+        if exist Injector32.exe ( echo Injector32.exe found. ) else ( echo Error: Injector32.exe missing! & exit 1 )
 
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
-      # 默认使用 x64 主机 x86 目标，或者 x64 目标均可。
-      # 这里不指定 arch，通常默认为 x64，这对于构建 32位/64位 兼容的启动器通常没问题，
-      # 但为了最大兼容性，通常建议启动器编译为 x86 (32位)，这样可以在所有系统运行。
-      # 如果你想强制编译为 32位 EXE，请取消下面注释：
-      # with:
-      #   arch: x86
+      # 默认构建 x64 启动器 (也可以改为 x86，取决于需求)
 
-    - name: Build Full Version (With Embedded INI and DLLs)
+    - name: Build Full Version (With Embedded INI, DLLs, and Injector)
       shell: cmd
       run: |
         echo Building Full Version...
         
-        REM 1. 编译资源文件
-        REM 定义 EMBED_HOOK_DLLS 宏，告诉 rc 文件去包含当前目录下的 Hook32.dll 和 Hook64.dll
-        REM 定义 EMBED_INI_FILE 宏 (假设 launcher.ini 存在于源码中，或者你可以创建一个空的)
-        
+        REM 1. 准备空 INI (如果不存在)
         if not exist "launcher.ini" echo ;Empty INI > launcher.ini
+        
+        REM 2. 编译资源文件
+        REM 定义 EMBED_HOOK_DLLS: 包含 Hook32.dll/Hook64.dll
+        REM 定义 EMBED_INI_FILE: 包含 launcher.ini
         
         rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc || exit 1
 
-        REM 2. 编译 C++ 代码并链接资源
+        REM 3. 编译 C++ 代码并链接资源
         cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
 
     - name: Upload Final EXE
