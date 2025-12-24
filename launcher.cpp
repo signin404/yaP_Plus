@@ -4142,8 +4142,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
             if (arch == 32) targetDll = ipcParam.dll32Path;
             else if (arch == 64) targetDll = ipcParam.dll64Path;
-
-            else if (arch == 64) targetDll = ipcParam.dll64Path;
             
             // [修改] 传递 pi.hThread
             if (!targetDll.empty()) InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
