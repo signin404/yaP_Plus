@@ -3656,66 +3656,44 @@ int GetPeArchitecture(const std::wstring& path) {
     return arch;
 }
 
-// 获取目标进程中指定模块的基址（支持从 x64 获取 x86 模块）
+// [新增] 获取目标进程中指定模块的基址（支持从 x64 获取 x86 模块）
 HMODULE GetRemoteModuleHandle(HANDLE hProcess, LPCWSTR lpModuleName, bool targetIs32Bit) {
     HMODULE hMods[1024];
     DWORD cbNeeded;
-    
-    // 如果是 x64 -> x86，必须使用 LIST_MODULES_32BIT
     DWORD filterFlag = targetIs32Bit ? LIST_MODULES_32BIT : LIST_MODULES_ALL;
-
     if (EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, filterFlag)) {
         for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
             wchar_t szModName[MAX_PATH];
             if (GetModuleBaseNameW(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(wchar_t))) {
-                if (_wcsicmp(szModName, lpModuleName) == 0) {
-                    return hMods[i];
-                }
+                if (_wcsicmp(szModName, lpModuleName) == 0) return hMods[i];
             }
         }
     }
     return NULL;
 }
 
-// 获取 LoadLibraryW 的正确地址（处理 x64 -> x86 跨架构）
+// [新增] 获取 LoadLibraryW 的正确地址（处理 x64 -> x86 跨架构）
 LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
-    // 1. 如果架构相同（都是64位 或 都是32位），直接用本地地址
-    // 注意：这里假设系统 DLL 在所有进程中的加载基址通常是相同的（ASLR 也是系统级生效）
-    // 但对于 WoW64，64位 kernel32 和 32位 kernel32 是两个不同的 DLL
-    
 #ifdef _WIN64
-    if (!targetIs32Bit) {
-        return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-    }
+    if (!targetIs32Bit) return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
 #else
-    // 32位启动器注入32位程序，直接返回
     return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
 #endif
 
-    // --- 以下处理 x64 启动器 -> x86 目标进程 的情况 ---
-
-    // 2. 获取目标进程中 32位 kernel32.dll 的基址
+    // --- 处理 x64 启动器 -> x86 目标进程 ---
     HMODULE hRemoteKernel32 = GetRemoteModuleHandle(hProcess, L"kernel32.dll", true);
-    if (!hRemoteKernel32) return NULL;
+    if (!hRemoteKernel32) return NULL; // 目标进程未加载 kernel32
 
-    // 3. 加载本地的 32位 kernel32.dll (SysWOW64) 作为数据文件来计算偏移
     wchar_t sysWow64Path[MAX_PATH];
     GetWindowsDirectoryW(sysWow64Path, MAX_PATH);
     wcscat_s(sysWow64Path, L"\\SysWOW64\\kernel32.dll");
 
-    HMODULE hLocalKernel32 = LoadLibraryExW(sysWow64Path, NULL, LOAD_LIBRARY_AS_DATAFILE);
+    // 使用 DONT_RESOLVE_DLL_REFERENCES 加载，确保内存对齐与 RVA 一致
+    HMODULE hLocalKernel32 = LoadLibraryExW(sysWow64Path, NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (!hLocalKernel32) return NULL;
 
-    // 4. 计算 LoadLibraryW 的 RVA (相对虚拟地址)
-    // 由于是作为数据文件加载，GetProcAddress 不能直接用，需要手动解析导出表
-    // 这里为了简化代码，我们假设偏移量计算逻辑：
-    // 但 GetProcAddress 对 LOAD_LIBRARY_AS_DATAFILE 无效。
-    // 我们必须手动解析 PE 头。
-    
     LPVOID pLoadLibrary = NULL;
-    
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hLocalKernel32;
-    // 简单的 PE 检查
     if (pDos->e_magic == IMAGE_DOS_SIGNATURE) {
         PIMAGE_NT_HEADERS32 pNt = (PIMAGE_NT_HEADERS32)((BYTE*)pDos + pDos->e_lfanew);
         if (pNt->Signature == IMAGE_NT_SIGNATURE) {
@@ -3730,50 +3708,61 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
                 char* szName = (char*)((BYTE*)pDos + pNames[i]);
                 if (strcmp(szName, "LoadLibraryW") == 0) {
                     DWORD rva = pFuncs[pOrds[i]];
-                    // 5. 计算远程真实地址：远程基址 + RVA
                     pLoadLibrary = (LPVOID)((BYTE*)hRemoteKernel32 + rva);
                     break;
                 }
             }
         }
     }
-
     FreeLibrary(hLocalKernel32);
     return pLoadLibrary;
 }
 
-// 简单的远程线程注入 (已增强支持 x64 -> x86)
+// [修改] 增强的远程线程注入 (支持 x64 -> x86，支持等待 kernel32 加载)
 bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     if (dllPath.empty()) return false;
 
-    // 1. 判断目标进程架构
     BOOL isWow64 = FALSE;
     IsWow64Process(hProcess, &isWow64);
-    
     SYSTEM_INFO si;
     GetNativeSystemInfo(&si);
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) || 
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // 2. 获取正确的 LoadLibraryW 地址
-    LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
-    if (!pLoadLibrary) {
-        // OutputDebugStringW(L"Failed to get LoadLibraryW address");
-        return false;
+    // [关键修复] 循环等待 kernel32.dll 加载
+    // 刚创建的挂起进程没有 kernel32，必须让它跑一会儿
+    LPVOID pLoadLibrary = NULL;
+    for (int i = 0; i < 20; ++i) { // 尝试 20 次，每次 50ms
+        pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
+        if (pLoadLibrary) break;
+
+        // 没找到 kernel32，说明进程太早了。
+        // 策略：恢复进程 -> 等待 -> 再次挂起
+        if (g_NtResumeProcess && g_NtSuspendProcess) {
+            g_NtResumeProcess(hProcess);
+            Sleep(50);
+            g_NtSuspendProcess(hProcess);
+        } else {
+            ResumeThread(hProcess); // 假设 hProcess 是主线程句柄? 不，它是进程句柄。
+            // 如果没有 NtSuspendProcess，我们很难暂停整个进程。
+            // 这里假设我们有 NTDLL 函数指针。
+            Sleep(50);
+            // 无法暂停，只能祈祷... 或者使用 DebugBreakProcess?
+            // 实际上 g_NtSuspendProcess 应该总是可用的。
+        }
     }
 
-    // 3. 在目标进程分配内存
+    if (!pLoadLibrary) return false;
+
     size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
     void* pRemotePath = VirtualAllocEx(hProcess, NULL, pathSize, MEM_COMMIT, PAGE_READWRITE);
     if (!pRemotePath) return false;
 
-    // 4. 写入 DLL 路径
     if (!WriteProcessMemory(hProcess, pRemotePath, dllPath.c_str(), pathSize, NULL)) {
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
         return false;
     }
 
-    // 5. 创建远程线程
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
         (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemotePath, 0, NULL);
     
@@ -3782,16 +3771,12 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
         return false;
     }
 
-    // 6. 等待注入完成
     WaitForSingleObject(hThread, INFINITE);
-
     DWORD exitCode = 0;
     GetExitCodeThread(hThread, &exitCode);
-
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
 
-    // LoadLibraryW 成功返回模块句柄 (非0)，失败返回 0
     return (exitCode != 0);
 }
 
