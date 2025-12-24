@@ -25,6 +25,7 @@
 #include <codecvt>
 #include <regex>
 #include "IpcCommon.h"
+#include "yapi.hpp"
 
 // --- [新增] 32位 PEB 结构定义 (用于手动查找 Kernel32) ---
 // 必须确保字节对齐正确
@@ -79,6 +80,7 @@ struct YAP_LDR_DATA_TABLE_ENTRY32 {
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
 #define IDR_HOOK_DLL_64 103
+#define IDR_INJECTOR32 104
 
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -3876,7 +3878,7 @@ struct ShellcodeData {
 };
 #pragma pack(pop)
 
-// --- [修改] 核心注入函数 ---
+// --- [修改] 最终方案：使用 YAPI 进行跨架构注入 ---
 bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     if (dllPath.empty()) return false;
 
@@ -3887,12 +3889,11 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // 1. 尝试获取 LoadLibraryW 地址
+    // 1. 确保 Kernel32 已加载 (自旋锁逻辑 - 必不可少)
+    // 即使有 YAPI，如果目标进程里没有 kernel32，YAPI 也找不到 LoadLibraryW
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
-
-    // 2. 如果 Kernel32 尚未加载，使用入口点自旋锁等待初始化
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
-
+    
     if (!pLoadLibrary && pEntryPoint) {
         BYTE originalBytes[2];
         BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
@@ -3900,12 +3901,12 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
             if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
-
-                // 恢复线程让其运行到入口点
-                if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
+                
+                // 临时恢复线程
+                if (g_NtResumeProcess) g_NtResumeProcess(hProcess); 
                 else ResumeThread(hThread);
 
-                // 循环等待 Kernel32 加载 (增加等待时间到 3 秒)
+                // 循环等待 Kernel32 加载
                 for (int i = 0; i < 300; ++i) {
                     Sleep(10);
                     pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
@@ -3915,114 +3916,34 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
                 // 再次挂起
                 if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
                 else SuspendThread(hThread);
-
-                // 恢复原始入口点
+                
+                // 恢复入口点
                 WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
             }
         }
     }
 
-    if (!pLoadLibrary) return false;
+    if (!pLoadLibrary) return false; // 环境初始化失败
 
-    // 3. 准备内存
-    LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, sizeof(ShellcodeData), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!pRemoteMem) return false;
+    // 2. 使用 YAPI 执行注入
+    // YAPI 会自动处理 x64 -> x86 的复杂性 (Thunking / Heaven's Gate)
+    try {
+        // 构造 YAPI 调用对象：目标是 kernel32.dll 的 LoadLibraryW
+        // 注意：YAPI 内部会自动处理 32位/64位 模块查找
+        yapi::YAPICall loadLib(hProcess, _T("kernel32.dll"), "LoadLibraryW");
+        
+        // 设置超时 (可选)
+        loadLib.Timeout(5000); 
 
-    ShellcodeData localData;
-    memset(&localData, 0x90, sizeof(localData.code)); // 用 NOP 填充
-    wcscpy_s(localData.dllPath, MAX_PATH, dllPath.c_str());
+        // 执行远程调用
+        // YAPI 会自动分配内存写入 dllPath，并创建远程线程执行
+        DWORD64 hModule = loadLib(dllPath.c_str());
 
-    DWORD64 remoteDllPathAddr = (DWORD64)pRemoteMem;
-    DWORD64 remoteLoadLibAddr = (DWORD64)pLoadLibrary;
-
-    // 4. 注入逻辑
-    if (targetIs32Bit) {
-        // --- x86 (WOW64) 上下文劫持 ---
-        WOW64_CONTEXT ctx = { 0 };
-        ctx.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER;
-        if (!Wow64GetThreadContext(hThread, &ctx)) {
-            VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-            return false;
-        }
-
-        unsigned char* p = localData.code;
-        int idx = 0;
-
-        // --- 堆栈对齐 Shellcode ---
-        // PUSHAD (保存通用寄存器)
-        p[idx++] = 0x60;
-        // PUSHFD (保存标志位)
-        p[idx++] = 0x9C;
-
-        // 保存当前 ESP 到 EBP，以便稍后恢复
-        // MOV EBP, ESP
-        p[idx++] = 0x8B; p[idx++] = 0xEC;
-
-        // 16字节对齐堆栈 (AND ESP, 0xFFFFFFF0)
-        p[idx++] = 0x83; p[idx++] = 0xE4; p[idx++] = 0xF0;
-
-        // PUSH <Address of DLL Path>
-        p[idx++] = 0x68;
-        *(DWORD*)&p[idx] = (DWORD)remoteDllPathAddr;
-        idx += 4;
-
-        // MOV EAX, <Address of LoadLibraryW>
-        p[idx++] = 0xB8;
-        *(DWORD*)&p[idx] = (DWORD)remoteLoadLibAddr;
-        idx += 4;
-
-        // CALL EAX
-        p[idx++] = 0xFF; p[idx++] = 0xD0;
-
-        // 恢复堆栈指针
-        // MOV ESP, EBP
-        p[idx++] = 0x8B; p[idx++] = 0xE5;
-
-        // POPFD
-        p[idx++] = 0x9D;
-        // POPAD
-        p[idx++] = 0x61;
-
-        // PUSH <Original EIP>
-        p[idx++] = 0x68;
-        *(DWORD*)&p[idx] = ctx.Eip;
-        idx += 4;
-
-        // RET
-        p[idx++] = 0xC3;
-
-        if (!WriteProcessMemory(hProcess, pRemoteMem, &localData, sizeof(localData), NULL)) {
-            VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-            return false;
-        }
-        FlushInstructionCache(hProcess, pRemoteMem, sizeof(localData));
-
-        // 修改 EIP
-        ctx.Eip = (DWORD)((DWORD64)pRemoteMem + sizeof(localData.dllPath));
-
-        if (!Wow64SetThreadContext(hThread, &ctx)) {
-            VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-            return false;
-        }
-
-        return true;
-
-    } else {
-        // --- x64 注入 ---
-        size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
-        if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), pathSize, NULL)) {
-            VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-            return false;
-        }
-
-        HANDLE hRemoteThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
-        if (hRemoteThread) {
-            WaitForSingleObject(hRemoteThread, INFINITE);
-            CloseHandle(hRemoteThread);
-            VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-            return true;
-        }
+        // 如果 hModule 非 0，说明 LoadLibraryW 成功返回了模块句柄
+        return (hModule != 0);
+    }
+    catch (...) {
         return false;
     }
 }
@@ -4053,32 +3974,20 @@ bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstrin
         }
     }
 
-    // 传递 hThread
+    // 调用基于 YAPI 的注入
     if (!InjectDll(hProcess, hThread, dllPath)) {
         if (hMap) CloseHandle(hMap);
         CloseHandle(hEvent);
         return false;
     }
 
-    // 检测是否为 32位 目标
-    BOOL isWow64 = FALSE;
-    IsWow64Process(hProcess, &isWow64);
-    SYSTEM_INFO si; GetNativeSystemInfo(&si);
-    bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) || (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
-
-    if (targetIs32Bit) {
-        if (hMap) CloseHandle(hMap);
-        CloseHandle(hEvent);
-        return true; // 32位劫持成功，等待主线程 Resume 后执行
-    }
-
-    // 对于 64位进程，CreateRemoteThread 已经执行完毕，可以等待 Event 确认初始化完成
+    // [关键修改] 无论 32位 还是 64位，现在都可以放心地等待 Event 了
+    // 因为 YAPI 保证了 LoadLibraryW 已经执行完毕
     HANDLE handles[] = { hEvent, hProcess };
-    DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000);
+    DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000); // 3秒超时
 
-    bool success = false;
-    if (waitResult == WAIT_OBJECT_0) success = true;
-
+    bool success = (waitResult == WAIT_OBJECT_0);
+    
     if (hMap) CloseHandle(hMap);
     CloseHandle(hEvent);
     return success;
