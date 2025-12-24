@@ -3889,8 +3889,8 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // 1. 确保 Kernel32 已加载 (自旋锁逻辑 - 必不可少)
-    // 即使有 YAPI，如果目标进程里没有 kernel32，YAPI 也找不到 LoadLibraryW
+    // 1. 确保 Kernel32 已加载 (自旋锁逻辑)
+    // 这一步至关重要，因为挂起的进程没有加载 kernel32
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
     
@@ -3902,7 +3902,6 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
             if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
                 
-                // 临时恢复线程
                 if (g_NtResumeProcess) g_NtResumeProcess(hProcess); 
                 else ResumeThread(hThread);
 
@@ -3913,11 +3912,9 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
                     if (pLoadLibrary) break;
                 }
 
-                // 再次挂起
                 if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
                 else SuspendThread(hThread);
                 
-                // 恢复入口点
                 WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
             }
@@ -3927,20 +3924,17 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     if (!pLoadLibrary) return false; // 环境初始化失败
 
     // 2. 使用 YAPI 执行注入
-    // YAPI 会自动处理 x64 -> x86 的复杂性 (Thunking / Heaven's Gate)
+    // 我们直接传入找到的 LoadLibraryW 地址，绕过 YAPI 内部可能失败的查找逻辑
     try {
-        // 构造 YAPI 调用对象：目标是 kernel32.dll 的 LoadLibraryW
-        // 注意：YAPI 内部会自动处理 32位/64位 模块查找
-        yapi::YAPICall loadLib(hProcess, _T("kernel32.dll"), "LoadLibraryW");
+        // 构造 YAPI 调用对象
+        // 参数3: isTarget64Bit (如果目标是32位，则传 false)
+        yapi::YAPICall loadLib(hProcess, (DWORD64)pLoadLibrary, !targetIs32Bit);
         
-        // 设置超时 (可选)
         loadLib.Timeout(5000); 
 
         // 执行远程调用
-        // YAPI 会自动分配内存写入 dllPath，并创建远程线程执行
         DWORD64 hModule = loadLib(dllPath.c_str());
 
-        // 如果 hModule 非 0，说明 LoadLibraryW 成功返回了模块句柄
         return (hModule != 0);
     }
     catch (...) {
@@ -3981,10 +3975,9 @@ bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstrin
         return false;
     }
 
-    // [关键修改] 无论 32位 还是 64位，现在都可以放心地等待 Event 了
-    // 因为 YAPI 保证了 LoadLibraryW 已经执行完毕
+    // [恢复] 同步等待 Event
     HANDLE handles[] = { hEvent, hProcess };
-    DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000); // 3秒超时
+    DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, 3000);
 
     bool success = (waitResult == WAIT_OBJECT_0);
     
