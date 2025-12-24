@@ -616,6 +616,73 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
+// --- 路径处理辅助函数 ---
+
+// 辅助：将 ANSI 转换为 Wide
+std::wstring AnsiToWide(LPCSTR text) {
+    if (!text) return L"";
+    int size = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+    std::wstring res(size - 1, 0);
+    MultiByteToWideChar(CP_ACP, 0, text, -1, &res[0], size);
+    return res;
+}
+
+// 辅助：将 Wide 转换为 ANSI
+std::string WideToAnsi(LPCWSTR text) {
+    if (!text) return "";
+    int size = WideCharToMultiByte(CP_ACP, 0, text, -1, NULL, 0, NULL, NULL);
+    std::string res(size - 1, 0);
+    WideCharToMultiByte(CP_ACP, 0, text, -1, &res[0], size, NULL, NULL);
+    return res;
+}
+
+// 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
+// 如果不需要重定向或重定向后文件/目录不存在 返回空字符串
+std::wstring TryRedirectDosPath(LPCWSTR dosPath, bool isDirectory) {
+    if (!dosPath || !*dosPath) return L"";
+
+    wchar_t fullPath[MAX_PATH];
+    if (GetFullPathNameW(dosPath, MAX_PATH, fullPath, NULL) == 0) return L"";
+
+    std::wstring ntPath = L"\\??\\" + std::wstring(fullPath);
+    std::wstring targetNtPath;
+
+    if (ShouldRedirect(ntPath, targetNtPath)) {
+        std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+        DWORD attrs = GetFileAttributesW(targetDosPath.c_str());
+
+        // 检查是否存在
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            // 如果我们需要的是目录 确保它是目录；如果是文件 确保它不是目录
+            if (isDirectory) {
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY) return targetDosPath;
+            } else {
+                // 这里的逻辑稍微放宽 只要存在即可 因为有时候文件属性可能有误
+                return targetDosPath;
+            }
+        }
+    }
+    return L"";
+}
+
+// 辅助：从命令行提取 EXE 路径
+std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
+    if (lpApp && *lpApp) return lpApp;
+    if (!lpCmd || !*lpCmd) return L"";
+
+    std::wstring cmd = lpCmd;
+    std::wstring exePath;
+    if (cmd.front() == L'"') {
+        size_t end = cmd.find(L'"', 1);
+        if (end != std::wstring::npos) exePath = cmd.substr(1, end - 1);
+    } else {
+        size_t end = cmd.find(L' ');
+        if (end != std::wstring::npos) exePath = cmd.substr(0, end);
+        else exePath = cmd;
+    }
+    return exePath;
+}
+
 // --- IPC & Process Hooks ---
 
 bool RequestInjectionFromLauncher(DWORD targetPid) {
@@ -657,83 +724,103 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
     return result;
 }
 
-// 辅助：从 CreateProcess 参数解析出目标 EXE 的路径
-std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
-    std::wstring exePath;
-    if (lpApp && *lpApp) {
-        exePath = lpApp;
-    } else if (lpCmd && *lpCmd) {
-        // 如果 lpApp 为空 CreateProcess 使用 lpCmd 的第一个 token 作为程序名
-        std::wstring cmd = lpCmd;
-        // 处理引号
-        if (cmd.front() == L'"') {
-            size_t end = cmd.find(L'"', 1);
-            if (end != std::wstring::npos) exePath = cmd.substr(1, end - 1);
+// --- CreateProcess Hooks ---
+
+// 统一的处理逻辑模板
+template<typename Func, typename CharType>
+BOOL CreateProcessInternal(
+    Func originalFunc,
+    const CharType* lpApplicationName,
+    CharType* lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    const CharType* lpCurrentDirectory,
+    LPVOID lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    bool isAnsi
+) {
+    // 1. 处理 ApplicationName (EXE 路径)
+    std::wstring exePathW;
+    if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
+    else exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+
+    std::wstring cmdLineW;
+    if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
+    else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+
+    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    // 2. 处理 CurrentDirectory (工作目录)
+    std::wstring curDirW;
+    if (isAnsi) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
+    else curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+
+    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+
+    // 3. 准备新的参数
+    const void* finalAppName = lpApplicationName;
+    const void* finalCurDir = lpCurrentDirectory;
+
+    std::string ansiExe, ansiDir; // 保持生命周期
+
+    if (!redirectedExe.empty()) {
+        DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
+        if (isAnsi) {
+            ansiExe = WideToAnsi(redirectedExe.c_str());
+            finalAppName = ansiExe.c_str();
         } else {
-            size_t end = cmd.find(L' ');
-            if (end != std::wstring::npos) exePath = cmd.substr(0, end);
-            else exePath = cmd;
-        }
-    }
-    return exePath;
-}
-
-BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-
-    if (g_IsInHook) return fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    DWORD lastErr = GetLastError();
-
-    // --- [新增] 路径重定向逻辑 ---
-    std::wstring finalAppPath; // 用于存储重定向后的路径
-    std::wstring exePath = GetTargetExePath(lpApplicationName, lpCommandLine);
-
-    if (!exePath.empty()) {
-        wchar_t fullPath[MAX_PATH];
-        // 获取绝对路径 (SFX 通常使用绝对路径 这里是为了保险)
-        if (GetFullPathNameW(exePath.c_str(), MAX_PATH, fullPath, NULL)) {
-            std::wstring ntPath = L"\\??\\" + std::wstring(fullPath);
-            std::wstring targetNtPath;
-
-            // 检查该路径是否应该被重定向 (利用之前修复好的 ShouldRedirect 逻辑)
-            if (ShouldRedirect(ntPath, targetNtPath)) {
-                std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
-
-                // 关键检查：只有当沙盒里的文件确实存在时 才进行替换！
-                // 这样避免了误导向到不存在的文件
-                if (GetFileAttributesW(targetDosPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    finalAppPath = targetDosPath;
-                    DebugLog(L"Exec Redirect: %s -> %s", exePath.c_str(), finalAppPath.c_str());
-                }
-            }
+            finalAppName = redirectedExe.c_str();
         }
     }
 
-    // 决定传给原始 API 的 ApplicationName
-    // 如果 finalAppPath 不为空 说明发生了重定向 我们强制指定要运行沙盒里的 EXE
-    LPCWSTR realAppName = finalAppPath.empty() ? lpApplicationName : finalAppPath.c_str();
-    // ---------------------------
+    if (!redirectedDir.empty()) {
+        DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
+        if (isAnsi) {
+            ansiDir = WideToAnsi(redirectedDir.c_str());
+            finalCurDir = ansiDir.c_str();
+        } else {
+            finalCurDir = redirectedDir.c_str();
+        }
+    }
 
-    DebugLog(L"CreateProcessW: App=%s, Cmd=%s", realAppName ? realAppName : L"NULL", lpCommandLine ? lpCommandLine : L"NULL");
-
+    // 4. 调用原始函数
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
-    // 使用 realAppName 调用原始函数
-    BOOL result = fpCreateProcessW(realAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+    BOOL result;
+    if (isAnsi) {
+        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
+    } else {
+        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
+    }
 
+    // 5. 注入与恢复
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    SetLastError(lastErr);
+
     return result;
+}
+
+// --- 具体钩子实现 ---
+
+BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
+    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
+    if (g_IsInHook) return fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+    RecursionGuard guard;
+    DWORD lastErr = GetLastError();
+    BOOL res = CreateProcessInternal(fpCreateProcessW, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, false);
+    SetLastError(lastErr);
+    return res;
 }
 
 BOOL WINAPI Detour_CreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -742,18 +829,9 @@ BOOL WINAPI Detour_CreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine,
     if (g_IsInHook) return fpCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
     DWORD lastErr = GetLastError();
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
-    if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
+    BOOL res = CreateProcessInternal(fpCreateProcessA, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, true);
     SetLastError(lastErr);
-    return result;
+    return res;
 }
 
 BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -761,18 +839,36 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    DWORD lastErr = GetLastError();
+    // AsUser 系列稍微特殊 需要单独处理或适配 Internal 这里为了简洁直接展开逻辑 或者使用 lambda 封装
+    // 为了代码复用 我们可以稍微修改 Internal 让它接受 Token 但这里直接复制逻辑可能更清晰
+
+    // 简化的逻辑复用：
+    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+
+    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
+    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
+
+    if(!redirectedExe.empty()) DebugLog(L"AsUser Redirect EXE: %s", redirectedExe.c_str());
+    if(!redirectedDir.empty()) DebugLog(L"AsUser Redirect DIR: %s", redirectedDir.c_str());
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
+    BOOL result = fpCreateProcessAsUserW(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
+
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    SetLastError(lastErr);
     return result;
 }
 
@@ -781,54 +877,100 @@ BOOL WINAPI Detour_CreateProcessAsUserA(HANDLE hToken, LPCSTR lpApplicationName,
     LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessAsUserA(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    DWORD lastErr = GetLastError();
+
+    std::wstring exePathW = AnsiToWide(lpApplicationName);
+    std::wstring cmdLineW = AnsiToWide(lpCommandLine);
+    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    std::wstring curDirW = AnsiToWide(lpCurrentDirectory);
+    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+
+    std::string ansiExe, ansiDir;
+    LPCSTR finalAppName = lpApplicationName;
+    LPCSTR finalCurDir = lpCurrentDirectory;
+
+    if (!redirectedExe.empty()) {
+        ansiExe = WideToAnsi(redirectedExe.c_str());
+        finalAppName = ansiExe.c_str();
+    }
+    if (!redirectedDir.empty()) {
+        ansiDir = WideToAnsi(redirectedDir.c_str());
+        finalCurDir = ansiDir.c_str();
+    }
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessAsUserA(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
+    BOOL result = fpCreateProcessAsUserA(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
+
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    SetLastError(lastErr);
     return result;
 }
 
 BOOL WINAPI Detour_CreateProcessWithTokenW(HANDLE hToken, DWORD dwLogonFlags, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessWithTokenW(hToken, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    DWORD lastErr = GetLastError();
+
+    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+
+    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
+    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessWithTokenW(hToken, dwLogonFlags, lpApplicationName, lpCommandLine, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
+    BOOL result = fpCreateProcessWithTokenW(hToken, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
+
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    SetLastError(lastErr);
     return result;
 }
 
 BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain, LPCWSTR lpPassword, DWORD dwLogonFlags, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    DWORD lastErr = GetLastError();
+
+    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+
+    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
+    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, lpApplicationName, lpCommandLine, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
+    BOOL result = fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
+
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    SetLastError(lastErr);
     return result;
 }
 
