@@ -181,9 +181,11 @@ wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 
 // 缓存的 NT 路径
 std::wstring g_LauncherDirNt;
-std::wstring g_UserProfileNt;   // user\current
-std::wstring g_ProgramDataNt;   // user\all
-std::wstring g_PublicNt;        // user\public
+std::wstring g_UserProfileNt;
+std::wstring g_UserProfileNtShort; // [新增] 用户目录短路径
+std::wstring g_ProgramDataNt;
+std::wstring g_ProgramDataNtShort; // [新增] ProgramData 短路径
+std::wstring g_PublicNt;
 
 thread_local bool g_IsInHook = false;
 
@@ -343,58 +345,45 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
-    // 必须是 \??\ 开头的路径 (DosDevices)
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
-    // [关键修复] 检查是否已经是沙盒路径 (不区分大小写)
-    // 防止 Z:\Portable\Data 被再次重定向到 Z:\Portable\Data\Data
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
-    // 构造目标路径前缀: \??\Z:\Portable\Data
     targetPath = L"\\??\\";
     targetPath += g_SandboxRoot;
-    // 确保 targetPath 结尾没有斜杠 方便 CheckAndMap 统一处理
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
-    // --- 1. 检查是否在启动器目录内 (最高优先级) ---
-    // 映射为相对路径 例如: \App\Config.ini
+    // --- 1. 检查是否在启动器目录内 ---
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) {
         return true;
     }
 
     // --- 2. 检查当前用户目录 (user\current) ---
-    // 例如: C:\Users\Admin\AppData -> user\current\AppData
-    if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\user\\current", targetPath)) {
+    // [修改] 同时检查长路径和短路径
+    if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\user\\current", targetPath) ||
+        CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\user\\current", targetPath)) {
         return true;
     }
 
     // --- 3. 检查所有用户目录/ProgramData (user\all) ---
-    // 例如: C:\ProgramData\Adobe -> user\all\Adobe
-    if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\user\\all", targetPath)) {
+    // [修改] 同时检查长路径和短路径
+    if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\user\\all", targetPath) ||
+        CheckAndMap(fullNtPath, g_ProgramDataNtShort, L"\\user\\all", targetPath)) {
         return true;
     }
 
     // --- 4. 检查公用目录 (user\public) ---
-    // 例如: C:\Users\Public\Documents -> user\public\Documents
     if (CheckAndMap(fullNtPath, g_PublicNt, L"\\user\\public", targetPath)) {
         return true;
     }
 
     // --- 5. 默认绝对路径映射 ---
-    // 路径在启动器目录外 且不是特殊用户目录
-    // 使用绝对路径映射 (DriveLetter + Path)
-    // 例如: \??\C:\Windows\System32 -> \??\Z:\Portable\Data\C\Windows\System32
-
-    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
+    std::wstring relPath = fullNtPath.substr(4);
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
-
-    // 去掉驱动器号后的冒号 (C: -> C)
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
         relPath.erase(colonPos, 1);
     }
-
-    // 补上分隔符
     targetPath += L"\\";
     targetPath += relPath;
     return true;
@@ -801,6 +790,24 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
 
 // --- 初始化 ---
 
+// 辅助函数：获取 NT 格式的短路径
+std::wstring GetNtShortPath(const wchar_t* longPath) {
+    if (!longPath || !*longPath) return L"";
+
+    // 获取短路径 (8.3 格式)
+    DWORD len = GetShortPathNameW(longPath, NULL, 0);
+    if (len == 0) return L"";
+
+    std::vector<wchar_t> buffer(len);
+    GetShortPathNameW(longPath, buffer.data(), len);
+
+    std::wstring shortPath = buffer.data();
+    if (shortPath.empty()) return L"";
+
+    // 转换为 NT 路径
+    return L"\\??\\" + shortPath;
+}
+
 DWORD WINAPI InitHookThread(LPVOID) {
     wchar_t buffer[MAX_PATH] = { 0 };
     std::wstring mapName = GetConfigMapName(GetCurrentProcessId());
@@ -836,11 +843,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"USERPROFILE", buffer, MAX_PATH)) {
         g_UserProfileNt = L"\\??\\";
         g_UserProfileNt += buffer;
+        // [新增] 获取短路径版本
+        g_UserProfileNtShort = GetNtShortPath(buffer);
     }
 
     if (GetEnvironmentVariableW(L"ALLUSERSPROFILE", buffer, MAX_PATH)) {
         g_ProgramDataNt = L"\\??\\";
         g_ProgramDataNt += buffer;
+        // [新增] 获取短路径版本
+        g_ProgramDataNtShort = GetNtShortPath(buffer);
     }
 
     if (GetEnvironmentVariableW(L"PUBLIC", buffer, MAX_PATH)) {
