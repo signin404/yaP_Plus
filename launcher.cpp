@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <winternl.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -42,8 +43,15 @@
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
+typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS (NTAPI *pfnRtlCreateUserThread)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
+
+// [修改] 确保全局变量已声明
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
+pfnNtQueryInformationProcess g_NtQueryInformationProcess = nullptr;
+pfnRtlCreateUserThread g_RtlCreateUserThread = nullptr;
+
 std::wstring g_originalPath;
 std::wstring g_LauncherDir;
 
@@ -3660,7 +3668,9 @@ int GetPeArchitecture(const std::wstring& path) {
 LPVOID GetEntryPoint(HANDLE hProcess) {
     PROCESS_BASIC_INFORMATION pbi;
     ULONG len;
-    if (g_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), &len) != 0) return NULL;
+    if (!g_NtQueryInformationProcess) return NULL;
+    // 使用 ProcessBasicInformation (0)
+    if (g_NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &len) != 0) return NULL;
 
     BOOL isWow64 = FALSE;
     IsWow64Process(hProcess, &isWow64);
@@ -3668,20 +3678,24 @@ LPVOID GetEntryPoint(HANDLE hProcess) {
     if (isWow64) {
         // 32-bit process (WOW64)
         ULONG_PTR peb32 = 0;
-        if (g_NtQueryInformationProcess(hProcess, 26 /* ProcessWow64Information */, &peb32, sizeof(peb32), &len) != 0) return NULL;
+        // ProcessWow64Information = 26
+        if (g_NtQueryInformationProcess(hProcess, (PROCESSINFOCLASS)26, &peb32, sizeof(peb32), &len) != 0) return NULL;
 
         if (peb32 == 0) return NULL;
 
         DWORD imageBase32 = 0;
+        // [修复] 显式转换 peb32 + 8 为 PVOID
         if (!ReadProcessMemory(hProcess, (PVOID)(peb32 + 8), &imageBase32, sizeof(imageBase32), NULL)) return NULL;
 
         IMAGE_DOS_HEADER dosHeader;
-        if (!ReadProcessMemory(hProcess, (PVOID)imageBase32, &dosHeader, sizeof(dosHeader), NULL)) return NULL;
+        // [修复] imageBase32 是 DWORD 在 x64 下需先转 ULONG_PTR 再转 PVOID
+        if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)imageBase32, &dosHeader, sizeof(dosHeader), NULL)) return NULL;
 
         IMAGE_NT_HEADERS32 ntHeaders32;
-        if (!ReadProcessMemory(hProcess, (PVOID)(imageBase32 + dosHeader.e_lfanew), &ntHeaders32, sizeof(ntHeaders32), NULL)) return NULL;
+        // [修复] 指针算术运算修正
+        if (!ReadProcessMemory(hProcess, (PVOID)((ULONG_PTR)imageBase32 + dosHeader.e_lfanew), &ntHeaders32, sizeof(ntHeaders32), NULL)) return NULL;
 
-        return (LPVOID)(imageBase32 + ntHeaders32.OptionalHeader.AddressOfEntryPoint);
+        return (LPVOID)((ULONG_PTR)imageBase32 + ntHeaders32.OptionalHeader.AddressOfEntryPoint);
     } else {
         // 64-bit process
         PVOID imageBase = 0;
@@ -4264,6 +4278,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (hNtdll) {
         g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
         g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+        // [新增] 初始化这两个关键函数
+        g_NtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+        g_RtlCreateUserThread = (pfnRtlCreateUserThread)GetProcAddress(hNtdll, "RtlCreateUserThread");
     }
 
     // <-- [新增] 在程序开始时获取并存储原始的Path环境变量
