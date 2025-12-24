@@ -10,6 +10,7 @@
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
 #define IDR_HOOK_DLL_64 103
+#define IDR_INJECTOR32 104
 
 // 检查是否在命令行定义了 EMBED_INI_FILE 宏
 // 如果定义了 则将其作为 RCDATA (原始数据) 包含进来
@@ -22,6 +23,7 @@ IDR_INI_FILE RCDATA EMBED_INI_FILE
 #ifdef EMBED_HOOK_DLLS
 IDR_HOOK_DLL_32 RCDATA "Hook32.dll"
 IDR_HOOK_DLL_64 RCDATA "Hook64.dll"
+IDR_INJECTOR32 RCDATA "Injector32.exe"
 #endif
 
 // 将 icon.ico 文件作为图标资源嵌入
