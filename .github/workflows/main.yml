@@ -46,13 +46,13 @@ jobs:
         echo Compiling MinHook for ${{ matrix.arch }}...
         mkdir minhook_build
         cd minhook_build
-        
+
         :: 编译 MinHook 源码
         cl /nologo /c /O2 /MT /MP /DNDEBUG /I ..\MinHook\include ..\MinHook\src\*.c ..\MinHook\src\hde\*.c || exit 1
-        
+
         :: 打包成静态库
         lib /nologo /OUT:..\${{ matrix.lib_minhook }} *.obj || exit 1
-        
+
         cd ..
         echo MinHook library built: ${{ matrix.lib_minhook }}
 
@@ -60,16 +60,16 @@ jobs:
       shell: cmd
       run: |
         echo Compiling ${{ matrix.name }}...
-        
+
         :: 编译 HookDll.cpp 并链接 MinHook
         cl /nologo /LD /O2 /MT /EHsc /DUNICODE /D_UNICODE /I MinHook\include HookDll.cpp ${{ matrix.lib_minhook }} Shlwapi.lib Shell32.lib /Fe:${{ matrix.name }} || exit 1
-        
+
         :: 验证 DLL 是否存在
         if not exist "${{ matrix.name }}" (
             echo Error: ${{ matrix.name }} was not created!
             exit 1
         )
-        
+
         :: 清理垃圾文件
         del *.obj *.exp *.lib
 
@@ -87,7 +87,7 @@ jobs:
   build-injector:
     name: Build Injector32 (x86)
     runs-on: windows-latest
-    
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -101,16 +101,16 @@ jobs:
       shell: cmd
       run: |
         echo Compiling Injector32.exe...
-        
+
         :: 编译 Injector32.cpp 为 32位 EXE
-        :: 使用 /MT 静态链接 CRT，确保在无 VC++ 运行库的机器上也能运行
+        :: 使用 /MT 静态链接 CRT 确保在无 VC++ 运行库的机器上也能运行
         cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:Injector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
-        
+
         if not exist "Injector32.exe" (
             echo Error: Injector32.exe was not created!
             exit 1
         )
-        
+
         del *.obj
 
     - name: Upload Injector EXE
@@ -147,24 +147,24 @@ jobs:
 
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
-      # 默认构建 x64 启动器 (也可以改为 x86，取决于需求)
+      # 默认构建 x64 启动器 (也可以改为 x86 取决于需求)
 
     - name: Build Full Version (With Embedded INI, DLLs, and Injector)
       shell: cmd
       run: |
         echo Building Full Version...
-        
+
         REM 1. 准备空 INI (如果不存在)
         if not exist "launcher.ini" echo ;Empty INI > launcher.ini
-        
+
         REM 2. 编译资源文件
         REM 定义 EMBED_HOOK_DLLS: 包含 Hook32.dll/Hook64.dll
         REM 定义 EMBED_INI_FILE: 包含 launcher.ini
-        
+
         rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc || exit 1
 
         REM 3. 编译 C++ 代码并链接资源
-        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
+        cl.exe /std:c++17 /EHsc /O2 /MT /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
 
     - name: Upload Final EXE
       uses: actions/upload-artifact@v4
