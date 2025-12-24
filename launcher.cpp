@@ -3889,84 +3889,92 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
     // 1. 确保 Kernel32 已加载 (自旋锁逻辑)
-    // 无论用什么注入方式，挂起的进程必须先初始化环境
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
+    
+    // 只有当能获取到入口点时才尝试自旋锁，这有助于让挂起的进程初始化 Kernel32
+    if (pEntryPoint) {
+        // 如果第一次没获取到地址，或者为了保险起见，执行自旋等待
+        // 注意：对于 x64->x86，GetLoadLibraryAddress 经常失败，所以这个循环通常会跑满 3 秒
+        // 这是为了确保目标进程有足够时间初始化 Ldr
+        if (!pLoadLibrary) {
+            BYTE originalBytes[2];
+            BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
 
-    if (!pLoadLibrary && pEntryPoint) {
-        BYTE originalBytes[2];
-        BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
+            if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
+                if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
+                    FlushInstructionCache(hProcess, pEntryPoint, 2);
+                    
+                    if (g_NtResumeProcess) g_NtResumeProcess(hProcess); 
+                    else ResumeThread(hThread);
 
-        if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
-            if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
-                FlushInstructionCache(hProcess, pEntryPoint, 2);
+                    // 等待 Kernel32 加载
+                    // [优化] 对于 32 位目标，我们不需要疯狂查询，因为 Launcher 查不到是正常的
+                    // 直接睡一会，让子进程跑一会初始化逻辑即可
+                    if (targetIs32Bit) {
+                        Sleep(1000); // 给 32 位进程 1 秒钟时间初始化
+                    } else {
+                        for (int i = 0; i < 300; ++i) {
+                            Sleep(10);
+                            pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
+                            if (pLoadLibrary) break;
+                        }
+                    }
 
-                if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
-                else ResumeThread(hThread);
-
-                // 等待 Kernel32
-                for (int i = 0; i < 300; ++i) {
-                    Sleep(10);
-                    pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
-                    if (pLoadLibrary) break;
+                    if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
+                    else SuspendThread(hThread);
+                    
+                    WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
+                    FlushInstructionCache(hProcess, pEntryPoint, 2);
                 }
-
-                if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
-                else SuspendThread(hThread);
-
-                WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
-                FlushInstructionCache(hProcess, pEntryPoint, 2);
             }
         }
     }
 
-    if (!pLoadLibrary) return false; // 环境初始化失败
+    // [核心修复]：如果是 32 位目标，即使 Launcher 没找到 LoadLibrary 地址，
+    // 也不能返回 false！因为我们要依赖 Injector32.exe 去做这件事。
+    // 只有当目标是 64 位且没找到地址时，才认为是真正的失败。
+    if (!pLoadLibrary && !targetIs32Bit) return false; 
 
     // 2. 分支处理
     if (targetIs32Bit) {
         // --- 方案：调用外部 32位 Injector ---
-
-        // A. 准备 Injector32.exe 路径
+        
+        // [路径修复] 从 dllPath 推导 Injector32.exe 路径 (假设它们在同一目录)
         wchar_t drive[_MAX_DRIVE];
         wchar_t dir[_MAX_DIR];
         _wsplitpath_s(dllPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
-
         std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"Injector32.exe";
-
-        // [修改] 移除 ExtractResourceToFile 调用，因为主线程已经释放了
-        // ExtractResourceToFile(IDR_INJECTOR32, injectorPath);
-
+        
         // C. 构造命令行: Injector32.exe <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
         std::wstring cmdLine = L"\"" + injectorPath + L"\" " + std::to_wstring(pid) + L" \"" + dllPath + L"\"";
-
+        
         STARTUPINFOW si_inj = { 0 };
         si_inj.cb = sizeof(si_inj);
         si_inj.dwFlags = STARTF_USESHOWWINDOW;
         si_inj.wShowWindow = SW_HIDE; // 隐藏窗口
-
+        
         PROCESS_INFORMATION pi_inj = { 0 };
 
         if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE, 0, NULL, NULL, &si_inj, &pi_inj)) {
-            // 等待注入器执行完成
-            WaitForSingleObject(pi_inj.hProcess, 5000); // 最多等5秒
-
+            WaitForSingleObject(pi_inj.hProcess, 5000);
+            
             DWORD exitCode = 1;
             GetExitCodeProcess(pi_inj.hProcess, &exitCode);
-
+            
             CloseHandle(pi_inj.hProcess);
             CloseHandle(pi_inj.hThread);
-
-            // 删除临时文件 (可选，可能因为文件被占用删不掉，可以留给清理函数)
-            // DeleteFileW(injectorPath.c_str());
 
             return (exitCode == 0);
         }
         return false;
 
     } else {
-        // --- x64 原生注入 (CreateRemoteThread) ---
-        // 64位对64位非常稳定，保持原样
+        // --- x64 原生注入 ---
+        // 必须确保 pLoadLibrary 有效
+        if (!pLoadLibrary) return false;
+
         LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, MAX_PATH * sizeof(wchar_t), MEM_COMMIT, PAGE_READWRITE);
         if (!pRemoteMem) return false;
 
@@ -3974,7 +3982,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
             VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
             return false;
         }
-
+        
         HANDLE hRemoteThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
         if (hRemoteThread) {
             WaitForSingleObject(hRemoteThread, INFINITE);
