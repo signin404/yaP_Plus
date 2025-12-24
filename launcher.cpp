@@ -3656,7 +3656,49 @@ int GetPeArchitecture(const std::wstring& path) {
     return arch;
 }
 
-// [新增] 获取目标进程中指定模块的基址（支持从 x64 获取 x86 模块）
+// --- [新增] 关键修复：获取远程进程入口点 ---
+LPVOID GetEntryPoint(HANDLE hProcess) {
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG len;
+    if (g_NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), &len) != 0) return NULL;
+
+    BOOL isWow64 = FALSE;
+    IsWow64Process(hProcess, &isWow64);
+
+    if (isWow64) {
+        // 32-bit process (WOW64)
+        ULONG_PTR peb32 = 0;
+        if (g_NtQueryInformationProcess(hProcess, 26 /* ProcessWow64Information */, &peb32, sizeof(peb32), &len) != 0) return NULL;
+
+        if (peb32 == 0) return NULL;
+
+        DWORD imageBase32 = 0;
+        if (!ReadProcessMemory(hProcess, (PVOID)(peb32 + 8), &imageBase32, sizeof(imageBase32), NULL)) return NULL;
+
+        IMAGE_DOS_HEADER dosHeader;
+        if (!ReadProcessMemory(hProcess, (PVOID)imageBase32, &dosHeader, sizeof(dosHeader), NULL)) return NULL;
+
+        IMAGE_NT_HEADERS32 ntHeaders32;
+        if (!ReadProcessMemory(hProcess, (PVOID)(imageBase32 + dosHeader.e_lfanew), &ntHeaders32, sizeof(ntHeaders32), NULL)) return NULL;
+
+        return (LPVOID)(imageBase32 + ntHeaders32.OptionalHeader.AddressOfEntryPoint);
+    } else {
+        // 64-bit process
+        PVOID imageBase = 0;
+        // PEB + 0x10 is ImageBaseAddress in x64
+        if (!ReadProcessMemory(hProcess, (PBYTE)pbi.PebBaseAddress + 0x10, &imageBase, sizeof(imageBase), NULL)) return NULL;
+
+        IMAGE_DOS_HEADER dosHeader;
+        if (!ReadProcessMemory(hProcess, imageBase, &dosHeader, sizeof(dosHeader), NULL)) return NULL;
+
+        IMAGE_NT_HEADERS64 ntHeaders64;
+        if (!ReadProcessMemory(hProcess, (PBYTE)imageBase + dosHeader.e_lfanew, &ntHeaders64, sizeof(ntHeaders64), NULL)) return NULL;
+
+        return (LPVOID)((PBYTE)imageBase + ntHeaders64.OptionalHeader.AddressOfEntryPoint);
+    }
+}
+
+// --- [修改] 增强的远程模块获取 ---
 HMODULE GetRemoteModuleHandle(HANDLE hProcess, LPCWSTR lpModuleName, bool targetIs32Bit) {
     HMODULE hMods[1024];
     DWORD cbNeeded;
@@ -3672,7 +3714,7 @@ HMODULE GetRemoteModuleHandle(HANDLE hProcess, LPCWSTR lpModuleName, bool target
     return NULL;
 }
 
-// [新增] 获取 LoadLibraryW 的正确地址（处理 x64 -> x86 跨架构）
+// --- [修改] 获取 LoadLibraryW 地址 ---
 LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
 #ifdef _WIN64
     if (!targetIs32Bit) return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
@@ -3680,15 +3722,14 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
     return (LPVOID)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
 #endif
 
-    // --- 处理 x64 启动器 -> x86 目标进程 ---
+    // x64 Launcher -> x86 Target
     HMODULE hRemoteKernel32 = GetRemoteModuleHandle(hProcess, L"kernel32.dll", true);
-    if (!hRemoteKernel32) return NULL; // 目标进程未加载 kernel32
+    if (!hRemoteKernel32) return NULL;
 
     wchar_t sysWow64Path[MAX_PATH];
     GetWindowsDirectoryW(sysWow64Path, MAX_PATH);
     wcscat_s(sysWow64Path, L"\\SysWOW64\\kernel32.dll");
 
-    // 使用 DONT_RESOLVE_DLL_REFERENCES 加载，确保内存对齐与 RVA 一致
     HMODULE hLocalKernel32 = LoadLibraryExW(sysWow64Path, NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (!hLocalKernel32) return NULL;
 
@@ -3699,7 +3740,6 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
         if (pNt->Signature == IMAGE_NT_SIGNATURE) {
             PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)pDos +
                 pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-
             DWORD* pNames = (DWORD*)((BYTE*)pDos + pExport->AddressOfNames);
             DWORD* pFuncs = (DWORD*)((BYTE*)pDos + pExport->AddressOfFunctions);
             WORD* pOrds = (WORD*)((BYTE*)pDos + pExport->AddressOfNameOrdinals);
@@ -3718,7 +3758,7 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
     return pLoadLibrary;
 }
 
-// [修改] 增强的远程线程注入 (支持 x64 -> x86，支持等待 kernel32 加载)
+// --- [修改] 核心注入函数：支持自旋锁和 RtlCreateUserThread ---
 bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     if (dllPath.empty()) return false;
 
@@ -3729,31 +3769,41 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // [关键修复] 循环等待 kernel32.dll 加载
-    // 刚创建的挂起进程没有 kernel32，必须让它跑一会儿
-    LPVOID pLoadLibrary = NULL;
-    for (int i = 0; i < 20; ++i) { // 尝试 20 次，每次 50ms
-        pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
-        if (pLoadLibrary) break;
+    LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
 
-        // 没找到 kernel32，说明进程太早了。
-        // 策略：恢复进程 -> 等待 -> 再次挂起
-        if (g_NtResumeProcess && g_NtSuspendProcess) {
-            g_NtResumeProcess(hProcess);
-            Sleep(50);
-            g_NtSuspendProcess(hProcess);
-        } else {
-            ResumeThread(hProcess); // 假设 hProcess 是主线程句柄? 不，它是进程句柄。
-            // 如果没有 NtSuspendProcess，我们很难暂停整个进程。
-            // 这里假设我们有 NTDLL 函数指针。
-            Sleep(50);
-            // 无法暂停，只能祈祷... 或者使用 DebugBreakProcess?
-            // 实际上 g_NtSuspendProcess 应该总是可用的。
+    // 1. 如果 Kernel32 尚未加载 使用入口点自旋锁 (Spinlock)
+    if (!pLoadLibrary) {
+        LPVOID pEntryPoint = GetEntryPoint(hProcess);
+        if (pEntryPoint) {
+            BYTE originalBytes[2];
+            BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $ (Infinite Loop)
+
+            if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
+                if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
+                    // 恢复进程让其运行到入口点并卡住
+                    if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
+                    else ResumeThread(hProcess); // Fallback
+
+                    // 等待 Kernel32 加载
+                    for (int i = 0; i < 200; ++i) { // 最多等 2 秒
+                        Sleep(10);
+                        pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
+                        if (pLoadLibrary) break;
+                    }
+
+                    // 再次挂起
+                    if (g_NtSuspendProcess) g_NtSuspendProcess(hProcess);
+
+                    // 恢复原始入口点指令
+                    WriteProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL);
+                }
+            }
         }
     }
 
     if (!pLoadLibrary) return false;
 
+    // 2. 写入 DLL 路径
     size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
     void* pRemotePath = VirtualAllocEx(hProcess, NULL, pathSize, MEM_COMMIT, PAGE_READWRITE);
     if (!pRemotePath) return false;
@@ -3763,8 +3813,15 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
         return false;
     }
 
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
-        (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemotePath, 0, NULL);
+    // 3. 创建远程线程
+    HANDLE hThread = NULL;
+
+    // 关键修复：对于 x64 -> x86 使用 RtlCreateUserThread 替代 CreateRemoteThread
+    if (targetIs32Bit && g_RtlCreateUserThread) {
+        g_RtlCreateUserThread(hProcess, NULL, FALSE, 0, 0, 0, pLoadLibrary, pRemotePath, &hThread, NULL);
+    } else {
+        hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemotePath, 0, NULL);
+    }
 
     if (!hThread) {
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
@@ -3777,7 +3834,7 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
 
-    return (exitCode != 0);
+    return (exitCode != 0); // LoadLibraryW returns handle (non-zero) on success
 }
 
 // --- IPC 服务端逻辑 ---
@@ -3933,7 +3990,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
-    // [修改] 将 DLL 路径变量移到函数作用域顶部，以便最后删除
+    // [修改] 将 DLL 路径变量移到函数作用域顶部 以便最后删除
     std::wstring dll32Path;
     std::wstring dll64Path;
 

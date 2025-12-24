@@ -180,7 +180,7 @@ wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 
 // 缓存的 NT 路径
-std::wstring g_LauncherDirNt; 
+std::wstring g_LauncherDirNt;
 std::wstring g_UserProfileNt;   // user\current
 std::wstring g_ProgramDataNt;   // user\all
 std::wstring g_PublicNt;        // user\public
@@ -304,33 +304,33 @@ bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
     return (it != str.end());
 }
 
-// [修改] 检查路径是否匹配前缀，并进行映射
+// [修改] 检查路径是否匹配前缀 并进行映射
 bool CheckAndMap(const std::wstring& fullPath, const std::wstring& prefix, const std::wstring& replacement, std::wstring& outTarget) {
     if (prefix.empty()) return false;
     size_t pLen = prefix.length();
-    
+
     // 检查前缀匹配 (不区分大小写)
     if (fullPath.length() >= pLen && _wcsnicmp(fullPath.c_str(), prefix.c_str(), pLen) == 0) {
         // 确保匹配的是完整目录名 (例如匹配 C:\User 而不是 C:\UsersOld)
         // 或者是完全相等
         if (fullPath.length() == pLen || fullPath[pLen] == L'\\') {
             outTarget += replacement;
-            
+
             // 提取相对路径
             std::wstring rel = fullPath.substr(pLen);
-            
+
             // 拼接逻辑优化：避免双斜杠
             if (!rel.empty()) {
-                // 如果 outTarget 结尾有 \ 且 rel 开头有 \，去掉一个
+                // 如果 outTarget 结尾有 \ 且 rel 开头有 \ 去掉一个
                 if (!outTarget.empty() && outTarget.back() == L'\\' && rel[0] == L'\\') {
                     rel.erase(0, 1);
                 }
-                // 如果 outTarget 结尾没有 \ 且 rel 开头没有 \，补一个 (除非 replacement 为空且 rel 为空)
+                // 如果 outTarget 结尾没有 \ 且 rel 开头没有 \ 补一个 (除非 replacement 为空且 rel 为空)
                 else if (!outTarget.empty() && outTarget.back() != L'\\' && rel[0] != L'\\') {
                     outTarget += L"\\";
                 }
             }
-            
+
             outTarget += rel;
             return true;
         }
@@ -342,7 +342,7 @@ bool CheckAndMap(const std::wstring& fullPath, const std::wstring& prefix, const
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
-    
+
     // 必须是 \??\ 开头的路径 (DosDevices)
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
@@ -353,11 +353,11 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     // 构造目标路径前缀: \??\Z:\Portable\Data
     targetPath = L"\\??\\";
     targetPath += g_SandboxRoot;
-    // 确保 targetPath 结尾没有斜杠，方便 CheckAndMap 统一处理
+    // 确保 targetPath 结尾没有斜杠 方便 CheckAndMap 统一处理
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
     // --- 1. 检查是否在启动器目录内 (最高优先级) ---
-    // 映射为相对路径，例如: \App\Config.ini
+    // 映射为相对路径 例如: \App\Config.ini
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) {
         return true;
     }
@@ -381,13 +381,13 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     }
 
     // --- 5. 默认绝对路径映射 ---
-    // 路径在启动器目录外，且不是特殊用户目录
+    // 路径在启动器目录外 且不是特殊用户目录
     // 使用绝对路径映射 (DriveLetter + Path)
     // 例如: \??\C:\Windows\System32 -> \??\Z:\Portable\Data\C\Windows\System32
-    
+
     std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
-    
+
     // 去掉驱动器号后的冒号 (C: -> C)
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
@@ -447,9 +447,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
-        
+
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER));
-        
+
         if (isWrite) {
             if (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE || CreateDisposition == FILE_OVERWRITE_IF) {
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
@@ -458,7 +458,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, targetNtPath.c_str());
-        
+
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
@@ -470,14 +470,14 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         }
 
         NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-        
+
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (status == STATUS_SUCCESS) {
             return status;
-        } 
-        
+        }
+
         if (!isWrite && (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF)) {
              // Fallthrough to original call
         } else {
@@ -524,7 +524,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                         std::wstring targetPath;
                         if (ShouldRedirect(currentPath, targetPath)) {
                             DebugLog(L"Virtual Delete: %s", currentPath.c_str());
-                            
+
                             std::wstring targetDos = NtPathToDosPath(targetPath);
                             wchar_t dirBuf[MAX_PATH];
                             wcscpy_s(dirBuf, targetDos.c_str());
@@ -826,7 +826,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         DebugLog(L"Init Failed: YAP_HOOK_PATH not found");
         return 0;
     }
-    
+
     // [新增] 初始化特殊目录的 NT 路径
     if (g_LauncherDir[0] != L'\0') {
         g_LauncherDirNt = L"\\??\\";
@@ -860,7 +860,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
-        
+
         MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
 
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
@@ -873,7 +873,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
     MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
-    
+
     HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
     if (hAdvapi32) {
         void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
@@ -895,14 +895,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     MH_EnableHook(MH_ALL_HOOKS);
-    
+
     std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
     HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
     if (hEvent) {
         SetEvent(hEvent);
         CloseHandle(hEvent);
     }
-    
+
     return 0;
 }
 
