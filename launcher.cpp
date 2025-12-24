@@ -3697,9 +3697,9 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
     if (pDos->e_magic == IMAGE_DOS_SIGNATURE) {
         PIMAGE_NT_HEADERS32 pNt = (PIMAGE_NT_HEADERS32)((BYTE*)pDos + pDos->e_lfanew);
         if (pNt->Signature == IMAGE_NT_SIGNATURE) {
-            PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)pDos + 
+            PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)pDos +
                 pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-            
+
             DWORD* pNames = (DWORD*)((BYTE*)pDos + pExport->AddressOfNames);
             DWORD* pFuncs = (DWORD*)((BYTE*)pDos + pExport->AddressOfFunctions);
             WORD* pOrds = (WORD*)((BYTE*)pDos + pExport->AddressOfNameOrdinals);
@@ -3726,7 +3726,7 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
     IsWow64Process(hProcess, &isWow64);
     SYSTEM_INFO si;
     GetNativeSystemInfo(&si);
-    bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) || 
+    bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
     // [关键修复] 循环等待 kernel32.dll 加载
@@ -3763,9 +3763,9 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
         return false;
     }
 
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemotePath, 0, NULL);
-    
+
     if (!hThread) {
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
         return false;
@@ -3784,13 +3784,8 @@ bool InjectDll(HANDLE hProcess, const std::wstring& dllPath) {
 
 // --- [新增] Launcher 日志 ---
 void LauncherLog(const std::wstring& msg) {
-    if (g_LauncherDir.empty()) return;
-    std::wstring logPath = g_LauncherDir + L"\\yap_launcher_debug.txt";
-    std::wofstream log(logPath, std::ios::app);
-    if (log.is_open()) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        log << L"[" << st.wHour << L":" << st.wMinute << L":" << st.wSecond << L"] " << msg << std::endl;
-    }
+    // 日志功能已禁用
+    return;
 }
 
 // --- [修改] 注入并智能等待 ---
@@ -3929,7 +3924,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
     // --- 2. 解析 Hook 配置 ---
-    bool enableHook = (GetValueFromIniContent(data->iniContent, L"General", L"hook") == L"1");
+    bool enableHook = (GetValueFromIniContent(data->iniContent, L"General", L"hookfile") == L"1");
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
@@ -3938,13 +3933,18 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
-    if (enableHook) {
-        // A. 确定 DLL 释放路径 (释放到 YAPROOT 目录下)
-        std::wstring baseDir = data->variables[L"YAPROOT"];
-        if (baseDir.back() != L'\\') baseDir += L'\\';
+    // [修改] 将 DLL 路径变量移到函数作用域顶部，以便最后删除
+    std::wstring dll32Path;
+    std::wstring dll64Path;
 
-        std::wstring dll32Path = baseDir + L"Hook32.dll";
-        std::wstring dll64Path = baseDir + L"Hook64.dll";
+    if (enableHook) {
+        // [修改] A. 确定 DLL 释放路径 (改为 tempfile 路径)
+        wchar_t dllDir[MAX_PATH];
+        wcscpy_s(dllDir, MAX_PATH, data->tempFilePath.c_str());
+        PathRemoveFileSpecW(dllDir); // 从 temp INI 路径获取目录
+
+        dll32Path = std::wstring(dllDir) + L"\\Hook32.dll";
+        dll64Path = std::wstring(dllDir) + L"\\Hook64.dll";
 
         // B. 释放资源到磁盘
         // IDR_HOOK_DLL_32/64 必须在 launcher.cpp 顶部定义且与 rc 文件一致
@@ -4157,9 +4157,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         WaitForSingleObject(hIpcThread, 1000);
         CloseHandle(hIpcThread);
 
-        // 可选：清理释放的 DLL 文件 (如果需要)
-        // DeleteFileW(ipcParam.dll32Path.c_str());
-        // DeleteFileW(ipcParam.dll64Path.c_str());
     }
 
     // --- 9. 停止监控线程 ---
@@ -4185,6 +4182,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid, data->iniContent);
 
     DeleteFileW(data->tempFilePath.c_str());
+
+    // [修改] 删除已释放的 DLL 文件
+    if (enableHook) {
+        DeleteFileW(dll32Path.c_str());
+        DeleteFileW(dll64Path.c_str());
+    }
 
     CoUninitialize();
     return 0;
