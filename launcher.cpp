@@ -30,6 +30,12 @@
 // 必须确保字节对齐正确
 #pragma pack(push, 1)
 
+struct YAP_UNICODE_STRING32 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONG  Buffer;
+};
+
 struct YAP_PEB_LDR_DATA32 {
     ULONG Length;
     BOOLEAN Initialized;
@@ -49,8 +55,8 @@ struct YAP_LDR_DATA_TABLE_ENTRY32 {
     ULONG DllBase;
     ULONG EntryPoint;
     ULONG SizeOfImage;
-    UNICODE_STRING32 FullDllName;
-    UNICODE_STRING32 BaseDllName;
+    YAP_UNICODE_STRING32 FullDllName; // 使用自定义类型
+    YAP_UNICODE_STRING32 BaseDllName; // 使用自定义类型
     ULONG Flags;
     USHORT LoadCount;
     USHORT TlsIndex;
@@ -3766,27 +3772,23 @@ HMODULE GetRemoteModuleHandle32_Manual(HANDLE hProcess, LPCWSTR lpModuleName) {
 
     // 读取 InLoadOrderModuleList 头 (PEB_LDR_DATA + 0x0C)
     LIST_ENTRY32 listHead;
-    // [修复] 使用 (PVOID)(ULONG_PTR) 消除 x64 下的类型转换警告
     if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)(ldrDataAddr + 0x0C), &listHead, sizeof(listHead), NULL)) return NULL;
 
     ULONG currentAddr = listHead.Flink;
-    // 防止死循环，设置最大遍历次数
     int maxCount = 100; 
 
     while (currentAddr != (ldrDataAddr + 0x0C) && maxCount-- > 0) {
         YAP_LDR_DATA_TABLE_ENTRY32 entry;
-        // [修复] 类型转换
         if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)currentAddr, &entry, sizeof(entry), NULL)) break;
 
         // 读取 BaseDllName
         wchar_t buffer[MAX_PATH];
         SIZE_T bytesRead = 0;
         if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Length < sizeof(buffer)) {
-            // [修复] 类型转换 entry.BaseDllName.Buffer 是 DWORD (32位地址)
+            // entry.BaseDllName.Buffer 是 ULONG (32位地址)，需转换为 PVOID
             if (ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)entry.BaseDllName.Buffer, buffer, entry.BaseDllName.Length, &bytesRead)) {
                 buffer[bytesRead / 2] = L'\0';
                 if (_wcsicmp(buffer, lpModuleName) == 0) {
-                    // [修复] 类型转换
                     return (HMODULE)(ULONG_PTR)entry.DllBase;
                 }
             }
