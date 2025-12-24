@@ -351,39 +351,24 @@ struct LauncherThreadData {
 // --- 提取嵌入资源的辅助函数 ---
 bool ExtractResourceToFile(int resourceId, const std::wstring& outputPath) {
     // 1. 查找资源
-    // 注意：这里假设资源类型是 RT_RCDATA。如果 .rc 里写的不是 RCDATA，这里会失败。
+    // NULL 表示查找当前模块(EXE)
+    // MAKEINTRESOURCE(resourceId) 是资源的数字 ID
+    // RT_RCDATA 是资源类型 (Raw Data)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
-    if (!hRes) {
-        DWORD err = GetLastError();
-        wchar_t msg[256];
-        swprintf_s(msg, L"查找资源失败 ID: %d\n错误代码: %d\n(1813=类型不匹配/找不到)", resourceId, err);
-        MessageBoxW(NULL, msg, L"资源错误", MB_ICONERROR);
-        return false;
-    }
+    if (!hRes) return false; // 资源不存在
 
     // 2. 加载资源
     HGLOBAL hData = LoadResource(NULL, hRes);
-    if (!hData) {
-        MessageBoxW(NULL, L"加载资源失败", L"资源错误", MB_ICONERROR);
-        return false;
-    }
+    if (!hData) return false;
 
-    // 3. 获取大小和指针
+    // 3. 获取资源大小和指针
     DWORD dataSize = SizeofResource(NULL, hRes);
     void* pData = LockResource(hData);
-    if (!pData || dataSize == 0) {
-        MessageBoxW(NULL, L"锁定资源失败或大小为0", L"资源错误", MB_ICONERROR);
-        return false;
-    }
+    if (!pData || dataSize == 0) return false;
 
     // 4. 写入文件
     std::ofstream out(outputPath, std::ios::binary);
-    if (!out.is_open()) {
-        wchar_t msg[MAX_PATH + 100];
-        swprintf_s(msg, L"无法创建文件:\n%s\n请检查路径或权限。", outputPath.c_str());
-        MessageBoxW(NULL, msg, L"文件IO错误", MB_ICONERROR);
-        return false;
-    }
+    if (!out.is_open()) return false;
 
     out.write(static_cast<const char*>(pData), dataSize);
     out.close();
@@ -3893,7 +3878,7 @@ struct ShellcodeData {
 #pragma pack(pop)
 
 // --- [修改] 核心注入函数 ---
-bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
+bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath, const std::wstring& injectorPath) {
     if (dllPath.empty()) return false;
 
     BOOL isWow64 = FALSE;
@@ -3903,23 +3888,20 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) ||
                          (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
 
-    // 1. 确保 Kernel32 已加载 (自旋锁逻辑)
-    // 无论用什么注入方式，挂起的进程必须先初始化环境
+    // 1. 自旋锁逻辑 (保持不变，确保 Kernel32 加载)
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
     
     if (!pLoadLibrary && pEntryPoint) {
         BYTE originalBytes[2];
-        BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
+        BYTE loopBytes[2] = { 0xEB, 0xFE }; 
 
         if (ReadProcessMemory(hProcess, pEntryPoint, originalBytes, 2, NULL)) {
             if (WriteProcessMemory(hProcess, pEntryPoint, loopBytes, 2, NULL)) {
                 FlushInstructionCache(hProcess, pEntryPoint, 2);
-                
                 if (g_NtResumeProcess) g_NtResumeProcess(hProcess); 
                 else ResumeThread(hThread);
 
-                // 等待 Kernel32
                 for (int i = 0; i < 300; ++i) {
                     Sleep(10);
                     pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
@@ -3935,54 +3917,40 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         }
     }
 
-    if (!pLoadLibrary) return false; // 环境初始化失败
+    if (!pLoadLibrary) return false;
 
     // 2. 分支处理
     if (targetIs32Bit) {
-        // --- 方案：调用外部 32位 Injector ---
+        // --- 32位：调用外部 Injector32.exe ---
         
-        // A. 准备 Injector32.exe 路径
-        wchar_t tempPath[MAX_PATH];
-        GetTempPathW(MAX_PATH, tempPath);
-        std::wstring injectorPath = std::wstring(tempPath) + L"Injector32.exe";
-        
-        // B. 释放资源 (如果文件不存在或为了确保版本)
-        if (!ExtractResourceToFile(IDR_INJECTOR32, injectorPath)) {
-    // 如果这里返回 false，上面的调试版函数会弹窗告诉你原因
-    return false; 
-}
+        // 检查注入器是否存在
+        if (!PathFileExistsW(injectorPath.c_str())) {
+            // MessageBoxW(NULL, injectorPath.c_str(), L"注入器未找到", MB_ICONERROR);
+            return false;
+        }
 
-        // C. 构造命令行: Injector32.exe <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
         std::wstring cmdLine = L"\"" + injectorPath + L"\" " + std::to_wstring(pid) + L" \"" + dllPath + L"\"";
         
         STARTUPINFOW si_inj = { 0 };
         si_inj.cb = sizeof(si_inj);
         si_inj.dwFlags = STARTF_USESHOWWINDOW;
-        si_inj.wShowWindow = SW_HIDE; // 隐藏窗口
+        si_inj.wShowWindow = SW_HIDE; 
         
         PROCESS_INFORMATION pi_inj = { 0 };
 
         if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE, 0, NULL, NULL, &si_inj, &pi_inj)) {
-            // 等待注入器执行完成
-            WaitForSingleObject(pi_inj.hProcess, 5000); // 最多等5秒
-            
+            WaitForSingleObject(pi_inj.hProcess, 5000);
             DWORD exitCode = 1;
             GetExitCodeProcess(pi_inj.hProcess, &exitCode);
-            
             CloseHandle(pi_inj.hProcess);
             CloseHandle(pi_inj.hThread);
-            
-            // 删除临时文件 (可选，可能因为文件被占用删不掉，可以留给清理函数)
-            // DeleteFileW(injectorPath.c_str());
-
             return (exitCode == 0);
         }
         return false;
 
     } else {
-        // --- x64 原生注入 (CreateRemoteThread) ---
-        // 64位对64位非常稳定，保持原样
+        // --- x64：原生注入 (保持不变) ---
         LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, MAX_PATH * sizeof(wchar_t), MEM_COMMIT, PAGE_READWRITE);
         if (!pRemoteMem) return false;
 
@@ -4052,66 +4020,37 @@ struct IpcThreadParam {
     std::wstring pipeName;
     std::wstring dll32Path;
     std::wstring dll64Path;
-    std::wstring hookPath; // [新增]
+    std::wstring hookPath;
+    std::wstring injectorPath; // [新增]
     std::atomic<bool>* shouldStop;
 };
 
 // --- [修改] IPC 服务端线程 ---
 DWORD WINAPI IpcServerThread(LPVOID lpParam) {
     IpcThreadParam* param = (IpcThreadParam*)lpParam;
-    LauncherLog(L"IPC Server started: " + param->pipeName);
-
     while (!*(param->shouldStop)) {
-        HANDLE hPipe = CreateNamedPipeW(
-            param->pipeName.c_str(),
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            512, 512, 0, NULL
-        );
-
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            LauncherLog(L"IPC CreateNamedPipe failed: " + std::to_wstring(GetLastError()));
-            Sleep(1000);
-            continue;
-        }
-
-        bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
-
-        if (connected) {
-            IpcMessage msg;
-            DWORD bytesRead;
+        HANDLE hPipe = CreateNamedPipeW(param->pipeName.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES, 512, 512, 0, NULL);
+        if (hPipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
+        if (ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED)) {
+            IpcMessage msg; DWORD bytesRead;
             if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
-                LauncherLog(L"IPC Received Request: Inject PID " + std::to_wstring(msg.targetPid));
-
                 bool success = false;
                 HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
                 if (hTarget) {
-                    BOOL isWow64 = FALSE;
-                    IsWow64Process(hTarget, &isWow64);
-                    SYSTEM_INFO si;
-                    GetNativeSystemInfo(&si);
-                    bool systemIs64 = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64);
-                    bool targetIs32Bit = systemIs64 ? (isWow64 == TRUE) : true;
-
+                    BOOL isWow64 = FALSE; IsWow64Process(hTarget, &isWow64);
+                    SYSTEM_INFO si; GetNativeSystemInfo(&si);
+                    bool targetIs32Bit = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 && isWow64) || (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL);
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
-
-                    // 调用修改后的 InjectAndWait
-                    // success = InjectAndWait(hTarget, msg.targetPid, targetDll, param->hookPath, param->pipeName);
+                    
+                    // [修改] 传递 param->injectorPath
+                    success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
                     CloseHandle(hTarget);
-                } else {
-                    LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
                 }
-
-                IpcResponse resp = { success, 0 };
-                DWORD bytesWritten;
+                IpcResponse resp = { success, 0 }; DWORD bytesWritten;
                 WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
-                LauncherLog(L"IPC Response sent: " + std::wstring(success ? L"OK" : L"FAIL"));
             }
         }
-
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
+        DisconnectNamedPipe(hPipe); CloseHandle(hPipe);
     }
     return 0;
 }
@@ -4144,40 +4083,32 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
-    // [修改] 将 DLL 路径变量移到函数作用域顶部 以便最后删除
-    std::wstring dll32Path;
-    std::wstring dll64Path;
+    std::atomic<bool> stopIpc(false); HANDLE hIpcThread = NULL; IpcThreadParam ipcParam;
+    std::wstring dll32Path, dll64Path, injectorPath; // [新增] injectorPath 变量
 
     if (enableHook) {
-        // [修改] A. 确定 DLL 释放路径 (改为 tempfile 路径)
-        wchar_t dllDir[MAX_PATH];
-        wcscpy_s(dllDir, MAX_PATH, data->tempFilePath.c_str());
-        PathRemoveFileSpecW(dllDir); // 从 temp INI 路径获取目录
-
+        wchar_t dllDir[MAX_PATH]; wcscpy_s(dllDir, MAX_PATH, data->tempFilePath.c_str()); PathRemoveFileSpecW(dllDir);
+        
         dll32Path = std::wstring(dllDir) + L"\\Hook32.dll";
         dll64Path = std::wstring(dllDir) + L"\\Hook64.dll";
+        injectorPath = std::wstring(dllDir) + L"\\Injector32.exe"; // [新增] 路径计算
 
-        // B. 释放资源到磁盘
-        // IDR_HOOK_DLL_32/64 必须在 launcher.cpp 顶部定义且与 rc 文件一致
+        // [关键] 在这里释放！与 DLL 一起释放，确保文件存在
         ExtractResourceToFile(IDR_HOOK_DLL_32, dll32Path);
         ExtractResourceToFile(IDR_HOOK_DLL_64, dll64Path);
+        ExtractResourceToFile(IDR_INJECTOR32, injectorPath); // [新增] 释放 EXE
 
-        // C. 配置 IPC 参数
-        ipcParam.dll32Path = dll32Path;
+        ipcParam.dll32Path = dll32Path; 
         ipcParam.dll64Path = dll64Path;
-        ipcParam.hookPath = finalHookPath;
+        ipcParam.hookPath = finalHookPath; 
+        ipcParam.injectorPath = injectorPath; // [新增] 赋值给 IPC 参数
         ipcParam.shouldStop = &stopIpc;
-        // 生成唯一的管道名称 防止多开冲突
         ipcParam.pipeName = kPipeNamePrefix + std::to_wstring(GetCurrentProcessId());
-
-        // D. 设置环境变量 (供 Hook DLL 读取)
+        
         SetEnvironmentVariableW(L"YAP_IPC_PIPE", ipcParam.pipeName.c_str());
-        if (!finalHookPath.empty()) {
-            SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
-        }
+        if (!finalHookPath.empty()) SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
-
-        // E. 启动 IPC 服务端线程
+        
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
     }
 
@@ -4191,15 +4122,15 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     } else {
         // --- 5. 主进程注入逻辑 ---
         if (enableHook) {
-            // 检测目标架构
             int arch = GetPeArchitecture(data->absoluteAppPath);
             std::wstring targetDll;
-
             if (arch == 32) targetDll = ipcParam.dll32Path;
             else if (arch == 64) targetDll = ipcParam.dll64Path;
-
-            // [修改] 传递 pi.hThread
-            if (!targetDll.empty()) InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
+            
+            if (!targetDll.empty()) {
+                // [修改] 传递 injectorPath
+                InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName, injectorPath);
+            }
         }
         ResumeThread(pi.hThread);
 
@@ -4389,11 +4320,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     DeleteFileW(data->tempFilePath.c_str());
 
     // [修改] 删除已释放的 DLL 文件
-    if (enableHook) {
-        DeleteFileW(dll32Path.c_str());
-        DeleteFileW(dll64Path.c_str());
+    if (enableHook) { 
+        DeleteFileW(dll32Path.c_str()); 
+        DeleteFileW(dll64Path.c_str()); 
+        DeleteFileW(injectorPath.c_str()); // [新增]
     }
-
+    
     CoUninitialize();
     return 0;
 }
