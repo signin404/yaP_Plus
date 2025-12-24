@@ -3947,7 +3947,10 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         std::wstring injectorPath = std::wstring(tempPath) + L"Injector32.exe";
         
         // B. 释放资源 (如果文件不存在或为了确保版本)
-        ExtractResourceToFile(IDR_INJECTOR32, injectorPath);
+        if (!ExtractResourceToFile(IDR_INJECTOR32, injectorPath)) {
+    // 如果这里返回 false，上面的调试版函数会弹窗告诉你原因
+    return false; 
+}
 
         // C. 构造命令行: Injector32.exe <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
