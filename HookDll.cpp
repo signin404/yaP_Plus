@@ -657,18 +657,76 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
     return result;
 }
 
+// 辅助：从 CreateProcess 参数解析出目标 EXE 的路径
+std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
+    std::wstring exePath;
+    if (lpApp && *lpApp) {
+        exePath = lpApp;
+    } else if (lpCmd && *lpCmd) {
+        // 如果 lpApp 为空 CreateProcess 使用 lpCmd 的第一个 token 作为程序名
+        std::wstring cmd = lpCmd;
+        // 处理引号
+        if (cmd.front() == L'"') {
+            size_t end = cmd.find(L'"', 1);
+            if (end != std::wstring::npos) exePath = cmd.substr(1, end - 1);
+        } else {
+            size_t end = cmd.find(L' ');
+            if (end != std::wstring::npos) exePath = cmd.substr(0, end);
+            else exePath = cmd;
+        }
+    }
+    return exePath;
+}
+
 BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
     LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
     LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
+
     if (g_IsInHook) return fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
+
     DWORD lastErr = GetLastError();
-    DebugLog(L"CreateProcessW: App=%s, Cmd=%s", lpApplicationName ? lpApplicationName : L"NULL", lpCommandLine ? lpCommandLine : L"NULL");
+
+    // --- [新增] 路径重定向逻辑 ---
+    std::wstring finalAppPath; // 用于存储重定向后的路径
+    std::wstring exePath = GetTargetExePath(lpApplicationName, lpCommandLine);
+
+    if (!exePath.empty()) {
+        wchar_t fullPath[MAX_PATH];
+        // 获取绝对路径 (SFX 通常使用绝对路径 这里是为了保险)
+        if (GetFullPathNameW(exePath.c_str(), MAX_PATH, fullPath, NULL)) {
+            std::wstring ntPath = L"\\??\\" + std::wstring(fullPath);
+            std::wstring targetNtPath;
+
+            // 检查该路径是否应该被重定向 (利用之前修复好的 ShouldRedirect 逻辑)
+            if (ShouldRedirect(ntPath, targetNtPath)) {
+                std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+
+                // 关键检查：只有当沙盒里的文件确实存在时 才进行替换！
+                // 这样避免了误导向到不存在的文件
+                if (GetFileAttributesW(targetDosPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    finalAppPath = targetDosPath;
+                    DebugLog(L"Exec Redirect: %s -> %s", exePath.c_str(), finalAppPath.c_str());
+                }
+            }
+        }
+    }
+
+    // 决定传给原始 API 的 ApplicationName
+    // 如果 finalAppPath 不为空 说明发生了重定向 我们强制指定要运行沙盒里的 EXE
+    LPCWSTR realAppName = finalAppPath.empty() ? lpApplicationName : finalAppPath.c_str();
+    // ---------------------------
+
+    DebugLog(L"CreateProcessW: App=%s, Cmd=%s", realAppName ? realAppName : L"NULL", lpCommandLine ? lpCommandLine : L"NULL");
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL result = fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
+    // 使用 realAppName 调用原始函数
+    BOOL result = fpCreateProcessW(realAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, pPI);
+
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
