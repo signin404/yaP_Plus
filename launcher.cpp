@@ -4143,15 +4143,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             if (arch == 32) targetDll = ipcParam.dll32Path;
             else if (arch == 64) targetDll = ipcParam.dll64Path;
 
-            if (!targetDll.empty()) {
-                // [修改] 传递配置
-                InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
-                    // OutputDebugStringW(L"Main process injection failed");
-                }
-            }
+            else if (arch == 64) targetDll = ipcParam.dll64Path;
+            
+            // [修改] 传递 pi.hThread
+            if (!targetDll.empty()) InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
         }
-
-        // --- 6. 恢复主线程运行 ---
         ResumeThread(pi.hThread);
 
         // --- 7. 等待逻辑 (WaitProcess) ---
