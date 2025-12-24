@@ -30,18 +30,7 @@
 // 必须确保字节对齐正确
 #pragma pack(push, 1)
 
-struct UNICODE_STRING32 {
-    USHORT Length;
-    USHORT MaximumLength;
-    ULONG  Buffer;
-};
-
-struct LIST_ENTRY32 {
-    ULONG Flink;
-    ULONG Blink;
-};
-
-struct PEB_LDR_DATA32 {
+struct YAP_PEB_LDR_DATA32 {
     ULONG Length;
     BOOLEAN Initialized;
     ULONG SsHandle;
@@ -53,7 +42,7 @@ struct PEB_LDR_DATA32 {
     ULONG ShutdownThreadId;
 };
 
-struct LDR_DATA_TABLE_ENTRY32 {
+struct YAP_LDR_DATA_TABLE_ENTRY32 {
     LIST_ENTRY32 InLoadOrderLinks;
     LIST_ENTRY32 InMemoryOrderLinks;
     LIST_ENTRY32 InInitializationOrderLinks;
@@ -3776,26 +3765,29 @@ HMODULE GetRemoteModuleHandle32_Manual(HANDLE hProcess, LPCWSTR lpModuleName) {
     if (!ReadProcessMemory(hProcess, (PVOID)(peb32 + 0x0C), &ldrDataAddr, sizeof(ldrDataAddr), NULL) || ldrDataAddr == 0) return NULL;
 
     // 读取 InLoadOrderModuleList 头 (PEB_LDR_DATA + 0x0C)
-    // 注意：PEB_LDR_DATA32 定义中 InLoadOrderModuleList 偏移就是 0x0C
     LIST_ENTRY32 listHead;
-    if (!ReadProcessMemory(hProcess, (PVOID)(ldrDataAddr + 0x0C), &listHead, sizeof(listHead), NULL)) return NULL;
+    // [修复] 使用 (PVOID)(ULONG_PTR) 消除 x64 下的类型转换警告
+    if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)(ldrDataAddr + 0x0C), &listHead, sizeof(listHead), NULL)) return NULL;
 
     ULONG currentAddr = listHead.Flink;
     // 防止死循环，设置最大遍历次数
-    int maxCount = 100;
+    int maxCount = 100; 
 
     while (currentAddr != (ldrDataAddr + 0x0C) && maxCount-- > 0) {
-        LDR_DATA_TABLE_ENTRY32 entry;
-        if (!ReadProcessMemory(hProcess, (PVOID)currentAddr, &entry, sizeof(entry), NULL)) break;
+        YAP_LDR_DATA_TABLE_ENTRY32 entry;
+        // [修复] 类型转换
+        if (!ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)currentAddr, &entry, sizeof(entry), NULL)) break;
 
         // 读取 BaseDllName
         wchar_t buffer[MAX_PATH];
         SIZE_T bytesRead = 0;
         if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Length < sizeof(buffer)) {
-            if (ReadProcessMemory(hProcess, (PVOID)entry.BaseDllName.Buffer, buffer, entry.BaseDllName.Length, &bytesRead)) {
+            // [修复] 类型转换 entry.BaseDllName.Buffer 是 DWORD (32位地址)
+            if (ReadProcessMemory(hProcess, (PVOID)(ULONG_PTR)entry.BaseDllName.Buffer, buffer, entry.BaseDllName.Length, &bytesRead)) {
                 buffer[bytesRead / 2] = L'\0';
                 if (_wcsicmp(buffer, lpModuleName) == 0) {
-                    return (HMODULE)entry.DllBase;
+                    // [修复] 类型转换
+                    return (HMODULE)(ULONG_PTR)entry.DllBase;
                 }
             }
         }
