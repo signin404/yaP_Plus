@@ -735,6 +735,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 检查是否匹配重定向规则
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
+        // **修复关键点1: 判断是否为目录操作**
+        bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
+
         // 判断是否为写入操作
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
@@ -744,8 +747,31 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
         bool shouldRedirect = false;
 
-        if (isWrite) {
-            // --- 写入操作逻辑 ---
+        // **修复关键点2: 目录的读取操作不重定向**
+        if (isDirectory && !isWrite) {
+            // 对于目录的读取操作(列举文件),始终打开真实目录
+            // 目录合并逻辑在 NtQueryDirectoryFile 中处理
+            shouldRedirect = false;
+
+            // 检查沙盒目录是否为墓碑
+            if (sandboxExists) {
+                std::wstring sandboxDosPath = NtPathToDosPath(targetNtPath);
+                DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
+                if (IsTombstone(attrs)) {
+                    // 沙盒中有墓碑,说明目录被删除,返回不存在
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+            }
+
+            // 如果真实目录不存在但沙盒目录存在,打开沙盒目录
+            if (!realExists && sandboxExists) {
+                shouldRedirect = true;
+            } else {
+                // 打开真实目录(目录合并在查询时处理)
+                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            }
+        } else if (isWrite) {
+            // --- 写入操作逻辑 (包括目录创建) ---
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
@@ -753,11 +779,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
                 shouldRedirect = true;
             } else {
-                // 新建文件
+                // 新建文件或目录
                 shouldRedirect = true;
             }
         } else {
-            // --- 读取操作逻辑 ---
+            // --- 文件的读取操作逻辑 ---
             if (sandboxExists) {
                 // 检查是否为墓碑文件 (隐藏+系统)
                 std::wstring sandboxDosPath = NtPathToDosPath(targetNtPath);
@@ -769,7 +795,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             } else if (realExists) {
                 // 穿透读取：直接读取原文件，不重定向
                 shouldRedirect = false;
-                // [修复] 这里补全了所有参数，不再使用 ...
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
                 // 都不存在，重定向到沙盒以报错
