@@ -1032,12 +1032,12 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
 
     // 3. 检查句柄是否已经指向沙盒 (反向解析)
     // 使用不区分大小写的比较更安全，或者确保路径都已规范化
-    if (handleNtPath.size() >= sandboxRootNt.size() && 
+    if (handleNtPath.size() >= sandboxRootNt.size() &&
         _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
-        
+
         // 句柄在沙盒内，例如: \??\D:\Portable\Data\C
         size_t rootLen = sandboxRootNt.length();
-        
+
         // 提取相对部分: \C
         std::wstring relPath = handleNtPath.substr(rootLen);
 
@@ -1057,7 +1057,7 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
              wchar_t driveLetter = relPath[1];
              realNtPath = L"\\??\\";
              realNtPath += driveLetter;
-             realNtPath += L":"; 
+             realNtPath += L":";
              // 注意：这里不需要补斜杠，NtPathToDosPath 会处理为 C:
              // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
         }
@@ -1095,6 +1095,16 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
 ) {
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
+
+    // [新增修复] 关键：先检查句柄是否为目录！
+    // 如果是对文件句柄调用此函数，必须直接放行给内核处理，否则会导致"目录名称无效"错误
+    FILE_STANDARD_INFORMATION stdInfo;
+    IO_STATUS_BLOCK stdIoBlock;
+    if (NT_SUCCESS(fpNtQueryInformationFile(FileHandle, &stdIoBlock, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
+        if (!stdInfo.Directory) {
+            return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
+        }
+    }
 
     // [修改] 使用新的逻辑判断是否需要合并
     std::wstring realDosPath;
@@ -1226,6 +1236,17 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFileEx(
 ) {
     if (g_IsInHook) return fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
     RecursionGuard guard;
+
+    // [新增修复] 同样检查目录属性
+    FILE_STANDARD_INFORMATION stdInfo;
+    IO_STATUS_BLOCK stdIoBlock;
+    if (NT_SUCCESS(fpNtQueryInformationFile(FileHandle, &stdIoBlock, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
+        if (!stdInfo.Directory) {
+            return fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
+        }
+    }
+
+    // 注意：Ex 版本目前你的代码只是透传，如果未来要实现合并逻辑，也需要像上面一样处理
     NTSTATUS status = fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
     if (status == STATUS_SUCCESS && IoStatusBlock->Information > 0) {
         ProcessQueryData(FileInformation, Length, FileInformationClass);
