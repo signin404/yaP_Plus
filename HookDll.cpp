@@ -34,6 +34,26 @@
 #define FileRenameInformation ((FILE_INFORMATION_CLASS)10)
 #endif
 
+#ifndef FileDispositionInformationEx
+#define FileDispositionInformationEx ((FILE_INFORMATION_CLASS)64)
+#endif
+
+#ifndef FileRenameInformationEx
+#define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
+#endif
+
+// 定义 Ex 结构体 (标志位)
+typedef struct _FILE_DISPOSITION_INFORMATION_EX {
+    ULONG Flags;
+} FILE_DISPOSITION_INFORMATION_EX, *PFILE_DISPOSITION_INFORMATION_EX;
+
+// 标志位定义
+#define FILE_DISPOSITION_DELETE 0x00000001
+#define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
+#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
+#define FILE_DISPOSITION_ON_CLOSE 0x00000008
+#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -172,6 +192,8 @@ typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFile)(HANDLE, HANDLE, PIO_APC_ROUTINE,
 typedef NTSTATUS(NTAPI* P_NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS, ULONG, PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
+P_NtDeleteFile fpNtDeleteFile = NULL;
 
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
@@ -562,6 +584,44 @@ std::wstring GetPathFromHandle(HANDLE hFile) {
     return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
 
+NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
+    if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring targetNtPath;
+
+    // 检查是否需要重定向
+    if (ShouldRedirect(fullNtPath, targetNtPath)) {
+        DebugLog(L"NtDeleteFile Redirect: %s", fullNtPath.c_str());
+
+        // 1. 确保沙盒里有文件 (Copy-on-Write)
+        // 虽然是要删除，但为了模拟成功，我们需要沙盒里有个东西被删
+        PerformCopyOnWrite(fullNtPath, targetNtPath);
+
+        // 2. 修改 ObjectAttributes 指向沙盒路径
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        // 3. 删除沙盒文件
+        NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
+
+        // 4. 恢复
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+
+        return status;
+    }
+
+    return fpNtDeleteFile(ObjectAttributes);
+}
+
 NTSTATUS NTAPI Detour_NtSetInformationFile(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -572,93 +632,90 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // 检查是否为破坏性操作
+    // [修改] 增加对 Ex 版本的检查
     bool isDestructive = (FileInformationClass == FileDispositionInformation ||
+                          FileInformationClass == FileDispositionInformationEx || // 新增
                           FileInformationClass == FileBasicInformation ||
-                          FileInformationClass == FileRenameInformation);
+                          FileInformationClass == FileRenameInformation ||
+                          FileInformationClass == FileRenameInformationEx);       // 新增
 
     if (!isDestructive) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 获取当前句柄指向的路径 (这是设备路径)
+    // 获取路径并转换设备路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
     if (rawPath.empty()) {
+        // 如果获取路径失败，为了安全起见，如果是删除操作，建议拦截或记录
+        // 但为了兼容性，暂时放行，或者你可以选择在这里 return STATUS_ACCESS_DENIED;
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // [新增] 将设备路径转换为 NT DOS 路径 (\??\C:\...)
     std::wstring currentPath = DevicePathToNtPath(rawPath);
 
-    // 如果已经是沙盒路径，直接放行
     if (ContainsCaseInsensitive(currentPath, g_SandboxRoot)) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // --- 关键逻辑：句柄指向真实文件 ---
-    
-    // 检查该路径是否属于应该被重定向的范围
     std::wstring targetNtPath;
-    // 现在 currentPath 是 \??\C:\... 格式，ShouldRedirect 可以正确识别了
     if (!ShouldRedirect(currentPath, targetNtPath)) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 既然应该重定向，但句柄却是真实的，说明 NtCreateFile 没拦截住（或者是只读打开后又想修改）
-    // 我们必须在这里进行“亡羊补牢”：将操作应用到沙盒，保护真实文件。
+    DebugLog(L"Intercepted Destructive Op (Class %d) on Real File: %s", FileInformationClass, currentPath.c_str());
 
-    DebugLog(L"Intercepted Destructive Op on Real File: %s", currentPath.c_str());
-
-    // 1. 确保沙盒中有副本 (Copy-on-Write)
     PerformCopyOnWrite(currentPath, targetNtPath);
-
-    // 2. 将 NT 路径转换为 DOS 路径以便使用 Win32 API 操作沙盒文件
     std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
 
-    // 3. 根据操作类型，在沙盒文件上执行操作
+    // --- 处理删除逻辑 ---
+    bool isDelete = false;
+
     if (FileInformationClass == FileDispositionInformation) {
         FILE_DISPOSITION_INFORMATION* info = (FILE_DISPOSITION_INFORMATION*)FileInformation;
-        if (info->DeleteFile) {
-            DebugLog(L"Redirect Delete: %s", targetDosPath.c_str());
-            // 在沙盒中创建“墓碑”文件或直接删除沙盒副本
-            // 简单起见，我们先删除沙盒副本，并创建一个特殊的 0 字节文件作为删除标记
-            // (更完善的实现需要配合 NtQueryDirectoryFile 过滤该标记)
-
-            // 这里我们模拟成功，但不删除真实文件
-            // 如果沙盒里有副本，删掉副本
-            DeleteFileW(targetDosPath.c_str());
-
-            // 创建一个墓碑文件 (可选，防止再次读取)
-            // HANDLE hMarker = CreateFileW(targetDosPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            // if (hMarker != INVALID_HANDLE_VALUE) CloseHandle(hMarker);
-        }
+        if (info->DeleteFile) isDelete = true;
     }
-    else if (FileInformationClass == FileBasicInformation) {
-        FILE_BASIC_INFORMATION* info = (FILE_BASIC_INFORMATION*)FileInformation;
-        DebugLog(L"Redirect Attributes: %s", targetDosPath.c_str());
+    // [新增] 处理 Ex 删除
+    else if (FileInformationClass == FileDispositionInformationEx) {
+        FILE_DISPOSITION_INFORMATION_EX* info = (FILE_DISPOSITION_INFORMATION_EX*)FileInformation;
+        // 只要有 DELETE 标志，就是删除
+        if (info->Flags & FILE_DISPOSITION_DELETE) isDelete = true;
+    }
 
-        // 使用 Win32 API 修改沙盒文件的属性
-        // 注意：时间戳为 0 或 -1 表示不修改
+    if (isDelete) {
+        DebugLog(L"Redirect Delete (Safe): %s", targetDosPath.c_str());
+        // 删除沙盒文件
+        DeleteFileW(targetDosPath.c_str());
+
+        // 伪造成功返回
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        return STATUS_SUCCESS;
+    }
+
+    // --- 处理属性修改 ---
+    if (FileInformationClass == FileBasicInformation) {
+        DebugLog(L"Redirect Attributes (Safe): %s", targetDosPath.c_str());
         HANDLE hSandbox = CreateFileW(targetDosPath.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (hSandbox != INVALID_HANDLE_VALUE) {
-            // 我们需要调用原始 NT 函数来设置沙盒文件的属性，因为 Win32 SetFileTime/Attr 不够灵活
             IO_STATUS_BLOCK ioBlock;
             fpNtSetInformationFile(hSandbox, &ioBlock, FileInformation, Length, FileInformationClass);
             CloseHandle(hSandbox);
         }
-    }
-    else if (FileInformationClass == FileRenameInformation) {
-        // 重命名稍微复杂，因为涉及新路径
-        // 简单处理：如果是重命名，我们通常不支持跨卷重命名到沙盒外
-        // 这里暂时返回成功欺骗程序，或者尝试在沙盒内重命名
-        DebugLog(L"Redirect Rename: Blocked for safety");
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 0;
+        return STATUS_SUCCESS;
     }
 
-    // 4. 无论如何，返回成功 (STATUS_SUCCESS)，欺骗应用程序它已经修改了文件
-    // 绝对不要调用原始函数去操作真实句柄！
-    IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = 0;
-    return STATUS_SUCCESS;
+    // --- 处理重命名 ---
+    if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
+        DebugLog(L"Redirect Rename (Blocked): %s", currentPath.c_str());
+        // 简单粗暴地阻止对真实文件的重命名
+        IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+        IoStatusBlock->Information = 0;
+        return STATUS_ACCESS_DENIED;
+    }
+
+    return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
 NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_BASIC_INFORMATION FileInformation) {
@@ -1224,6 +1281,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
 
         MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
+        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
 
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
