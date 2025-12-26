@@ -3935,11 +3935,11 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
 
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
-                    // [修复] 取消注释，并传递 NULL 作为 hThread 参数
-                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程，
-                    // 所以这里 hThread 为 NULL 是安全的。
+                    // [修复] 取消注释 并传递 NULL 作为 hThread 参数
+                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程 
+                    // 所以这里 hThread 为 NULL 是安全的
                     success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName);
-                    
+
                     CloseHandle(hTarget);
                 } else {
                     LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
@@ -3977,7 +3977,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
     // --- 2. 解析 Hook 配置 ---
-    bool enableHook = (GetValueFromIniContent(data->iniContent, L"General", L"hookfile") == L"1");
+    std::wstring hookFileStr = GetValueFromIniContent(data->iniContent, L"General", L"hookfile");
+    int hookMode = _wtoi(hookFileStr.c_str());
+    bool enableHook = (hookMode > 0);
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
@@ -4021,6 +4023,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
         SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
+        SetEnvironmentVariableW(L"YAP_HOOK_MODE", std::to_wstring(hookMode).c_str());
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
