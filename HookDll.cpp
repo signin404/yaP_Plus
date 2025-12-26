@@ -537,7 +537,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 检查是否匹配重定向规则
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
-        // 判断是否为写入操作 (包括删除、修改属性等)
+        // 判断是否为写入操作
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
         // 检查文件存在性
@@ -549,60 +549,37 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (isWrite) {
             // --- 写入操作逻辑 ---
             if (sandboxExists) {
-                // 1. 沙盒中有文件 -> 直接操作沙盒文件
                 shouldRedirect = true;
             } else if (realExists) {
-                // 2. 沙盒无文件，但真实路径有 -> 复制到沙盒 (CoW) -> 操作沙盒文件
-                // 注意：如果是 OPEN_ALWAYS 或 CREATE_ALWAYS，PerformCopyOnWrite 内部会处理目录创建
+                // 写入时复制 (CoW)
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
                 shouldRedirect = true;
             } else {
-                // 3. 都不存在 -> 新建文件 -> 在沙盒创建
+                // 新建文件
                 shouldRedirect = true;
             }
         } else {
             // --- 读取操作逻辑 ---
-
-            // 1. 检查沙盒
-            if (NtPathExists(targetNtPath)) {
-            std::wstring sandboxDosPath = NtPathToDosPath(targetNtPath);
-            DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
-
-            // [关键] 检查是否为墓碑文件
-            if (IsTombstone(attrs)) {
-                // 是墓碑，说明原文件被“删除”了，返回未找到
-                return STATUS_OBJECT_NAME_NOT_FOUND;
-            }
-
-            // 是正常沙盒文件，重定向读取
-            shouldRedirect = true;
-        }
-        else if (NtPathExists(fullNtPath)) {
-            // 2. 沙盒无文件，真实路径有 -> 穿透读取
-            shouldRedirect = false;
-            return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, ...);
-        }
-        else {
-            // 3. 都不存在
-            shouldRedirect = true;
-        }
-
             if (sandboxExists) {
-                // 1. 沙盒中有文件 -> 优先读取沙盒 (遮挡真实文件)
+                // 检查是否为墓碑文件 (隐藏+系统)
+                std::wstring sandboxDosPath = NtPathToDosPath(targetNtPath);
+                DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
+                if (IsTombstone(attrs)) {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
                 shouldRedirect = true;
             } else if (realExists) {
-                // 2. 沙盒无文件，真实路径有 -> **穿透读取** (不重定向，直接读原文件)
+                // 穿透读取：直接读取原文件，不重定向
                 shouldRedirect = false;
-                // 这里直接返回原始调用，操作的是 fullNtPath
+                // [修复] 这里补全了所有参数，不再使用 ...
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
-                // 3. 都不存在 -> 重定向到沙盒 (让系统报错 "文件未找到" 或创建新文件)
+                // 都不存在，重定向到沙盒以报错
                 shouldRedirect = true;
             }
         }
 
         if (shouldRedirect) {
-            // 执行重定向逻辑
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
 
@@ -612,14 +589,13 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
-            // 确保目标目录存在 (对于创建/写入操作)
+            // 确保目标目录存在
             if (isWrite || CreateDisposition == FILE_CREATE || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_SUPERSEDE) {
                 EnsureDirectoryExistsNT(targetNtPath.c_str());
             }
 
             NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
-            // 恢复原始参数
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
 
@@ -627,7 +603,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         }
     }
 
-    // 不重定向，直接调用原始函数
     return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 }
 
