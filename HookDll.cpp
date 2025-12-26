@@ -26,6 +26,14 @@
 #define FILE_DIRECTORY_FILE 0x00000001
 #endif
 
+#ifndef FileBasicInformation
+#define FileBasicInformation ((FILE_INFORMATION_CLASS)4)
+#endif
+
+#ifndef FileRenameInformation
+#define FileRenameInformation ((FILE_INFORMATION_CLASS)10)
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
