@@ -947,21 +947,24 @@ void CreateDummyFile(const std::wstring& path) {
 
 // [修改] Detour_NtDeleteFile
 NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
-    // 防止递归调用
     if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+    
+    // [修复] 强制转换为 NT 路径，否则 ShouldRedirect 会失败
+    if (fullNtPath.find(L"\\Device\\") == 0) {
+        fullNtPath = DevicePathToNtPath(fullNtPath);
+    }
+
     std::wstring targetNtPath;
 
     // 检查是否需要重定向
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
-        // 获取 DOS 路径以便进行属性检查和文件创建
         std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
         std::wstring fullDosPath = NtPathToDosPath(fullNtPath);
 
-        // 检查文件存在性
         DWORD sandboxAttrs = GetFileAttributesW(targetDosPath.c_str());
         bool sandboxExists = (sandboxAttrs != INVALID_FILE_ATTRIBUTES);
 
@@ -969,7 +972,6 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
         bool realExists = (realAttrs != INVALID_FILE_ATTRIBUTES);
 
         // --- 情况 1: 沙盒中存在文件 ---
-        // 无论是正常文件还是之前的墓碑文件，都直接删除它
         if (sandboxExists) {
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
@@ -1000,7 +1002,6 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
             RecursiveCreateDirectory(dirBuf);
 
             // 2. 创建墓碑文件 (0字节，隐藏 + 系统属性)
-            // 使用 CREATE_ALWAYS 确保创建新文件
             HANDLE hFile = CreateFileW(targetDosPath.c_str(),
                                        GENERIC_WRITE,
                                        0,
@@ -1011,37 +1012,28 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
 
             if (hFile != INVALID_HANDLE_VALUE) {
                 CloseHandle(hFile);
-                // 欺骗应用程序：文件已成功删除
                 return STATUS_SUCCESS;
             } else {
-                // 如果创建墓碑失败（例如权限问题），返回访问拒绝
                 return STATUS_ACCESS_DENIED;
             }
         }
-
+        
         // --- 情况 3: 哪里都没有 ---
-        // 重定向到沙盒路径让系统报错，或者直接调用原始路径报错
-        // 这里选择重定向到沙盒，保持行为一致性
+        // 重定向到沙盒让系统报错
         else {
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
-
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
-
             NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
-
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
-
             return status;
         }
     }
 
-    // 不需要重定向，调用原始函数
     return fpNtDeleteFile(ObjectAttributes);
 }
 
@@ -1055,14 +1047,23 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // **修复: 处理删除操作**
-    if (FileInformationClass == FileDispositionInformation ||
-        FileInformationClass == FileDispositionInformationEx)
-    {
-        std::wstring ntPath = GetPathFromHandle(FileHandle);
-        if (ntPath.empty()) {
+    // 检查是否为删除操作
+    bool isDelete = false;
+    if (FileInformationClass == FileDispositionInformation) {
+        isDelete = ((PFILE_DISPOSITION_INFORMATION)FileInformation)->DeleteFile;
+    }
+    else if (FileInformationClass == FileDispositionInformationEx) {
+        isDelete = (((PFILE_DISPOSITION_INFORMATION_EX)FileInformation)->Flags & FILE_DISPOSITION_DELETE) != 0;
+    }
+
+    if (isDelete) {
+        std::wstring rawPath = GetPathFromHandle(FileHandle);
+        if (rawPath.empty()) {
             return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
         }
+
+        // [修复] 关键：将设备路径转换为 NT 路径
+        std::wstring ntPath = DevicePathToNtPath(rawPath);
 
         // 检查是否需要重定向
         std::wstring targetPath;
@@ -1070,12 +1071,21 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
         }
 
-        // 检查文件是否在沙盒中
         std::wstring targetDosPath = NtPathToDosPath(targetPath);
         DWORD attrs = GetFileAttributesW(targetDosPath.c_str());
 
+        // --- 情况 1: 文件在沙盒中 ---
         if (attrs != INVALID_FILE_ATTRIBUTES) {
-            // **修复: 文件在沙盒中,需要在沙盒路径上执行删除操作**
+            // 需要在沙盒路径上执行删除
+            // 注意：我们不能直接用 FileHandle，因为它指向的是真实文件（如果是在 CoW 之前打开的）
+            // 或者它指向沙盒文件。我们需要确认句柄指向哪里。
+            
+            // 简单判断：如果句柄路径包含沙盒根目录，直接放行
+            if (rawPath.find(g_SandboxRoot) != std::wstring::npos) {
+                 return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+            }
+
+            // 如果句柄指向真实文件，但沙盒里也有（CoW副本），我们需要删除沙盒里的副本
             OBJECT_ATTRIBUTES objAttr;
             UNICODE_STRING usPath;
             RtlInitUnicodeString(&usPath, targetPath.c_str());
@@ -1084,13 +1094,11 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             HANDLE hSandbox = NULL;
             IO_STATUS_BLOCK iosb = {0};
 
-            // 确定打开选项
             ULONG openOptions = FILE_OPEN_FOR_BACKUP_INTENT;
             if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
                 openOptions |= FILE_DIRECTORY_FILE;
             }
 
-            // 打开沙盒文件/目录
             NTSTATUS status = fpNtOpenFile(
                 &hSandbox,
                 DELETE | SYNCHRONIZE,
@@ -1101,28 +1109,29 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             );
 
             if (NT_SUCCESS(status)) {
-                // 在沙盒句柄上执行删除
                 status = fpNtSetInformationFile(hSandbox, IoStatusBlock, FileInformation, Length, FileInformationClass);
                 fpNtClose(hSandbox);
+                
+                // 成功删除了沙盒文件，返回成功
+                // 注意：原始句柄指向的真实文件不会被删除
                 return status;
             }
-
-            // 如果打开失败,回退到原始调用
-            return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-        } else {
-            // 文件不在沙盒中,检查是否在真实目录中
+        } 
+        // --- 情况 2: 文件不在沙盒中 (仅在真实目录) ---
+        else {
             std::wstring realDosPath = NtPathToDosPath(ntPath);
             DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
 
             if (realAttrs != INVALID_FILE_ATTRIBUTES) {
-                // **修复: 文件在真实目录中,创建墓碑文件**
-                // 确保沙盒父目录存在
+                DebugLog(L"Fake Delete via SetInfo (Tombstone): %s", targetDosPath.c_str());
+
+                // 1. 确保沙盒父目录存在
                 wchar_t dirBuf[MAX_PATH];
                 wcscpy_s(dirBuf, targetDosPath.c_str());
                 PathRemoveFileSpecW(dirBuf);
                 RecursiveCreateDirectory(dirBuf);
 
-                // 创建墓碑文件 (隐藏+系统属性)
+                // 2. 创建墓碑文件
                 HANDLE hTombstone = CreateFileW(
                     targetDosPath.c_str(),
                     GENERIC_WRITE,
@@ -1136,7 +1145,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                 if (hTombstone != INVALID_HANDLE_VALUE) {
                     CloseHandle(hTombstone);
 
-                    // 返回成功(虚拟删除)
+                    // 欺骗应用程序：删除成功
                     IoStatusBlock->Status = STATUS_SUCCESS;
                     IoStatusBlock->Information = 0;
                     return STATUS_SUCCESS;
@@ -1145,7 +1154,6 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         }
     }
 
-    // 其他信息类别或非删除操作,直接调用原始函数
     return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
