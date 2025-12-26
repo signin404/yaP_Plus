@@ -69,6 +69,10 @@
 #define SL_RETURN_SINGLE_ENTRY 0x00000002
 #endif
 
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -1231,7 +1235,7 @@ NTSTATUS HandleDirectoryQuery(
     PUNICODE_STRING FileName,
     BOOLEAN RestartScan
 ) {
-    // 1. 获取路径 (如果失败，返回 NOT_SUPPORTED 让原始函数处理，不要返回错误)
+    // 1. 获取路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
     if (rawPath.empty()) return STATUS_NOT_SUPPORTED;
 
@@ -1244,7 +1248,7 @@ NTSTATUS HandleDirectoryQuery(
     }
 
     // --- 关键修复：扩大锁的范围 ---
-    // 锁必须持有到函数结束，否则 ctx 可能在读取过程中被 NtClose 删除
+    // 锁必须持有到函数结束，防止 ctx 在读取过程中被 NtClose 删除
     std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
 
     // 清理旧上下文
@@ -1268,10 +1272,6 @@ NTSTATUS HandleDirectoryQuery(
 
     // 初始化合并列表
     if (!ctx->IsInitialized) {
-        // 临时释放锁去执行耗时的文件搜索？
-        // 不，为了安全起见，这里保持锁定。虽然会影响并发性能，但能保证绝对稳定。
-        // 如果性能是瓶颈，需要重构 DirContext 为引用计数对象。
-        
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
 
@@ -1296,140 +1296,132 @@ NTSTATUS HandleDirectoryQuery(
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
 
-    // 使用 SEH 捕获内存写入异常 (防止 bad pointer 崩溃)
-    __try {
-        while (ctx->CurrentIndex < ctx->Entries.size()) {
-            const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
-            ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
-            ULONG entrySize = 0;
+    // 移除 __try，依靠逻辑检查保证安全
+    while (ctx->CurrentIndex < ctx->Entries.size()) {
+        const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
+        ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
+        ULONG entrySize = 0;
 
-            // 计算大小
-            switch (FileInformationClass) {
-                case FileDirectoryInformation:
-                    entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes;
-                    break;
-                case FileFullDirectoryInformation:
-                    entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes;
-                    break;
-                case FileBothDirectoryInformation:
-                    entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
-                    break;
-                case FileIdBothDirectoryInformation:
-                    entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
-                    break;
-                default:
-                    IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
-                    IoStatusBlock->Information = 0;
-                    return STATUS_INVALID_INFO_CLASS;
+        // 计算大小
+        switch (FileInformationClass) {
+            case FileDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileFullDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileBothDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileIdBothDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
+            default:
+                IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+                IoStatusBlock->Information = 0;
+                return STATUS_INVALID_INFO_CLASS;
+        }
+
+        // 8字节对齐
+        entrySize = (entrySize + 7) & ~7;
+
+        // 检查缓冲区
+        if (offset + entrySize > Length) {
+            if (bytesWritten == 0) {
+                IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+                IoStatusBlock->Information = 0;
+                return STATUS_BUFFER_OVERFLOW;
             }
+            break;
+        }
 
-            // 8字节对齐
-            entrySize = (entrySize + 7) & ~7;
+        // 填充数据
+        void* entryPtr = buffer + offset;
+        memset(entryPtr, 0, entrySize);
 
-            // 检查缓冲区
-            if (offset + entrySize > Length) {
-                if (bytesWritten == 0) {
-                    IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
-                    IoStatusBlock->Information = 0;
-                    return STATUS_BUFFER_OVERFLOW;
-                }
+        switch (FileInformationClass) {
+            case FileDirectoryInformation: {
+                FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
+                info->NextEntryOffset = 0;
+                info->FileIndex = 0;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->FileNameLength = fileNameBytes;
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
-
-            // 填充数据
-            void* entryPtr = buffer + offset;
-            memset(entryPtr, 0, entrySize);
-
-            switch (FileInformationClass) {
-                case FileDirectoryInformation: {
-                    FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
-                    info->NextEntryOffset = 0; // 稍后更新
-                    info->FileIndex = 0;
-                    info->CreationTime = entry.CreationTime;
-                    info->LastAccessTime = entry.LastAccessTime;
-                    info->LastWriteTime = entry.LastWriteTime;
-                    info->ChangeTime = entry.ChangeTime;
-                    info->EndOfFile = entry.EndOfFile;
-                    info->AllocationSize = entry.AllocationSize;
-                    info->FileAttributes = entry.FileAttributes;
-                    info->FileNameLength = fileNameBytes;
-                    memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
-                    break;
-                }
-                case FileFullDirectoryInformation: {
-                    FILE_FULL_DIR_INFORMATION* info = (FILE_FULL_DIR_INFORMATION*)entryPtr;
-                    info->NextEntryOffset = 0;
-                    info->FileIndex = 0;
-                    info->CreationTime = entry.CreationTime;
-                    info->LastAccessTime = entry.LastAccessTime;
-                    info->LastWriteTime = entry.LastWriteTime;
-                    info->ChangeTime = entry.ChangeTime;
-                    info->EndOfFile = entry.EndOfFile;
-                    info->AllocationSize = entry.AllocationSize;
-                    info->FileAttributes = entry.FileAttributes;
-                    info->FileNameLength = fileNameBytes;
-                    info->EaSize = 0;
-                    memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
-                    break;
-                }
-                case FileBothDirectoryInformation: {
-                    FILE_BOTH_DIR_INFORMATION* info = (FILE_BOTH_DIR_INFORMATION*)entryPtr;
-                    info->NextEntryOffset = 0;
-                    info->FileIndex = 0;
-                    info->CreationTime = entry.CreationTime;
-                    info->LastAccessTime = entry.LastAccessTime;
-                    info->LastWriteTime = entry.LastWriteTime;
-                    info->ChangeTime = entry.ChangeTime;
-                    info->EndOfFile = entry.EndOfFile;
-                    info->AllocationSize = entry.AllocationSize;
-                    info->FileAttributes = entry.FileAttributes;
-                    info->FileNameLength = fileNameBytes;
-                    info->EaSize = 0;
-                    size_t shortLen = min(entry.ShortName.length(), 12);
-                    info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
-                    if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
-                    memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
-                    break;
-                }
-                case FileIdBothDirectoryInformation: {
-                    FILE_ID_BOTH_DIR_INFORMATION* info = (FILE_ID_BOTH_DIR_INFORMATION*)entryPtr;
-                    info->NextEntryOffset = 0;
-                    info->FileIndex = 0;
-                    info->CreationTime = entry.CreationTime;
-                    info->LastAccessTime = entry.LastAccessTime;
-                    info->LastWriteTime = entry.LastWriteTime;
-                    info->ChangeTime = entry.ChangeTime;
-                    info->EndOfFile = entry.EndOfFile;
-                    info->AllocationSize = entry.AllocationSize;
-                    info->FileAttributes = entry.FileAttributes;
-                    info->FileNameLength = fileNameBytes;
-                    info->EaSize = 0;
-                    size_t shortLen = min(entry.ShortName.length(), 12);
-                    info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
-                    if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
-                    info->FileId.QuadPart = 0;
-                    memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
-                    break;
-                }
-            }
-
-            ctx->CurrentIndex++;
-
-            if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
-                // 最后一项，NextEntryOffset 保持为 0
-                bytesWritten += entrySize;
+            case FileFullDirectoryInformation: {
+                FILE_FULL_DIR_INFORMATION* info = (FILE_FULL_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = 0;
+                info->FileIndex = 0;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->FileNameLength = fileNameBytes;
+                info->EaSize = 0;
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
-            } else {
-                // 设置 NextEntryOffset 指向下一项
-                *(ULONG*)entryPtr = entrySize;
-                offset += entrySize;
-                bytesWritten += entrySize;
+            }
+            case FileBothDirectoryInformation: {
+                FILE_BOTH_DIR_INFORMATION* info = (FILE_BOTH_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = 0;
+                info->FileIndex = 0;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->FileNameLength = fileNameBytes;
+                info->EaSize = 0;
+                size_t shortLen = min(entry.ShortName.length(), 12);
+                info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
+                if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
+                break;
+            }
+            case FileIdBothDirectoryInformation: {
+                FILE_ID_BOTH_DIR_INFORMATION* info = (FILE_ID_BOTH_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = 0;
+                info->FileIndex = 0;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->FileNameLength = fileNameBytes;
+                info->EaSize = 0;
+                size_t shortLen = min(entry.ShortName.length(), 12);
+                info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
+                if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                info->FileId.QuadPart = 0;
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
+                break;
             }
         }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 如果发生内存访问错误，返回状态码
-        return STATUS_ACCESS_VIOLATION;
+
+        ctx->CurrentIndex++;
+
+        if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
+            bytesWritten += entrySize;
+            break;
+        } else {
+            *(ULONG*)entryPtr = entrySize;
+            offset += entrySize;
+            bytesWritten += entrySize;
+        }
     }
 
     IoStatusBlock->Status = STATUS_SUCCESS;
