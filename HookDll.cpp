@@ -613,75 +613,58 @@ CachedDirEntry ConvertFindData(const WIN32_FIND_DATAW& fd) {
 }
 
 // 核心：构建合并后的文件列表
-std::vector<MergedDirEntry> BuildMergedDirectoryList(
-    const wchar_t* realDirPath,
-    const wchar_t* sandboxDirPath
-) {
-    std::map<std::wstring, MergedDirEntry, CaseInsensitiveCompare> entryMap;
+void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& sandboxPath, const std::wstring& pattern, std::vector<CachedDirEntry>& outList) {
+    std::map<std::wstring, CachedDirEntry> mergedMap;
 
-    // **修复1: 总是先读取真实目录**
-    WIN32_FIND_DATAW findData;
-    std::wstring realPattern = std::wstring(realDirPath) + L"\\*";
-    HANDLE hFind = FindFirstFileW(realPattern.c_str(), &findData);
-
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            std::wstring name = findData.cFileName;
-            if (name == L"." || name == L"..") continue;
-
-            MergedDirEntry entry;
-            entry.fileName = name;
-            entry.attributes = findData.dwFileAttributes;
-            entry.creationTime = findData.ftCreationTime;
-            entry.lastAccessTime = findData.ftLastAccessTime;
-            entry.lastWriteTime = findData.ftLastWriteTime;
-            entry.fileSize = ((LARGE_INTEGER*)&findData.nFileSizeHigh)->QuadPart;
-            entry.isFromSandbox = false;
-
-            entryMap[name] = entry;
-        } while (FindNextFileW(hFind, &findData));
-        FindClose(hFind);
+    // **修复1: 总是先扫描真实目录 (即使沙盒目录不存在)**
+    if (!realPath.empty()) {
+        std::wstring searchPath = realPath + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                std::wstring key = fd.cFileName;
+                std::transform(key.begin(), key.end(), key.begin(), towlower);
+                mergedMap[key] = ConvertFindData(fd);
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
     }
 
-    // **修复2: 然后读取沙盒目录(如果存在),沙盒文件会覆盖或添加到映射中**
-    std::wstring sandboxPattern = std::wstring(sandboxDirPath) + L"\\*";
-    hFind = FindFirstFileW(sandboxPattern.c_str(), &findData);
+    // **修复2: 然后扫描沙盒目录,沙盒文件会覆盖或添加到映射中**
+    if (!sandboxPath.empty()) {
+        std::wstring searchPath = sandboxPath + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            std::wstring name = findData.cFileName;
-            if (name == L"." || name == L"..") continue;
+                std::wstring key = fd.cFileName;
+                std::transform(key.begin(), key.end(), key.begin(), towlower);
 
-            // 检查是否为墓碑文件 (隐藏 + 系统属性)
-            if (IsTombstone(findData.dwFileAttributes)) {
-                // 从映射中移除该文件(隐藏真实目录中的对应文件)
-                entryMap.erase(name);
-                continue;
-            }
-
-            // 沙盒文件覆盖真实文件,或添加新文件
-            MergedDirEntry entry;
-            entry.fileName = name;
-            entry.attributes = findData.dwFileAttributes;
-            entry.creationTime = findData.ftCreationTime;
-            entry.lastAccessTime = findData.ftLastAccessTime;
-            entry.lastWriteTime = findData.ftLastWriteTime;
-            entry.fileSize = ((LARGE_INTEGER*)&findData.nFileSizeHigh)->QuadPart;
-            entry.isFromSandbox = true;
-
-            entryMap[name] = entry;  // 覆盖或添加
-        } while (FindNextFileW(hFind, &findData));
-        FindClose(hFind);
+                // 检查是否为墓碑文件 (隐藏 + 系统属性)
+                if (IsTombstone(fd.dwFileAttributes)) {
+                    mergedMap.erase(key); // 墓碑:从列表中删除,隐藏真实目录中的对应文件
+                } else {
+                    mergedMap[key] = ConvertFindData(fd); // 覆盖或添加:使用沙盒版本
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
     }
 
-    // 转换为vector返回
-    std::vector<MergedDirEntry> result;
-    result.reserve(entryMap.size());
-    for (auto& pair : entryMap) {
-        result.push_back(pair.second);
-    }
+    // 3. 总是添加 . 和 ..
+    CachedDirEntry dotEntry = {}; dotEntry.FileName = L"."; dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+    outList.push_back(dotEntry);
+    CachedDirEntry dotDotEntry = {}; dotDotEntry.FileName = L".."; dotDotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+    outList.push_back(dotDotEntry);
 
-    return result;
+    // 4. 转为 Vector
+    for (const auto& pair : mergedMap) {
+        outList.push_back(pair.second);
+    }
 }
 
 // 辅助：检查 NT 路径对应的文件是否存在
@@ -926,32 +909,50 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
+    // **修复: 处理删除操作**
     if (FileInformationClass == FileDispositionInformation ||
         FileInformationClass == FileDispositionInformationEx)
     {
-        std::wstring ntPath = GetNtPathFromHandle(FileHandle);
-        if (ntPath.empty() || !ShouldIntercept(ntPath.c_str())) {
+        std::wstring ntPath = GetPathFromHandle(FileHandle);
+        if (ntPath.empty()) {
             return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
         }
 
-        std::wstring sandboxPath = TryRedirectNtPath(ntPath.c_str(), false);
-        std::wstring realPath = ntPath;
+        // 检查是否需要重定向
+        std::wstring targetPath;
+        if (!ShouldRedirect(ntPath, targetPath)) {
+            return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+        }
 
-        // **修复:确保删除操作在沙盒路径上执行**
-        if (!sandboxPath.empty() && sandboxPath != ntPath) {
-            // 需要在沙盒路径上操作
+        // 检查文件是否在沙盒中
+        std::wstring targetDosPath = NtPathToDosPath(targetPath);
+        DWORD attrs = GetFileAttributesW(targetDosPath.c_str());
+
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            // **修复: 文件在沙盒中,需要在沙盒路径上执行删除操作**
             OBJECT_ATTRIBUTES objAttr;
             UNICODE_STRING usPath;
-            RtlInitUnicodeString(&usPath, sandboxPath.c_str());
+            RtlInitUnicodeString(&usPath, targetPath.c_str());
             InitializeObjectAttributes(&objAttr, &usPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             HANDLE hSandbox = NULL;
             IO_STATUS_BLOCK iosb = {0};
 
+            // 确定打开选项
+            ULONG openOptions = FILE_OPEN_FOR_BACKUP_INTENT;
+            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                openOptions |= FILE_DIRECTORY_FILE;
+            }
+
             // 打开沙盒文件/目录
-            NTSTATUS status = fpNtOpenFile(&hSandbox, DELETE | SYNCHRONIZE, &objAttr, &iosb,
-                                           FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                           FILE_OPEN_FOR_BACKUP_INTENT);
+            NTSTATUS status = fpNtOpenFile(
+                &hSandbox,
+                DELETE | SYNCHRONIZE,
+                &objAttr,
+                &iosb,
+                FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                openOptions
+            );
 
             if (NT_SUCCESS(status)) {
                 // 在沙盒句柄上执行删除
@@ -959,9 +960,46 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                 fpNtClose(hSandbox);
                 return status;
             }
+
+            // 如果打开失败,回退到原始调用
+            return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+        } else {
+            // 文件不在沙盒中,检查是否在真实目录中
+            std::wstring realDosPath = NtPathToDosPath(ntPath);
+            DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
+
+            if (realAttrs != INVALID_FILE_ATTRIBUTES) {
+                // **修复: 文件在真实目录中,创建墓碑文件**
+                // 确保沙盒父目录存在
+                wchar_t dirBuf[MAX_PATH];
+                wcscpy_s(dirBuf, targetDosPath.c_str());
+                PathRemoveFileSpecW(dirBuf);
+                RecursiveCreateDirectory(dirBuf);
+
+                // 创建墓碑文件 (隐藏+系统属性)
+                HANDLE hTombstone = CreateFileW(
+                    targetDosPath.c_str(),
+                    GENERIC_WRITE,
+                    0,
+                    NULL,
+                    CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                    NULL
+                );
+
+                if (hTombstone != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hTombstone);
+
+                    // 返回成功(虚拟删除)
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_SUCCESS;
+                }
+            }
         }
     }
 
+    // 其他信息类别或非删除操作,直接调用原始函数
     return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
@@ -1091,98 +1129,80 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     BOOLEAN RestartScan
 ) {
     if (g_IsInHook) {
-        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                     IoStatusBlock, FileInformation, Length,
-                                     FileInformationClass, ReturnSingleEntry,
-                                     FileName, RestartScan);
+        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
     RecursionGuard guard;
 
     // 获取目录路径
-    std::wstring ntPath = GetNtPathFromHandle(FileHandle);
-    if (ntPath.empty() || !ShouldIntercept(ntPath.c_str())) {
-        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                     IoStatusBlock, FileInformation, Length,
-                                     FileInformationClass, ReturnSingleEntry,
-                                     FileName, RestartScan);
+    std::wstring ntDirPath = GetPathFromHandle(FileHandle);
+    if (ntDirPath.empty()) {
+        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // 使用句柄作为缓存键
-    ULONGLONG handleKey = (ULONGLONG)FileHandle;
+    // 检查是否需要拦截
+    std::wstring targetPath;
+    if (!ShouldRedirect(ntDirPath, targetPath)) {
+        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
+    }
 
-    // 如果是重新扫描,清除缓存
+    // --- 目录合并逻辑 ---
+
+    std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+
+    // 如果请求重新扫描,清除上下文
     if (RestartScan) {
-        std::lock_guard<std::mutex> lock(g_DirCacheMutex);
-        g_DirCache.erase(handleKey);
+        auto it = g_DirContextMap.find(FileHandle);
+        if (it != g_DirContextMap.end()) {
+            delete it->second;
+            g_DirContextMap.erase(it);
+        }
     }
 
-    // 检查缓存
-    std::lock_guard<std::mutex> lock(g_DirCacheMutex);
-    auto it = g_DirCache.find(handleKey);
+    // 查找或创建上下文
+    DirContext* ctx = nullptr;
+    auto it = g_DirContextMap.find(FileHandle);
+    if (it == g_DirContextMap.end()) {
+        ctx = new DirContext();
+        g_DirContextMap[FileHandle] = ctx;
+    } else {
+        ctx = it->second;
+    }
 
-    if (it == g_DirCache.end()) {
-        // **修复3: 构建合并列表时使用DOS路径**
-        std::wstring realDir = ntPath;
-        std::wstring sandboxDir = TryRedirectNtPath(ntPath.c_str(), true);
+    // 如果尚未初始化,构建合并列表
+    if (!ctx->IsInitialized) {
+        std::wstring realDosPath = NtPathToDosPath(ntDirPath);
+        std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
 
-        // 转换为DOS路径进行合并
-        std::wstring realDosPath = NtPathToDosPath(realDir.c_str());
-        std::wstring sandboxDosPath = NtPathToDosPath(sandboxDir.c_str());
-
-        // 如果转换失败,回退到原始调用
-        if (realDosPath.empty() || sandboxDosPath.empty()) {
-            return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                         IoStatusBlock, FileInformation, Length,
-                                         FileInformationClass, ReturnSingleEntry,
-                                         FileName, RestartScan);
-        }
-
-        // **修复4: 调用修复后的合并函数**
-        std::vector<MergedDirEntry> mergedList = BuildMergedDirectoryList(
-            realDosPath.c_str(),
-            sandboxDosPath.c_str()
-        );
-
-        // 应用过滤器(如果有)
+        std::wstring pattern = L"*";
         if (FileName && FileName->Length > 0) {
-            std::wstring pattern(FileName->Buffer, FileName->Length / sizeof(wchar_t));
-            std::vector<MergedDirEntry> filtered;
-            for (auto& entry : mergedList) {
-                if (MatchPattern(entry.fileName.c_str(), pattern.c_str())) {
-                    filtered.push_back(entry);
-                }
-            }
-            mergedList = std::move(filtered);
+            pattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
         }
 
-        // 存入缓存
-        DirectoryCache cache;
-        cache.entries = std::move(mergedList);
-        cache.currentIndex = 0;
-        g_DirCache[handleKey] = std::move(cache);
-        it = g_DirCache.find(handleKey);
+        // **修复3: 调用修复后的合并函数**
+        BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, ctx->Entries);
+        ctx->CurrentIndex = 0;
+        ctx->IsInitialized = true;
     }
 
-    DirectoryCache& cache = it->second;
+    lock.unlock();
 
-    // 检查是否已读取完毕
-    if (cache.currentIndex >= cache.entries.size()) {
+    // 从缓存中填充数据
+    if (ctx->CurrentIndex >= ctx->Entries.size()) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
         return STATUS_NO_MORE_FILES;
     }
 
-    // 填充缓冲区
     ULONG bytesWritten = 0;
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
 
-    while (cache.currentIndex < cache.entries.size()) {
-        const MergedDirEntry& entry = cache.entries[cache.currentIndex];
-        ULONG fileNameBytes = (ULONG)(entry.fileName.length() * sizeof(wchar_t));
+    while (ctx->CurrentIndex < ctx->Entries.size()) {
+        const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
+        ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
         ULONG entrySize = 0;
 
-        // 根据信息类别计算所需大小
+        // 计算所需大小
         switch (FileInformationClass) {
             case FileDirectoryInformation:
                 entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes;
@@ -1207,7 +1227,6 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
 
         // 检查缓冲区空间
         if (offset + entrySize > Length) {
-            // 如果一个条目都没写入,返回缓冲区溢出
             if (bytesWritten == 0) {
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
                 IoStatusBlock->Information = 0;
@@ -1220,70 +1239,85 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
-        LARGE_INTEGER fileSize;
-        fileSize.QuadPart = entry.fileSize;
-
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
-                info->FileAttributes = entry.attributes;
-                FileTimeToLargeInteger(entry.creationTime, &info->CreationTime);
-                FileTimeToLargeInteger(entry.lastAccessTime, &info->LastAccessTime);
-                FileTimeToLargeInteger(entry.lastWriteTime, &info->LastWriteTime);
-                info->EndOfFile = fileSize;
-                info->AllocationSize = fileSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
-                memcpy(info->FileName, entry.fileName.c_str(), fileNameBytes);
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
             case FileFullDirectoryInformation: {
                 FILE_FULL_DIR_INFORMATION* info = (FILE_FULL_DIR_INFORMATION*)entryPtr;
-                info->FileAttributes = entry.attributes;
-                FileTimeToLargeInteger(entry.creationTime, &info->CreationTime);
-                FileTimeToLargeInteger(entry.lastAccessTime, &info->LastAccessTime);
-                FileTimeToLargeInteger(entry.lastWriteTime, &info->LastWriteTime);
-                info->EndOfFile = fileSize;
-                info->AllocationSize = fileSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
-                memcpy(info->FileName, entry.fileName.c_str(), fileNameBytes);
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
             case FileBothDirectoryInformation: {
                 FILE_BOTH_DIR_INFORMATION* info = (FILE_BOTH_DIR_INFORMATION*)entryPtr;
-                info->FileAttributes = entry.attributes;
-                FileTimeToLargeInteger(entry.creationTime, &info->CreationTime);
-                FileTimeToLargeInteger(entry.lastAccessTime, &info->LastAccessTime);
-                FileTimeToLargeInteger(entry.lastWriteTime, &info->LastWriteTime);
-                info->EndOfFile = fileSize;
-                info->AllocationSize = fileSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
-                info->ShortNameLength = 0;
-                memcpy(info->FileName, entry.fileName.c_str(), fileNameBytes);
+
+                // 设置短文件名
+                size_t shortLen = min(entry.ShortName.length(), 12);
+                info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
+                if (shortLen > 0) {
+                    memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                }
+
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
             case FileIdBothDirectoryInformation: {
                 FILE_ID_BOTH_DIR_INFORMATION* info = (FILE_ID_BOTH_DIR_INFORMATION*)entryPtr;
-                info->FileAttributes = entry.attributes;
-                FileTimeToLargeInteger(entry.creationTime, &info->CreationTime);
-                FileTimeToLargeInteger(entry.lastAccessTime, &info->LastAccessTime);
-                FileTimeToLargeInteger(entry.lastWriteTime, &info->LastWriteTime);
-                info->EndOfFile = fileSize;
-                info->AllocationSize = fileSize;
+                info->FileAttributes = entry.FileAttributes;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
-                info->ShortNameLength = 0;
-                info->FileId.QuadPart = 0;
-                memcpy(info->FileName, entry.fileName.c_str(), fileNameBytes);
+
+                // 设置短文件名
+                size_t shortLen = min(entry.ShortName.length(), 12);
+                info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
+                if (shortLen > 0) {
+                    memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                }
+
+                info->FileId.QuadPart = 0; // 简化处理
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
         }
 
         // 设置 NextEntryOffset
-        cache.currentIndex++;
+        ctx->CurrentIndex++;
 
-        if (ReturnSingleEntry || cache.currentIndex >= cache.entries.size()) {
+        if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
             // 最后一个条目,NextEntryOffset = 0
             *(ULONG*)entryPtr = 0;
             bytesWritten += entrySize;
