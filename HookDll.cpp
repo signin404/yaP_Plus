@@ -636,25 +636,21 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
-    // [新增] 模式 1 判断：仅重定向系统分区和启动器目录
+    // 模式 1 判断
     if (g_HookMode == 1) {
         bool isSystem = (!g_SystemDriveNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.length()) == 0);
         bool isLauncher = (!g_LauncherDirNt.empty() && ContainsCaseInsensitive(fullNtPath, g_LauncherDirNt));
-
-        // 如果既不是系统盘 也不是启动器目录 不重定向 (直接访问真实路径)
         if (!isSystem && !isLauncher) {
             return false;
         }
     }
-
-    // [新增] 模式 3 判断：虽然限制访问 但只要允许访问的路径 都进行重定向
-    // 所以模式 3 的重定向逻辑与模式 2 相同 区别在于 Detour_NtCreateFile 里的拦截
 
     targetPath = L"\\??\\";
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
     // --- 1. 检查是否在启动器目录内 ---
+    // 如果启动器目录本身就是沙盒根目录，这里会直接映射到沙盒根目录
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
     // --- 2. 检查当前用户目录 (user\current) ---
@@ -674,24 +670,23 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         return true;
     }
 
-    // --- [新增] 5. 检查 Users 根目录 ---
-    // 必须放在 user\current 和 user\public 之后
-    // 映射: C:\Users -> \Users (即 Data\Users)
-    // 映射: C:\Users\Other -> \Users\Other (即 Data\Users\Other)
+    // --- 5. 检查 Users 根目录 ---
     if (CheckAndMap(fullNtPath, g_UsersDirNt, L"\\Users", targetPath) ||
         CheckAndMap(fullNtPath, g_UsersDirNtShort, L"\\Users", targetPath)) {
         return true;
     }
 
-    // --- 5. 默认绝对路径映射 ---
-    std::wstring relPath = fullNtPath.substr(4);
+    // --- [关键修复] 6. 默认绝对路径映射 ---
+    // 例如：C:\#New -> \??\SandboxRoot\C\#New
+    // fullNtPath 是 \??\C:\#New
+    std::wstring relPath = fullNtPath.substr(4); // 得到 C:\#New
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
-    size_t colonPos = relPath.find(L':');
-    if (colonPos != std::wstring::npos) {
-        relPath.erase(colonPos, 1);
+    
+    // 确保 targetPath 后面有斜杠，除非 relPath 是空的
+    if (targetPath.back() != L'\\' && !relPath.empty()) {
+        targetPath += L"\\";
     }
-    targetPath += L"\\";
-    targetPath += relPath;
+    targetPath += relPath; // 拼接 C:\#New
     return true;
 }
 
@@ -840,6 +835,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 // 辅助：检查 NT 路径对应的文件是否存在
 bool NtPathExists(const std::wstring& ntPath) {
     std::wstring dosPath = NtPathToDosPath(ntPath);
+    if (dosPath.empty()) return false; // [修复] 如果 DOS 路径转换失败，则认为不存在
     DWORD attrs = GetFileAttributesW(dosPath.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
@@ -1357,66 +1353,60 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
 
 // [新增] 智能获取真实路径和沙盒路径
 bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
-    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Portable\Data\C)
     std::wstring rawPath = GetPathFromHandle(hFile);
     if (rawPath.empty()) return false;
 
-    // 2. [关键修复] 转换为 NT DOS 路径 (例如 \??\D:\Portable\Data\C)
     std::wstring handleNtPath = DevicePathToNtPath(rawPath);
+    if (handleNtPath.empty()) return false; // 如果转换失败，直接返回
 
-    // 构造沙盒的 NT 路径前缀用于比较
     std::wstring sandboxRootNt = L"\\??\\";
     sandboxRootNt += g_SandboxRoot;
-    // 移除末尾斜杠以防万一 确保匹配准确
     if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
 
-    // 3. 检查句柄是否已经指向沙盒 (反向解析)
-    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
+    // 1. 句柄是否已经指向沙盒 (反向解析)
     if (handleNtPath.size() >= sandboxRootNt.size() &&
         _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
 
-        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
-        size_t rootLen = sandboxRootNt.length();
+        std::wstring relPath = handleNtPath.substr(sandboxRootNt.length());
+        if (!relPath.empty() && relPath[0] == L'\\') relPath.erase(0, 1); // 移除开头的斜杠
 
-        // 提取相对部分: \C
-        std::wstring relPath = handleNtPath.substr(rootLen);
-
-        std::wstring realNtPath;
-
-        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
-        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
-            // \C\Windows -> \??\C:\Windows
-            wchar_t driveLetter = relPath[1];
-            realNtPath = L"\\??\\";
-            realNtPath += driveLetter;
-            realNtPath += L":";
-            realNtPath += relPath.substr(2);
+        // [关键修复] 反向映射逻辑需要更通用
+        // 假设沙盒结构是 SandboxRoot\C\Path 或 SandboxRoot\Users\Current\Path
+        // 这里的 relPath 可能是 C\Path 或 Users\Current\Path
+        
+        // 尝试从 relPath 还原出原始的 NT 路径
+        std::wstring tempRealNtPath = L"\\??\\";
+        
+        // 检查是否是驱动器根目录映射 (例如 C\...)
+        if (relPath.length() >= 2 && relPath[1] == L'\\') { // 匹配 C\Windows
+            tempRealNtPath += relPath[0]; // C
+            tempRealNtPath += L":";       // C:
+            tempRealNtPath += relPath.substr(1); // \Windows
+        } else if (relPath.length() == 1) { // 匹配 C
+             tempRealNtPath += relPath[0]; // C
+             tempRealNtPath += L":";       // C:
         }
-        // 针对根目录 \C
-        else if (relPath.length() == 2 && relPath[0] == L'\\') {
-             wchar_t driveLetter = relPath[1];
-             realNtPath = L"\\??\\";
-             realNtPath += driveLetter;
-             realNtPath += L":";
-             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
-             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
+        // [新增] 处理特殊目录的反向映射 (例如 Users\Current -> C:\Users\CurrentUser)
+        else if (ContainsCaseInsensitive(relPath, L"Users\\Current")) {
+            // 这需要更复杂的反向映射表，这里简化处理
+            // 如果你的 ShouldRedirect 映射了 Users\Current 到 UserProfile，这里需要反推
+            // 暂时跳过复杂反推，直接返回 false，让它走默认逻辑
+            // 更好的方式是维护一个双向映射表
+            return false; 
         }
         else {
-            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
-            // 比如检测 \Users 映射回 C:\Users
-            // 目前暂不支持 返回 false
+            // 其他情况，例如 SandboxRoot\SomeOtherPath，无法反推到标准驱动器路径
             return false;
         }
 
         outSandboxDos = NtPathToDosPath(handleNtPath);
-        outRealDos = NtPathToDosPath(realNtPath);
+        outRealDos = NtPathToDosPath(tempRealNtPath);
         return true;
     }
 
-    // 4. 句柄指向真实路径 (正向解析)
+    // 2. 句柄指向真实路径 (正向解析)
     else {
         std::wstring targetNtPath;
-        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
         if (ShouldRedirect(handleNtPath, targetNtPath)) {
             outRealDos = NtPathToDosPath(handleNtPath);
             outSandboxDos = NtPathToDosPath(targetNtPath);
