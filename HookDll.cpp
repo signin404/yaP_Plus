@@ -288,6 +288,39 @@ typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
 #define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
 #endif
 
+// [新增] 补充缺失的目录信息结构体
+typedef struct _FILE_NAMES_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_NAMES_INFORMATION, *PFILE_NAMES_INFORMATION;
+
+typedef struct _FILE_ID_FULL_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    LARGE_INTEGER FileId;
+    WCHAR FileName[1];
+} FILE_ID_FULL_DIR_INFORMATION, *PFILE_ID_FULL_DIR_INFORMATION;
+
+// [新增] 补充枚举值
+#ifndef FileNamesInformation
+#define FileNamesInformation ((FILE_INFORMATION_CLASS)12)
+#endif
+
+#ifndef FileIdFullDirectoryInformation
+#define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
+#endif
+
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
@@ -1227,6 +1260,16 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
     return false;
 }
 
+// [新增] 生成简单的 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    std::hash<std::wstring> hasher;
+    // 简单的哈希，确保非零
+    size_t h = hasher(name);
+    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
+    return id;
+}
+
 // [新增] 内部公共查询逻辑
 NTSTATUS HandleDirectoryQuery(
     HANDLE FileHandle,
@@ -1244,21 +1287,17 @@ NTSTATUS HandleDirectoryQuery(
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
 
-    // 检查重定向
     if (!ShouldRedirect(ntDirPath, targetPath)) {
         return STATUS_NOT_SUPPORTED;
     }
 
-    // 准备本地变量，避免在锁内做复杂操作
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
 
-    // --- 阶段 1: 检查是否需要构建 (使用读锁/共享锁) ---
+    // --- 阶段 1: 检查是否需要构建 ---
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
-
-        // 如果是重新扫描，我们需要在写锁阶段删除，这里先标记
         if (RestartScan) {
             needsBuild = true;
         } else {
@@ -1272,9 +1311,7 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
-    // --- 阶段 2: 执行 I/O (无锁状态) ---
-    // 这是防止死锁的关键：BuildMergedDirectoryList 内部调用 FindFirstFile (可能涉及堆锁/加载器锁)
-    // 绝对不能在持有 g_DirContextMutex 时调用它
+    // --- 阶段 2: 执行 I/O (无锁) ---
     if (needsBuild) {
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
@@ -1282,26 +1319,21 @@ NTSTATUS HandleDirectoryQuery(
         if (FileName && FileName->Length > 0) {
             pattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
         }
-
-        // 即使 realDosPath 为空(转换失败)，BuildMergedDirectoryList 也能处理(只扫沙盒)
         BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, localEntries);
     }
 
-    // --- 阶段 3: 更新上下文 (使用写锁/独占锁) ---
+    // --- 阶段 3: 更新上下文 ---
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
-
-        // 处理 RestartScan: 删除旧的
         if (RestartScan) {
             auto it = g_DirContextMap.find(FileHandle);
             if (it != g_DirContextMap.end()) {
                 delete it->second;
                 g_DirContextMap.erase(it);
             }
-            ctx = nullptr; // 强制重新创建
+            ctx = nullptr;
         }
 
-        // 获取或创建
         auto it = g_DirContextMap.find(FileHandle);
         if (it == g_DirContextMap.end()) {
             ctx = new DirContext();
@@ -1310,8 +1342,6 @@ NTSTATUS HandleDirectoryQuery(
             ctx = it->second;
         }
 
-        // 如果我们刚才构建了列表，现在更新进去
-        // 注意：可能在无锁期间有其他线程也构建了，这里简单的覆盖策略即可
         if (needsBuild) {
             ctx->Entries = std::move(localEntries);
             ctx->CurrentIndex = 0;
@@ -1319,11 +1349,9 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
-    // --- 阶段 4: 填充缓冲区 (无锁，使用局部副本或再次加读锁) ---
-    // 为了安全，我们再次获取读锁来读取 ctx->Entries
+    // --- 阶段 4: 填充缓冲区 ---
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
 
-    // 再次检查 ctx 有效性 (防止极端情况)
     if (!ctx || !ctx->IsInitialized) {
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
         return STATUS_UNSUCCESSFUL;
@@ -1350,7 +1378,12 @@ NTSTATUS HandleDirectoryQuery(
             case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
             case FileBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
             case FileIdBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
+            // [新增] 支持更多类型
+            case FileNamesInformation: entrySize = FIELD_OFFSET(FILE_NAMES_INFORMATION, FileName) + fileNameBytes; break;
+            case FileIdFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
+
             default:
+                // 遇到不支持的类型，返回错误，这通常是导致“无法访问”的原因
                 IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
                 IoStatusBlock->Information = 0;
                 return STATUS_INVALID_INFO_CLASS;
@@ -1369,6 +1402,9 @@ NTSTATUS HandleDirectoryQuery(
 
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
+
+        // 生成 FileId
+        LARGE_INTEGER fileId = GenerateFileId(entry.FileName);
 
         // 填充数据
         switch (FileInformationClass) {
@@ -1430,7 +1466,31 @@ NTSTATUS HandleDirectoryQuery(
                 size_t shortLen = min(entry.ShortName.length(), 12);
                 info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
                 if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
-                info->FileId.QuadPart = 0;
+                info->FileId = fileId; // 使用生成的 ID
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
+                break;
+            }
+            // [新增] 处理 FileNamesInformation
+            case FileNamesInformation: {
+                FILE_NAMES_INFORMATION* info = (FILE_NAMES_INFORMATION*)entryPtr;
+                info->FileIndex = 0;
+                info->FileNameLength = fileNameBytes;
+                memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
+                break;
+            }
+            // [新增] 处理 FileIdFullDirectoryInformation
+            case FileIdFullDirectoryInformation: {
+                FILE_ID_FULL_DIR_INFORMATION* info = (FILE_ID_FULL_DIR_INFORMATION*)entryPtr;
+                info->FileAttributes = entry.FileAttributes;
+                info->CreationTime = entry.CreationTime;
+                info->LastAccessTime = entry.LastAccessTime;
+                info->LastWriteTime = entry.LastWriteTime;
+                info->ChangeTime = entry.ChangeTime;
+                info->EndOfFile = entry.EndOfFile;
+                info->AllocationSize = entry.AllocationSize;
+                info->FileNameLength = fileNameBytes;
+                info->EaSize = 0;
+                info->FileId = fileId; // 使用生成的 ID
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
