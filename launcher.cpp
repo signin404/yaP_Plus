@@ -3936,7 +3936,7 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
                     // [修复] 取消注释 并传递 NULL 作为 hThread 参数
-                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程 
+                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程
                     // 所以这里 hThread 为 NULL 是安全的
                     success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName);
 

@@ -615,7 +615,7 @@ bool IsPathAllowed(const std::wstring& ntPath) {
     // 3. 特殊处理：允许访问系统盘根目录 (为了能找到 Windows)
     // 但不允许访问根目录下的其他文件 这将在目录列举时过滤
     if (!g_SystemDriveNt.empty()) {
-        // 精确匹配 \??\C: 或 \??\C:\
+        // 精确匹配 \??\C: 或 \??\C: (注意：移除末尾的反斜杠以免造成续行注释错误)
         if (_wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.length()) == 0) {
             // 如果长度相等 或者是根目录反斜杠
             if (ntPath.length() == g_SystemDriveNt.length()) return true;
