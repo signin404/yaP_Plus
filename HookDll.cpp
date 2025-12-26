@@ -548,16 +548,28 @@ void PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
     std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
     std::wstring targetDos = NtPathToDosPath(targetNtPath);
 
-    if (GetFileAttributesW(sourceDos.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return;
+
+    // 如果目标已存在，不需要复制
     if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
+    // 1. 确保父目录存在
     wchar_t dirBuf[MAX_PATH];
     wcscpy_s(dirBuf, targetDos.c_str());
     PathRemoveFileSpecW(dirBuf);
     RecursiveCreateDirectory(dirBuf);
 
-    DebugLog(L"Migrating: %s -> %s", sourceDos.c_str(), targetDos.c_str());
-    CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE);
+    // 2. 根据类型处理
+    if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+        // 如果是目录，直接在沙盒创建空目录即可
+        // 不需要复制内容，因为后续访问内容时会通过 BuildMergedDirectoryList 合并显示
+        CreateDirectoryW(targetDos.c_str(), NULL);
+    } else {
+        // 如果是文件，执行复制
+        DebugLog(L"Migrating: %s -> %s", sourceDos.c_str(), targetDos.c_str());
+        CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE);
+    }
 }
 
 void ProcessQueryData(PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS FileInformationClass) {
@@ -893,25 +905,20 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // [修改] 增加对 Ex 版本的检查
     bool isDestructive = (FileInformationClass == FileDispositionInformation ||
-                          FileInformationClass == FileDispositionInformationEx || // 新增
+                          FileInformationClass == FileDispositionInformationEx ||
                           FileInformationClass == FileBasicInformation ||
                           FileInformationClass == FileRenameInformation ||
-                          FileInformationClass == FileRenameInformationEx);       // 新增
+                          FileInformationClass == FileRenameInformationEx);
 
     if (!isDestructive) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 获取路径并转换设备路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
-    if (rawPath.empty()) {
-        // 如果获取路径失败，为了安全起见，如果是删除操作，建议拦截或记录
-        // 但为了兼容性，暂时放行，或者你可以选择在这里 return STATUS_ACCESS_DENIED;
-        return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-    }
+    if (rawPath.empty()) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
+    // 转换设备路径
     std::wstring currentPath = DevicePathToNtPath(rawPath);
 
     if (ContainsCaseInsensitive(currentPath, g_SandboxRoot)) {
@@ -923,59 +930,100 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    DebugLog(L"Intercepted Destructive Op (Class %d) on Real File: %s", FileInformationClass, currentPath.c_str());
-
-    PerformCopyOnWrite(currentPath, targetNtPath);
-    std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
-
-    // --- 处理删除逻辑 ---
+    // --- 预处理删除标志 ---
     bool isDelete = false;
-
     if (FileInformationClass == FileDispositionInformation) {
         FILE_DISPOSITION_INFORMATION* info = (FILE_DISPOSITION_INFORMATION*)FileInformation;
         if (info->DeleteFile) isDelete = true;
     }
-    // [新增] 处理 Ex 删除
     else if (FileInformationClass == FileDispositionInformationEx) {
         FILE_DISPOSITION_INFORMATION_EX* info = (FILE_DISPOSITION_INFORMATION_EX*)FileInformation;
-        // 只要有 DELETE 标志，就是删除
         if (info->Flags & FILE_DISPOSITION_DELETE) isDelete = true;
     }
 
+    // 如果不是删除操作，先执行 CoW
+    if (!isDelete) {
+        PerformCopyOnWrite(currentPath, targetNtPath);
+    }
+
+    std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+    std::wstring realDosPath = NtPathToDosPath(currentPath);
+
+    // --- 处理删除逻辑 ---
     if (isDelete) {
-        DebugLog(L"Redirect Delete (Safe): %s", targetDosPath.c_str());
-        // 删除沙盒文件
-        DeleteFileW(targetDosPath.c_str());
+        DebugLog(L"Redirect Delete: %s", targetDosPath.c_str());
 
-        // 伪造成功返回
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = 0;
-        return STATUS_SUCCESS;
-    }
+        // 检查真实文件是否存在
+        DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
+        bool realExists = (realAttrs != INVALID_FILE_ATTRIBUTES);
 
-    // --- 处理属性修改 ---
-    if (FileInformationClass == FileBasicInformation) {
-        DebugLog(L"Redirect Attributes (Safe): %s", targetDosPath.c_str());
-        HANDLE hSandbox = CreateFileW(targetDosPath.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (hSandbox != INVALID_HANDLE_VALUE) {
-            IO_STATUS_BLOCK ioBlock;
-            fpNtSetInformationFile(hSandbox, &ioBlock, FileInformation, Length, FileInformationClass);
-            CloseHandle(hSandbox);
+        // 确保沙盒父目录存在
+        wchar_t dirBuf[MAX_PATH];
+        wcscpy_s(dirBuf, targetDosPath.c_str());
+        PathRemoveFileSpecW(dirBuf);
+        RecursiveCreateDirectory(dirBuf);
+
+        if (realExists) {
+            // 【关键】如果真实文件存在，必须创建“墓碑”来遮挡它
+            // 即使原对象是目录，我们也创建一个文件墓碑，这样 BuildMergedDirectoryList 会把它过滤掉
+
+            // 先尝试删除沙盒中可能存在的同名对象（防止冲突）
+            DWORD sandboxAttrs = GetFileAttributesW(targetDosPath.c_str());
+            if (sandboxAttrs != INVALID_FILE_ATTRIBUTES) {
+                if (sandboxAttrs & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(targetDosPath.c_str());
+                else DeleteFileW(targetDosPath.c_str());
+            }
+
+            // 创建墓碑 (隐藏 + 系统属性)
+            HANDLE hTomb = CreateFileW(targetDosPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
+            if (hTomb != INVALID_HANDLE_VALUE) {
+                CloseHandle(hTomb);
+            } else {
+                // 如果创建失败，可能是权限问题，返回错误
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
+        } else {
+            // 如果真实文件不存在（只在沙盒里），直接删除沙盒对象
+            DWORD sandboxAttrs = GetFileAttributesW(targetDosPath.c_str());
+            if (sandboxAttrs != INVALID_FILE_ATTRIBUTES) {
+                if (sandboxAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+                    if (!RemoveDirectoryW(targetDosPath.c_str())) {
+                        // 目录非空等原因删除失败
+                        IoStatusBlock->Status = STATUS_DIRECTORY_NOT_EMPTY; // 近似错误码
+                        return STATUS_DIRECTORY_NOT_EMPTY;
+                    }
+                } else {
+                    if (!DeleteFileW(targetDosPath.c_str())) {
+                        IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+            }
         }
+
+        // 伪造成功
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = 0;
         return STATUS_SUCCESS;
     }
 
-    // --- 处理重命名 ---
+    // --- 处理其他操作 (属性、重命名等) ---
+    // 此时文件已通过 CoW 复制到沙盒，直接操作沙盒文件
+    HANDLE hSandbox = CreateFileW(targetDosPath.c_str(), GENERIC_WRITE | GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hSandbox != INVALID_HANDLE_VALUE) {
+        NTSTATUS status = fpNtSetInformationFile(hSandbox, IoStatusBlock, FileInformation, Length, FileInformationClass);
+        CloseHandle(hSandbox);
+        return status;
+    }
+
+    // 如果打开沙盒文件失败，可能是重命名等复杂操作，暂时拦截
     if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
-        DebugLog(L"Redirect Rename (Blocked): %s", currentPath.c_str());
-        // 简单粗暴地阻止对真实文件的重命名
         IoStatusBlock->Status = STATUS_ACCESS_DENIED;
-        IoStatusBlock->Information = 0;
         return STATUS_ACCESS_DENIED;
     }
 
+    // 兜底：调用原始函数（通常不会走到这里，除非 CoW 失败）
     return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
