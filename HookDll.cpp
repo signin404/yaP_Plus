@@ -187,6 +187,50 @@ wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 
+// --- 设备路径映射缓存 ---
+std::vector<std::pair<std::wstring, std::wstring>> g_DeviceMap;
+
+void RefreshDeviceMap() {
+    g_DeviceMap.clear();
+    wchar_t drives[512];
+    if (GetLogicalDriveStringsW(512, drives)) {
+        wchar_t* drive = drives;
+        while (*drive) {
+            // drive 是 "C:\"，我们需要 "C:"
+            std::wstring driveStr = drive;
+            if (!driveStr.empty() && driveStr.back() == L'\\') driveStr.pop_back();
+
+            wchar_t devicePath[MAX_PATH];
+            // QueryDosDeviceW("C:", ...) -> "\Device\HarddiskVolume1"
+            if (QueryDosDeviceW(driveStr.c_str(), devicePath, MAX_PATH)) {
+                g_DeviceMap.push_back({ std::wstring(devicePath), driveStr });
+            }
+            drive += wcslen(drive) + 1;
+        }
+    }
+}
+
+// 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
+std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
+    if (g_DeviceMap.empty()) RefreshDeviceMap();
+
+    for (const auto& pair : g_DeviceMap) {
+        const std::wstring& devPrefix = pair.first;
+        const std::wstring& driveLetter = pair.second;
+
+        // 检查前缀匹配
+        if (devicePath.find(devPrefix) == 0) {
+            // 确保匹配的是完整路径段 (防止 Volume1 匹配 Volume10)
+            if (devicePath.length() == devPrefix.length() || devicePath[devPrefix.length()] == L'\\') {
+                std::wstring suffix = devicePath.substr(devPrefix.length());
+                return L"\\??\\" + driveLetter + suffix;
+            }
+        }
+    }
+    // 如果无法转换（例如网络路径或管道），返回原样
+    return devicePath;
+}
+
 // 缓存的 NT 路径
 std::wstring g_LauncherDirNt;
 std::wstring g_UserProfileNt;
@@ -537,25 +581,26 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 获取当前句柄指向的路径
-    std::wstring currentPath = GetPathFromHandle(FileHandle);
-    if (currentPath.empty()) {
+    // 获取当前句柄指向的路径 (这是设备路径)
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 如果已经是沙盒路径，直接放行 (让系统去修改沙盒里的文件)
+    // [新增] 将设备路径转换为 NT DOS 路径 (\??\C:\...)
+    std::wstring currentPath = DevicePathToNtPath(rawPath);
+
+    // 如果已经是沙盒路径，直接放行
     if (ContainsCaseInsensitive(currentPath, g_SandboxRoot)) {
-        // TODO: 这里未来可以优化“虚拟删除”逻辑 (即删除沙盒文件后创建墓碑文件)
-        // 目前先允许直接删除沙盒内的副本
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
     // --- 关键逻辑：句柄指向真实文件 ---
-
+    
     // 检查该路径是否属于应该被重定向的范围
     std::wstring targetNtPath;
+    // 现在 currentPath 是 \??\C:\... 格式，ShouldRedirect 可以正确识别了
     if (!ShouldRedirect(currentPath, targetNtPath)) {
-        // 如果不在重定向规则内（例如 D:\ 盘文件且没配置重定向），则允许修改真实文件
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
@@ -1087,6 +1132,9 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
+    // [新增] 初始化设备路径映射
+    RefreshDeviceMap();
+
     wchar_t buffer[MAX_PATH] = { 0 };
     std::wstring mapName = GetConfigMapName(GetCurrentProcessId());
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, mapName.c_str());
