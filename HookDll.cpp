@@ -45,6 +45,10 @@
 #define FileDispositionInformationEx ((FILE_INFORMATION_CLASS)64)
 #endif
 
+#ifndef FileStandardInformation
+#define FileStandardInformation ((FILE_INFORMATION_CLASS)5)
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
