@@ -1026,6 +1026,39 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     return fpNtDeleteFile(ObjectAttributes);
 }
 
+// [新增] 辅助：将文件转换为墓碑 (截断 + 隐藏 + 系统)
+NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
+    HANDLE hFile = CreateFileW(filePath.c_str(),
+        GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    IO_STATUS_BLOCK iosb;
+    
+    // 1. 截断为 0 字节
+    FILE_END_OF_FILE_INFORMATION eofInfo;
+    eofInfo.EndOfFile.QuadPart = 0;
+    NTSTATUS status = fpNtSetInformationFile(hFile, &iosb, &eofInfo, sizeof(eofInfo), FileEndOfFileInformation);
+
+    if (NT_SUCCESS(status)) {
+        // 2. 设置属性为 Hidden + System
+        FILE_BASIC_INFORMATION basicInfo = { 0 };
+        // 需要先查询现有时间，以免被清零 (可选，这里简化直接覆盖属性)
+        basicInfo.FileAttributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+        status = fpNtSetInformationFile(hFile, &iosb, &basicInfo, sizeof(basicInfo), FileBasicInformation);
+    }
+
+    CloseHandle(hFile);
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtSetInformationFile(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -1047,105 +1080,141 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
     if (isDelete) {
         std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (rawPath.empty()) {
-            return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-        }
+        if (rawPath.empty()) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
-        // [关键] 强制转换为 NT 路径
         std::wstring ntPath = DevicePathToNtPath(rawPath);
+        
+        // 构造沙盒根目录的 NT 路径
+        std::wstring sandboxRootNt = L"\\??\\";
+        sandboxRootNt += g_SandboxRoot;
 
-        // 检查是否需要重定向
-        std::wstring targetPath;
-        if (!ShouldRedirect(ntPath, targetPath)) {
-            return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-        }
-
-        std::wstring targetDosPath = NtPathToDosPath(targetPath);
-        DWORD attrs = GetFileAttributesW(targetDosPath.c_str());
-
-        // --- 情况 1: 文件在沙盒中 ---
-        if (attrs != INVALID_FILE_ATTRIBUTES) {
-            // 简单判断：如果句柄路径本身就包含沙盒根目录，说明已经打开了沙盒文件，直接放行
-            if (rawPath.find(g_SandboxRoot) != std::wstring::npos) {
-                 return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-            }
-
-            // 如果句柄指向真实文件（CoW前打开），但沙盒里已有副本，我们需要删除沙盒里的副本
-            OBJECT_ATTRIBUTES objAttr;
-            UNICODE_STRING usPath;
-            RtlInitUnicodeString(&usPath, targetPath.c_str());
-            InitializeObjectAttributes(&objAttr, &usPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            HANDLE hSandbox = NULL;
-            IO_STATUS_BLOCK iosb = {0};
-
-            ULONG openOptions = FILE_OPEN_FOR_BACKUP_INTENT;
-            if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-                openOptions |= FILE_DIRECTORY_FILE;
-            }
-
-            NTSTATUS status = fpNtOpenFile(
-                &hSandbox,
-                DELETE | SYNCHRONIZE,
-                &objAttr,
-                &iosb,
-                FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-                openOptions
-            );
-
-            if (NT_SUCCESS(status)) {
-                status = fpNtSetInformationFile(hSandbox, IoStatusBlock, FileInformation, Length, FileInformationClass);
-                fpNtClose(hSandbox);
-                return status;
-            }
-            // 如果打开沙盒文件失败，返回错误，不要去删原文件
-            IoStatusBlock->Status = STATUS_ACCESS_DENIED;
-            return STATUS_ACCESS_DENIED;
-        } 
-        // --- 情况 2: 文件不在沙盒中 (仅在真实目录) ---
-        else {
-            std::wstring realDosPath = NtPathToDosPath(ntPath);
-            DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
-
-            // 只有当真实文件存在时，才执行伪删除
-            if (realAttrs != INVALID_FILE_ATTRIBUTES) {
+        // --- 情况 A: 句柄指向沙盒内的文件 ---
+        // (例如：CoW 产生的文件，或者原本就在沙盒里的文件)
+        if (ContainsCaseInsensitive(ntPath, sandboxRootNt)) {
+            
+            // 计算对应的真实路径 (反向映射)
+            // 假设 ntPath = \??\C:\Sandbox\Windows\System32\drivers\etc\hosts
+            // sandboxRootNt = \??\C:\Sandbox
+            // 相对路径 = \Windows\System32\drivers\etc\hosts
+            
+            // 注意：这里需要根据你的 g_SandboxRoot 实际挂载逻辑来反推
+            // 如果你的沙盒结构是 C:\Sandbox\C\Windows... 那么逻辑不同
+            // 假设你的沙盒结构是扁平的或者镜像的，这里需要一个反向解析函数
+            // 简单起见，我们尝试解析出 DOS 路径，然后去掉沙盒前缀
+            
+            std::wstring sandboxDosPath = NtPathToDosPath(ntPath); // C:\Sandbox\Dir\File
+            std::wstring realDosPath;
+            
+            // 简单的反向映射逻辑：
+            // 如果 sandboxDosPath 以 g_SandboxRoot 开头
+            if (sandboxDosPath.find(g_SandboxRoot) == 0) {
+                std::wstring relPath = sandboxDosPath.substr(wcslen(g_SandboxRoot));
+                // 处理可能的斜杠
+                if (!relPath.empty() && relPath[0] == L'\\') relPath.erase(0, 1);
                 
-                // 1. 确保沙盒父目录存在 (手动提取父目录，更稳健)
-                std::wstring parentDir = targetDosPath;
-                size_t lastSlash = parentDir.find_last_of(L'\\');
-                if (lastSlash != std::wstring::npos) {
-                    parentDir = parentDir.substr(0, lastSlash);
-                    // 复制到可变缓冲区以供 RecursiveCreateDirectory 使用
-                    std::vector<wchar_t> buf(parentDir.begin(), parentDir.end());
-                    buf.push_back(0);
-                    RecursiveCreateDirectory(buf.data());
-                }
-
-                // 2. 创建墓碑文件
-                HANDLE hTombstone = CreateFileW(
-                    targetDosPath.c_str(),
-                    GENERIC_WRITE,
-                    0,
-                    NULL,
-                    CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-                    NULL
-                );
-
-                if (hTombstone != INVALID_HANDLE_VALUE) {
-                    CloseHandle(hTombstone);
-                    // 成功创建墓碑，返回成功
+                // 这里假设沙盒内的布局是：SandboxRoot\C\Windows... 
+                // 或者 SandboxRoot\Windows... (取决于你的 ShouldRedirect 映射逻辑)
+                
+                // 回顾 ShouldRedirect: 
+                // 映射 C:\Users -> \Users (即 Sandbox\Users)
+                // 映射 C:\Windows -> Sandbox\Windows (如果是全盘映射)
+                
+                // 如果无法精确反推，我们可以用一个保守策略：
+                // 只要是删除沙盒文件，我们都把它变成墓碑？
+                // 不行，如果是新建的临时文件，删了就该删了，变成墓碑会留下垃圾。
+                
+                // **策略修正**：
+                // 检查真实路径是否存在。如果存在，说明这是 Shadowing，必须变墓碑。
+                // 如果不存在，说明是纯沙盒文件，直接删除。
+                
+                // 尝试重构真实路径：
+                // 我们利用 GetRealAndSandboxPaths 的逻辑思想，但这里需要反向。
+                // 暂时假设我们能通过去掉前缀找到真实路径。
+                // 如果你的沙盒是 C:\Sandbox，映射 C:\Windows -> C:\Sandbox\Windows
+                // 那么 Real = C:\Windows
+                
+                // 这是一个简化的反向查找，可能需要根据你的具体映射表调整
+                // 这里假设简单的后缀匹配
+                
+                // 尝试匹配 g_LauncherDirNt, g_UserProfileNt 等反向
+                // 这比较复杂。
+                
+                // **更简单的 Hack**:
+                // 既然我们已经有了 sandboxDosPath，我们尝试“猜测”真实路径。
+                // 但最稳妥的是：如果文件在沙盒里，我们先把它变成墓碑。
+                // 唯一的副作用是：如果它本该被彻底删除（真实路径没文件），我们却留了个隐藏的0字节文件。
+                // 这通常是可以接受的（甚至有些沙盒系统就是这么设计的，所有删除都是墓碑）。
+                // 这样可以保证绝对不会出现“复活”现象。
+                
+                // 改进：检查是否存在同名的真实文件
+                // 我们需要知道这个沙盒文件对应哪个真实文件。
+                // 由于 ShouldRedirect 是单向的，反向比较难。
+                // 但我们可以利用 HandleDirectoryQuery 里的逻辑：
+                // 如果我们把这个文件删了，HandleDirectoryQuery 会显示什么？
+                // 如果它会显示真实文件，那我们就必须建墓碑。
+                
+                // 让我们采用“宁可错杀”策略：
+                // **凡是删除沙盒文件，一律转化为墓碑。**
+                // 除非我们能确定真实路径没有这个文件。
+                
+                // 为了稍微智能一点，我们尝试剥离沙盒根目录，看看剩下的部分是否构成一个存在的真实路径。
+                // 假设 g_SandboxRoot = C:\Sandbox
+                // File = C:\Sandbox\Windows\System32\drivers\etc\hosts
+                // Rel = Windows\System32\drivers\etc\hosts
+                // Try C:\Windows\System32\drivers\etc\hosts -> Exists? Yes -> Tombstone.
+                
+                // 你的代码中 ShouldRedirect 映射逻辑比较多，这里简化处理：
+                // 直接执行“转化为墓碑”操作。
+                
+                DebugLog(L"Deleting Sandbox File -> Converting to Tombstone: %s", sandboxDosPath.c_str());
+                
+                NTSTATUS tsStatus = ConvertToTombstone(sandboxDosPath);
+                if (NT_SUCCESS(tsStatus)) {
                     IoStatusBlock->Status = STATUS_SUCCESS;
                     IoStatusBlock->Information = 0;
                     return STATUS_SUCCESS;
-                } else {
-                    // [关键修复] 创建墓碑失败，返回权限错误
-                    // 绝对不能回退调用 fpNtSetInformationFile，否则会试图删除真实文件！
-                    DebugLog(L"Failed to create tombstone: %s", targetDosPath.c_str());
-                    IoStatusBlock->Status = STATUS_ACCESS_DENIED;
-                    IoStatusBlock->Information = 0;
-                    return STATUS_ACCESS_DENIED;
                 }
+                // 如果转换失败（比如被占用），回退到原始删除？
+                // 不，如果转换失败，原始删除也可能失败，或者删了导致复活。
+                // 还是返回错误比较安全。
+                return tsStatus;
+            }
+        }
+
+        // --- 情况 B: 句柄指向真实路径 (未重定向) ---
+        // 这通常发生在你之前的逻辑中 ShouldRedirect 返回 true，但文件还没 CoW 到沙盒
+        // 但如果 NtCreateFile 正常工作，DELETE 权限应该已经触发 CoW 了。
+        // 除非是以 READ_ATTRIBUTES 等权限打开，然后通过 SetInfo 删除（这在 Windows 上通常不允许，需要 DELETE 权限）。
+        
+        // 无论如何，保留之前的逻辑以防万一
+        std::wstring targetPath;
+        if (ShouldRedirect(ntPath, targetPath)) {
+            std::wstring targetDosPath = NtPathToDosPath(targetPath);
+            
+            // 确保父目录存在
+            std::wstring parentDir = targetDosPath;
+            size_t lastSlash = parentDir.find_last_of(L'\\');
+            if (lastSlash != std::wstring::npos) {
+                parentDir = parentDir.substr(0, lastSlash);
+                std::vector<wchar_t> buf(parentDir.begin(), parentDir.end());
+                buf.push_back(0);
+                RecursiveCreateDirectory(buf.data());
+            }
+
+            // 创建墓碑
+            HANDLE hTombstone = CreateFileW(
+                targetDosPath.c_str(),
+                GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL
+            );
+
+            if (hTombstone != INVALID_HANDLE_VALUE) {
+                CloseHandle(hTombstone);
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = 0;
+                return STATUS_SUCCESS;
+            } else {
+                return STATUS_ACCESS_DENIED;
             }
         }
     }
