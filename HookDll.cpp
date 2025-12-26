@@ -45,6 +45,41 @@
 #define FileDispositionInformationEx ((FILE_INFORMATION_CLASS)64)
 #endif
 
+// 1. 补充 NTSTATUS 状态码
+#ifndef STATUS_NO_MORE_FILES
+#define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
+#endif
+
+#ifndef STATUS_BUFFER_OVERFLOW
+#define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
+#endif
+
+// 2. 补充 FILE_INFORMATION_CLASS 枚举值
+// winternl.h 通常只定义了部分值，这里使用宏强制补充
+#ifndef FileDirectoryInformation
+#define FileDirectoryInformation ((FILE_INFORMATION_CLASS)1)
+#endif
+
+#ifndef FileFullDirectoryInformation
+#define FileFullDirectoryInformation ((FILE_INFORMATION_CLASS)2)
+#endif
+
+#ifndef FileBothDirectoryInformation
+#define FileBothDirectoryInformation ((FILE_INFORMATION_CLASS)3)
+#endif
+
+#ifndef FileIdBothDirectoryInformation
+#define FileIdBothDirectoryInformation ((FILE_INFORMATION_CLASS)37)
+#endif
+
+// 3. 补充 IsTombstone 辅助函数 (必须在 BuildMergedDirectoryList 之前定义)
+// 辅助：判断是否为墓碑文件 (隐藏 + 系统)
+bool IsTombstone(DWORD attrs) {
+    return (attrs != INVALID_FILE_ATTRIBUTES) && 
+           (attrs & FILE_ATTRIBUTE_HIDDEN) && 
+           (attrs & FILE_ATTRIBUTE_SYSTEM);
+}
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -623,13 +658,6 @@ bool NtPathExists(const std::wstring& ntPath) {
     std::wstring dosPath = NtPathToDosPath(ntPath);
     DWORD attrs = GetFileAttributesW(dosPath.c_str());
     return attrs != INVALID_FILE_ATTRIBUTES;
-}
-
-// 辅助：判断是否为墓碑文件 (隐藏 + 系统)
-bool IsTombstone(DWORD attrs) {
-    return (attrs != INVALID_FILE_ATTRIBUTES) &&
-           (attrs & FILE_ATTRIBUTE_HIDDEN) &&
-           (attrs & FILE_ATTRIBUTE_SYSTEM);
 }
 
 NTSTATUS NTAPI Detour_NtCreateFile(
