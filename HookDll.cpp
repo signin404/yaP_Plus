@@ -1018,45 +1018,42 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
 // [新增] 智能获取真实路径和沙盒路径
 // 返回值：是否成功获取到成对的路径
 bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
-    std::wstring handleNtPath = GetPathFromHandle(hFile);
-    if (handleNtPath.empty()) return false;
+    // 1. 获取原始设备路径 (e.g., \Device\HarddiskVolume2\Portable\Data\C)
+    std::wstring rawHandlePath = GetPathFromHandle(hFile);
+    if (rawHandlePath.empty()) return false;
 
-    // 1. 检查句柄是否已经指向沙盒 (反向解析)
-    if (handleNtPath.find(g_SandboxRoot) == 0) {
-        // 句柄在沙盒内，例如: \??\D:\Portable\Data\C\Windows
-        // g_SandboxRoot:      \??\D:\Portable\Data
+    // 2. [关键修复] 将设备路径转换为 NT DOS 路径 (e.g., \??\D:\Portable\Data\C)
+    // DevicePathToNtPath 函数在之前已经定义过，它利用了 g_DeviceMap
+    std::wstring handleNtPath = DevicePathToNtPath(rawHandlePath);
 
+    // 3. 检查句柄是否已经指向沙盒 (反向解析)
+    // 注意：不区分大小写比较
+    if (handleNtPath.length() >= wcslen(g_SandboxRoot) &&
+        _wcsnicmp(handleNtPath.c_str(), g_SandboxRoot, wcslen(g_SandboxRoot)) == 0) {
+
+        // 句柄在沙盒内
         size_t rootLen = wcslen(g_SandboxRoot);
-        // 提取相对部分: \C\Windows
-        std::wstring relPath = handleNtPath.substr(rootLen);
-
-        // 这里的 relPath 结构通常是 "\DriveLetter\Path" (例如 \C\Windows)
-        // 或者 "\Users\..." 等特殊映射
-        // 我们需要将其还原为真实 NT 路径
+        std::wstring relPath = handleNtPath.substr(rootLen); // e.g., \C or \C\Windows
 
         std::wstring realNtPath;
 
-        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
-        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
-            // \C\Windows -> \??\C:\Windows
+        // 反向映射逻辑：将 \C\... 映射回 \??\C:\...
+        if (relPath.length() >= 2 && relPath[0] == L'\\') {
             wchar_t driveLetter = relPath[1];
-            realNtPath = L"\\??\\";
-            realNtPath += driveLetter;
-            realNtPath += L":";
-            realNtPath += relPath.substr(2);
-        }
-        // 针对根目录 \C
-        else if (relPath.length() == 2 && relPath[0] == L'\\') {
-             wchar_t driveLetter = relPath[1];
-             realNtPath = L"\\??\\";
-             realNtPath += driveLetter;
-             realNtPath += L":";
-        }
-        else {
-            // 对于 Users 等特殊目录，反向映射比较复杂
-            // 这里做一个简单的回退：假设它是普通路径
-            // 如果你的 ShouldRedirect 逻辑很复杂，这里也需要对应的反向逻辑
-            // 暂时返回 false，只处理驱动器映射
+            // 检查是否为驱动器字母 (简单检查)
+            if ((driveLetter >= L'a' && driveLetter <= L'z') || (driveLetter >= L'A' && driveLetter <= L'Z')) {
+                realNtPath = L"\\??\\";
+                realNtPath += driveLetter;
+                realNtPath += L":";
+                if (relPath.length() > 2) {
+                    realNtPath += relPath.substr(2);
+                }
+            } else {
+                // 处理非驱动器映射 (如 Users)，如果你的 ShouldRedirect 包含 Users 映射，这里也要处理
+                // 暂时只处理驱动器映射，这是最常见的情况
+                return false;
+            }
+        } else {
             return false;
         }
 
@@ -1065,7 +1062,7 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
         return true;
     }
 
-    // 2. 句柄指向真实路径 (正向解析)
+    // 4. 句柄指向真实路径 (正向解析)
     else {
         std::wstring targetNtPath;
         if (ShouldRedirect(handleNtPath, targetNtPath)) {
@@ -1647,23 +1644,52 @@ DWORD WINAPI InitHookThread(LPVOID) {
     wchar_t buffer[MAX_PATH] = { 0 };
     std::wstring mapName = GetConfigMapName(GetCurrentProcessId());
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, mapName.c_str());
+
     if (hMap) {
         void* pBuf = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(HookConfig));
         if (pBuf) {
             HookConfig* config = (HookConfig*)pBuf;
-            wcscpy_s(g_SandboxRoot, MAX_PATH, config->hookPath);
+
+            // 1. 先从配置中读取原始路径
+            std::wstring rawRoot = config->hookPath;
+
+            // 2. [关键] 强制转换为 NT 路径格式并存入全局变量
+            if (!rawRoot.empty()) {
+                if (rawRoot.rfind(L"\\??\\", 0) != 0) {
+                    std::wstring ntRoot = L"\\??\\" + rawRoot;
+                    wcscpy_s(g_SandboxRoot, MAX_PATH, ntRoot.c_str());
+                } else {
+                    wcscpy_s(g_SandboxRoot, MAX_PATH, rawRoot.c_str());
+                }
+            }
+
+            // 3. 读取其他配置
             wcscpy_s(g_IpcPipeName, MAX_PATH, config->pipeName);
             wcscpy_s(g_LauncherDir, MAX_PATH, config->launcherDir);
+
             UnmapViewOfFile(pBuf);
         }
         CloseHandle(hMap);
     }
+
+    // 环境变量回退逻辑 (如果 Map 读取失败)
     if (g_SandboxRoot[0] == L'\0') {
-        if (GetEnvironmentVariableW(L"YAP_HOOK_PATH", buffer, MAX_PATH) > 0) wcscpy_s(g_SandboxRoot, MAX_PATH, buffer);
+        if (GetEnvironmentVariableW(L"YAP_HOOK_PATH", buffer, MAX_PATH) > 0) {
+            std::wstring rawRoot = buffer;
+            // 同样的 NT 路径转换逻辑
+            if (rawRoot.rfind(L"\\??\\", 0) != 0) {
+                std::wstring ntRoot = L"\\??\\" + rawRoot;
+                wcscpy_s(g_SandboxRoot, MAX_PATH, ntRoot.c_str());
+            } else {
+                wcscpy_s(g_SandboxRoot, MAX_PATH, rawRoot.c_str());
+            }
+        }
     }
+
     if (g_IpcPipeName[0] == L'\0') {
         if (GetEnvironmentVariableW(L"YAP_IPC_PIPE", buffer, MAX_PATH) > 0) wcscpy_s(g_IpcPipeName, MAX_PATH, buffer);
     }
+
     if (g_SandboxRoot[0] == L'\0') {
         DebugLog(L"Init Failed: YAP_HOOK_PATH not found");
         return 0;
