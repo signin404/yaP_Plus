@@ -10,6 +10,8 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <memory>
+#include <atomic>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -291,8 +293,8 @@ struct DirContext {
 };
 
 // 全局映射表：Handle -> Context
-std::map<HANDLE, DirContext*> g_DirContextMap;
-std::shared_mutex g_DirContextMutex; // 读写锁
+std::map<HANDLE, std::shared_ptr<DirContext>> g_DirContextMap;
+std::shared_mutex g_DirContextMutex;
 
 // 原始 NtClose 指针 (需要 Hook 它来清理内存)
 typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
@@ -1090,6 +1092,18 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
     return false;
 }
 
+// 辅助：生成简单的伪造 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    id.QuadPart = 0x1000000000000000ULL; //以此为基数
+    unsigned long long hash = 5381;
+    for (wchar_t c : name) {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    id.QuadPart |= (hash & 0xFFFFFFFFFFFFFFULL);
+    return id;
+}
+
 NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1099,34 +1113,46 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
 
-    // 1. 检查是否支持该 InfoClass
-    // 如果不支持，直接返回原始调用，防止写坏内存
-    if (FileInformationClass != FileBothDirectoryInformation &&
-        FileInformationClass != FileIdBothDirectoryInformation) {
+    // 1. 安全检查：只处理支持的类型，且缓冲区有效
+    if ((FileInformationClass != FileBothDirectoryInformation &&
+         FileInformationClass != FileIdBothDirectoryInformation) ||
+         FileInformation == NULL) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // 2. 解析路径
+    // 2. 路径解析
     std::wstring realDosPath;
     std::wstring sandboxDosPath;
     if (!GetRealAndSandboxPaths(FileHandle, realDosPath, sandboxDosPath)) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // 3. 获取或创建 Context
-    DirContext* ctx = nullptr;
+    // 3. 获取 Context (使用 shared_ptr 锁定生命周期)
+    std::shared_ptr<DirContext> ctx = nullptr;
     {
+        std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
+        auto it = g_DirContextMap.find(FileHandle);
+        if (it != g_DirContextMap.end()) {
+            ctx = it->second;
+        }
+    }
+
+    // 如果不存在，创建新 Context (需要写锁)
+    if (!ctx) {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+        // 双重检查
         auto it = g_DirContextMap.find(FileHandle);
         if (it != g_DirContextMap.end()) {
             ctx = it->second;
         } else {
-            ctx = new DirContext();
+            ctx = std::make_shared<DirContext>();
             g_DirContextMap[FileHandle] = ctx;
         }
     }
 
     // 4. 初始化快照
+    // 注意：这里需要对 ctx 加锁，或者因为我们是单线程操作同一个 Handle，通常不需要
+    // 但为了保险，假设同一个 Handle 不会被并发 Query
     if (RestartScan) {
         ctx->CurrentIndex = 0;
     }
@@ -1157,28 +1183,31 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
         ULONG fileNameBytes = (ULONG)entry.FileName.length() * sizeof(WCHAR);
         ULONG structSize = 0;
 
-        // [关键修复] 根据 InfoClass 计算正确的大小
+        // 计算结构体大小 (精确计算)
         if (FileInformationClass == FileIdBothDirectoryInformation) {
-            structSize = sizeof(FILE_ID_BOTH_DIR_INFORMATION) + fileNameBytes - sizeof(WCHAR);
+            // offsetof(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes
+            structSize = (ULONG)((ULONG_PTR)&((PFILE_ID_BOTH_DIR_INFORMATION)0)->FileName + fileNameBytes);
         } else {
-            // FileBothDirectoryInformation
-            structSize = sizeof(FILE_BOTH_DIR_INFORMATION) + fileNameBytes - sizeof(WCHAR);
+            structSize = (ULONG)((ULONG_PTR)&((PFILE_BOTH_DIR_INFORMATION)0)->FileName + fileNameBytes);
         }
 
         // 8字节对齐
         structSize = (structSize + 7) & ~7;
 
+        // [关键修复] 缓冲区溢出检查
         if (bytesWritten + structSize > Length) {
             if (bytesWritten == 0) {
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
                 return STATUS_BUFFER_OVERFLOW;
             }
+            // 缓冲区满了，返回已有的数据
             break;
         }
 
+        // 安全清零
         RtlZeroMemory(pBuffer, structSize);
 
-        // [关键修复] 根据 InfoClass 填充不同的结构体
+        // 填充数据
         if (FileInformationClass == FileIdBothDirectoryInformation) {
             PFILE_ID_BOTH_DIR_INFORMATION pInfo = (PFILE_ID_BOTH_DIR_INFORMATION)pBuffer;
             pInfo->NextEntryOffset = 0;
@@ -1192,15 +1221,21 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
             pInfo->FileAttributes = entry.FileAttributes;
             pInfo->FileNameLength = fileNameBytes;
             pInfo->EaSize = 0;
-            pInfo->ShortNameLength = (CCHAR)(entry.ShortName.length() * sizeof(WCHAR));
-            if (pInfo->ShortNameLength > 0) {
-                memcpy(pInfo->ShortName, entry.ShortName.c_str(), pInfo->ShortNameLength);
+
+            // [关键修复] 安全复制 ShortName，防止溢出
+            size_t shortNameBytes = entry.ShortName.length() * sizeof(WCHAR);
+            if (shortNameBytes > 24) shortNameBytes = 24; // 强制截断为 12 WCHAR
+            pInfo->ShortNameLength = (CCHAR)shortNameBytes;
+            if (shortNameBytes > 0) {
+                memcpy(pInfo->ShortName, entry.ShortName.c_str(), shortNameBytes);
             }
-            pInfo->FileId.QuadPart = 0; // 虚拟 ID
+
+            // 生成 FileId
+            pInfo->FileId = GenerateFileId(entry.FileName);
+
             memcpy(pInfo->FileName, entry.FileName.c_str(), fileNameBytes);
         }
         else {
-            // FileBothDirectoryInformation
             PFILE_BOTH_DIR_INFORMATION pInfo = (PFILE_BOTH_DIR_INFORMATION)pBuffer;
             pInfo->NextEntryOffset = 0;
             pInfo->FileIndex = 0;
@@ -1213,16 +1248,21 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
             pInfo->FileAttributes = entry.FileAttributes;
             pInfo->FileNameLength = fileNameBytes;
             pInfo->EaSize = 0;
-            pInfo->ShortNameLength = (CCHAR)(entry.ShortName.length() * sizeof(WCHAR));
-            if (pInfo->ShortNameLength > 0) {
-                memcpy(pInfo->ShortName, entry.ShortName.c_str(), pInfo->ShortNameLength);
+
+            // 安全复制 ShortName
+            size_t shortNameBytes = entry.ShortName.length() * sizeof(WCHAR);
+            if (shortNameBytes > 24) shortNameBytes = 24;
+            pInfo->ShortNameLength = (CCHAR)shortNameBytes;
+            if (shortNameBytes > 0) {
+                memcpy(pInfo->ShortName, entry.ShortName.c_str(), shortNameBytes);
             }
+
             memcpy(pInfo->FileName, entry.FileName.c_str(), fileNameBytes);
         }
 
         // 链接链表
         if (prevEntry) {
-            // NextEntryOffset 的位置在两个结构体中都是第一个 ULONG，所以强转哪个都行
+            // 两个结构体的 NextEntryOffset 都在偏移 0 处，安全
             ((PFILE_BOTH_DIR_INFORMATION)prevEntry)->NextEntryOffset = (ULONG)(pBuffer - (BYTE*)prevEntry);
         }
 
@@ -1263,17 +1303,13 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 清理 Context
+    // 从 Map 中移除 Context
+    // shared_ptr 机制保证：如果 Query 正在使用该 Context，它不会被立即释放，直到 Query 结束
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
-        auto it = g_DirContextMap.find(Handle);
-        if (it != g_DirContextMap.end()) {
-            delete it->second;
-            g_DirContextMap.erase(it);
-        }
+        g_DirContextMap.erase(Handle);
     }
 
-    // 调用原始 NtClose
     return fpNtClose(Handle);
 }
 
