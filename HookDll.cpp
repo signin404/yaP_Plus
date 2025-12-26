@@ -61,6 +61,14 @@
 #define SL_RETURN_SINGLE_ENTRY 0x00000002
 #define SL_INDEX_SPECIFIED 0x00000004
 
+#ifndef SL_RESTART_SCAN
+#define SL_RESTART_SCAN 0x00000001
+#endif
+
+#ifndef SL_RETURN_SINGLE_ENTRY
+#define SL_RETURN_SINGLE_ENTRY 0x00000002
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -748,11 +756,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         // [修复 1] 完善写入判断逻辑
         // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建)，都视为写入意图
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
-        
-        if (CreateDisposition == FILE_CREATE || 
-            CreateDisposition == FILE_SUPERSEDE || 
-            CreateDisposition == FILE_OVERWRITE || 
-            CreateDisposition == FILE_OVERWRITE_IF || 
+
+        if (CreateDisposition == FILE_CREATE ||
+            CreateDisposition == FILE_SUPERSEDE ||
+            CreateDisposition == FILE_OVERWRITE ||
+            CreateDisposition == FILE_OVERWRITE_IF ||
             CreateDisposition == FILE_OPEN_IF) {
             isWrite = true;
         }
@@ -1199,17 +1207,26 @@ NTSTATUS HandleDirectoryQuery(
     PUNICODE_STRING FileName,
     BOOLEAN RestartScan
 ) {
-    // 获取目录路径
-    std::wstring ntDirPath = GetPathFromHandle(FileHandle);
-    if (ntDirPath.empty()) return STATUS_INVALID_HANDLE; // 让外部处理
+    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Dir)
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) return STATUS_INVALID_HANDLE;
 
-    // 检查是否需要拦截
+    // 2. [关键修复] 转换为 NT 路径 (例如 \??\D:\Dir)
+    // 如果不转换，ShouldRedirect 会因为没有 \??\ 前缀而直接返回 false
+    std::wstring ntDirPath = DevicePathToNtPath(rawPath);
+
+    // 3. 检查是否需要重定向
     std::wstring targetPath;
-    if (!ShouldRedirect(ntDirPath, targetPath)) return STATUS_NOT_SUPPORTED; // 让外部调用原始函数
+    if (!ShouldRedirect(ntDirPath, targetPath)) {
+        // 返回特殊状态码，告知调用者执行原始函数
+        return STATUS_NOT_SUPPORTED;
+    }
 
-    // --- 目录合并逻辑 ---
+    // --- 开始合并逻辑 ---
+
     std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
 
+    // 清理旧上下文
     if (RestartScan) {
         auto it = g_DirContextMap.find(FileHandle);
         if (it != g_DirContextMap.end()) {
@@ -1218,6 +1235,7 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
+    // 获取或创建上下文
     DirContext* ctx = nullptr;
     auto it = g_DirContextMap.find(FileHandle);
     if (it == g_DirContextMap.end()) {
@@ -1227,19 +1245,25 @@ NTSTATUS HandleDirectoryQuery(
         ctx = it->second;
     }
 
+    // 初始化合并列表
     if (!ctx->IsInitialized) {
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
+
         std::wstring pattern = L"*";
         if (FileName && FileName->Length > 0) {
             pattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
         }
+
+        // 执行合并：真实目录 + 沙盒目录
         BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, ctx->Entries);
         ctx->CurrentIndex = 0;
         ctx->IsInitialized = true;
     }
+
     lock.unlock();
 
+    // 检查是否读取完毕
     if (ctx->CurrentIndex >= ctx->Entries.size()) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
@@ -1250,40 +1274,51 @@ NTSTATUS HandleDirectoryQuery(
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
 
+    // 遍历并填充缓冲区
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
         ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
         ULONG entrySize = 0;
 
-        // 计算所需大小
+        // 计算结构体大小
         switch (FileInformationClass) {
-            case FileDirectoryInformation: entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes; break;
-            case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
-            case FileBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
-            case FileIdBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
+            case FileDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileFullDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileBothDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
+            case FileIdBothDirectoryInformation:
+                entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
+                break;
             default:
+                // 不支持的类型，回退到原始函数可能更安全，或者报错
+                // 这里选择报错，因为我们已经接管了枚举过程
                 IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
                 IoStatusBlock->Information = 0;
                 return STATUS_INVALID_INFO_CLASS;
         }
 
-        entrySize = (entrySize + 7) & ~7; // 8字节对齐
+        // 8字节对齐
+        entrySize = (entrySize + 7) & ~7;
 
+        // 检查缓冲区剩余空间
         if (offset + entrySize > Length) {
             if (bytesWritten == 0) {
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
                 IoStatusBlock->Information = 0;
                 return STATUS_BUFFER_OVERFLOW;
             }
-            break;
+            break; // 缓冲区满了，下次再读
         }
 
+        // 填充数据
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
-        // 填充数据 (简化版，复用你原有的 switch case 逻辑)
-        // 注意：这里为了节省篇幅，请确保将你原有的 switch (FileInformationClass) { ... } 完整复制过来
-        // 或者直接使用你原来的填充逻辑。
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
@@ -1323,9 +1358,13 @@ NTSTATUS HandleDirectoryQuery(
                 info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
+
                 size_t shortLen = min(entry.ShortName.length(), 12);
                 info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
-                if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                if (shortLen > 0) {
+                    memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                }
+
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
@@ -1340,23 +1379,28 @@ NTSTATUS HandleDirectoryQuery(
                 info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
+
                 size_t shortLen = min(entry.ShortName.length(), 12);
                 info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
-                if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
-                info->FileId.QuadPart = 0;
+                if (shortLen > 0) {
+                    memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
+                }
+
+                info->FileId.QuadPart = 0; // 虚拟 ID
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
         }
 
+        // 更新索引和指针
         ctx->CurrentIndex++;
 
         if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
-            *(ULONG*)entryPtr = 0;
+            *(ULONG*)entryPtr = 0; // 最后一个条目，NextEntryOffset = 0
             bytesWritten += entrySize;
             break;
         } else {
-            *(ULONG*)entryPtr = entrySize;
+            *(ULONG*)entryPtr = entrySize; // 指向下一个条目
             offset += entrySize;
             bytesWritten += entrySize;
         }
@@ -1383,19 +1427,20 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
 
-    // 尝试使用合并逻辑
+    // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
-    
-    // 如果返回 STATUS_NOT_SUPPORTED (说明不需要重定向) 或 STATUS_INVALID_HANDLE，则调用原始函数
+
+    // 如果不需要重定向 (STATUS_NOT_SUPPORTED) 或句柄无效，调用原始函数
     if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // 手动触发 Event (因为我们没有调用底层函数)
+    // 模拟异步完成信号 (如果提供了 Event)
     if (NT_SUCCESS(status) && Event && Event != INVALID_HANDLE_VALUE) {
         SetEvent(Event);
     }
-    
+
+    // 注意：这里忽略了 ApcRoutine，因为手动模拟 APC 比较复杂且通常不需要
     return status;
 }
 
@@ -1407,11 +1452,11 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFileEx(
     if (g_IsInHook) return fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
     RecursionGuard guard;
 
-    // [修复 2] 将 Ex 调用的参数转换为普通参数，并调用合并逻辑
+    // 解析 Ex 标志位
     BOOLEAN restartScan = (QueryFlags & SL_RESTART_SCAN) != 0;
     BOOLEAN returnSingle = (QueryFlags & SL_RETURN_SINGLE_ENTRY) != 0;
 
-    // 尝试使用合并逻辑
+    // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, returnSingle, FileName, restartScan);
 
     if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
