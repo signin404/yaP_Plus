@@ -369,6 +369,7 @@ struct DirContext {
     std::vector<CachedDirEntry> Entries;
     size_t CurrentIndex = 0;
     bool IsInitialized = false;
+    std::wstring SearchPattern; // [新增] 保存当前的搜索模式
 };
 
 // 全局映射表：Handle -> Context
@@ -1294,10 +1295,20 @@ NTSTATUS HandleDirectoryQuery(
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
+    std::wstring currentPattern = L"*"; // 默认匹配所有
+
+    // 获取请求的 Pattern (如果有)
+    if (FileName && FileName->Length > 0) {
+        currentPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
+    }
 
     // --- 阶段 1: 检查是否需要构建 ---
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
+        
+        // 逻辑变更：只要 Context 存在且已初始化，就不需要重新构建 (除非 RestartScan)
+        // 我们总是构建完整的列表 (*)，所以不需要根据 FileName 重新构建
+        
         if (RestartScan) {
             needsBuild = true;
         } else {
@@ -1315,16 +1326,16 @@ NTSTATUS HandleDirectoryQuery(
     if (needsBuild) {
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
-        std::wstring pattern = L"*";
-        if (FileName && FileName->Length > 0) {
-            pattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
-        }
-        BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, localEntries);
+        
+        // [关键修复] 总是构建完整列表 "*"，忽略当前的 FileName
+        // 这样缓存中就包含了所有文件，后续过滤由输出阶段处理
+        BuildMergedDirectoryList(realDosPath, sandboxDosPath, L"*", localEntries);
     }
 
     // --- 阶段 3: 更新上下文 ---
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+        
         if (RestartScan) {
             auto it = g_DirContextMap.find(FileHandle);
             if (it != g_DirContextMap.end()) {
@@ -1347,9 +1358,20 @@ NTSTATUS HandleDirectoryQuery(
             ctx->CurrentIndex = 0;
             ctx->IsInitialized = true;
         }
+
+        // [关键修复] 更新搜索模式
+        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL)，更新 Pattern
+        // 如果 FileName == NULL，保持之前的 Pattern (继续之前的搜索)
+        if (RestartScan || (FileName && FileName->Length > 0)) {
+            ctx->SearchPattern = currentPattern;
+        }
+        // 兜底：如果 Pattern 为空，设为 *
+        if (ctx->SearchPattern.empty()) {
+            ctx->SearchPattern = L"*";
+        }
     }
 
-    // --- 阶段 4: 填充缓冲区 (关键修复) ---
+    // --- 阶段 4: 填充缓冲区 ---
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
     
     if (!ctx || !ctx->IsInitialized) {
@@ -1357,19 +1379,22 @@ NTSTATUS HandleDirectoryQuery(
         return STATUS_UNSUCCESSFUL;
     }
 
-    if (ctx->CurrentIndex >= ctx->Entries.size()) {
-        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-        IoStatusBlock->Information = 0;
-        return STATUS_NO_MORE_FILES;
-    }
-
     ULONG bytesWritten = 0;
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
-    void* prevEntryPtr = nullptr; // [修复] 用于回溯修改 NextEntryOffset
+    void* prevEntryPtr = nullptr;
 
+    // 遍历列表
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
+        
+        // [关键修复] 过滤逻辑：使用 PathMatchSpecW 进行通配符匹配
+        // 如果不匹配，跳过此条目，继续下一个
+        if (!PathMatchSpecW(entry.FileName.c_str(), ctx->SearchPattern.c_str())) {
+            ctx->CurrentIndex++;
+            continue;
+        }
+
         ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
         ULONG entrySize = 0;
 
@@ -1389,17 +1414,13 @@ NTSTATUS HandleDirectoryQuery(
 
         entrySize = (entrySize + 7) & ~7; // 8字节对齐
 
-        // [修复] 检查缓冲区剩余空间
         if (offset + entrySize > Length) {
-            // 缓冲区满了
             if (prevEntryPtr) {
-                // 如果之前已经写入了条目，将上一个条目的 NextEntryOffset 设为 0，表示这是本批次的最后一个
                 *(ULONG*)prevEntryPtr = 0;
                 IoStatusBlock->Status = STATUS_SUCCESS;
                 IoStatusBlock->Information = bytesWritten;
                 return STATUS_SUCCESS;
             } else {
-                // 如果连第一个条目都放不下，返回溢出错误
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
                 IoStatusBlock->Information = 0;
                 return STATUS_BUFFER_OVERFLOW;
@@ -1408,15 +1429,13 @@ NTSTATUS HandleDirectoryQuery(
 
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
-
-        // 生成 FileId
         LARGE_INTEGER fileId = GenerateFileId(entry.FileName);
 
         // 填充数据
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
-                info->NextEntryOffset = entrySize; // 默认指向下一个，稍后修正
+                info->NextEntryOffset = entrySize;
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1506,22 +1525,26 @@ NTSTATUS HandleDirectoryQuery(
             }
         }
 
-        // 更新状态
         ctx->CurrentIndex++;
         bytesWritten += entrySize;
         offset += entrySize;
-        prevEntryPtr = entryPtr; // 记录当前条目，以便下一次循环或结束时修改 NextEntryOffset
+        prevEntryPtr = entryPtr;
 
-        // 如果只请求一个条目，立即结束
         if (ReturnSingleEntry) {
-            *(ULONG*)entryPtr = 0; // 终止链表
+            *(ULONG*)entryPtr = 0;
             break;
         }
     }
 
-    // [修复] 循环结束后，确保最后一个条目的 NextEntryOffset 为 0
     if (prevEntryPtr) {
         *(ULONG*)prevEntryPtr = 0;
+    }
+
+    // 如果没有写入任何字节，说明没有更多文件了 (或者过滤后没有匹配项)
+    if (bytesWritten == 0) {
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        IoStatusBlock->Information = 0;
+        return STATUS_NO_MORE_FILES;
     }
 
     IoStatusBlock->Status = STATUS_SUCCESS;
