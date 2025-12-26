@@ -229,6 +229,45 @@ typedef struct _FILE_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_BOTH_DIR_INFORMATION, *PFILE_BOTH_DIR_INFORMATION;
 
+// FILE_DIRECTORY_INFORMATION 结构体
+typedef struct _FILE_DIRECTORY_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_DIRECTORY_INFORMATION, *PFILE_DIRECTORY_INFORMATION;
+
+// FILE_ID_BOTH_DIR_INFORMATION 结构体
+typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    CCHAR ShortNameLength;
+    WCHAR ShortName[12];
+    LARGE_INTEGER FileId;
+    WCHAR FileName[1];
+} FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
+
+// 添加缺失的状态码
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
+#endif
+
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
