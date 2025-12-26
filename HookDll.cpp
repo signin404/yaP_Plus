@@ -1286,9 +1286,9 @@ NTSTATUS HandleDirectoryQuery(
 
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
-
+    
     if (!ShouldRedirect(ntDirPath, targetPath)) {
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED; 
     }
 
     std::vector<CachedDirEntry> localEntries;
@@ -1349,9 +1349,9 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
-    // --- 阶段 4: 填充缓冲区 ---
+    // --- 阶段 4: 填充缓冲区 (关键修复) ---
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
-
+    
     if (!ctx || !ctx->IsInitialized) {
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
         return STATUS_UNSUCCESSFUL;
@@ -1366,6 +1366,7 @@ NTSTATUS HandleDirectoryQuery(
     ULONG bytesWritten = 0;
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
+    void* prevEntryPtr = nullptr; // [修复] 用于回溯修改 NextEntryOffset
 
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
@@ -1378,26 +1379,31 @@ NTSTATUS HandleDirectoryQuery(
             case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
             case FileBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
             case FileIdBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
-            // [新增] 支持更多类型
             case FileNamesInformation: entrySize = FIELD_OFFSET(FILE_NAMES_INFORMATION, FileName) + fileNameBytes; break;
             case FileIdFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
-
             default:
-                // 遇到不支持的类型，返回错误，这通常是导致“无法访问”的原因
                 IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
                 IoStatusBlock->Information = 0;
                 return STATUS_INVALID_INFO_CLASS;
         }
 
-        entrySize = (entrySize + 7) & ~7;
+        entrySize = (entrySize + 7) & ~7; // 8字节对齐
 
+        // [修复] 检查缓冲区剩余空间
         if (offset + entrySize > Length) {
-            if (bytesWritten == 0) {
+            // 缓冲区满了
+            if (prevEntryPtr) {
+                // 如果之前已经写入了条目，将上一个条目的 NextEntryOffset 设为 0，表示这是本批次的最后一个
+                *(ULONG*)prevEntryPtr = 0;
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = bytesWritten;
+                return STATUS_SUCCESS;
+            } else {
+                // 如果连第一个条目都放不下，返回溢出错误
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
                 IoStatusBlock->Information = 0;
                 return STATUS_BUFFER_OVERFLOW;
             }
-            break;
         }
 
         void* entryPtr = buffer + offset;
@@ -1410,6 +1416,7 @@ NTSTATUS HandleDirectoryQuery(
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize; // 默认指向下一个，稍后修正
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1423,6 +1430,7 @@ NTSTATUS HandleDirectoryQuery(
             }
             case FileFullDirectoryInformation: {
                 FILE_FULL_DIR_INFORMATION* info = (FILE_FULL_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize;
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1437,6 +1445,7 @@ NTSTATUS HandleDirectoryQuery(
             }
             case FileBothDirectoryInformation: {
                 FILE_BOTH_DIR_INFORMATION* info = (FILE_BOTH_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize;
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1454,6 +1463,7 @@ NTSTATUS HandleDirectoryQuery(
             }
             case FileIdBothDirectoryInformation: {
                 FILE_ID_BOTH_DIR_INFORMATION* info = (FILE_ID_BOTH_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize;
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1466,21 +1476,21 @@ NTSTATUS HandleDirectoryQuery(
                 size_t shortLen = min(entry.ShortName.length(), 12);
                 info->ShortNameLength = (CCHAR)(shortLen * sizeof(wchar_t));
                 if (shortLen > 0) memcpy(info->ShortName, entry.ShortName.c_str(), shortLen * sizeof(wchar_t));
-                info->FileId = fileId; // 使用生成的 ID
+                info->FileId = fileId;
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
-            // [新增] 处理 FileNamesInformation
             case FileNamesInformation: {
                 FILE_NAMES_INFORMATION* info = (FILE_NAMES_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize;
                 info->FileIndex = 0;
                 info->FileNameLength = fileNameBytes;
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
-            // [新增] 处理 FileIdFullDirectoryInformation
             case FileIdFullDirectoryInformation: {
                 FILE_ID_FULL_DIR_INFORMATION* info = (FILE_ID_FULL_DIR_INFORMATION*)entryPtr;
+                info->NextEntryOffset = entrySize;
                 info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
@@ -1490,23 +1500,28 @@ NTSTATUS HandleDirectoryQuery(
                 info->AllocationSize = entry.AllocationSize;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
-                info->FileId = fileId; // 使用生成的 ID
+                info->FileId = fileId;
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
         }
 
+        // 更新状态
         ctx->CurrentIndex++;
+        bytesWritten += entrySize;
+        offset += entrySize;
+        prevEntryPtr = entryPtr; // 记录当前条目，以便下一次循环或结束时修改 NextEntryOffset
 
-        if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
-            *(ULONG*)entryPtr = 0;
-            bytesWritten += entrySize;
+        // 如果只请求一个条目，立即结束
+        if (ReturnSingleEntry) {
+            *(ULONG*)entryPtr = 0; // 终止链表
             break;
-        } else {
-            *(ULONG*)entryPtr = entrySize;
-            offset += entrySize;
-            bytesWritten += entrySize;
         }
+    }
+
+    // [修复] 循环结束后，确保最后一个条目的 NextEntryOffset 为 0
+    if (prevEntryPtr) {
+        *(ULONG*)prevEntryPtr = 0;
     }
 
     IoStatusBlock->Status = STATUS_SUCCESS;
