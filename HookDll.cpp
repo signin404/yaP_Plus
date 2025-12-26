@@ -501,6 +501,20 @@ struct RecursionGuard {
 
 // --- NTDLL Hooks ---
 
+// 辅助：检查 NT 路径对应的文件是否存在
+bool NtPathExists(const std::wstring& ntPath) {
+    std::wstring dosPath = NtPathToDosPath(ntPath);
+    DWORD attrs = GetFileAttributesW(dosPath.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES;
+}
+
+// 辅助：判断是否为墓碑文件 (隐藏 + 系统)
+bool IsTombstone(DWORD attrs) {
+    return (attrs != INVALID_FILE_ATTRIBUTES) &&
+           (attrs & FILE_ATTRIBUTE_HIDDEN) &&
+           (attrs & FILE_ATTRIBUTE_SYSTEM);
+}
+
 NTSTATUS NTAPI Detour_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -520,45 +534,100 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring targetNtPath;
 
+    // 检查是否匹配重定向规则
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
+        // 判断是否为写入操作 (包括删除、修改属性等)
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
+        // 检查文件存在性
+        bool sandboxExists = NtPathExists(targetNtPath);
+        bool realExists = NtPathExists(fullNtPath);
+
+        bool shouldRedirect = false;
+
         if (isWrite) {
-            if (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE || CreateDisposition == FILE_OVERWRITE_IF) {
+            // --- 写入操作逻辑 ---
+            if (sandboxExists) {
+                // 1. 沙盒中有文件 -> 直接操作沙盒文件
+                shouldRedirect = true;
+            } else if (realExists) {
+                // 2. 沙盒无文件，但真实路径有 -> 复制到沙盒 (CoW) -> 操作沙盒文件
+                // 注意：如果是 OPEN_ALWAYS 或 CREATE_ALWAYS，PerformCopyOnWrite 内部会处理目录创建
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
+                shouldRedirect = true;
+            } else {
+                // 3. 都不存在 -> 新建文件 -> 在沙盒创建
+                shouldRedirect = true;
+            }
+        } else {
+            // --- 读取操作逻辑 ---
+
+            // 1. 检查沙盒
+            if (NtPathExists(targetNtPath)) {
+            std::wstring sandboxDosPath = NtPathToDosPath(targetNtPath);
+            DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
+
+            // [关键] 检查是否为墓碑文件
+            if (IsTombstone(attrs)) {
+                // 是墓碑，说明原文件被“删除”了，返回未找到
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+
+            // 是正常沙盒文件，重定向读取
+            shouldRedirect = true;
+        }
+        else if (NtPathExists(fullNtPath)) {
+            // 2. 沙盒无文件，真实路径有 -> 穿透读取
+            shouldRedirect = false;
+            return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, ...);
+        }
+        else {
+            // 3. 都不存在
+            shouldRedirect = true;
+        }
+
+            if (sandboxExists) {
+                // 1. 沙盒中有文件 -> 优先读取沙盒 (遮挡真实文件)
+                shouldRedirect = true;
+            } else if (realExists) {
+                // 2. 沙盒无文件，真实路径有 -> **穿透读取** (不重定向，直接读原文件)
+                shouldRedirect = false;
+                // 这里直接返回原始调用，操作的是 fullNtPath
+                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            } else {
+                // 3. 都不存在 -> 重定向到沙盒 (让系统报错 "文件未找到" 或创建新文件)
+                shouldRedirect = true;
             }
         }
 
-        UNICODE_STRING uStr;
-        RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+        if (shouldRedirect) {
+            // 执行重定向逻辑
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
 
-        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        ObjectAttributes->ObjectName = &uStr;
-        ObjectAttributes->RootDirectory = NULL;
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
 
-        if (CreateDisposition == FILE_CREATE || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_SUPERSEDE) {
-            EnsureDirectoryExistsNT(targetNtPath.c_str());
-        }
+            // 确保目标目录存在 (对于创建/写入操作)
+            if (isWrite || CreateDisposition == FILE_CREATE || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_SUPERSEDE) {
+                EnsureDirectoryExistsNT(targetNtPath.c_str());
+            }
 
-        NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
-        ObjectAttributes->ObjectName = oldName;
-        ObjectAttributes->RootDirectory = oldRoot;
+            // 恢复原始参数
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
 
-        if (status == STATUS_SUCCESS) {
-            return status;
-        }
-
-        if (!isWrite && (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF)) {
-             // Fallthrough to original call
-        } else {
             return status;
         }
     }
 
+    // 不重定向，直接调用原始函数
     return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 }
 
@@ -588,7 +657,17 @@ std::wstring GetPathFromHandle(HANDLE hFile) {
     return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
 
+// [新增] 创建一个空的占位文件
+void CreateDummyFile(const std::wstring& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), 0, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(hFile);
+    }
+}
+
+// [修改] Detour_NtDeleteFile
 NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
+    // 防止递归调用
     if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
     RecursionGuard guard;
 
@@ -597,32 +676,92 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
 
     // 检查是否需要重定向
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
-        DebugLog(L"NtDeleteFile Redirect: %s", fullNtPath.c_str());
 
-        // 1. 确保沙盒里有文件 (Copy-on-Write)
-        // 虽然是要删除，但为了模拟成功，我们需要沙盒里有个东西被删
-        PerformCopyOnWrite(fullNtPath, targetNtPath);
+        // 获取 DOS 路径以便进行属性检查和文件创建
+        std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+        std::wstring fullDosPath = NtPathToDosPath(fullNtPath);
 
-        // 2. 修改 ObjectAttributes 指向沙盒路径
-        UNICODE_STRING uStr;
-        RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+        // 检查文件存在性
+        DWORD sandboxAttrs = GetFileAttributesW(targetDosPath.c_str());
+        bool sandboxExists = (sandboxAttrs != INVALID_FILE_ATTRIBUTES);
 
-        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+        DWORD realAttrs = GetFileAttributesW(fullDosPath.c_str());
+        bool realExists = (realAttrs != INVALID_FILE_ATTRIBUTES);
 
-        ObjectAttributes->ObjectName = &uStr;
-        ObjectAttributes->RootDirectory = NULL;
+        // --- 情况 1: 沙盒中存在文件 ---
+        // 无论是正常文件还是之前的墓碑文件，都直接删除它
+        if (sandboxExists) {
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
 
-        // 3. 删除沙盒文件
-        NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 4. 恢复
-        ObjectAttributes->ObjectName = oldName;
-        ObjectAttributes->RootDirectory = oldRoot;
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
 
-        return status;
+            NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            return status;
+        }
+
+        // --- 情况 2: 沙盒无文件，但真实路径有文件 ---
+        // 执行“伪删除”：创建墓碑文件
+        else if (realExists) {
+            DebugLog(L"Fake Delete (Tombstone): %s", targetDosPath.c_str());
+
+            // 1. 确保沙盒目录结构存在
+            wchar_t dirBuf[MAX_PATH];
+            wcscpy_s(dirBuf, targetDosPath.c_str());
+            PathRemoveFileSpecW(dirBuf);
+            RecursiveCreateDirectory(dirBuf);
+
+            // 2. 创建墓碑文件 (0字节，隐藏 + 系统属性)
+            // 使用 CREATE_ALWAYS 确保创建新文件
+            HANDLE hFile = CreateFileW(targetDosPath.c_str(),
+                                       GENERIC_WRITE,
+                                       0,
+                                       NULL,
+                                       CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                                       NULL);
+
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                // 欺骗应用程序：文件已成功删除
+                return STATUS_SUCCESS;
+            } else {
+                // 如果创建墓碑失败（例如权限问题），返回访问拒绝
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+
+        // --- 情况 3: 哪里都没有 ---
+        // 重定向到沙盒路径让系统报错，或者直接调用原始路径报错
+        // 这里选择重定向到沙盒，保持行为一致性
+        else {
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            return status;
+        }
     }
 
+    // 不需要重定向，调用原始函数
     return fpNtDeleteFile(ObjectAttributes);
 }
 
