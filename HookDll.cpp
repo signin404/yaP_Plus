@@ -69,10 +69,6 @@
 #define SL_RETURN_SINGLE_ENTRY 0x00000002
 #endif
 
-#ifndef STATUS_INFO_LENGTH_MISMATCH
-#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
-#endif
-
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -371,22 +367,21 @@ void RefreshDeviceMap() {
 
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    if (g_DeviceMap.empty()) RefreshDeviceMap();
+    // 注意：不再这里调用 RefreshDeviceMap()，依赖 InitHookThread 初始化
+    // 如果 g_DeviceMap 为空，说明初始化未完成或失败，直接返回原路径
+    if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
         const std::wstring& devPrefix = pair.first;
         const std::wstring& driveLetter = pair.second;
 
-        // 检查前缀匹配
         if (devicePath.find(devPrefix) == 0) {
-            // 确保匹配的是完整路径段 (防止 Volume1 匹配 Volume10)
             if (devicePath.length() == devPrefix.length() || devicePath[devPrefix.length()] == L'\\') {
                 std::wstring suffix = devicePath.substr(devPrefix.length());
                 return L"\\??\\" + driveLetter + suffix;
             }
         }
     }
-    // 如果无法转换（例如网络路径或管道），返回原样
     return devicePath;
 }
 
@@ -476,6 +471,11 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
+    }
+    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
+    // 如果无法转换为 DOS 路径，返回空字符串，避免 FindFirstFile 访问错误的路径
+    if (ntPath.find(L"\\Device\\") == 0) {
+        return L""; 
     }
     return ntPath;
 }
@@ -760,11 +760,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         // [修复 1] 完善写入判断逻辑
         // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建)，都视为写入意图
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
-
-        if (CreateDisposition == FILE_CREATE ||
-            CreateDisposition == FILE_SUPERSEDE ||
-            CreateDisposition == FILE_OVERWRITE ||
-            CreateDisposition == FILE_OVERWRITE_IF ||
+        
+        if (CreateDisposition == FILE_CREATE || 
+            CreateDisposition == FILE_SUPERSEDE || 
+            CreateDisposition == FILE_OVERWRITE || 
+            CreateDisposition == FILE_OVERWRITE_IF || 
             CreateDisposition == FILE_OPEN_IF) {
             isWrite = true;
         }
@@ -863,41 +863,17 @@ NTSTATUS NTAPI Detour_NtOpenFile(
 
 // 辅助：获取文件句柄对应的路径
 std::wstring GetPathFromHandle(HANDLE hFile) {
-    if (!hFile || hFile == INVALID_HANDLE_VALUE) return L"";
-    if (!fpNtQueryObject) return L""; // 防止未初始化调用
-
     ULONG len = 0;
-    // 第一次调用获取所需长度
-    NTSTATUS status = fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
-    
-    // STATUS_INFO_LENGTH_MISMATCH 是正常的，表示缓冲区太小
-    if (status != STATUS_SUCCESS && status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_OVERFLOW) {
-        return L"";
-    }
-
+    fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
     if (len == 0) return L"";
 
-    // 分配缓冲区
-    std::vector<BYTE> buffer;
-    try {
-        buffer.resize(len + sizeof(WCHAR)); // 多分配一点防止溢出
-    } catch (...) {
-        return L"";
-    }
-
-    // 第二次调用获取实际数据
-    status = fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len);
-    if (!NT_SUCCESS(status)) return L"";
+    std::vector<BYTE> buffer(len);
+    if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
 
     POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-    if (!nameInfo->Name.Buffer || nameInfo->Name.Length == 0) return L"";
+    if (!nameInfo->Name.Buffer) return L"";
 
-    // 安全构造字符串
-    try {
-        return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-    } catch (...) {
-        return L"";
-    }
+    return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
 
 // [新增] 创建一个空的占位文件
@@ -1235,57 +1211,97 @@ NTSTATUS HandleDirectoryQuery(
     PUNICODE_STRING FileName,
     BOOLEAN RestartScan
 ) {
-    // 1. 获取路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
-    if (rawPath.empty()) return STATUS_NOT_SUPPORTED;
+    if (rawPath.empty()) return STATUS_INVALID_HANDLE;
 
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
-
-    // 2. 检查重定向
+    
+    // 检查重定向
     if (!ShouldRedirect(ntDirPath, targetPath)) {
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_NOT_SUPPORTED; 
     }
 
-    // --- 关键修复：扩大锁的范围 ---
-    // 锁必须持有到函数结束，防止 ctx 在读取过程中被 NtClose 删除
-    std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+    // 准备本地变量，避免在锁内做复杂操作
+    std::vector<CachedDirEntry> localEntries;
+    bool needsBuild = false;
+    DirContext* ctx = nullptr;
 
-    // 清理旧上下文
-    if (RestartScan) {
-        auto it = g_DirContextMap.find(FileHandle);
-        if (it != g_DirContextMap.end()) {
-            delete it->second;
-            g_DirContextMap.erase(it);
+    // --- 阶段 1: 检查是否需要构建 (使用读锁/共享锁) ---
+    {
+        std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
+        
+        // 如果是重新扫描，我们需要在写锁阶段删除，这里先标记
+        if (RestartScan) {
+            needsBuild = true;
+        } else {
+            auto it = g_DirContextMap.find(FileHandle);
+            if (it == g_DirContextMap.end()) {
+                needsBuild = true;
+            } else {
+                ctx = it->second;
+                if (!ctx->IsInitialized) needsBuild = true;
+            }
         }
     }
 
-    // 获取或创建上下文
-    DirContext* ctx = nullptr;
-    auto it = g_DirContextMap.find(FileHandle);
-    if (it == g_DirContextMap.end()) {
-        ctx = new DirContext();
-        g_DirContextMap[FileHandle] = ctx;
-    } else {
-        ctx = it->second;
-    }
-
-    // 初始化合并列表
-    if (!ctx->IsInitialized) {
+    // --- 阶段 2: 执行 I/O (无锁状态) ---
+    // 这是防止死锁的关键：BuildMergedDirectoryList 内部调用 FindFirstFile (可能涉及堆锁/加载器锁)
+    // 绝对不能在持有 g_DirContextMutex 时调用它
+    if (needsBuild) {
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
-
         std::wstring pattern = L"*";
         if (FileName && FileName->Length > 0) {
             pattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
         }
 
-        BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, ctx->Entries);
-        ctx->CurrentIndex = 0;
-        ctx->IsInitialized = true;
+        // 即使 realDosPath 为空(转换失败)，BuildMergedDirectoryList 也能处理(只扫沙盒)
+        BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, localEntries);
     }
 
-    // 检查是否读取完毕
+    // --- 阶段 3: 更新上下文 (使用写锁/独占锁) ---
+    {
+        std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+
+        // 处理 RestartScan: 删除旧的
+        if (RestartScan) {
+            auto it = g_DirContextMap.find(FileHandle);
+            if (it != g_DirContextMap.end()) {
+                delete it->second;
+                g_DirContextMap.erase(it);
+            }
+            ctx = nullptr; // 强制重新创建
+        }
+
+        // 获取或创建
+        auto it = g_DirContextMap.find(FileHandle);
+        if (it == g_DirContextMap.end()) {
+            ctx = new DirContext();
+            g_DirContextMap[FileHandle] = ctx;
+        } else {
+            ctx = it->second;
+        }
+
+        // 如果我们刚才构建了列表，现在更新进去
+        // 注意：可能在无锁期间有其他线程也构建了，这里简单的覆盖策略即可
+        if (needsBuild) {
+            ctx->Entries = std::move(localEntries);
+            ctx->CurrentIndex = 0;
+            ctx->IsInitialized = true;
+        }
+    }
+
+    // --- 阶段 4: 填充缓冲区 (无锁，使用局部副本或再次加读锁) ---
+    // 为了安全，我们再次获取读锁来读取 ctx->Entries
+    std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
+    
+    // 再次检查 ctx 有效性 (防止极端情况)
+    if (!ctx || !ctx->IsInitialized) {
+        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+        return STATUS_UNSUCCESSFUL;
+    }
+
     if (ctx->CurrentIndex >= ctx->Entries.size()) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
@@ -1296,7 +1312,6 @@ NTSTATUS HandleDirectoryQuery(
     char* buffer = (char*)FileInformation;
     ULONG offset = 0;
 
-    // 移除 __try，依靠逻辑检查保证安全
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
         ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
@@ -1304,28 +1319,18 @@ NTSTATUS HandleDirectoryQuery(
 
         // 计算大小
         switch (FileInformationClass) {
-            case FileDirectoryInformation:
-                entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes;
-                break;
-            case FileFullDirectoryInformation:
-                entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes;
-                break;
-            case FileBothDirectoryInformation:
-                entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
-                break;
-            case FileIdBothDirectoryInformation:
-                entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes;
-                break;
+            case FileDirectoryInformation: entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes; break;
+            case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
+            case FileBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
+            case FileIdBothDirectoryInformation: entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + fileNameBytes; break;
             default:
                 IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
                 IoStatusBlock->Information = 0;
                 return STATUS_INVALID_INFO_CLASS;
         }
 
-        // 8字节对齐
         entrySize = (entrySize + 7) & ~7;
 
-        // 检查缓冲区
         if (offset + entrySize > Length) {
             if (bytesWritten == 0) {
                 IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
@@ -1335,37 +1340,33 @@ NTSTATUS HandleDirectoryQuery(
             break;
         }
 
-        // 填充数据
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
+        // 填充数据
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
-                info->NextEntryOffset = 0;
-                info->FileIndex = 0;
+                info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
                 info->LastWriteTime = entry.LastWriteTime;
                 info->ChangeTime = entry.ChangeTime;
                 info->EndOfFile = entry.EndOfFile;
                 info->AllocationSize = entry.AllocationSize;
-                info->FileAttributes = entry.FileAttributes;
                 info->FileNameLength = fileNameBytes;
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
                 break;
             }
             case FileFullDirectoryInformation: {
                 FILE_FULL_DIR_INFORMATION* info = (FILE_FULL_DIR_INFORMATION*)entryPtr;
-                info->NextEntryOffset = 0;
-                info->FileIndex = 0;
+                info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
                 info->LastWriteTime = entry.LastWriteTime;
                 info->ChangeTime = entry.ChangeTime;
                 info->EndOfFile = entry.EndOfFile;
                 info->AllocationSize = entry.AllocationSize;
-                info->FileAttributes = entry.FileAttributes;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
                 memcpy(info->FileName, entry.FileName.c_str(), fileNameBytes);
@@ -1373,15 +1374,13 @@ NTSTATUS HandleDirectoryQuery(
             }
             case FileBothDirectoryInformation: {
                 FILE_BOTH_DIR_INFORMATION* info = (FILE_BOTH_DIR_INFORMATION*)entryPtr;
-                info->NextEntryOffset = 0;
-                info->FileIndex = 0;
+                info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
                 info->LastWriteTime = entry.LastWriteTime;
                 info->ChangeTime = entry.ChangeTime;
                 info->EndOfFile = entry.EndOfFile;
                 info->AllocationSize = entry.AllocationSize;
-                info->FileAttributes = entry.FileAttributes;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
                 size_t shortLen = min(entry.ShortName.length(), 12);
@@ -1392,15 +1391,13 @@ NTSTATUS HandleDirectoryQuery(
             }
             case FileIdBothDirectoryInformation: {
                 FILE_ID_BOTH_DIR_INFORMATION* info = (FILE_ID_BOTH_DIR_INFORMATION*)entryPtr;
-                info->NextEntryOffset = 0;
-                info->FileIndex = 0;
+                info->FileAttributes = entry.FileAttributes;
                 info->CreationTime = entry.CreationTime;
                 info->LastAccessTime = entry.LastAccessTime;
                 info->LastWriteTime = entry.LastWriteTime;
                 info->ChangeTime = entry.ChangeTime;
                 info->EndOfFile = entry.EndOfFile;
                 info->AllocationSize = entry.AllocationSize;
-                info->FileAttributes = entry.FileAttributes;
                 info->FileNameLength = fileNameBytes;
                 info->EaSize = 0;
                 size_t shortLen = min(entry.ShortName.length(), 12);
@@ -1415,6 +1412,7 @@ NTSTATUS HandleDirectoryQuery(
         ctx->CurrentIndex++;
 
         if (ReturnSingleEntry || ctx->CurrentIndex >= ctx->Entries.size()) {
+            *(ULONG*)entryPtr = 0;
             bytesWritten += entrySize;
             break;
         } else {
@@ -1445,17 +1443,20 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
 
+    // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
 
-    // 只有在明确不支持（需要回退）或句柄无效时，才调用原始函数
-    if (status == STATUS_NOT_SUPPORTED) {
+    // 如果不需要重定向 (STATUS_NOT_SUPPORTED) 或句柄无效，调用原始函数
+    if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
+    // 模拟异步完成信号 (如果提供了 Event)
     if (NT_SUCCESS(status) && Event && Event != INVALID_HANDLE_VALUE) {
         SetEvent(Event);
     }
     
+    // 注意：这里忽略了 ApcRoutine，因为手动模拟 APC 比较复杂且通常不需要
     return status;
 }
 
