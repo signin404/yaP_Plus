@@ -182,9 +182,11 @@ wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 // 缓存的 NT 路径
 std::wstring g_LauncherDirNt;
 std::wstring g_UserProfileNt;
-std::wstring g_UserProfileNtShort; // [新增] 用户目录短路径
+std::wstring g_UserProfileNtShort;
+std::wstring g_UsersDirNt;      // [新增] Users 根目录 (长路径)
+std::wstring g_UsersDirNtShort; // [新增] Users 根目录 (短路径)
 std::wstring g_ProgramDataNt;
-std::wstring g_ProgramDataNtShort; // [新增] ProgramData 短路径
+std::wstring g_ProgramDataNtShort;
 std::wstring g_PublicNt;
 
 thread_local bool g_IsInHook = false;
@@ -354,19 +356,15 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
     // --- 1. 检查是否在启动器目录内 ---
-    if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) {
-        return true;
-    }
+    if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
     // --- 2. 检查当前用户目录 (user\current) ---
-    // [修改] 同时检查长路径和短路径
     if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\user\\current", targetPath) ||
         CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\user\\current", targetPath)) {
         return true;
     }
 
     // --- 3. 检查所有用户目录/ProgramData (user\all) ---
-    // [修改] 同时检查长路径和短路径
     if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\user\\all", targetPath) ||
         CheckAndMap(fullNtPath, g_ProgramDataNtShort, L"\\user\\all", targetPath)) {
         return true;
@@ -374,6 +372,15 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
 
     // --- 4. 检查公用目录 (user\public) ---
     if (CheckAndMap(fullNtPath, g_PublicNt, L"\\user\\public", targetPath)) {
+        return true;
+    }
+
+    // --- [新增] 5. 检查 Users 根目录 ---
+    // 必须放在 user\current 和 user\public 之后
+    // 映射: C:\Users -> \Users (即 Data\Users)
+    // 映射: C:\Users\Other -> \Users\Other (即 Data\Users\Other)
+    if (CheckAndMap(fullNtPath, g_UsersDirNt, L"\\Users", targetPath) ||
+        CheckAndMap(fullNtPath, g_UsersDirNtShort, L"\\Users", targetPath)) {
         return true;
     }
 
@@ -1043,8 +1050,33 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"USERPROFILE", buffer, MAX_PATH)) {
         g_UserProfileNt = L"\\??\\";
         g_UserProfileNt += buffer;
-        // [新增] 获取短路径版本
         g_UserProfileNtShort = GetNtShortPath(buffer);
+
+        // [新增] 计算 Users 根目录 (例如 C:\Users)
+        // 逻辑：取 UserProfile 的父目录
+        std::wstring temp = g_UserProfileNt;
+        if (!temp.empty() && temp.back() == L'\\') temp.pop_back(); // 去除末尾斜杠
+
+        size_t lastSlash = temp.find_last_of(L'\\');
+        if (lastSlash != std::wstring::npos) {
+            // 简单的防错：确保不是驱动器根目录 (例如 \??\C:)
+            // \??\C: 长度为 6，我们要求路径长度大于此才截取
+            if (lastSlash > 6) {
+                g_UsersDirNt = temp.substr(0, lastSlash);
+            }
+        }
+
+        // [新增] 计算 Users 根目录的短路径
+        if (!g_UserProfileNtShort.empty()) {
+            std::wstring tempShort = g_UserProfileNtShort;
+            if (!tempShort.empty() && tempShort.back() == L'\\') tempShort.pop_back();
+            size_t lastSlashShort = tempShort.find_last_of(L'\\');
+            if (lastSlashShort != std::wstring::npos) {
+                if (lastSlashShort > 6) {
+                    g_UsersDirNtShort = tempShort.substr(0, lastSlashShort);
+                }
+            }
+        }
     }
 
     if (GetEnvironmentVariableW(L"ALLUSERSPROFILE", buffer, MAX_PATH)) {
