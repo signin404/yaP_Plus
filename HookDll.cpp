@@ -952,16 +952,14 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
 
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
     
-    // [修复] 强制转换为 NT 路径，否则 ShouldRedirect 会失败
+    // [关键] 强制转换为 NT 路径
     if (fullNtPath.find(L"\\Device\\") == 0) {
         fullNtPath = DevicePathToNtPath(fullNtPath);
     }
 
     std::wstring targetNtPath;
 
-    // 检查是否需要重定向
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
-
         std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
         std::wstring fullDosPath = NtPathToDosPath(fullNtPath);
 
@@ -975,52 +973,43 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
         if (sandboxExists) {
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
-
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
-
             NTSTATUS status = fpNtDeleteFile(ObjectAttributes);
-
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
-
             return status;
         }
-
-        // --- 情况 2: 沙盒无文件，但真实路径有文件 ---
-        // 执行“伪删除”：创建墓碑文件
+        // --- 情况 2: 仅真实路径有文件 (伪删除) ---
         else if (realExists) {
-            DebugLog(L"Fake Delete (Tombstone): %s", targetDosPath.c_str());
+            // 1. 确保父目录存在
+            std::wstring parentDir = targetDosPath;
+            size_t lastSlash = parentDir.find_last_of(L'\\');
+            if (lastSlash != std::wstring::npos) {
+                parentDir = parentDir.substr(0, lastSlash);
+                std::vector<wchar_t> buf(parentDir.begin(), parentDir.end());
+                buf.push_back(0);
+                RecursiveCreateDirectory(buf.data());
+            }
 
-            // 1. 确保沙盒目录结构存在
-            wchar_t dirBuf[MAX_PATH];
-            wcscpy_s(dirBuf, targetDosPath.c_str());
-            PathRemoveFileSpecW(dirBuf);
-            RecursiveCreateDirectory(dirBuf);
-
-            // 2. 创建墓碑文件 (0字节，隐藏 + 系统属性)
+            // 2. 创建墓碑
             HANDLE hFile = CreateFileW(targetDosPath.c_str(),
-                                       GENERIC_WRITE,
-                                       0,
-                                       NULL,
-                                       CREATE_ALWAYS,
-                                       FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-                                       NULL);
+                                       GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
 
             if (hFile != INVALID_HANDLE_VALUE) {
                 CloseHandle(hFile);
                 return STATUS_SUCCESS;
             } else {
+                // 创建失败，返回错误，禁止回退
                 return STATUS_ACCESS_DENIED;
             }
         }
-        
-        // --- 情况 3: 哪里都没有 ---
-        // 重定向到沙盒让系统报错
+        // --- 情况 3: 都不存在 ---
         else {
+            // 重定向到沙盒以触发“文件未找到”错误
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
@@ -1062,7 +1051,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
         }
 
-        // [修复] 关键：将设备路径转换为 NT 路径
+        // [关键] 强制转换为 NT 路径
         std::wstring ntPath = DevicePathToNtPath(rawPath);
 
         // 检查是否需要重定向
@@ -1076,16 +1065,12 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
         // --- 情况 1: 文件在沙盒中 ---
         if (attrs != INVALID_FILE_ATTRIBUTES) {
-            // 需要在沙盒路径上执行删除
-            // 注意：我们不能直接用 FileHandle，因为它指向的是真实文件（如果是在 CoW 之前打开的）
-            // 或者它指向沙盒文件。我们需要确认句柄指向哪里。
-            
-            // 简单判断：如果句柄路径包含沙盒根目录，直接放行
+            // 简单判断：如果句柄路径本身就包含沙盒根目录，说明已经打开了沙盒文件，直接放行
             if (rawPath.find(g_SandboxRoot) != std::wstring::npos) {
                  return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
             }
 
-            // 如果句柄指向真实文件，但沙盒里也有（CoW副本），我们需要删除沙盒里的副本
+            // 如果句柄指向真实文件（CoW前打开），但沙盒里已有副本，我们需要删除沙盒里的副本
             OBJECT_ATTRIBUTES objAttr;
             UNICODE_STRING usPath;
             RtlInitUnicodeString(&usPath, targetPath.c_str());
@@ -1111,25 +1096,30 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             if (NT_SUCCESS(status)) {
                 status = fpNtSetInformationFile(hSandbox, IoStatusBlock, FileInformation, Length, FileInformationClass);
                 fpNtClose(hSandbox);
-                
-                // 成功删除了沙盒文件，返回成功
-                // 注意：原始句柄指向的真实文件不会被删除
                 return status;
             }
+            // 如果打开沙盒文件失败，返回错误，不要去删原文件
+            IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+            return STATUS_ACCESS_DENIED;
         } 
         // --- 情况 2: 文件不在沙盒中 (仅在真实目录) ---
         else {
             std::wstring realDosPath = NtPathToDosPath(ntPath);
             DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
 
+            // 只有当真实文件存在时，才执行伪删除
             if (realAttrs != INVALID_FILE_ATTRIBUTES) {
-                DebugLog(L"Fake Delete via SetInfo (Tombstone): %s", targetDosPath.c_str());
-
-                // 1. 确保沙盒父目录存在
-                wchar_t dirBuf[MAX_PATH];
-                wcscpy_s(dirBuf, targetDosPath.c_str());
-                PathRemoveFileSpecW(dirBuf);
-                RecursiveCreateDirectory(dirBuf);
+                
+                // 1. 确保沙盒父目录存在 (手动提取父目录，更稳健)
+                std::wstring parentDir = targetDosPath;
+                size_t lastSlash = parentDir.find_last_of(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    parentDir = parentDir.substr(0, lastSlash);
+                    // 复制到可变缓冲区以供 RecursiveCreateDirectory 使用
+                    std::vector<wchar_t> buf(parentDir.begin(), parentDir.end());
+                    buf.push_back(0);
+                    RecursiveCreateDirectory(buf.data());
+                }
 
                 // 2. 创建墓碑文件
                 HANDLE hTombstone = CreateFileW(
@@ -1144,11 +1134,17 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
                 if (hTombstone != INVALID_HANDLE_VALUE) {
                     CloseHandle(hTombstone);
-
-                    // 欺骗应用程序：删除成功
+                    // 成功创建墓碑，返回成功
                     IoStatusBlock->Status = STATUS_SUCCESS;
                     IoStatusBlock->Information = 0;
                     return STATUS_SUCCESS;
+                } else {
+                    // [关键修复] 创建墓碑失败，返回权限错误
+                    // 绝对不能回退调用 fpNtSetInformationFile，否则会试图删除真实文件！
+                    DebugLog(L"Failed to create tombstone: %s", targetDosPath.c_str());
+                    IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_ACCESS_DENIED;
                 }
             }
         }
