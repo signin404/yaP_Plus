@@ -112,6 +112,14 @@ bool IsTombstone(DWORD attrs) {
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+#ifndef FileEndOfFileInformation
+#define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
+#endif
+
+typedef struct _FILE_END_OF_FILE_INFORMATION {
+    LARGE_INTEGER EndOfFile;
+} FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
+
 #ifndef FileRenameInformationEx
 #define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
 #endif
