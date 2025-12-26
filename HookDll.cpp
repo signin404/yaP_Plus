@@ -221,6 +221,25 @@ typedef struct _FILE_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_BOTH_DIR_INFORMATION, *PFILE_BOTH_DIR_INFORMATION;
 
+// [新增] 补充 FILE_ID_BOTH_DIR_INFORMATION 结构体
+typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    CCHAR ShortNameLength;
+    WCHAR ShortName[12];
+    LARGE_INTEGER FileId; // <--- 比 BothDirInfo 多了这个
+    WCHAR FileName[1];
+} FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
+
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
@@ -1018,42 +1037,38 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
 // [新增] 智能获取真实路径和沙盒路径
 // 返回值：是否成功获取到成对的路径
 bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
-    // 1. 获取原始设备路径 (e.g., \Device\HarddiskVolume2\Portable\Data\C)
     std::wstring rawHandlePath = GetPathFromHandle(hFile);
     if (rawHandlePath.empty()) return false;
 
-    // 2. [关键修复] 将设备路径转换为 NT DOS 路径 (e.g., \??\D:\Portable\Data\C)
-    // DevicePathToNtPath 函数在之前已经定义过，它利用了 g_DeviceMap
     std::wstring handleNtPath = DevicePathToNtPath(rawHandlePath);
+    if (handleNtPath.empty()) return false;
 
-    // 3. 检查句柄是否已经指向沙盒 (反向解析)
-    // 注意：不区分大小写比较
+    // 1. 检查句柄是否在沙盒内
     if (handleNtPath.length() >= wcslen(g_SandboxRoot) &&
         _wcsnicmp(handleNtPath.c_str(), g_SandboxRoot, wcslen(g_SandboxRoot)) == 0) {
 
-        // 句柄在沙盒内
         size_t rootLen = wcslen(g_SandboxRoot);
-        std::wstring relPath = handleNtPath.substr(rootLen); // e.g., \C or \C\Windows
+        std::wstring relPath = handleNtPath.substr(rootLen);
 
         std::wstring realNtPath;
 
-        // 反向映射逻辑：将 \C\... 映射回 \??\C:\...
-        if (relPath.length() >= 2 && relPath[0] == L'\\') {
+        // 安全检查：确保 relPath 长度足够
+        // 匹配 \C\Windows 格式
+        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
             wchar_t driveLetter = relPath[1];
-            // 检查是否为驱动器字母 (简单检查)
-            if ((driveLetter >= L'a' && driveLetter <= L'z') || (driveLetter >= L'A' && driveLetter <= L'Z')) {
-                realNtPath = L"\\??\\";
-                realNtPath += driveLetter;
-                realNtPath += L":";
-                if (relPath.length() > 2) {
-                    realNtPath += relPath.substr(2);
-                }
-            } else {
-                // 处理非驱动器映射 (如 Users)，如果你的 ShouldRedirect 包含 Users 映射，这里也要处理
-                // 暂时只处理驱动器映射，这是最常见的情况
-                return false;
-            }
-        } else {
+            realNtPath = L"\\??\\";
+            realNtPath += driveLetter;
+            realNtPath += L":";
+            realNtPath += relPath.substr(2);
+        }
+        // 匹配 \C 格式 (根目录)
+        else if (relPath.length() == 2 && relPath[0] == L'\\') {
+             wchar_t driveLetter = relPath[1];
+             realNtPath = L"\\??\\";
+             realNtPath += driveLetter;
+             realNtPath += L":";
+        }
+        else {
             return false;
         }
 
@@ -1062,7 +1077,7 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
         return true;
     }
 
-    // 4. 句柄指向真实路径 (正向解析)
+    // 2. 句柄指向真实路径
     else {
         std::wstring targetNtPath;
         if (ShouldRedirect(handleNtPath, targetNtPath)) {
@@ -1084,22 +1099,19 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
 
-    // [修改] 使用新的逻辑判断是否需要合并
-    std::wstring realDosPath;
-    std::wstring sandboxDosPath;
-    bool needMerge = GetRealAndSandboxPaths(FileHandle, realDosPath, sandboxDosPath);
-
-    // 如果无法解析出成对路径，或者不支持的查询类，直接调用原始函数
-    if (!needMerge ||
-        (FileInformationClass != FileBothDirectoryInformation &&
-         FileInformationClass != FileDirectoryInformation &&
-         FileInformationClass != FileFullDirectoryInformation &&
-         FileInformationClass != FileIdBothDirectoryInformation)) {
-
+    // 1. 检查是否支持该 InfoClass
+    // 如果不支持，直接返回原始调用，防止写坏内存
+    if (FileInformationClass != FileBothDirectoryInformation &&
+        FileInformationClass != FileIdBothDirectoryInformation) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // --- 以下逻辑保持不变，负责缓存和填充 ---
+    // 2. 解析路径
+    std::wstring realDosPath;
+    std::wstring sandboxDosPath;
+    if (!GetRealAndSandboxPaths(FileHandle, realDosPath, sandboxDosPath)) {
+        return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
+    }
 
     // 3. 获取或创建 Context
     DirContext* ctx = nullptr;
@@ -1121,18 +1133,15 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
 
     if (!ctx->IsInitialized || RestartScan) {
         ctx->Entries.clear();
-
         std::wstring pattern = L"*";
         if (FileName && FileName->Buffer) {
             pattern.assign(FileName->Buffer, FileName->Length / sizeof(WCHAR));
         }
-
-        // [修改] 传入解析出的 DOS 路径
         BuildMergedDirectoryList(realDosPath, sandboxDosPath, pattern, ctx->Entries);
         ctx->IsInitialized = true;
     }
 
-    // 5. 填充缓冲区 (代码与之前相同，略)
+    // 5. 填充缓冲区
     if (ctx->CurrentIndex >= ctx->Entries.size()) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         return STATUS_NO_MORE_FILES;
@@ -1148,15 +1157,16 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
         ULONG fileNameBytes = (ULONG)entry.FileName.length() * sizeof(WCHAR);
         ULONG structSize = 0;
 
-        // 简单的结构体大小估算
-        if (FileInformationClass == FileBothDirectoryInformation) {
-            structSize = sizeof(FILE_BOTH_DIR_INFORMATION) + fileNameBytes - sizeof(WCHAR);
+        // [关键修复] 根据 InfoClass 计算正确的大小
+        if (FileInformationClass == FileIdBothDirectoryInformation) {
+            structSize = sizeof(FILE_ID_BOTH_DIR_INFORMATION) + fileNameBytes - sizeof(WCHAR);
         } else {
-             // 兜底估算，防止溢出
-             structSize = sizeof(FILE_BOTH_DIR_INFORMATION) + fileNameBytes;
+            // FileBothDirectoryInformation
+            structSize = sizeof(FILE_BOTH_DIR_INFORMATION) + fileNameBytes - sizeof(WCHAR);
         }
 
-        structSize = (structSize + 7) & ~7; // 8字节对齐
+        // 8字节对齐
+        structSize = (structSize + 7) & ~7;
 
         if (bytesWritten + structSize > Length) {
             if (bytesWritten == 0) {
@@ -1168,29 +1178,51 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
 
         RtlZeroMemory(pBuffer, structSize);
 
-        // 填充数据 (以 BothDirInfo 为例)
-        // 注意：如果你要支持其他 InfoClass，这里需要 switch case
-        PFILE_BOTH_DIR_INFORMATION pInfo = (PFILE_BOTH_DIR_INFORMATION)pBuffer;
-
-        pInfo->NextEntryOffset = 0;
-        pInfo->FileIndex = 0;
-        pInfo->CreationTime = entry.CreationTime;
-        pInfo->LastAccessTime = entry.LastAccessTime;
-        pInfo->LastWriteTime = entry.LastWriteTime;
-        pInfo->ChangeTime = entry.ChangeTime;
-        pInfo->EndOfFile = entry.EndOfFile;
-        pInfo->AllocationSize = entry.AllocationSize;
-        pInfo->FileAttributes = entry.FileAttributes;
-        pInfo->FileNameLength = fileNameBytes;
-        pInfo->ShortNameLength = (CCHAR)(entry.ShortName.length() * sizeof(WCHAR));
-        if (pInfo->ShortNameLength > 0) {
-            memcpy(pInfo->ShortName, entry.ShortName.c_str(), pInfo->ShortNameLength);
+        // [关键修复] 根据 InfoClass 填充不同的结构体
+        if (FileInformationClass == FileIdBothDirectoryInformation) {
+            PFILE_ID_BOTH_DIR_INFORMATION pInfo = (PFILE_ID_BOTH_DIR_INFORMATION)pBuffer;
+            pInfo->NextEntryOffset = 0;
+            pInfo->FileIndex = 0;
+            pInfo->CreationTime = entry.CreationTime;
+            pInfo->LastAccessTime = entry.LastAccessTime;
+            pInfo->LastWriteTime = entry.LastWriteTime;
+            pInfo->ChangeTime = entry.ChangeTime;
+            pInfo->EndOfFile = entry.EndOfFile;
+            pInfo->AllocationSize = entry.AllocationSize;
+            pInfo->FileAttributes = entry.FileAttributes;
+            pInfo->FileNameLength = fileNameBytes;
+            pInfo->EaSize = 0;
+            pInfo->ShortNameLength = (CCHAR)(entry.ShortName.length() * sizeof(WCHAR));
+            if (pInfo->ShortNameLength > 0) {
+                memcpy(pInfo->ShortName, entry.ShortName.c_str(), pInfo->ShortNameLength);
+            }
+            pInfo->FileId.QuadPart = 0; // 虚拟 ID
+            memcpy(pInfo->FileName, entry.FileName.c_str(), fileNameBytes);
         }
-        memcpy(pInfo->FileName, entry.FileName.c_str(), fileNameBytes);
+        else {
+            // FileBothDirectoryInformation
+            PFILE_BOTH_DIR_INFORMATION pInfo = (PFILE_BOTH_DIR_INFORMATION)pBuffer;
+            pInfo->NextEntryOffset = 0;
+            pInfo->FileIndex = 0;
+            pInfo->CreationTime = entry.CreationTime;
+            pInfo->LastAccessTime = entry.LastAccessTime;
+            pInfo->LastWriteTime = entry.LastWriteTime;
+            pInfo->ChangeTime = entry.ChangeTime;
+            pInfo->EndOfFile = entry.EndOfFile;
+            pInfo->AllocationSize = entry.AllocationSize;
+            pInfo->FileAttributes = entry.FileAttributes;
+            pInfo->FileNameLength = fileNameBytes;
+            pInfo->EaSize = 0;
+            pInfo->ShortNameLength = (CCHAR)(entry.ShortName.length() * sizeof(WCHAR));
+            if (pInfo->ShortNameLength > 0) {
+                memcpy(pInfo->ShortName, entry.ShortName.c_str(), pInfo->ShortNameLength);
+            }
+            memcpy(pInfo->FileName, entry.FileName.c_str(), fileNameBytes);
+        }
 
+        // 链接链表
         if (prevEntry) {
-            // 修正上一个节点的 NextEntryOffset
-            // 注意：这里必须根据具体的结构体类型转换指针
+            // NextEntryOffset 的位置在两个结构体中都是第一个 ULONG，所以强转哪个都行
             ((PFILE_BOTH_DIR_INFORMATION)prevEntry)->NextEntryOffset = (ULONG)(pBuffer - (BYTE*)prevEntry);
         }
 
