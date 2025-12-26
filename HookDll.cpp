@@ -479,7 +479,7 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
     // 如果无法转换为 DOS 路径，返回空字符串，避免 FindFirstFile 访问错误的路径
     if (ntPath.find(L"\\Device\\") == 0) {
-        return L""; 
+        return L"";
     }
     return ntPath;
 }
@@ -675,13 +675,26 @@ CachedDirEntry ConvertFindData(const WIN32_FIND_DATAW& fd) {
     return entry;
 }
 
+// [修复] 辅助：判断是否为驱动器根目录 (如 C: 或 C:\)
+bool IsDriveRoot(const std::wstring& path) {
+    if (path.empty()) return false;
+    // 匹配 C:
+    if (path.length() == 2 && path[1] == L':') return true;
+    // 匹配 C:\ (注意：不匹配 C:\Windows)
+    if (path.length() == 3 && path[1] == L':' && path[2] == L'\\') return true;
+    return false;
+}
+
 // 核心：构建合并后的文件列表
 void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& sandboxPath, const std::wstring& pattern, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
-    // **修复1: 总是先扫描真实目录 (即使沙盒目录不存在)**
+    // 1. 扫描真实目录
     if (!realPath.empty()) {
-        std::wstring searchPath = realPath + L"\\" + pattern;
+        std::wstring searchPath = realPath;
+        if (searchPath.back() != L'\\') searchPath += L"\\";
+        searchPath += pattern;
+
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -695,9 +708,12 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // **修复2: 然后扫描沙盒目录,沙盒文件会覆盖或添加到映射中**
+    // 2. 扫描沙盒目录
     if (!sandboxPath.empty()) {
-        std::wstring searchPath = sandboxPath + L"\\" + pattern;
+        std::wstring searchPath = sandboxPath;
+        if (searchPath.back() != L'\\') searchPath += L"\\";
+        searchPath += pattern;
+
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -707,22 +723,29 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                 std::wstring key = fd.cFileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
 
-                // 检查是否为墓碑文件 (隐藏 + 系统属性)
                 if (IsTombstone(fd.dwFileAttributes)) {
-                    mergedMap.erase(key); // 墓碑:从列表中删除,隐藏真实目录中的对应文件
+                    mergedMap.erase(key);
                 } else {
-                    mergedMap[key] = ConvertFindData(fd); // 覆盖或添加:使用沙盒版本
+                    mergedMap[key] = ConvertFindData(fd);
                 }
             } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
         }
     }
 
-    // 3. 总是添加 . 和 ..
-    CachedDirEntry dotEntry = {}; dotEntry.FileName = L"."; dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-    outList.push_back(dotEntry);
-    CachedDirEntry dotDotEntry = {}; dotDotEntry.FileName = L".."; dotDotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-    outList.push_back(dotDotEntry);
+    // 3. [关键修复] 仅在非根目录时添加 . 和 ..
+    // 驱动器根目录 (C:\) 不应该包含这些条目，否则会导致 Explorer 路径解析错误
+    if (!IsDriveRoot(realPath)) {
+        CachedDirEntry dotEntry = {};
+        dotEntry.FileName = L".";
+        dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        outList.push_back(dotEntry);
+
+        CachedDirEntry dotDotEntry = {};
+        dotDotEntry.FileName = L"..";
+        dotDotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        outList.push_back(dotDotEntry);
+    }
 
     // 4. 转为 Vector
     for (const auto& pair : mergedMap) {
@@ -764,11 +787,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         // [修复 1] 完善写入判断逻辑
         // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建)，都视为写入意图
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
-        
-        if (CreateDisposition == FILE_CREATE || 
-            CreateDisposition == FILE_SUPERSEDE || 
-            CreateDisposition == FILE_OVERWRITE || 
-            CreateDisposition == FILE_OVERWRITE_IF || 
+
+        if (CreateDisposition == FILE_CREATE ||
+            CreateDisposition == FILE_SUPERSEDE ||
+            CreateDisposition == FILE_OVERWRITE ||
+            CreateDisposition == FILE_OVERWRITE_IF ||
             CreateDisposition == FILE_OPEN_IF) {
             isWrite = true;
         }
@@ -1220,10 +1243,10 @@ NTSTATUS HandleDirectoryQuery(
 
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
-    
+
     // 检查重定向
     if (!ShouldRedirect(ntDirPath, targetPath)) {
-        return STATUS_NOT_SUPPORTED; 
+        return STATUS_NOT_SUPPORTED;
     }
 
     // 准备本地变量，避免在锁内做复杂操作
@@ -1234,7 +1257,7 @@ NTSTATUS HandleDirectoryQuery(
     // --- 阶段 1: 检查是否需要构建 (使用读锁/共享锁) ---
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
-        
+
         // 如果是重新扫描，我们需要在写锁阶段删除，这里先标记
         if (RestartScan) {
             needsBuild = true;
@@ -1299,7 +1322,7 @@ NTSTATUS HandleDirectoryQuery(
     // --- 阶段 4: 填充缓冲区 (无锁，使用局部副本或再次加读锁) ---
     // 为了安全，我们再次获取读锁来读取 ctx->Entries
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
-    
+
     // 再次检查 ctx 有效性 (防止极端情况)
     if (!ctx || !ctx->IsInitialized) {
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1459,7 +1482,7 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (NT_SUCCESS(status) && Event && Event != INVALID_HANDLE_VALUE) {
         SetEvent(Event);
     }
-    
+
     // 注意：这里忽略了 ApcRoutine，因为手动模拟 APC 比较复杂且通常不需要
     return status;
 }
