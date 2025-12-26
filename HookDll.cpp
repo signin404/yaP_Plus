@@ -22,6 +22,10 @@
 #define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034L)
 #endif
 
+#ifndef STATUS_ACCESS_DENIED
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
+#endif
+
 #ifndef FILE_DIRECTORY_FILE
 #define FILE_DIRECTORY_FILE 0x00000001
 #endif
@@ -38,6 +42,10 @@
 #define FileDispositionInformationEx ((FILE_INFORMATION_CLASS)64)
 #endif
 
+// -----------------------------------------------------------
+// 2. 补全缺失的 NT 结构体与枚举
+// -----------------------------------------------------------
+
 #ifndef FileRenameInformationEx
 #define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
 #endif
@@ -53,10 +61,6 @@ typedef struct _FILE_DISPOSITION_INFORMATION_EX {
 #define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
 #define FILE_DISPOSITION_ON_CLOSE 0x00000008
 #define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
-
-// -----------------------------------------------------------
-// 2. 补全缺失的 NT 结构体与枚举
-// -----------------------------------------------------------
 
 #ifndef ObjectNameInformation
 #define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
