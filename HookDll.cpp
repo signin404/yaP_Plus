@@ -1085,9 +1085,17 @@ std::wstring GetPathFromHandle(HANDLE hFile) {
 
 // [新增] 创建一个空的占位文件
 void CreateDummyFile(const std::wstring& path) {
-    HANDLE hFile = CreateFileW(path.c_str(), 0, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // [修复] 为墓碑文件设置隐藏+系统属性
+    HANDLE hFile = CreateFileW(path.c_str(), 0, 0, NULL, CREATE_NEW, 
+                               FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
         CloseHandle(hFile);
+    } else {
+        // [修复] 如果CREATE_NEW失败(可能文件已存在),尝试修改现有文件的属性
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+            SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+        }
     }
 }
 
@@ -1138,14 +1146,28 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
 
             // 2. 创建墓碑
             std::wstring tombstonePath = targetDosPath + kTombstoneSuffix;
+            
+            // [修复] 先检查墓碑是否已存在
+            DWORD tombstoneAttrs = GetFileAttributesW(tombstonePath.c_str());
+            if (tombstoneAttrs != INVALID_FILE_ATTRIBUTES) {
+                // 墓碑已存在,直接返回成功
+                return STATUS_SUCCESS;
+            }
+            
+            // 创建新墓碑,设置隐藏+系统属性
             HANDLE hFile = CreateFileW(tombstonePath.c_str(),
-                                       GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                       FILE_ATTRIBUTE_NORMAL, NULL);
+                                       GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                       FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, NULL);
 
             if (hFile != INVALID_HANDLE_VALUE) {
                 CloseHandle(hFile);
                 return STATUS_SUCCESS;
             } else {
+                DWORD err = GetLastError();
+                // [修复] 如果因为文件已存在而失败,也视为成功
+                if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+                    return STATUS_SUCCESS;
+                }
                 return STATUS_ACCESS_DENIED;
             }
         }
@@ -1326,26 +1348,49 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
             // 2. 创建墓碑文件 (原始名 + .YapDel)
             std::wstring tombstonePath = targetDosPath + kTombstoneSuffix;
+            
+            // [修复] 检查墓碑文件是否已存在
+            DWORD tombstoneAttrs = GetFileAttributesW(tombstonePath.c_str());
+            bool tombstoneExists = (tombstoneAttrs != INVALID_FILE_ATTRIBUTES);
+            
+            if (tombstoneExists) {
+                // 墓碑已存在,无需重复创建
+                DebugLog(L"Tombstone Already Exists: %s", tombstonePath.c_str());
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = 0;
+                return STATUS_SUCCESS;
+            }
+            
+            // 墓碑不存在,创建新墓碑
             HANDLE hTombstone = CreateFileW(
                 tombstonePath.c_str(),
                 GENERIC_WRITE,
                 0,
                 NULL,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
+                CREATE_NEW,  // [修复] 改为 CREATE_NEW 避免意外覆盖
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,  // [修复] 设置隐藏+系统属性
                 NULL
             );
 
             if (hTombstone != INVALID_HANDLE_VALUE) {
                 CloseHandle(hTombstone);
-                DebugLog(L"Fake Delete (Tombstone): %s", tombstonePath.c_str());
+                DebugLog(L"Fake Delete (Tombstone Created): %s", tombstonePath.c_str());
 
-                // 返回成功，欺骗 Explorer 文件已删除
+                // 返回成功,欺骗 Explorer 文件已删除
                 IoStatusBlock->Status = STATUS_SUCCESS;
                 IoStatusBlock->Information = 0;
                 return STATUS_SUCCESS;
             } else {
-                DebugLog(L"Fake Delete Failed: %s", tombstonePath.c_str());
+                DWORD err = GetLastError();
+                DebugLog(L"Fake Delete Failed: %s (Error: %d)", tombstonePath.c_str(), err);
+                
+                // [修复] 如果是因为文件已存在导致的失败(不应该发生,但防御性编程)
+                if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_SUCCESS;
+                }
+                
                 IoStatusBlock->Status = STATUS_ACCESS_DENIED;
                 return STATUS_ACCESS_DENIED;
             }
