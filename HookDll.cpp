@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <set>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -111,6 +112,14 @@ bool IsTombstone(DWORD attrs) {
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// [新增] 补充 FILE_RENAME_INFORMATION 结构体
+typedef struct _FILE_RENAME_INFORMATION {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
 #ifndef FileEndOfFileInformation
 #define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
