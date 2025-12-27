@@ -488,6 +488,7 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"ConDrv")) return true;
     if (wcsstr(path, L"CONIN$")) return true;
     if (wcsstr(path, L"CONOUT$")) return true;
+    if (wcsstr(path, L"Global\\")) return true; // 全局对象
     return false;
 }
 
@@ -654,13 +655,39 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         }
     }
 
-    // --- 6. 默认绝对路径映射 (模式2 或 模式1下的系统盘路径) ---
+    // --- 6. 默认绝对路径映射 ---
+    // fullNtPath 格式通常为 \??\C:\Path...
+    // 我们需要判断它是否真的包含盘符 如果像 \??\cpuz159 这样没有盘符 则是设备 不应重定向
+
+    // 检查长度是否足够包含盘符 (例如 \??\C: 长度为 6)
+    if (fullNtPath.length() < 6) return false;
+
+    // 检查第 6 个字符是否为冒号 (索引 5)
+    // \ ? ? \ C :
+    // 0 1 2 3 4 5
+    if (fullNtPath[5] != L':') {
+        // 特殊情况：UNC 路径 \??\UNC\Server\Share...
+        if (_wcsnicmp(fullNtPath.c_str(), L"\\??\\UNC\\", 8) == 0) {
+            // UNC 路径处理逻辑 (可选 目前简单放行或按需映射)
+            // 这里简单处理：如果是 UNC 暂时不重定向 或者你需要实现 UNC 到沙盒的映射逻辑
+            return false;
+        }
+
+        // 既不是盘符路径 也不是 UNC 那极大概率是设备对象 (如 \??\cpuz159)
+        // 或者是 \??\Volume{GUID} 等
+        // 直接返回 false 不重定向
+        return false;
+    }
+
     std::wstring relPath = fullNtPath.substr(4);
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
+
+    // 再次确认冒号位置 (虽然上面检查过了 这里为了提取路径)
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
         relPath.erase(colonPos, 1);
     }
+
     targetPath += L"\\";
     targetPath += relPath;
     return true;
