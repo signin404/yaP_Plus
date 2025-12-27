@@ -706,23 +706,65 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
+
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
+
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
     targetPath = L"\\??\\";
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
+    // -------------------------------------------------------
+    // 1. 特殊目录映射 (优先级最高 适用于所有模式)
+    // -------------------------------------------------------
+
+    // [启动器目录] -> 映射为沙盒根目录 (相对路径)
+    // 例如: Z:\Portable\App\Config.ini -> Sandbox\Config.ini
+    if (!g_LauncherDirNt.empty()) {
+        if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
+    }
+
+    // [当前用户目录] -> Users\Current
+    // 例如: C:\Users\Admin\AppData -> Sandbox\Users\Current\AppData
+    if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\Users\\Current", targetPath) ||
+        CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\Users\\Current", targetPath)) {
+        return true;
+    }
+
+    // [所有用户目录/ProgramData] -> Users\All
+    // 例如: C:\ProgramData -> Sandbox\Users\All
+    if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\Users\\All", targetPath) ||
+        CheckAndMap(fullNtPath, g_ProgramDataNtShort, L"\\Users\\All", targetPath)) {
+        return true;
+    }
+
+    // [公用目录] -> Users\Public
+    if (CheckAndMap(fullNtPath, g_PublicNt, L"\\Users\\Public", targetPath)) {
+        return true;
+    }
+
+    // [Users 根目录] -> Users
+    // 例如: C:\Users -> Sandbox\Users
+    if (CheckAndMap(fullNtPath, g_UsersDirNt, L"\\Users", targetPath) ||
+        CheckAndMap(fullNtPath, g_UsersDirNtShort, L"\\Users", targetPath)) {
+        return true;
+    }
+
+    // -------------------------------------------------------
+    // 2. 通用路径映射 (根据模式决定策略)
+    // -------------------------------------------------------
+
     // --- Mode 3: 激进隔离策略 ---
     if (g_HookMode == 3) {
-        // 排除沙盒根目录本身 (防止递归)
-        // 排除特殊设备路径 (已在开头处理)
+        // 上面没有匹配到的特殊目录 全部按绝对路径映射 (保留盘符结构)
+        // 例如: C:\Windows\System32 -> Sandbox\C\Windows\System32
+        // 例如: D:\Games -> Sandbox\D\Games
 
-        // 映射所有路径到沙盒
         std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
         std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
 
-        // 处理驱动器号冒号
+        // 处理驱动器号冒号 (C: -> C)
         size_t colonPos = relPath.find(L':');
         if (colonPos != std::wstring::npos) {
             relPath.erase(colonPos, 1);
@@ -733,47 +775,20 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         return true;
     }
 
-    // --- 1. 检查是否在启动器目录内 (最高优先级 无论模式如何都重定向) ---
-    if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
-
-    // --- 2. 检查当前用户目录 (user\current) ---
-    if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\Users\\Current", targetPath) ||
-        CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\Users\\Current", targetPath)) {
-        return true;
-    }
-
-    // --- 3. 检查所有用户目录/ProgramData (user\all) ---
-    if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\Users\\All", targetPath) ||
-        CheckAndMap(fullNtPath, g_ProgramDataNtShort, L"\\Users\\All", targetPath)) {
-        return true;
-    }
-
-    // --- 4. 检查公用目录 (user\public) ---
-    if (CheckAndMap(fullNtPath, g_PublicNt, L"\\Users\\Public", targetPath)) {
-        return true;
-    }
-
-    // --- 5. 检查 Users 根目录 ---
-    if (CheckAndMap(fullNtPath, g_UsersDirNt, L"\\Users", targetPath) ||
-        CheckAndMap(fullNtPath, g_UsersDirNtShort, L"\\Users", targetPath)) {
-        return true;
-    }
-
-    // [新增] 模式 1 过滤逻辑
-    // 如果 hookfile=1 且路径不在系统盘 (且前面没匹配到启动器或用户目录) 则不重定向
+    // --- Mode 1: 系统盘过滤 ---
     if (g_HookMode == 1) {
         // 检查是否以系统盘符开头 (例如 \??\C:)
-        // 使用不区分大小写比较
         if (!g_SystemDriveNt.empty()) {
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘 也不是启动器目录(前面已处理) 直接放行
+                // 不是系统盘 -> 不重定向 (直接读写原路径)
                 return false;
             }
         }
     }
 
-    // --- 6. 默认绝对路径映射 (模式2 或 模式1下的系统盘路径) ---
+    // --- Mode 2 & Mode 1(系统盘部分): 默认绝对路径映射 ---
+    // 映射为 Sandbox\DriveLetter\Path
     std::wstring relPath = fullNtPath.substr(4);
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
@@ -865,8 +880,8 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
     // 1. 扫描真实目录 (增加过滤)
     if (!realPath.empty()) {
-        // [新增] 如果真实目录本身不可见，则不扫描真实目录
-        // 注意：realPath 是 DOS 路径，需要转 NT 路径判断
+        // [新增] 如果真实目录本身不可见 则不扫描真实目录
+        // 注意：realPath 是 DOS 路径 需要转 NT 路径判断
         std::wstring realNtPath = L"\\??\\" + realPath;
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
 
@@ -900,7 +915,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 2. 扫描沙盒目录 (保持不变，沙盒内容始终可见)
+    // 2. 扫描沙盒目录 (保持不变 沙盒内容始终可见)
     if (!sandboxPath.empty()) {
         std::wstring searchPath = sandboxPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
@@ -976,7 +991,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         bool realExists = NtPathExists(fullNtPath);
 
         // [新增] Mode 3 可见性检查
-        // 如果真实文件存在，但根据策略不可见，则视为不存在
+        // 如果真实文件存在 但根据策略不可见 则视为不存在
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
@@ -990,7 +1005,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             if (!realExists && sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                // 如果真实存在且可见，直接打开真实目录
+                // 如果真实存在且可见 直接打开真实目录
                 // 目录内容的过滤由 NtQueryDirectoryFile (BuildMergedDirectoryList) 处理
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
@@ -1278,7 +1293,7 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         ObjectAttributes->RootDirectory = oldRoot;
         if (status == STATUS_SUCCESS) return status;
 
-        // 2. [新增] 如果沙盒没有，检查真实路径是否被隐藏
+        // 2. [新增] 如果沙盒没有 检查真实路径是否被隐藏
         if (g_HookMode == 3) {
             if (!IsPathVisible(fullNtPath)) {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
