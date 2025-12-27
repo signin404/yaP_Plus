@@ -1,4 +1,4 @@
-name: Build Complete Launcher (DLLs + Injector + EXE)
+name: Build Complete Launcher
 
 on:
   push:
@@ -19,10 +19,10 @@ jobs:
       matrix:
         include:
           - arch: x86
-            name: Hook32.dll
+            name: YapHook32.dll
             lib_minhook: libMinHook.x86.lib
           - arch: x64
-            name: Hook64.dll
+            name: YapHook64.dll
             lib_minhook: libMinHook.x64.lib
 
     steps:
@@ -82,7 +82,7 @@ jobs:
         if-no-files-found: error
 
   # ==================================================================
-  # 第二步：构建 32位 注入器 (Injector32.exe)
+  # 第二步：构建 32位 注入器 (YapInjector32.exe)
   # ==================================================================
   build-injector:
     name: Build Injector32 (x86)
@@ -100,14 +100,14 @@ jobs:
     - name: Compile Injector32
       shell: cmd
       run: |
-        echo Compiling Injector32.exe...
+        echo Compiling YapInjector32.exe...
 
         :: 编译 Injector32.cpp 为 32位 EXE
         :: 使用 /MT 静态链接 CRT 确保在无 VC++ 运行库的机器上也能运行
-        cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:Injector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
+        cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:YapInjector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
 
-        if not exist "Injector32.exe" (
-            echo Error: Injector32.exe was not created!
+        if not exist "YapInjector32.exe" (
+            echo Error: YapInjector32.exe was not created!
             exit 1
         )
 
@@ -116,8 +116,8 @@ jobs:
     - name: Upload Injector EXE
       uses: actions/upload-artifact@v4
       with:
-        name: Injector32.exe
-        path: Injector32.exe
+        name: YapInjector32.exe
+        path: YapInjector32.exe
         if-no-files-found: error
 
   # ==================================================================
@@ -132,7 +132,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 下载所有上游构建的工件 (Hook32.dll, Hook64.dll, Injector32.exe)
+    # 下载所有上游构建的工件 (YapHook32.dll, YapHook64.dll, YapInjector32.exe)
     - name: Download Artifacts
       uses: actions/download-artifact@v4
       with:
@@ -141,9 +141,9 @@ jobs:
     - name: Verify Dependencies Existence
       shell: cmd
       run: |
-        if exist Hook32.dll ( echo Hook32.dll found. ) else ( echo Error: Hook32.dll missing! & exit 1 )
-        if exist Hook64.dll ( echo Hook64.dll found. ) else ( echo Error: Hook64.dll missing! & exit 1 )
-        if exist Injector32.exe ( echo Injector32.exe found. ) else ( echo Error: Injector32.exe missing! & exit 1 )
+        if exist YapHook32.dll ( echo YapHook32.dll found. ) else ( echo Error: YapHook32.dll missing! & exit 1 )
+        if exist YapHook64.dll ( echo YapHook64.dll found. ) else ( echo Error: YapHook64.dll missing! & exit 1 )
+        if exist YapInjector32.exe ( echo YapInjector32.exe found. ) else ( echo Error: YapInjector32.exe missing! & exit 1 )
 
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -158,7 +158,7 @@ jobs:
         if not exist "launcher.ini" echo ;Empty INI > launcher.ini
 
         REM 2. 编译资源文件
-        REM 定义 EMBED_HOOK_DLLS: 包含 Hook32.dll/Hook64.dll
+        REM 定义 EMBED_HOOK_DLLS: 包含 YapHook32.dll/YapHook64.dll
         REM 定义 EMBED_INI_FILE: 包含 launcher.ini
 
         rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc || exit 1
