@@ -383,11 +383,36 @@ std::wstring GetOriginalNameFromTombstone(const std::wstring& tombstoneName) {
     return tombstoneName.substr(0, tombstoneName.length() - kTombstoneSuffix.length());
 }
 
-// 检查路径是否包含回收站
+// 检查路径是否包含回收站 (不区分大小写)
 bool IsRecycleBinPath(const std::wstring& path) {
+    if (path.empty()) return false;
     std::wstring upper = path;
     std::transform(upper.begin(), upper.end(), upper.begin(), towupper);
     return upper.find(L"$RECYCLE.BIN") != std::wstring::npos;
+}
+
+// [新增] 解析重命名操作的目标路径
+std::wstring GetRenameTargetPath(HANDLE hFile, PFILE_RENAME_INFORMATION renameInfo) {
+    std::wstring targetName;
+
+    // 1. 获取 RootDirectory (如果有)
+    if (renameInfo->RootDirectory) {
+        std::wstring rootPath = GetPathFromHandle(renameInfo->RootDirectory);
+        if (!rootPath.empty()) {
+            targetName = rootPath;
+            if (targetName.back() != L'\\') targetName += L"\\";
+        }
+    }
+
+    // 2. 追加 FileName
+    if (renameInfo->FileNameLength > 0) {
+        targetName.append(renameInfo->FileName, renameInfo->FileNameLength / sizeof(WCHAR));
+    }
+
+    // 3. 如果没有 RootDirectory 且 FileName 是相对路径 (不以 \ 开头)，则相对于当前文件目录
+    // 但通常 Rename 的 FileName 是完整的或相对于 Root 的。
+    // 如果 targetName 为空，说明解析失败
+    return targetName;
 }
 
 // 定义目录项结构 用于缓存
@@ -786,13 +811,13 @@ bool IsDriveRoot(const std::wstring& path) {
 // 核心：构建合并后的文件列表
 void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& sandboxPath, const std::wstring& pattern, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
-    std::set<std::wstring> deletedFiles; // 记录被墓碑标记删除的文件名 (小写)
+    std::set<std::wstring> deletedFiles; // 记录被删除的文件名 (小写)
 
-    // 1. 扫描沙盒目录 (优先处理，提取墓碑)
+    // 1. 扫描沙盒目录
     if (!sandboxPath.empty()) {
         std::wstring searchPath = sandboxPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
-        searchPath += L"*"; // 扫描所有文件以查找墓碑
+        searchPath += L"*";
 
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
@@ -802,19 +827,14 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
                 std::wstring fileName = fd.cFileName;
 
-                // 检查是否为墓碑文件
+                // [关键] 识别墓碑
                 if (IsTombstoneName(fileName)) {
                     std::wstring originalName = GetOriginalNameFromTombstone(fileName);
                     std::transform(originalName.begin(), originalName.end(), originalName.begin(), towlower);
                     deletedFiles.insert(originalName);
-                    // 墓碑文件本身不添加到列表中
-                    continue;
+                    continue; // 不显示墓碑文件本身
                 }
 
-                // 普通沙盒文件，添加到列表
-                // 需检查是否匹配 pattern (这里简化处理，后续由调用者过滤或在此处过滤)
-                // 为了性能，建议在此处做简单的通配符匹配，或者全部加入由后续逻辑过滤
-                // 这里我们全部加入，依赖 HandleDirectoryQuery 中的 PathMatchSpecW 过滤
                 std::wstring key = fileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
                 mergedMap[key] = ConvertFindData(fd);
@@ -828,7 +848,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
     if (!realPath.empty()) {
         std::wstring searchPath = realPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
-        searchPath += pattern; // 真实目录可以直接用 pattern 优化
+        searchPath += pattern;
 
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
@@ -839,10 +859,10 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                 std::wstring key = fd.cFileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
 
-                // 如果该文件已被墓碑标记，则跳过
+                // [关键] 如果文件已被墓碑标记，则跳过
                 if (deletedFiles.count(key)) continue;
 
-                // 如果沙盒中已有同名文件（覆盖），则跳过（优先显示沙盒的）
+                // 如果沙盒中已有同名文件，跳过
                 if (mergedMap.find(key) != mergedMap.end()) continue;
 
                 mergedMap[key] = ConvertFindData(fd);
@@ -852,7 +872,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 3. 处理 . 和 ..
+    // 3. 添加 . 和 ..
     if (!IsDriveRoot(realPath)) {
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
@@ -865,7 +885,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         outList.push_back(dotDotEntry);
     }
 
-    // 4. 转为 Vector
     for (const auto& pair : mergedMap) {
         outList.push_back(pair.second);
     }
@@ -891,7 +910,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    // 1. 递归守卫：防止 Hook 内部调用导致死循环
+    // 1. 递归守卫
     if (g_IsInHook) {
         return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     }
@@ -904,11 +923,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 3. 检查是否需要重定向
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
-        // --- [新增] 墓碑检查逻辑 ---
-        // 检查是否存在对应的墓碑文件 (Target.YapDel)
+        // --- [新增] 墓碑检查逻辑 (.YapDel) ---
+        // 检查是否存在对应的墓碑文件
         std::wstring tombstoneNtPath = targetNtPath + kTombstoneSuffix;
         if (NtPathExists(tombstoneNtPath)) {
-            // 判断是否为“创建/覆盖”操作
+            // 判断当前操作是否为“创建新文件”
             bool isCreate = (CreateDisposition == FILE_CREATE ||
                              CreateDisposition == FILE_SUPERSEDE ||
                              CreateDisposition == FILE_OVERWRITE_IF ||
@@ -916,12 +935,12 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
             if (isCreate) {
                 // 如果是创建新文件，我们需要物理删除墓碑文件，以便新文件能被创建
+                // (相当于复活了该文件名)
                 std::wstring tombstoneDos = NtPathToDosPath(tombstoneNtPath);
                 DeleteFileW(tombstoneDos.c_str());
-                // 继续执行后续逻辑，现在墓碑没了，就像文件从未存在过一样
             } else {
-                // 如果只是打开(FILE_OPEN/FILE_OVERWRITE)，则返回“文件未找到”
-                // 从而实现了对原始文件的隐藏
+                // 如果只是打开现有文件 (FILE_OPEN / FILE_OVERWRITE)，
+                // 由于墓碑存在，应视为文件不存在 (隐藏原始文件)
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
@@ -929,8 +948,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         // --- 4. 判定操作意图 (读 vs 写) ---
 
         // [关键修复] 判定是否为写入操作
-        // 注意：这里移除了 DELETE 权限。单纯的 DELETE 请求不应触发 CoW。
-        // 如果只请求 DELETE，我们让其打开真实文件，然后在 NtSetInformationFile 中拦截并创建墓碑。
+        // 必须移除 DELETE 权限！单纯的 DELETE 请求不应触发 CoW。
+        // 逻辑：如果 Explorer 请求删除真实文件，我们让其打开真实文件句柄，
+        // 然后在 Detour_NtSetInformationFile 中拦截并创建墓碑。
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
         // 如果设置了“关闭时删除”标志，这本质上是修改操作，视为写入
@@ -938,7 +958,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             isWrite = true;
         }
 
-        // 检查 CreateDisposition 是否隐含写入意图
+        // 检查 CreateDisposition 是否隐含写入意图 (创建、覆盖等)
         if (CreateDisposition == FILE_CREATE ||
             CreateDisposition == FILE_SUPERSEDE ||
             CreateDisposition == FILE_OVERWRITE ||
@@ -962,7 +982,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             if (!realExists && sandboxExists) {
                 shouldRedirect = true;
             } else {
-                // 打开真实目录 (合并逻辑在 QueryDirectory 中处理)
+                // 打开真实目录 (目录合并逻辑在 QueryDirectory 中处理)
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             }
         } else if (isWrite) {
@@ -1195,6 +1215,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     bool isDelete = false;
     bool isRename = false;
 
+    // 1. 识别操作类型
     if (FileInformationClass == FileDispositionInformation) {
         isDelete = ((PFILE_DISPOSITION_INFORMATION)FileInformation)->DeleteFile;
     }
@@ -1209,7 +1230,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 获取当前文件路径
+    // 2. 获取当前文件路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
     if (rawPath.empty()) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
@@ -1217,27 +1238,27 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     std::wstring ntPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
 
-    // 检查是否需要重定向
+    // 3. 检查是否需要重定向 (如果不需要，直接放行)
     if (!ShouldRedirect(ntPath, targetPath)) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // --- 处理重命名 (拦截移动到回收站) ---
+    // 4. 处理重命名 (拦截移动到回收站)
     if (isRename) {
         PFILE_RENAME_INFORMATION renameInfo = (PFILE_RENAME_INFORMATION)FileInformation;
-        std::wstring targetName(renameInfo->FileName, renameInfo->FileNameLength / sizeof(WCHAR));
+        std::wstring targetName = GetRenameTargetPath(FileHandle, renameInfo);
 
-        // 简单判断：如果目标路径包含 $RECYCLE.BIN，则视为删除操作
+        // 检查目标是否为回收站
         if (IsRecycleBinPath(targetName)) {
-            isDelete = true; // 强制转换为删除
-            // 继续向下执行删除逻辑
+            isDelete = true; // 强制转换为删除操作
+            DebugLog(L"Intercepted RecycleBin Move: %s -> Delete", ntPath.c_str());
         } else {
-            // 普通重命名，这里暂不处理，放行给系统或后续实现 CoW 重命名
+            // 普通重命名：放行 (或者你需要实现沙盒内的重命名逻辑，这里暂且放行)
             return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
         }
     }
 
-    // --- 处理删除 (包括被转换的回收站移动) ---
+    // 5. 执行删除逻辑 (包括被转换的回收站移动)
     if (isDelete) {
         // 构造沙盒根目录前缀
         std::wstring sandboxRootNt = L"\\??\\";
@@ -1245,13 +1266,12 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
         bool isHandleInSandbox = ContainsCaseInsensitive(ntPath, sandboxRootNt);
         std::wstring targetDosPath = NtPathToDosPath(targetPath);
+        std::wstring realDosPath = NtPathToDosPath(ntPath);
 
+        // 逻辑分支 A: 句柄指向沙盒文件
         if (isHandleInSandbox) {
-            // --- 情况 A: 文件已在沙盒中 ---
-            // 直接物理删除沙盒文件
-            // 我们需要调用原始的 SetInformationFile(Delete)
-            // 如果之前是 Rename 操作，我们需要构造一个 DispositionInfo 来执行删除
-
+            // 1. 物理删除沙盒文件
+            // 注意：必须构造一个新的 DispositionInfo，因为原始请求可能是 RenameInfo
             FILE_DISPOSITION_INFORMATION dispInfo;
             dispInfo.DeleteFile = TRUE;
 
@@ -1263,12 +1283,29 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                 FileDispositionInformation
             );
 
+            if (!NT_SUCCESS(status)) return status;
+
+            // 2. [关键] 检查是否存在底层的真实文件
+            // 如果删除了沙盒副本，真实文件会露出来，所以必须补一个墓碑
+            // 我们需要反推真实路径。targetDosPath 是沙盒路径，我们需要计算对应的真实路径。
+            // 这里利用之前计算的 targetPath (沙盒NT) 和 ntPath (当前句柄NT) 关系可能比较复杂
+            // 简单方法：GetRealAndSandboxPaths
+
+            std::wstring realPathCheck, sandboxPathCheck;
+            if (GetRealAndSandboxPaths(FileHandle, realPathCheck, sandboxPathCheck)) {
+                DWORD realAttrs = GetFileAttributesW(realPathCheck.c_str());
+                if (realAttrs != INVALID_FILE_ATTRIBUTES) {
+                    // 真实文件存在，必须创建墓碑
+                    std::wstring tombstonePath = sandboxPathCheck + kTombstoneSuffix;
+                    CreateDummyFile(tombstonePath); // 创建空文件作为墓碑
+                    DebugLog(L"Deleted Sandbox File & Created Tombstone: %s", tombstonePath.c_str());
+                }
+            }
+
             return status;
         }
+        // 逻辑分支 B: 句柄指向真实文件
         else {
-            // --- 情况 B: 文件在真实目录中 ---
-            // 创建墓碑文件：SandboxPath + .YapDel
-
             // 1. 确保沙盒父目录存在
             std::wstring parentDir = targetDosPath;
             size_t lastSlash = parentDir.find_last_of(L'\\');
@@ -1279,7 +1316,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                 RecursiveCreateDirectory(buf.data());
             }
 
-            // 2. 创建墓碑文件
+            // 2. 创建墓碑文件 (原始名 + .YapDel)
             std::wstring tombstonePath = targetDosPath + kTombstoneSuffix;
             HANDLE hTombstone = CreateFileW(
                 tombstonePath.c_str(),
@@ -1287,23 +1324,20 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                 0,
                 NULL,
                 CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL, // 普通文件即可，不需要隐藏属性，因为我们会通过后缀过滤
+                FILE_ATTRIBUTE_NORMAL,
                 NULL
             );
 
             if (hTombstone != INVALID_HANDLE_VALUE) {
                 CloseHandle(hTombstone);
-                DebugLog(L"Created Tombstone: %s", tombstonePath.c_str());
+                DebugLog(L"Fake Delete (Tombstone): %s", tombstonePath.c_str());
 
-                // 3. 关键：清除目录缓存，确保下次查询时刷新
-                // 由于我们无法轻易获取父目录句柄，这里依赖下次查询时的重新扫描
-                // 但为了让当前操作看起来成功，我们必须返回 SUCCESS
-
+                // 返回成功，欺骗 Explorer 文件已删除
                 IoStatusBlock->Status = STATUS_SUCCESS;
                 IoStatusBlock->Information = 0;
                 return STATUS_SUCCESS;
             } else {
-                DebugLog(L"Failed to create Tombstone: %s", tombstonePath.c_str());
+                DebugLog(L"Fake Delete Failed: %s", tombstonePath.c_str());
                 IoStatusBlock->Status = STATUS_ACCESS_DENIED;
                 return STATUS_ACCESS_DENIED;
             }
