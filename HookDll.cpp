@@ -698,15 +698,14 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     // Mode 3: 所有允许访问的路径都必须重定向 (CoW)
     // 如果代码走到这里 说明不是 UserProfile 等特殊目录
     // 那么就执行下面的默认绝对路径映射
-    // Mode 3 不需要像 Mode 1 那样返回 false 因为它要求完全隔离
 
     // --- 6. 默认绝对路径映射 ---
     // 将 \??\C:\Windows 映射为 \??\SandboxRoot\C\Windows
-    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
+    std::wstring relPath = fullNtPath.substr(4); // 去掉 NT 前缀
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
-        relPath.erase(colonPos, 1); // C:\ -> C\
+        relPath.erase(colonPos, 1); // 移除冒号
     }
     targetPath += L"\\";
     targetPath += relPath;
