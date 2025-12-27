@@ -664,9 +664,8 @@ bool CheckAccessMode3(const std::wstring& fullNtPath) {
     }
 
     // 2. 启动器路径的父目录 -> 始终可见
-    // 必须允许访问父目录才能逐级打开并枚举到启动器
     for (const auto& parent : g_LauncherParents) {
-        // 使用 _wcsicmp 进行不区分大小写的比较
+        // 使用不区分大小写比较
         if (_wcsicmp(fullNtPath.c_str(), parent.c_str()) == 0) {
             return true;
         }
@@ -674,7 +673,7 @@ bool CheckAccessMode3(const std::wstring& fullNtPath) {
 
     // 3. 系统分区检查
     if (!g_SystemDriveNt.empty() && IsPathInDirectory(fullNtPath, g_SystemDriveNt)) {
-        // 3.1 系统盘根目录 -> 可见 (用于枚举)
+        // 3.1 系统盘根目录 -> 可见
         if (fullNtPath.size() == g_SystemDriveNt.size() ||
            (fullNtPath.size() == g_SystemDriveNt.size() + 1 && fullNtPath.back() == L'\\')) {
             return true;
@@ -698,11 +697,17 @@ bool CheckAccessMode3(const std::wstring& fullNtPath) {
             }
         }
 
-        // 如果不是根目录，也不在白名单，也不在启动器路径 -> 禁止
+        // 如果不是根目录，也不在白名单，则禁止访问
         return false;
     }
 
     // 4. 其他分区 -> 禁止
+    // [关键修改] 允许访问任何能解析到启动器路径或其父目录的路径
+    // 这里的 fullNtPath 已经是解析后的绝对路径
+    // 如果它能解析到启动器或其父目录，则应该允许访问
+    // (这个逻辑其实在第1、2点已经覆盖了，这里只是再次确认)
+
+    // 如果不是启动器相关路径，也不是系统盘，则禁止
     return false;
 }
 
@@ -711,46 +716,44 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
+    // 确保是 NT 路径格式 \??\...
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
+    // 如果路径已经在沙盒内，则不需要重定向 (理论上不应该发生，除非是内部调用)
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
+    // 准备沙盒目标路径的根部分
     targetPath = L"\\??\\";
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
     // --- 1. 检查是否在启动器目录内 (最高优先级) ---
+    // CheckAndMap 会处理 \??\Z:\Portable\App -> "" (映射到沙盒根目录)
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
-    // --- 2. 检查当前用户目录 (user\current) ---
-    // [关键修改] Mode 3 也会执行这里 从而实现 Users\Administrator -> Users\Current
+    // --- 2. 检查用户目录 (user\current) ---
     if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\Users\\Current", targetPath) ||
         CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\Users\\Current", targetPath)) {
         return true;
     }
 
-    // --- 3. 检查所有用户目录/ProgramData (user\all) ---
+    // --- 3. 检查 ProgramData, Public, Users 根目录 ---
     if (CheckAndMap(fullNtPath, g_ProgramDataNt, L"\\Users\\All", targetPath) ||
         CheckAndMap(fullNtPath, g_ProgramDataNtShort, L"\\Users\\All", targetPath)) {
         return true;
     }
-
-    // --- 4. 检查公用目录 (user\public) ---
     if (CheckAndMap(fullNtPath, g_PublicNt, L"\\Users\\Public", targetPath)) {
         return true;
     }
-
-    // --- 5. 检查 Users 根目录 ---
     if (CheckAndMap(fullNtPath, g_UsersDirNt, L"\\Users", targetPath) ||
         CheckAndMap(fullNtPath, g_UsersDirNtShort, L"\\Users", targetPath)) {
         return true;
     }
 
     // --- Mode 1 过滤逻辑 ---
-    // Mode 1: 仅重定向系统盘 其他盘放行(不重定向)
     if (g_HookMode == 1) {
         if (!g_SystemDriveNt.empty()) {
-            // 如果不是系统盘 返回 false (不重定向 直接读写原路径)
+            // 如果不是系统盘，返回 false (不重定向)
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
                 return false;
@@ -760,16 +763,17 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
 
     // --- Mode 3 逻辑 ---
     // Mode 3: 所有允许访问的路径都必须重定向 (CoW)
-    // 如果代码走到这里 说明不是 UserProfile 等特殊目录
-    // 那么就执行下面的默认绝对路径映射
+    // 如果 CheckAccessMode3 允许访问，那么这里就执行重定向。
+    // 即使是启动器目录本身，也应该被重定向到沙盒。
+    // 例如 Z:\Portable -> SandboxRoot\Z\Portable
 
     // --- 6. 默认绝对路径映射 ---
     // 将 \??\C:\Windows 映射为 \??\SandboxRoot\C\Windows
-    std::wstring relPath = fullNtPath.substr(4); // 去掉 NT 前缀
+    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
-        relPath.erase(colonPos, 1); // 移除冒号
+        relPath.erase(colonPos, 1); // C:\ -> C\
     }
     targetPath += L"\\";
     targetPath += relPath;
@@ -857,7 +861,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
     // Mode 3 过滤逻辑准备
     bool needFilter = false;
     bool isSystemRoot = false;
-    std::wstring nextLauncherComp; // 启动器路径上的下一级目录名
+    std::wstring nextLauncherComp;
 
     if (g_HookMode == 3 && !realPath.empty()) {
         std::wstring realPathNt = L"\\??\\" + realPath;
@@ -874,9 +878,9 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         // 检查是否为启动器父目录
         else {
             for (const auto& parent : g_LauncherParents) {
-                // 使用不区分大小写比较
                 if (_wcsicmp(realPathNt.c_str(), parent.c_str()) == 0) {
                     needFilter = true;
+                    // 这里使用 parent 而不是 g_SystemDriveNt，确保非系统盘也能工作
                     nextLauncherComp = GetNextPathComponent(parent, g_LauncherDirNt);
                     break;
                 }
@@ -913,8 +917,8 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                     }
 
                     // 规则 B: 启动器路径可见性
+                    // 只要文件名匹配通往启动器的下一级目录，就允许显示
                     if (!isVisible && !nextLauncherComp.empty()) {
-                        // 使用不区分大小写比较
                         if (_wcsicmp(fd.cFileName, nextLauncherComp.c_str()) == 0) {
                             isVisible = true;
                         }
@@ -951,8 +955,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
     }
 
     // 3. 添加 . 和 ..
-    // 只有当当前枚举的目录不是驱动器根目录时才添加
-    // 并且确保父目录本身是允许访问的 (由 CheckAccessMode3 保证)
     if (!IsDriveRoot(realPath)) {
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
@@ -997,8 +999,10 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
 
     // [新增] Mode 3 访问控制拦截
+    // 如果 CheckAccessMode3 返回 false，则直接拒绝访问
     if (!CheckAccessMode3(fullNtPath)) {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        // DebugLog(L"Access Denied (Mode 3): %s", fullNtPath.c_str());
+        return STATUS_OBJECT_NAME_NOT_FOUND; // 或者 STATUS_ACCESS_DENIED
     }
 
     std::wstring targetNtPath;
@@ -1007,7 +1011,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
 
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
-
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
         if (CreateDisposition == FILE_CREATE ||
@@ -1018,23 +1021,20 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             isWrite = true;
         }
 
-        // 检查文件存在性
         bool sandboxExists = NtPathExists(targetNtPath);
         bool realExists = NtPathExists(fullNtPath);
-
         bool shouldRedirect = false;
 
         if (isDirectory && !isWrite) {
-            // 目录读取逻辑保持不变
             shouldRedirect = false;
-            // [修改] 移除墓碑检查：如果沙盒存在目录 但真实不存在 则重定向
             if (!realExists && sandboxExists) {
                 shouldRedirect = true;
             } else {
+                // 如果真实目录存在，直接打开真实目录
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             }
         } else if (isWrite) {
-            // 写入操作逻辑
+            // 写入操作：优先沙盒，然后 CoW，最后创建
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
@@ -1044,10 +1044,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 shouldRedirect = true;
             }
         } else {
-            // 读取操作逻辑
+            // 读取操作：优先沙盒，然后真实路径，最后重定向到沙盒（如果都不存在）
             if (sandboxExists) {
-                // [修改] 移除 IsTombstone 检查
-                // 只要沙盒里有文件 就直接重定向去读取它
                 shouldRedirect = true;
             } else if (realExists) {
                 shouldRedirect = false;
@@ -1060,10 +1058,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (shouldRedirect) {
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
-
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
@@ -1072,14 +1068,13 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             }
 
             NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
-
             return status;
         }
     }
 
+    // 如果不满足重定向条件，直接调用原始函数
     return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 }
 
@@ -1452,10 +1447,19 @@ NTSTATUS HandleDirectoryQuery(
     if (rawPath.empty()) return STATUS_INVALID_HANDLE;
 
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
-    std::wstring targetPath;
 
+    // [新增] Mode 3 访问控制拦截
+    if (!CheckAccessMode3(ntDirPath)) {
+        // DebugLog(L"Directory Query Denied (Mode 3): %s", ntDirPath.c_str());
+        IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    std::wstring targetPath;
+    // 如果 ShouldRedirect 返回 false，说明不需要重定向，直接调用原始函数
     if (!ShouldRedirect(ntDirPath, targetPath)) {
-        return STATUS_NOT_SUPPORTED;
+        // DebugLog(L"Directory Query No Redirect: %s", ntDirPath.c_str());
+        return STATUS_NOT_SUPPORTED; // 标记为不被处理，以便调用原始函数
     }
 
     std::vector<CachedDirEntry> localEntries;
@@ -1734,20 +1738,15 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     if (g_IsInHook) return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     RecursionGuard guard;
 
-    // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
 
-    // 如果不需要重定向 (STATUS_NOT_SUPPORTED) 或句柄无效 调用原始函数
-    if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
+    if (status == STATUS_NOT_SUPPORTED) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
 
-    // 模拟异步完成信号 (如果提供了 Event)
     if (NT_SUCCESS(status) && Event && Event != INVALID_HANDLE_VALUE) {
         SetEvent(Event);
     }
-
-    // 注意：这里忽略了 ApcRoutine 因为手动模拟 APC 比较复杂且通常不需要
     return status;
 }
 
@@ -1759,21 +1758,19 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFileEx(
     if (g_IsInHook) return fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
     RecursionGuard guard;
 
-    // 解析 Ex 标志位
     BOOLEAN restartScan = (QueryFlags & SL_RESTART_SCAN) != 0;
     BOOLEAN returnSingle = (QueryFlags & SL_RETURN_SINGLE_ENTRY) != 0;
 
-    // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, returnSingle, FileName, restartScan);
 
-    if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
+    // 如果 HandleDirectoryQuery 返回 STATUS_NOT_SUPPORTED，表示它没有处理，调用原始函数
+    if (status == STATUS_NOT_SUPPORTED) {
         return fpNtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, QueryFlags, FileName);
     }
 
     if (NT_SUCCESS(status) && Event && Event != INVALID_HANDLE_VALUE) {
         SetEvent(Event);
     }
-
     return status;
 }
 
@@ -2234,47 +2231,44 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // [新增] 初始化 Mode 3 数据
     if (g_HookMode == 3) {
-        // ... (保留白名单初始化)
+        // 1. 初始化系统盘白名单 (大写)
+        const wchar_t* whitelist[] = {
+            L"$RECYCLE.BIN",
+            L"DOCUMENTS AND SETTINGS",
+            L"PROGRAM FILES",
+            L"PROGRAM FILES (X86)",
+            L"PROGRAMDATA",
+            L"RECOVERY",
+            L"SYSTEM VOLUME INFORMATION",
+            L"USERS",
+            L"WINDOWS",
+            L"DISKPT0.SYS",
+            L"DUMPSTACK.LOG.TMP",
+            L"PAGEFILE.SYS",
+            L"SWAPFILE.SYS"
+        };
+        for (const auto& name : whitelist) {
+            g_Mode3SystemWhitelist.push_back(name);
+        }
 
         // 2. 计算启动器目录的所有父目录
         if (g_LauncherDirNt.length() > 0) {
             std::wstring temp = g_LauncherDirNt;
-            if (temp.back() == L'\\') temp.pop_back(); // 移除末尾斜杠
+            // 移除可能的末尾斜杠以统一处理
+            if (temp.back() == L'\\') temp.pop_back();
 
             while (true) {
                 size_t lastSlash = temp.find_last_of(L'\\');
                 if (lastSlash == std::wstring::npos) break;
 
                 // 保护驱动器前缀 \??\X: (长度6)
-                // 如果 lastSlash < 6, 说明 temp 本身就是 \??\X: 这种格式
-                if (lastSlash < 6) {
-                    // 确保 \??\X: 本身也被添加到父目录列表
-                    // 并且停止循环，因为再往上就是无效路径了
-                    if (temp.length() >= 7 && temp.find(L':') != std::wstring::npos) {
-                         g_LauncherParents.push_back(temp);
-                    }
-                    break;
-                }
+                if (lastSlash < 6) break;
 
                 temp = temp.substr(0, lastSlash);
                 g_LauncherParents.push_back(temp);
-            }
-            // 确保驱动器根目录 \??\X: 也被添加 (如果上面循环没有处理到)
-            // 例如 Z:\Portable\App -> 父目录 Z:\Portable, Z:\
-            // 循环会得到 Z:\Portable, Z:
-            // 需要确保 Z:\ 也能被正确识别
-            if (g_LauncherDirNt.length() >= 7 && g_LauncherDirNt.find(L':') != std::wstring::npos) {
-                std::wstring driveRoot = g_LauncherDirNt.substr(0, 7); // \??\X:
-                bool found = false;
-                for(const auto& p : g_LauncherParents) {
-                    if (_wcsicmp(p.c_str(), driveRoot.c_str()) == 0) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    g_LauncherParents.push_back(driveRoot);
-                }
+
+                // 如果已经到达驱动器根目录 (如 \??\Z:)，停止
+                if (temp.length() <= 7 && temp.find(L':') != std::wstring::npos) break;
             }
         }
     }
