@@ -605,9 +605,14 @@ bool CheckAndMap(const std::wstring& fullPath, const std::wstring& prefix, const
 // [修改] 检查路径是否需要重定向
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
-    if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
-    if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
+    // 1. 基础过滤
+    if (IsPipeOrDevice(fullNtPath.c_str())) return false;
+    if (fullNtPath.rfind(L"\\??\\", 0) != 0) {
+        // [新增] 关键：如果路径以 \Registry\ 开头 (底层注册表操作)，绝对不要重定向
+        if (_wcsnicmp(fullNtPath.c_str(), L"\\Registry\\", 10) == 0) return false;
+        return false;
+    }
 
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
@@ -615,7 +620,7 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
-    // --- 1. 检查是否在启动器目录内 (最高优先级 无论模式如何都重定向) ---
+    // --- 1. 检查是否在启动器目录内 ---
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
     // --- 2. 检查当前用户目录 (user\current) ---
@@ -641,53 +646,35 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         return true;
     }
 
-    // [新增] 模式 1 过滤逻辑
-    // 如果 hookfile=1 且路径不在系统盘 (且前面没匹配到启动器或用户目录) 则不重定向
+    // [新增] 模式 1 过滤逻辑 (hookfile=1)
     if (g_HookMode == 1) {
-        // 检查是否以系统盘符开头 (例如 \??\C:)
-        // 使用不区分大小写比较
         if (!g_SystemDriveNt.empty()) {
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘 也不是启动器目录(前面已处理) 直接放行
                 return false;
             }
         }
     }
 
     // --- 6. 默认绝对路径映射 ---
-    // fullNtPath 格式通常为 \??\C:\Path...
-    // 我们需要判断它是否真的包含盘符 如果像 \??\cpuz159 这样没有盘符 则是设备 不应重定向
 
-    // 检查长度是否足够包含盘符 (例如 \??\C: 长度为 6)
-    if (fullNtPath.length() < 6) return false;
-
-    // 检查第 6 个字符是否为冒号 (索引 5)
-    // \ ? ? \ C :
-    // 0 1 2 3 4 5
-    if (fullNtPath[5] != L':') {
-        // 特殊情况：UNC 路径 \??\UNC\Server\Share...
-        if (_wcsnicmp(fullNtPath.c_str(), L"\\??\\UNC\\", 8) == 0) {
-            // UNC 路径处理逻辑 (可选 目前简单放行或按需映射)
-            // 这里简单处理：如果是 UNC 暂时不重定向 或者你需要实现 UNC 到沙盒的映射逻辑
+    // [新增] 关键：设备对象过滤
+    // 正常的磁盘文件路径格式为 \??\C:\Path... (第6个字符是冒号)
+    // 驱动设备路径格式为 \??\cpuz160 (没有冒号)
+    // 如果没有盘符冒号，说明是设备对象，必须放行，否则 CreateFile(\\.\cpuz160) 会失败
+    if (fullNtPath.length() < 6 || fullNtPath[5] != L':') {
+        // 排除 UNC 路径 (\??\UNC\...) 的误判，虽然 CPU-Z 不用 UNC
+        if (_wcsnicmp(fullNtPath.c_str(), L"\\??\\UNC\\", 8) != 0) {
             return false;
         }
-
-        // 既不是盘符路径 也不是 UNC 那极大概率是设备对象 (如 \??\cpuz159)
-        // 或者是 \??\Volume{GUID} 等
-        // 直接返回 false 不重定向
-        return false;
     }
 
     std::wstring relPath = fullNtPath.substr(4);
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
-
-    // 再次确认冒号位置 (虽然上面检查过了 这里为了提取路径)
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
         relPath.erase(colonPos, 1);
     }
-
     targetPath += L"\\";
     targetPath += relPath;
     return true;
