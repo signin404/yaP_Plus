@@ -360,6 +360,7 @@ wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
+std::wstring g_WindowsDirNt;
 
 // 定义目录项结构 用于缓存
 struct CachedDirEntry {
