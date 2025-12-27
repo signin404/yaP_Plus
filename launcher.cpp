@@ -3716,7 +3716,7 @@ LPVOID GetEntryPoint(HANDLE hProcess) {
 // --- [修改] 获取 LoadLibraryW 地址 ---
 LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
     // 如果目标是 32 位 Launcher (x64) 无法直接获取其地址
-    // 但我们现在使用 Injector32.exe 所以这里直接返回 NULL 即可
+    // 但我们现在使用 YapInjector32 所以这里直接返回 NULL 即可
     if (targetIs32Bit) return NULL;
 
     // 如果目标是 64 位 Kernel32 在所有 64 位进程中的加载地址通常是相同的
@@ -3779,7 +3779,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     }
 
     // [核心修复]：如果是 32 位目标 即使 Launcher 没找到 LoadLibrary 地址
-    // 也不能返回 false！因为我们要依赖 Injector32.exe 去做这件事
+    // 也不能返回 false！因为我们要依赖 YapInjector32 去做这件事
     // 只有当目标是 64 位且没找到地址时 才认为是真正的失败
     if (!pLoadLibrary && !targetIs32Bit) return false;
 
@@ -3787,13 +3787,13 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     if (targetIs32Bit) {
         // --- 方案：调用外部 32位 Injector ---
 
-        // [路径修复] 从 dllPath 推导 Injector32.exe 路径 (假设它们在同一目录)
+        // [路径修复] 从 dllPath 推导 YapInjector32 路径 (假设它们在同一目录)
         wchar_t drive[_MAX_DRIVE];
         wchar_t dir[_MAX_DIR];
         _wsplitpath_s(dllPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
-        std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"Injector32.exe";
+        std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"YapInjector32";
 
-        // C. 构造命令行: Injector32.exe <PID> <DLLPath>
+        // C. 构造命令行: YapInjector32 <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
         std::wstring cmdLine = L"\"" + injectorPath + L"\" " + std::to_wstring(pid) + L" \"" + dllPath + L"\"";
 
@@ -3935,9 +3935,9 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
 
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
-                    // [修复] 取消注释，并传递 NULL 作为 hThread 参数
-                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程，
-                    // 所以这里 hThread 为 NULL 是安全的。
+                    // [修复] 取消注释 并传递 NULL 作为 hThread 参数
+                    // InjectDll 内部会使用 g_NtResumeProcess (NtResumeProcess) 来恢复进程
+                    // 所以这里 hThread 为 NULL 是安全的
                     success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName);
 
                     CloseHandle(hTarget);
@@ -4000,9 +4000,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         wcscpy_s(dllDir, MAX_PATH, data->tempFilePath.c_str());
         PathRemoveFileSpecW(dllDir); // 从 temp INI 路径获取目录
 
-        dll32Path = std::wstring(dllDir) + L"\\Hook32.dll";
-        dll64Path = std::wstring(dllDir) + L"\\Hook64.dll";
-        injectorPath = std::wstring(dllDir) + L"\\Injector32.exe";
+        dll32Path = std::wstring(dllDir) + L"\\YapHook32.dll";
+        dll64Path = std::wstring(dllDir) + L"\\YapHook64.dll";
+        injectorPath = std::wstring(dllDir) + L"\\YapInjector32";
 
         // B. 释放资源到磁盘
         // IDR_HOOK_DLL_32/64 必须在 launcher.cpp 顶部定义且与 rc 文件一致

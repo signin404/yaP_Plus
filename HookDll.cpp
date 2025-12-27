@@ -83,7 +83,7 @@
 #endif
 
 // 2. 补充 FILE_INFORMATION_CLASS 枚举值
-// winternl.h 通常只定义了部分值，这里使用宏强制补充
+// winternl.h 通常只定义了部分值 这里使用宏强制补充
 #ifndef FileDirectoryInformation
 #define FileDirectoryInformation ((FILE_INFORMATION_CLASS)1)
 #endif
@@ -361,7 +361,7 @@ wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 
-// 定义目录项结构，用于缓存
+// 定义目录项结构 用于缓存
 struct CachedDirEntry {
     std::wstring FileName;
     std::wstring ShortName;
@@ -374,7 +374,7 @@ struct CachedDirEntry {
     ULONG FileAttributes;
 };
 
-// 目录上下文，用于维护每个句柄的状态
+// 目录上下文 用于维护每个句柄的状态
 struct DirContext {
     std::vector<CachedDirEntry> Entries;
     size_t CurrentIndex = 0;
@@ -399,7 +399,7 @@ void RefreshDeviceMap() {
     if (GetLogicalDriveStringsW(512, drives)) {
         wchar_t* drive = drives;
         while (*drive) {
-            // drive 是 "C:\"，我们需要 "C:"
+            // drive 是 "C:\" 我们需要 "C:"
             std::wstring driveStr = drive;
             if (!driveStr.empty() && driveStr.back() == L'\\') driveStr.pop_back();
 
@@ -415,8 +415,8 @@ void RefreshDeviceMap() {
 
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // 注意：不再这里调用 RefreshDeviceMap()，依赖 InitHookThread 初始化
-    // 如果 g_DeviceMap 为空，说明初始化未完成或失败，直接返回原路径
+    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
+    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
     if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
@@ -521,7 +521,7 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
         return ntPath.substr(4);
     }
     // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
-    // 如果无法转换为 DOS 路径，返回空字符串，避免 FindFirstFile 访问错误的路径
+    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
     if (ntPath.find(L"\\Device\\") == 0) {
         return L"";
     }
@@ -614,7 +614,7 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
-    // --- 1. 检查是否在启动器目录内 (最高优先级，无论模式如何都重定向) ---
+    // --- 1. 检查是否在启动器目录内 (最高优先级 无论模式如何都重定向) ---
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
     // --- 2. 检查当前用户目录 (user\current) ---
@@ -641,14 +641,14 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     }
 
     // [新增] 模式 1 过滤逻辑
-    // 如果 hookfile=1，且路径不在系统盘 (且前面没匹配到启动器或用户目录)，则不重定向
+    // 如果 hookfile=1 且路径不在系统盘 (且前面没匹配到启动器或用户目录) 则不重定向
     if (g_HookMode == 1) {
         // 检查是否以系统盘符开头 (例如 \??\C:)
         // 使用不区分大小写比较
         if (!g_SystemDriveNt.empty()) {
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘，也不是启动器目录(前面已处理)，直接放行
+                // 不是系统盘 也不是启动器目录(前面已处理) 直接放行
                 return false;
             }
         }
@@ -673,7 +673,7 @@ void PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
     DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
     if (srcAttrs == INVALID_FILE_ATTRIBUTES) return;
 
-    // 如果目标已存在，不需要复制
+    // 如果目标已存在 不需要复制
     if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
     // 1. 确保父目录存在
@@ -684,11 +684,11 @@ void PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
 
     // 2. 根据类型处理
     if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
-        // 如果是目录，直接在沙盒创建空目录即可
-        // 不需要复制内容，因为后续访问内容时会通过 BuildMergedDirectoryList 合并显示
+        // 如果是目录 直接在沙盒创建空目录即可
+        // 不需要复制内容 因为后续访问内容时会通过 BuildMergedDirectoryList 合并显示
         CreateDirectoryW(targetDos.c_str(), NULL);
     } else {
-        // 如果是文件，执行复制
+        // 如果是文件 执行复制
         DebugLog(L"Migrating: %s -> %s", sourceDos.c_str(), targetDos.c_str());
         CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE);
     }
@@ -721,7 +721,7 @@ CachedDirEntry ConvertFindData(const WIN32_FIND_DATAW& fd) {
     entry.LastWriteTime.LowPart = fd.ftLastWriteTime.dwLowDateTime;
     entry.LastWriteTime.HighPart = fd.ftLastWriteTime.dwHighDateTime;
 
-    entry.ChangeTime = entry.LastWriteTime; // Win32 没有 ChangeTime，暂用 WriteTime
+    entry.ChangeTime = entry.LastWriteTime; // Win32 没有 ChangeTime 暂用 WriteTime
 
     entry.EndOfFile.LowPart = fd.nFileSizeLow;
     entry.EndOfFile.HighPart = fd.nFileSizeHigh;
@@ -789,7 +789,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
     }
 
     // 3. [关键修复] 仅在非根目录时添加 . 和 ..
-    // 驱动器根目录 (C:\) 不应该包含这些条目，否则会导致 Explorer 路径解析错误
+    // 驱动器根目录 (C:\) 不应该包含这些条目 否则会导致 Explorer 路径解析错误
     if (!IsDriveRoot(realPath)) {
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
@@ -840,7 +840,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
 
         // [修复 1] 完善写入判断逻辑
-        // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建)，都视为写入意图
+        // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建) 都视为写入意图
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
 
         if (CreateDisposition == FILE_CREATE ||
@@ -896,11 +896,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 }
                 shouldRedirect = true;
             } else if (realExists) {
-                // 穿透读取：直接读取原文件，不重定向
+                // 穿透读取：直接读取原文件 不重定向
                 shouldRedirect = false;
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
-                // 都不存在，重定向到沙盒以报错
+                // 都不存在 重定向到沙盒以报错
                 shouldRedirect = true;
             }
         }
@@ -1024,7 +1024,7 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
                 CloseHandle(hFile);
                 return STATUS_SUCCESS;
             } else {
-                // 创建失败，返回错误，禁止回退
+                // 创建失败 返回错误 禁止回退
                 return STATUS_ACCESS_DENIED;
             }
         }
@@ -1053,7 +1053,7 @@ NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
     HANDLE hFile = INVALID_HANDLE_VALUE;
 
     // 1. 尝试打开文件以修改属性和内容
-    // 必须使用宽松的共享模式，因为应用程序此时正持有该文件的句柄
+    // 必须使用宽松的共享模式 因为应用程序此时正持有该文件的句柄
     hFile = CreateFileW(filePath.c_str(),
         GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1082,7 +1082,7 @@ NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
 
     // 3. 设置属性为 Hidden + System
     FILE_BASIC_INFORMATION basicInfo = { 0 };
-    // 为了安全，先查询现有时间，避免时间戳被清零
+    // 为了安全 先查询现有时间 避免时间戳被清零
     status = fpNtQueryInformationFile(hFile, &iosb, &basicInfo, sizeof(basicInfo), FileBasicInformation);
     if (NT_SUCCESS(status)) {
         basicInfo.FileAttributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
@@ -1118,7 +1118,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         isDelete = (((PFILE_DISPOSITION_INFORMATION_EX)FileInformation)->Flags & FILE_DISPOSITION_DELETE) != 0;
     }
 
-    // 如果不是删除操作，或者请求取消删除 (Delete=FALSE)，直接放行
+    // 如果不是删除操作 或者请求取消删除 (Delete=FALSE) 直接放行
     if (!isDelete) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
@@ -1150,7 +1150,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
     // --- 分支 A: 句柄指向沙盒内的文件 (CoW 副本) ---
     if (isHandleInSandbox) {
-        // [关键修复] 绝对不能调用原始的 Delete，否则副本会被物理删除
+        // [关键修复] 绝对不能调用原始的 Delete 否则副本会被物理删除
         // 我们需要将这个副本“原地”转化为墓碑
 
         std::wstring sandboxDosPath = NtPathToDosPath(ntPath);
@@ -1163,7 +1163,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             IoStatusBlock->Information = 0;
             return STATUS_SUCCESS;
         } else {
-            // 如果转化失败（例如文件被独占锁定），我们只能返回错误
+            // 如果转化失败（例如文件被独占锁定） 我们只能返回错误
             // 依然不能调用原始删除
             IoStatusBlock->Status = status;
             return status;
@@ -1171,7 +1171,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     }
 
     // --- 分支 B: 句柄指向真实文件 (尚未 CoW) ---
-    // 这种情况通常发生在你没有 DELETE 权限打开文件，却尝试用 SetInfo 删除
+    // 这种情况通常发生在你没有 DELETE 权限打开文件 却尝试用 SetInfo 删除
     // 或者 NtCreateFile Hook 漏掉了某些情况
     else {
         std::wstring realDosPath = NtPathToDosPath(ntPath);
@@ -1213,7 +1213,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         }
     }
 
-    // 如果逻辑走到这里，说明既不在沙盒，真实路径也没文件，或者其他异常
+    // 如果逻辑走到这里 说明既不在沙盒 真实路径也没文件 或者其他异常
     // 调用原始函数让系统处理（通常返回文件未找到）
     return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
@@ -1270,15 +1270,15 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
     // 构造沙盒的 NT 路径前缀用于比较
     std::wstring sandboxRootNt = L"\\??\\";
     sandboxRootNt += g_SandboxRoot;
-    // 移除末尾斜杠以防万一，确保匹配准确
+    // 移除末尾斜杠以防万一 确保匹配准确
     if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
 
     // 3. 检查句柄是否已经指向沙盒 (反向解析)
-    // 使用不区分大小写的比较更安全，或者确保路径都已规范化
+    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
     if (handleNtPath.size() >= sandboxRootNt.size() &&
         _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
 
-        // 句柄在沙盒内，例如: \??\D:\Portable\Data\C
+        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
         size_t rootLen = sandboxRootNt.length();
 
         // 提取相对部分: \C
@@ -1301,13 +1301,13 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
              realNtPath = L"\\??\\";
              realNtPath += driveLetter;
              realNtPath += L":";
-             // 注意：这里不需要补斜杠，NtPathToDosPath 会处理为 C:
+             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
              // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
         }
         else {
-            // 对于 Users 等特殊目录，如果需要支持反向合并，需要在这里添加逻辑
+            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
             // 比如检测 \Users 映射回 C:\Users
-            // 目前暂不支持，返回 false
+            // 目前暂不支持 返回 false
             return false;
         }
 
@@ -1319,7 +1319,7 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
     // 4. 句柄指向真实路径 (正向解析)
     else {
         std::wstring targetNtPath;
-        // ShouldRedirect 内部已经处理了 \??\ 前缀检查，现在传入转换后的路径就能正常工作了
+        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
         if (ShouldRedirect(handleNtPath, targetNtPath)) {
             outRealDos = NtPathToDosPath(handleNtPath);
             outSandboxDos = NtPathToDosPath(targetNtPath);
@@ -1334,7 +1334,7 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
 LARGE_INTEGER GenerateFileId(const std::wstring& name) {
     LARGE_INTEGER id;
     std::hash<std::wstring> hasher;
-    // 简单的哈希，确保非零
+    // 简单的哈希 确保非零
     size_t h = hasher(name);
     id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
     return id;
@@ -1375,8 +1375,8 @@ NTSTATUS HandleDirectoryQuery(
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
 
-        // 逻辑变更：只要 Context 存在且已初始化，就不需要重新构建 (除非 RestartScan)
-        // 我们总是构建完整的列表 (*)，所以不需要根据 FileName 重新构建
+        // 逻辑变更：只要 Context 存在且已初始化 就不需要重新构建 (除非 RestartScan)
+        // 我们总是构建完整的列表 (*) 所以不需要根据 FileName 重新构建
 
         if (RestartScan) {
             needsBuild = true;
@@ -1396,8 +1396,8 @@ NTSTATUS HandleDirectoryQuery(
         std::wstring realDosPath = NtPathToDosPath(ntDirPath);
         std::wstring sandboxDosPath = NtPathToDosPath(targetPath);
 
-        // [关键修复] 总是构建完整列表 "*"，忽略当前的 FileName
-        // 这样缓存中就包含了所有文件，后续过滤由输出阶段处理
+        // [关键修复] 总是构建完整列表 "*" 忽略当前的 FileName
+        // 这样缓存中就包含了所有文件 后续过滤由输出阶段处理
         BuildMergedDirectoryList(realDosPath, sandboxDosPath, L"*", localEntries);
     }
 
@@ -1429,12 +1429,12 @@ NTSTATUS HandleDirectoryQuery(
         }
 
         // [关键修复] 更新搜索模式
-        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL)，更新 Pattern
-        // 如果 FileName == NULL，保持之前的 Pattern (继续之前的搜索)
+        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL) 更新 Pattern
+        // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
         }
-        // 兜底：如果 Pattern 为空，设为 *
+        // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
             ctx->SearchPattern = L"*";
         }
@@ -1458,7 +1458,7 @@ NTSTATUS HandleDirectoryQuery(
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
         // [关键修复] 过滤逻辑：使用 PathMatchSpecW 进行通配符匹配
-        // 如果不匹配，跳过此条目，继续下一个
+        // 如果不匹配 跳过此条目 继续下一个
         if (!PathMatchSpecW(entry.FileName.c_str(), ctx->SearchPattern.c_str())) {
             ctx->CurrentIndex++;
             continue;
@@ -1609,7 +1609,7 @@ NTSTATUS HandleDirectoryQuery(
         *(ULONG*)prevEntryPtr = 0;
     }
 
-    // 如果没有写入任何字节，说明没有更多文件了 (或者过滤后没有匹配项)
+    // 如果没有写入任何字节 说明没有更多文件了 (或者过滤后没有匹配项)
     if (bytesWritten == 0) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
@@ -1640,7 +1640,7 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
     // 调用公共处理逻辑
     NTSTATUS status = HandleDirectoryQuery(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
 
-    // 如果不需要重定向 (STATUS_NOT_SUPPORTED) 或句柄无效，调用原始函数
+    // 如果不需要重定向 (STATUS_NOT_SUPPORTED) 或句柄无效 调用原始函数
     if (status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_HANDLE) {
         return fpNtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length, FileInformationClass, ReturnSingleEntry, FileName, RestartScan);
     }
@@ -1650,7 +1650,7 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFile(
         SetEvent(Event);
     }
 
-    // 注意：这里忽略了 ApcRoutine，因为手动模拟 APC 比较复杂且通常不需要
+    // 注意：这里忽略了 ApcRoutine 因为手动模拟 APC 比较复杂且通常不需要
     return status;
 }
 
@@ -2161,7 +2161,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         size_t lastSlash = temp.find_last_of(L'\\');
         if (lastSlash != std::wstring::npos) {
             // 简单的防错：确保不是驱动器根目录 (例如 \??\C:)
-            // \??\C: 长度为 6，我们要求路径长度大于此才截取
+            // \??\C: 长度为 6 我们要求路径长度大于此才截取
             if (lastSlash > 6) {
                 g_UsersDirNt = temp.substr(0, lastSlash);
             }
