@@ -855,7 +855,12 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
         // [修复 1] 完善写入判断逻辑
         // 只要是创建、覆盖、甚至 OpenIf (如果不存在则创建) 都视为写入意图
-        bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
+        bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
+
+        // 如果设置了“关闭时删除”标志，则必须视为写入（因为这会物理删除文件）
+        if (CreateOptions & FILE_DELETE_ON_CLOSE) {
+            isWrite = true;
+        }
 
         if (CreateDisposition == FILE_CREATE ||
             CreateDisposition == FILE_SUPERSEDE ||
@@ -1066,8 +1071,7 @@ NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
     IO_STATUS_BLOCK iosb;
     HANDLE hFile = INVALID_HANDLE_VALUE;
 
-    // 1. 尝试打开文件以修改属性和内容
-    // 必须使用宽松的共享模式 因为应用程序此时正持有该文件的句柄
+    // 1. 尝试以完全权限打开 (用于截断 + 修改属性)
     hFile = CreateFileW(filePath.c_str(),
         GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1076,6 +1080,17 @@ NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
         0,
         NULL);
 
+    // [新增] 降级重试：如果因共享冲突失败，尝试仅以修改属性权限打开
+    if (hFile == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION) {
+        hFile = CreateFileW(filePath.c_str(),
+            FILE_WRITE_ATTRIBUTES, // 仅请求修改属性
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL);
+    }
+
     if (hFile == INVALID_HANDLE_VALUE) {
         DebugLog(L"Tombstone Failed: Open Error %d for %s", GetLastError(), filePath.c_str());
         return STATUS_ACCESS_DENIED;
@@ -1083,20 +1098,14 @@ NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
 
     NTSTATUS status = STATUS_SUCCESS;
 
-    // 2. 截断为 0 字节
+    // 2. 截断为 0 字节 (仅当拥有写权限时)
+    // 如果是降级打开的句柄，这一步会失败，但我们忽略错误，优先保证属性被设置
     FILE_END_OF_FILE_INFORMATION eofInfo;
     eofInfo.EndOfFile.QuadPart = 0;
-    status = fpNtSetInformationFile(hFile, &iosb, &eofInfo, sizeof(eofInfo), FileEndOfFileInformation);
+    fpNtSetInformationFile(hFile, &iosb, &eofInfo, sizeof(eofInfo), FileEndOfFileInformation);
 
-    if (!NT_SUCCESS(status)) {
-        DebugLog(L"Tombstone Failed: Truncate Error 0x%X", status);
-        CloseHandle(hFile);
-        return status;
-    }
-
-    // 3. 设置属性为 Hidden + System
+    // 3. 设置属性为 Hidden + System (这是墓碑的核心标志)
     FILE_BASIC_INFORMATION basicInfo = { 0 };
-    // 为了安全 先查询现有时间 避免时间戳被清零
     status = fpNtQueryInformationFile(hFile, &iosb, &basicInfo, sizeof(basicInfo), FileBasicInformation);
     if (NT_SUCCESS(status)) {
         basicInfo.FileAttributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
