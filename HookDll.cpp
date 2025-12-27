@@ -517,15 +517,57 @@ void DebugLog(const wchar_t* format, ...) {
 
 // --- 辅助工具 ---
 
+// 辅助：判断是否为特殊设备、管道、网络驱动等 不应被重定向
 bool IsPipeOrDevice(LPCWSTR path) {
     if (!path) return false;
+
+    // --- 1. IPC (进程间通信) ---
     if (wcsstr(path, L"NamedPipe")) return true;
     if (wcsstr(path, L"Pipe\\")) return true;
     if (wcsstr(path, L"PIPE\\")) return true;
     if (wcsstr(path, L"pipe\\")) return true;
+    if (wcsstr(path, L"Mailslot")) return true;
+    if (wcsstr(path, L"RPC Control")) return true; // 关键：RPC/ALPC 端口
+
+    // --- 2. 控制台/终端 ---
     if (wcsstr(path, L"ConDrv")) return true;
     if (wcsstr(path, L"CONIN$")) return true;
     if (wcsstr(path, L"CONOUT$")) return true;
+    if (wcsstr(path, L"\\??\\CON")) return true;
+
+    // --- 3. 关键系统驱动 (必须排除 否则网络/加密挂掉) ---
+    if (wcsstr(path, L"Afd")) return true;        // 关键：Winsock 网络驱动
+    if (wcsstr(path, L"AFD")) return true;
+    if (wcsstr(path, L"KsecDD")) return true;     // 关键：加密服务
+    if (wcsstr(path, L"MountPointManager")) return true;
+
+    // --- 4. 硬件设备接口 (PnP 设备) ---
+    // HID (键盘鼠标)
+    if (wcsstr(path, L"hid#")) return true;
+    if (wcsstr(path, L"HID#")) return true;
+    // USB 设备
+    if (wcsstr(path, L"usb#")) return true;
+    if (wcsstr(path, L"USB#")) return true;
+    // PCI 设备
+    if (wcsstr(path, L"pci#")) return true;
+    if (wcsstr(path, L"PCI#")) return true;
+    // 其他常见硬件
+    if (wcsstr(path, L"acpi#")) return true;      // 电源管理
+    if (wcsstr(path, L"scsi#")) return true;      // 存储控制器
+    if (wcsstr(path, L"storage#")) return true;
+    if (wcsstr(path, L"display#")) return true;
+    if (wcsstr(path, L"monitor#")) return true;
+    if (wcsstr(path, L"hdaudio#")) return true;   // 音频
+    if (wcsstr(path, L"root#")) return true;      // 虚拟根设备
+
+    // --- 5. 网络路径 (UNC) ---
+    // NT 路径中 网络共享通常以 \??\UNC\ 开头 或者由 Mup (Multiple UNC Provider) 处理
+    if (wcsstr(path, L"\\UNC\\")) return true;
+    if (wcsstr(path, L"\\Mup\\")) return true;
+
+    // --- 6. 直接卷访问 ---
+    if (wcsstr(path, L"Volume{")) return true;
+
     return false;
 }
 
