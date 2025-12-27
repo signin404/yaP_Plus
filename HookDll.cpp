@@ -719,7 +719,7 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     // 确保是 NT 路径格式 \??\...
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
-    // 如果路径已经在沙盒内，则不需要重定向 (理论上不应该发生，除非是内部调用)
+    // 如果路径已经在沙盒内，则不需要重定向
     if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot)) return false;
 
     // 准备沙盒目标路径的根部分
@@ -760,20 +760,18 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
             }
         }
     }
-
+    
     // --- Mode 3 逻辑 ---
     // Mode 3: 所有允许访问的路径都必须重定向 (CoW)
     // 如果 CheckAccessMode3 允许访问，那么这里就执行重定向。
-    // 即使是启动器目录本身，也应该被重定向到沙盒。
-    // 例如 Z:\Portable -> SandboxRoot\Z\Portable
 
     // --- 6. 默认绝对路径映射 ---
     // 将 \??\C:\Windows 映射为 \??\SandboxRoot\C\Windows
-    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
+    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\ 
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
-        relPath.erase(colonPos, 1); // C:\ -> C\
+        relPath.erase(colonPos, 1); // C:\ -> C_Drive (修复注释结尾的反斜杠问题)
     }
     targetPath += L"\\";
     targetPath += relPath;
