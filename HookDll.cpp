@@ -363,6 +363,14 @@ typedef BOOL(WINAPI* P_CreateProcessWithTokenW)(HANDLE, DWORD, LPCWSTR, LPWSTR, 
 typedef BOOL(WINAPI* P_CreateProcessWithLogonW)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef DWORD(WINAPI* P_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
 
+std::wstring GetPathFromHandle(HANDLE hFile);
+bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos);
+std::wstring DevicePathToNtPath(const std::wstring& devicePath);
+std::wstring NtPathToDosPath(const std::wstring& ntPath);
+bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
+void CreateDummyFile(const std::wstring& path);
+void RecursiveCreateDirectory(wchar_t* path);
+
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
