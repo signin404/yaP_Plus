@@ -656,10 +656,9 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
         // 检查白名单
         for (const auto& whitePath : g_SystemWhitelist) {
             // 检查是否是白名单路径本身或其子路径
-            // 例如: fullNtPath = C:\Windows\System32, whitePath = C:\Windows -> 匹配
             if (fullNtPath.size() >= whitePath.size()) {
                 if (_wcsnicmp(fullNtPath.c_str(), whitePath.c_str(), whitePath.size()) == 0) {
-                    // 确保匹配完整路径段 (防止 C:\Win 匹配 C:\Windows)
+                    // 确保匹配完整路径段
                     if (fullNtPath.size() == whitePath.size() || fullNtPath[whitePath.size()] == L'\\') {
                         return true;
                     }
@@ -678,10 +677,7 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
         }
 
         // 逻辑：启动器目录及其子目录可见 + 到根目录的路径可见
-        // g_LauncherDirNt 例如: \??\Z:\Portable\App
-
-        // 情况 A: 访问的是启动器目录或其子目录 (Descendant)
-        // fullNtPath: \??\Z:\Portable\App\Config
+        // 情况 A: 访问的是启动器目录或其子目录
         if (fullNtPath.size() >= g_LauncherDirNt.size()) {
             if (_wcsnicmp(fullNtPath.c_str(), g_LauncherDirNt.c_str(), g_LauncherDirNt.size()) == 0) {
                 if (fullNtPath.size() == g_LauncherDirNt.size() || fullNtPath[g_LauncherDirNt.size()] == L'\\') {
@@ -690,9 +686,7 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
             }
         }
 
-        // 情况 B: 访问的是启动器目录的父级路径 (Ancestor)
-        // fullNtPath: \??\Z:\Portable
-        // g_LauncherDirNt: \??\Z:\Portable\App
+        // 情况 B: 访问的是启动器目录的父级路径
         if (g_LauncherDirNt.size() > fullNtPath.size()) {
             if (_wcsnicmp(g_LauncherDirNt.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
                 if (g_LauncherDirNt[fullNtPath.size()] == L'\\') {
@@ -2161,10 +2155,12 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
-    // [新增] 初始化设备路径映射
+    // 1. 刷新设备映射
     RefreshDeviceMap();
 
     wchar_t buffer[MAX_PATH] = { 0 };
+
+    // 2. 读取内存映射配置
     std::wstring mapName = GetConfigMapName(GetCurrentProcessId());
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, mapName.c_str());
     if (hMap) {
@@ -2179,73 +2175,65 @@ DWORD WINAPI InitHookThread(LPVOID) {
         CloseHandle(hMap);
     }
 
-    // [新增] 读取 Hook 模式
+    // 3. [新增] 读取 Hook 模式 (默认为 1)
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
-        if (g_HookMode <= 0) g_HookMode = 1; // 默认回退到 1
+        if (g_HookMode <= 0) g_HookMode = 1;
     }
 
-    // [新增] 获取系统盘符并转换为 NT 格式
+    // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         // buffer 类似于 "C:\Windows\System32"
-        // 我们只需要 "C:"
-        buffer[2] = L'\0';
+        buffer[2] = L'\0'; // 截断为 "C:"
         g_SystemDriveNt = L"\\??\\";
-        g_SystemDriveNt += buffer;
-        // 结果: \??\C:
+        g_SystemDriveNt += buffer; // 结果: \??\C:
+        InitSystemWhitelist(); // 初始化白名单 (Mode 3 依赖)
     }
 
+    // 5. 环境变量回退 (如果内存映射没读到)
     if (g_SandboxRoot[0] == L'\0') {
         if (GetEnvironmentVariableW(L"YAP_HOOK_PATH", buffer, MAX_PATH) > 0) wcscpy_s(g_SandboxRoot, MAX_PATH, buffer);
     }
     if (g_IpcPipeName[0] == L'\0') {
         if (GetEnvironmentVariableW(L"YAP_IPC_PIPE", buffer, MAX_PATH) > 0) wcscpy_s(g_IpcPipeName, MAX_PATH, buffer);
     }
+
+    // 检查根目录是否获取成功
     if (g_SandboxRoot[0] == L'\0') {
         DebugLog(L"Init Failed: YAP_HOOK_PATH not found");
         return 0;
     }
 
-    // [新增] 初始化特殊目录的 NT 路径
+    // 6. 初始化特殊目录 NT 路径
     if (g_LauncherDir[0] != L'\0') {
         g_LauncherDirNt = L"\\??\\";
         g_LauncherDirNt += g_LauncherDir;
-    }
 
-    // [新增] 计算启动器盘符 (例如 \??\Z:)
-    if (g_LauncherDirNt.length() >= 6) {
-        g_LauncherDriveNt = g_LauncherDirNt.substr(0, 6);
+        // [新增] 计算启动器盘符 (例如 \??\Z:)
+        if (g_LauncherDirNt.length() >= 6) {
+            g_LauncherDriveNt = g_LauncherDirNt.substr(0, 6);
         }
     }
 
+    // 初始化 UserProfile 等路径
     if (GetEnvironmentVariableW(L"USERPROFILE", buffer, MAX_PATH)) {
         g_UserProfileNt = L"\\??\\";
         g_UserProfileNt += buffer;
         g_UserProfileNtShort = GetNtShortPath(buffer);
 
-        // [新增] 计算 Users 根目录 (例如 C:\Users)
-        // 逻辑：取 UserProfile 的父目录
         std::wstring temp = g_UserProfileNt;
-        if (!temp.empty() && temp.back() == L'\\') temp.pop_back(); // 去除末尾斜杠
-
+        if (!temp.empty() && temp.back() == L'\\') temp.pop_back();
         size_t lastSlash = temp.find_last_of(L'\\');
-        if (lastSlash != std::wstring::npos) {
-            // 简单的防错：确保不是驱动器根目录 (例如 \??\C:)
-            // \??\C: 长度为 6 我们要求路径长度大于此才截取
-            if (lastSlash > 6) {
-                g_UsersDirNt = temp.substr(0, lastSlash);
-            }
+        if (lastSlash != std::wstring::npos && lastSlash > 6) {
+            g_UsersDirNt = temp.substr(0, lastSlash);
         }
 
-        // [新增] 计算 Users 根目录的短路径
         if (!g_UserProfileNtShort.empty()) {
             std::wstring tempShort = g_UserProfileNtShort;
             if (!tempShort.empty() && tempShort.back() == L'\\') tempShort.pop_back();
             size_t lastSlashShort = tempShort.find_last_of(L'\\');
-            if (lastSlashShort != std::wstring::npos) {
-                if (lastSlashShort > 6) {
-                    g_UsersDirNtShort = tempShort.substr(0, lastSlashShort);
-                }
+            if (lastSlashShort != std::wstring::npos && lastSlashShort > 6) {
+                g_UsersDirNtShort = tempShort.substr(0, lastSlashShort);
             }
         }
     }
@@ -2253,7 +2241,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"ALLUSERSPROFILE", buffer, MAX_PATH)) {
         g_ProgramDataNt = L"\\??\\";
         g_ProgramDataNt += buffer;
-        // [新增] 获取短路径版本
         g_ProgramDataNtShort = GetNtShortPath(buffer);
     }
 
@@ -2262,10 +2249,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
         g_PublicNt += buffer;
     }
 
-    DebugLog(L"Hook Initialized (NT Mode). Root: %s", g_SandboxRoot);
+    DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
 
+    // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
+    // 8. 创建 Hooks
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
@@ -2274,7 +2263,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
-
         MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
         MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
@@ -2310,8 +2298,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
+    // 9. 启用所有 Hook
     MH_EnableHook(MH_ALL_HOOKS);
 
+    // 10. 通知启动器就绪
     std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
     HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
     if (hEvent) {
