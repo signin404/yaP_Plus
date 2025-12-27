@@ -3791,7 +3791,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         wchar_t drive[_MAX_DRIVE];
         wchar_t dir[_MAX_DIR];
         _wsplitpath_s(dllPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
-        std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"YapInjector32";
+        std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"YapInjector32.exe";
 
         // C. 构造命令行: YapInjector32 <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
