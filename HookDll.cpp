@@ -368,18 +368,24 @@ std::vector<std::wstring> g_Mode3SystemWhitelist; // [新增] 系统盘白名单
 // 例如: current=\??\C:, target=\??\C:\Users\App -> 返回 "Users"
 std::wstring GetNextPathComponent(const std::wstring& current, const std::wstring& target) {
     if (target.size() <= current.size()) return L"";
-    if (target.find(current) != 0) return L"";
 
-    // current 可能是 \??\C: 或 \??\C:\A
+    // 检查前缀是否匹配 (不区分大小写)
+    if (_wcsnicmp(current.c_str(), target.c_str(), current.size()) != 0) return L"";
+
     size_t startPos = current.size();
+
+    // 处理分隔符逻辑
+    // 情况 1: current=\??\C: (无结尾斜杠) -> target 必须是 \??\C:\...
     if (current.back() != L'\\') {
         if (target[startPos] == L'\\') {
-            startPos++;
+            startPos++; // 跳过斜杠
         } else {
-            return L""; // 路径不匹配
+            return L""; // 路径不匹配 (例如 current=\??\C: target=\??\C_Backup)
         }
     }
+    // 情况 2: current=\??\C:\ (有结尾斜杠) -> 直接提取
 
+    // 提取下一级组件
     size_t endPos = target.find(L'\\', startPos);
     if (endPos == std::wstring::npos) {
         return target.substr(startPos);
@@ -657,8 +663,8 @@ bool CheckAccessMode3(const std::wstring& fullNtPath) {
         return true;
     }
 
-    // 2. 启动器路径的父目录 -> 始终可见 (确保卷信息可读，路径可达)
-    // 例如 Launcher=\??\Z:\A\B, full=\??\Z:\A -> 可见
+    // 2. 启动器路径的父目录 -> 始终可见
+    // 必须允许访问父目录才能逐级打开并枚举到启动器
     for (const auto& parent : g_LauncherParents) {
         if (_wcsicmp(fullNtPath.c_str(), parent.c_str()) == 0) {
             return true;
@@ -668,36 +674,37 @@ bool CheckAccessMode3(const std::wstring& fullNtPath) {
     // 3. 系统分区检查
     if (!g_SystemDriveNt.empty() && IsPathInDirectory(fullNtPath, g_SystemDriveNt)) {
         // 3.1 系统盘根目录 -> 可见 (用于枚举)
+        // 必须精确匹配根目录，不能是根目录下的任意文件
         if (fullNtPath.size() == g_SystemDriveNt.size() ||
            (fullNtPath.size() == g_SystemDriveNt.size() + 1 && fullNtPath.back() == L'\\')) {
             return true;
         }
 
         // 3.2 检查白名单
-        // 构造相对路径进行比较
-        // fullNtPath = \??\C:\Windows\System32
-        // relPath = Windows\System32
+        // 提取第一级目录/文件名进行匹配
         if (fullNtPath.size() > g_SystemDriveNt.size()) {
             std::wstring relPath = fullNtPath.substr(g_SystemDriveNt.size());
             if (!relPath.empty() && relPath[0] == L'\\') relPath.erase(0, 1);
 
-            // 提取第一级目录/文件名
             std::wstring firstComp = relPath;
             size_t slashPos = relPath.find(L'\\');
             if (slashPos != std::wstring::npos) {
                 firstComp = relPath.substr(0, slashPos);
             }
 
-            // 转换为大写比较
             std::transform(firstComp.begin(), firstComp.end(), firstComp.begin(), towupper);
 
             for (const auto& allowed : g_Mode3SystemWhitelist) {
                 if (firstComp == allowed) return true;
             }
         }
+
+        // 如果不是根目录，也不在白名单，也不在启动器路径(前面已检查) -> 禁止
+        return false;
     }
 
-    // 4. 其他情况 -> 隐藏
+    // 4. 其他分区 -> 禁止
+    // 除非它是启动器所在的路径(前面已检查)
     return false;
 }
 
@@ -852,7 +859,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
     // Mode 3 过滤逻辑准备
     bool needFilter = false;
     bool isSystemRoot = false;
-    std::wstring nextLauncherComp; // 启动器路径上的下一级目录名
+    std::wstring nextLauncherComp;
 
     if (g_HookMode == 3 && !realPath.empty()) {
         std::wstring realPathNt = L"\\??\\" + realPath;
@@ -862,16 +869,16 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         if (_wcsicmp(realPathNt.c_str(), g_SystemDriveNt.c_str()) == 0) {
             needFilter = true;
             isSystemRoot = true;
-            // 如果启动器在系统盘，计算需要显示的下一级目录
             if (!g_LauncherDirNt.empty()) {
                 nextLauncherComp = GetNextPathComponent(g_SystemDriveNt, g_LauncherDirNt);
             }
         }
-        // 检查是否为启动器父目录 (非系统盘根目录的情况，或者系统盘深层父目录)
+        // 检查是否为启动器父目录
         else {
             for (const auto& parent : g_LauncherParents) {
                 if (_wcsicmp(realPathNt.c_str(), parent.c_str()) == 0) {
                     needFilter = true;
+                    // 这里使用 parent 而不是 g_SystemDriveNt，确保非系统盘也能工作
                     nextLauncherComp = GetNextPathComponent(parent, g_LauncherDirNt);
                     break;
                 }
@@ -894,11 +901,11 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                 // [Mode 3 过滤]
                 if (needFilter) {
                     bool isVisible = false;
-                    std::wstring nameUpper = fd.cFileName;
-                    std::transform(nameUpper.begin(), nameUpper.end(), nameUpper.begin(), towupper);
 
-                    // 规则 A: 如果是系统根目录，检查白名单
+                    // 规则 A: 系统盘白名单
                     if (isSystemRoot) {
+                        std::wstring nameUpper = fd.cFileName;
+                        std::transform(nameUpper.begin(), nameUpper.end(), nameUpper.begin(), towupper);
                         for (const auto& allowed : g_Mode3SystemWhitelist) {
                             if (nameUpper == allowed) {
                                 isVisible = true;
@@ -907,14 +914,15 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                         }
                     }
 
-                    // 规则 B: 检查是否为启动器路径的一部分
+                    // 规则 B: 启动器路径可见性
+                    // 只要文件名匹配通往启动器的下一级目录，就允许显示
                     if (!isVisible && !nextLauncherComp.empty()) {
                         if (_wcsicmp(fd.cFileName, nextLauncherComp.c_str()) == 0) {
                             isVisible = true;
                         }
                     }
 
-                    if (!isVisible) continue; // 跳过不可见项
+                    if (!isVisible) continue;
                 }
 
                 std::wstring key = fd.cFileName;
@@ -925,9 +933,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 2. 扫描沙盒目录
-    // 逻辑：程序在沙盒里创建的文件应该总是可见的，除非我们想严格限制视觉。
-    // 通常沙盒内容视为用户数据，不做过滤。
+    // 2. 扫描沙盒目录 (Mode 3 下不过滤沙盒内容)
     if (!sandboxPath.empty()) {
         std::wstring searchPath = sandboxPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
@@ -938,8 +944,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
                 if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-
-                // Mode 3: 沙盒内容不过滤，直接显示
                 std::wstring key = fd.cFileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
                 mergedMap[key] = ConvertFindData(fd);
@@ -2230,8 +2234,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // [新增] 初始化 Mode 3 数据
     if (g_HookMode == 3) {
-        // 1. 初始化系统盘白名单 (仅存储根目录下的名称, 大写)
-        // 列表来源: 用户需求
+        // 1. 初始化系统盘白名单 (大写)
         const wchar_t* whitelist[] = {
             L"$RECYCLE.BIN",
             L"DOCUMENTS AND SETTINGS",
@@ -2254,20 +2257,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // 2. 计算启动器目录的所有父目录
         if (g_LauncherDirNt.length() > 0) {
             std::wstring temp = g_LauncherDirNt;
+            // 移除可能的末尾斜杠以统一处理
+            if (temp.back() == L'\\') temp.pop_back();
+
             while (true) {
                 size_t lastSlash = temp.find_last_of(L'\\');
                 if (lastSlash == std::wstring::npos) break;
 
-                // 处理 \??\C:\ 这种情况，find_last_of 可能会找到 C: 后的斜杠
-                // 我们需要保证路径至少包含 \??\X:
-                if (lastSlash < 6) break; // \??\C: 长度为 6
+                // 保护驱动器前缀 \??\X: (长度6)
+                if (lastSlash < 6) break;
 
                 temp = temp.substr(0, lastSlash);
-                // 存储父目录
                 g_LauncherParents.push_back(temp);
 
                 // 如果已经到达驱动器根目录 (如 \??\Z:)，停止
-                // 注意：temp 可能是 \??\Z:，长度为 6
                 if (temp.length() <= 7 && temp.find(L':') != std::wstring::npos) break;
             }
         }
