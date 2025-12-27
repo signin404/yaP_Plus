@@ -4002,7 +4002,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
         dll32Path = std::wstring(dllDir) + L"\\YapHook32.dll";
         dll64Path = std::wstring(dllDir) + L"\\YapHook64.dll";
-        injectorPath = std::wstring(dllDir) + L"\\YapInjector32";
+        injectorPath = std::wstring(dllDir) + L"\\YapInjector32.exe";
 
         // B. 释放资源到磁盘
         // IDR_HOOK_DLL_32/64 必须在 launcher.cpp 顶部定义且与 rc 文件一致
