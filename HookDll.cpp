@@ -601,6 +601,47 @@ bool CheckAndMap(const std::wstring& fullPath, const std::wstring& prefix, const
     return false;
 }
 
+// [新增] 检查路径是否在指定目录内 (不区分大小写)
+bool IsPathInDirectory(const std::wstring& fullPath, const std::wstring& parentDir) {
+    if (parentDir.empty()) return false;
+    if (fullPath.size() < parentDir.size()) return false;
+
+    // 检查前缀匹配
+    if (_wcsnicmp(fullPath.c_str(), parentDir.c_str(), parentDir.size()) != 0) return false;
+
+    // 匹配完全相等
+    if (fullPath.size() == parentDir.size()) return true;
+
+    // 匹配子目录 (确保前缀后面是反斜杠)
+    // 例如 parent=C:\Windows, full=C:\Windows\System32 -> 匹配
+    // 例如 parent=C:\Win, full=C:\Windows -> 不匹配
+    if (fullPath[parentDir.size()] == L'\\') return true;
+
+    return false;
+}
+
+// [新增] Mode 3 访问控制检查
+// 返回 true 表示允许访问 false 表示禁止访问(隐藏)
+bool CheckAccessMode3(const std::wstring& fullNtPath) {
+    if (g_HookMode != 3) return true;
+
+    // 1. 启动器目录始终可见
+    if (!g_LauncherDirNt.empty() && IsPathInDirectory(fullNtPath, g_LauncherDirNt)) {
+        return true;
+    }
+
+    // 2. 系统分区 -> 允许访问
+    // 需求：系统分区允许直接访问完整路径 (例如 C:\Program Files\dotnet\dotnet.exe)
+    // 即使它在枚举时是隐藏的
+    if (!g_SystemDriveNt.empty() && IsPathInDirectory(fullNtPath, g_SystemDriveNt)) {
+        return true;
+    }
+
+    // 3. 其他分区 -> 禁止访问
+    // 需求：其他分区都对程序隐藏 不论是枚举还是直接访问
+    return false;
+}
+
 // [修改] 检查路径是否需要重定向
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
@@ -614,10 +655,11 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     targetPath += g_SandboxRoot;
     if (targetPath.back() == L'\\') targetPath.pop_back();
 
-    // --- 1. 检查是否在启动器目录内 (最高优先级 无论模式如何都重定向) ---
+    // --- 1. 检查是否在启动器目录内 (最高优先级) ---
     if (CheckAndMap(fullNtPath, g_LauncherDirNt, L"", targetPath)) return true;
 
     // --- 2. 检查当前用户目录 (user\current) ---
+    // [关键修改] Mode 3 也会执行这里 从而实现 Users\Administrator -> Users\Current
     if (CheckAndMap(fullNtPath, g_UserProfileNt, L"\\Users\\Current", targetPath) ||
         CheckAndMap(fullNtPath, g_UserProfileNtShort, L"\\Users\\Current", targetPath)) {
         return true;
@@ -640,26 +682,31 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         return true;
     }
 
-    // [新增] 模式 1 过滤逻辑
-    // 如果 hookfile=1 且路径不在系统盘 (且前面没匹配到启动器或用户目录) 则不重定向
+    // --- Mode 1 过滤逻辑 ---
+    // Mode 1: 仅重定向系统盘 其他盘放行(不重定向)
     if (g_HookMode == 1) {
-        // 检查是否以系统盘符开头 (例如 \??\C:)
-        // 使用不区分大小写比较
         if (!g_SystemDriveNt.empty()) {
+            // 如果不是系统盘 返回 false (不重定向 直接读写原路径)
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘 也不是启动器目录(前面已处理) 直接放行
                 return false;
             }
         }
     }
 
-    // --- 6. 默认绝对路径映射 (模式2 或 模式1下的系统盘路径) ---
-    std::wstring relPath = fullNtPath.substr(4);
+    // --- Mode 3 逻辑 ---
+    // Mode 3: 所有允许访问的路径都必须重定向 (CoW)
+    // 如果代码走到这里 说明不是 UserProfile 等特殊目录
+    // 那么就执行下面的默认绝对路径映射
+    // Mode 3 不需要像 Mode 1 那样返回 false 因为它要求完全隔离
+
+    // --- 6. 默认绝对路径映射 ---
+    // 将 \??\C:\Windows 映射为 \??\SandboxRoot\C\Windows
+    std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
-        relPath.erase(colonPos, 1);
+        relPath.erase(colonPos, 1); // C:\ -> C\
     }
     targetPath += L"\\";
     targetPath += relPath;
@@ -744,7 +791,42 @@ bool IsDriveRoot(const std::wstring& path) {
 void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& sandboxPath, const std::wstring& pattern, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
-    // 1. 扫描真实目录
+    // Mode 3 枚举过滤标志
+    bool isMode3SystemRoot = false;
+    std::wstring allowedWinDirName;
+    std::wstring allowedLauncherDirName;
+
+    if (g_HookMode == 3 && !realPath.empty()) {
+        std::wstring realPathNt = L"\\??\\" + realPath;
+        if (realPathNt.back() == L'\\') realPathNt.pop_back();
+
+        // 检查是否为系统盘根目录 (例如 \??\C:)
+        if (_wcsicmp(realPathNt.c_str(), g_SystemDriveNt.c_str()) == 0) {
+            isMode3SystemRoot = true;
+
+            // 提取 Windows 目录名
+            if (!g_WindowsDirNt.empty()) {
+                size_t lastSlash = g_WindowsDirNt.find_last_of(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    allowedWinDirName = g_WindowsDirNt.substr(lastSlash + 1);
+                }
+            }
+
+            // 提取启动器目录名
+            if (!g_LauncherDirNt.empty() && IsPathInDirectory(g_LauncherDirNt, g_SystemDriveNt)) {
+                std::wstring rel = g_LauncherDirNt.substr(g_SystemDriveNt.size());
+                if (!rel.empty() && rel[0] == L'\\') rel.erase(0, 1);
+                size_t firstSlash = rel.find(L'\\');
+                if (firstSlash != std::wstring::npos) {
+                    allowedLauncherDirName = rel.substr(0, firstSlash);
+                } else {
+                    allowedLauncherDirName = rel;
+                }
+            }
+        }
+    }
+
+    // 1. 扫描真实目录 (应用过滤)
     if (!realPath.empty()) {
         std::wstring searchPath = realPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
@@ -755,6 +837,17 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
                 if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                // [关键] 仅在扫描真实目录时应用 Mode 3 过滤
+                if (isMode3SystemRoot) {
+                    bool isVisible = false;
+                    if (!allowedWinDirName.empty() && _wcsicmp(fd.cFileName, allowedWinDirName.c_str()) == 0) isVisible = true;
+                    if (!allowedLauncherDirName.empty() && _wcsicmp(fd.cFileName, allowedLauncherDirName.c_str()) == 0) isVisible = true;
+
+                    // 如果不是允许的目录 则隐藏 (不加入 mergedMap)
+                    if (!isVisible) continue;
+                }
+
                 std::wstring key = fd.cFileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
                 mergedMap[key] = ConvertFindData(fd);
@@ -763,7 +856,8 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 2. 扫描沙盒目录
+    // 2. 扫描沙盒目录 (不应用过滤)
+    // 程序应该总是能看到它自己在沙盒里创建的文件
     if (!sandboxPath.empty()) {
         std::wstring searchPath = sandboxPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
@@ -778,10 +872,8 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
                 std::wstring key = fd.cFileName;
                 std::transform(key.begin(), key.end(), key.begin(), towlower);
 
-                // [修改] 移除墓碑检查逻辑
-                // 只要沙盒里有文件 就直接覆盖真实目录的条目
+                // 直接覆盖 不检查过滤 也不检查墓碑(已移除)
                 mergedMap[key] = ConvertFindData(fd);
-
             } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
         }
@@ -830,6 +922,12 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    // [新增] Mode 3 访问控制拦截
+    if (!CheckAccessMode3(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     std::wstring targetNtPath;
 
     // 检查是否匹配重定向规则
@@ -1136,6 +1234,12 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     if (g_IsInHook) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    // [新增] 访问控制
+    if (!CheckAccessMode3(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     std::wstring targetNtPath;
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         UNICODE_STRING uStr;
@@ -1156,6 +1260,12 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
     if (g_IsInHook) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    // [新增] 访问控制
+    if (!CheckAccessMode3(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     std::wstring targetNtPath;
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         UNICODE_STRING uStr;
@@ -2032,17 +2142,21 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 读取 Hook 模式
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
-        if (g_HookMode <= 0) g_HookMode = 1; // 默认回退到 1
+        if (g_HookMode <= 0) g_HookMode = 1;
     }
 
     // [新增] 获取系统盘符并转换为 NT 格式
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
-        // buffer 类似于 "C:\Windows\System32"
-        // 我们只需要 "C:"
+        // buffer = "C:\Windows\System32" -> "C:"
         buffer[2] = L'\0';
         g_SystemDriveNt = L"\\??\\";
         g_SystemDriveNt += buffer;
-        // 结果: \??\C:
+    }
+
+    // [新增] 获取 Windows 目录并转换为 NT 格式 (用于 Mode 3)
+    if (GetWindowsDirectoryW(buffer, MAX_PATH) > 0) {
+        g_WindowsDirNt = L"\\??\\";
+        g_WindowsDirNt += buffer;
     }
 
     if (g_SandboxRoot[0] == L'\0') {
