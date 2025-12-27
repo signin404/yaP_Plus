@@ -3358,6 +3358,17 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
         value = trim(value);
 
+        // --- [修改] 在 General 部分处理 backupdir 和 backupfile ---
+        if (currentSection == Section::General) {
+            if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
+                backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
+                continue;
+            } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
+                backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
+                continue;
+            }
+        }
+
         if (currentSection == Section::Before) {
             BeforeOperation beforeOp;
             bool op_created = false;
@@ -3445,11 +3456,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     f_op.wasMoved = ArePathsOnSameVolume(f_op.sourcePath, f_op.destPath);
                     beforeOp.data = f_op; op_created = true;
                 }
-            } else if (_wcsicmp(key.c_str(), L"backupdir") == 0) {
-                backupData.backupDirs.push_back(ParseBackupEntry(value, variables));
-            } else if (_wcsicmp(key.c_str(), L"backupfile") == 0) {
-                backupData.backupFiles.push_back(ParseBackupEntry(value, variables));
-            } else {
+            }
+            else {
                 auto action_op = parse_action_op(key, value);
                 if (action_op) {
                     beforeOp.data = *action_op;
