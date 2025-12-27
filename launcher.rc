@@ -6,12 +6,24 @@
 // --- 图标资源 ---
 // 定义一个唯一的ID给我们的图标资源
 #define IDI_MAINICON 101
-#define IDR_INI_FILE 102
+
+#define IDR_INI_FILE 101
+#define IDR_HOOK_DLL_32 102
+#define IDR_HOOK_DLL_64 103
+#define IDR_INJECTOR32 104
 
 // 检查是否在命令行定义了 EMBED_INI_FILE 宏
 // 如果定义了 则将其作为 RCDATA (原始数据) 包含进来
 #ifdef EMBED_INI_FILE
 IDR_INI_FILE RCDATA EMBED_INI_FILE
+#endif
+
+// 定义 DLL 资源 (编译时需要确保这两个文件存在)
+// 这里的路径假设 DLL 就在源码目录下 你可以根据实际情况修改
+#ifdef EMBED_HOOK_DLLS
+IDR_HOOK_DLL_32 RCDATA "YapHook32.dll"
+IDR_HOOK_DLL_64 RCDATA "YapHook64.dll"
+IDR_INJECTOR32 RCDATA "YapInjector32.exe"
 #endif
 
 // 将 icon.ico 文件作为图标资源嵌入
@@ -22,7 +34,7 @@ IDI_MAINICON ICON "icon.ico"
 // '1' 是这个版本信息资源的ID 通常设为1
 VS_VERSION_INFO VERSIONINFO
 // 文件版本（数字格式） 供操作系统使用 格式：主版本, 次版本, 修订号, 内部版本号
-FILEVERSION     1, 5, 2, 0
+FILEVERSION     1, 6, 0, 0
 // 产品版本（数字格式） 供操作系统使用
 // PRODUCTVERSION  1, 0, 0, 0
 // 文件标志掩码 通常设置为 0x3f 表示所有标志都有效
@@ -54,7 +66,7 @@ BEGIN
             // VALUE "LegalCopyright",   "Copyright (C) 2025. All rights reserved." // 版权信息
             // VALUE "OriginalFilename", "yaP_Plus.exe"                      // 原始文件名
             VALUE "ProductName",      "yaP Plus"          // 产品名称
-            VALUE "ProductVersion",   "1.5.2"                               // 产品版本（字符串格式）
+            VALUE "ProductVersion",   "1.6"                               // 产品版本（字符串格式）
         END
     END
     // 变量信息块的开始 用于指定语言和代码页

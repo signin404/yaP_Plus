@@ -1,38 +1,172 @@
-name: Build C++ Launcher for Windows
+name: Build Complete Launcher
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
-  # 允许手动触发工作流
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  build:
+  # ==================================================================
+  # 第一步：构建 Hook DLLs (x86 和 x64)
+  # ==================================================================
+  build-hooks:
+    name: Build Hook DLL (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            name: YapHook32.dll
+            lib_minhook: libMinHook.x86.lib
+          - arch: x64
+            name: YapHook64.dll
+            lib_minhook: libMinHook.x64.lib
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Checkout MinHook
+      uses: actions/checkout@v4
+      with:
+        repository: TsudaKageyu/minhook
+        path: MinHook
+
+    - name: Setup MSVC (${{ matrix.arch }})
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.arch }}
+
+    - name: Compile MinHook Library
+      shell: cmd
+      run: |
+        echo Compiling MinHook for ${{ matrix.arch }}...
+        mkdir minhook_build
+        cd minhook_build
+
+        :: 编译 MinHook 源码
+        cl /nologo /c /O2 /MT /MP /DNDEBUG /I ..\MinHook\include ..\MinHook\src\*.c ..\MinHook\src\hde\*.c || exit 1
+
+        :: 打包成静态库
+        lib /nologo /OUT:..\${{ matrix.lib_minhook }} *.obj || exit 1
+
+        cd ..
+        echo MinHook library built: ${{ matrix.lib_minhook }}
+
+    - name: Compile Hook DLL
+      shell: cmd
+      run: |
+        echo Compiling ${{ matrix.name }}...
+
+        :: 编译 HookDll.cpp 并链接 MinHook
+        cl /nologo /LD /O2 /MT /EHsc /DUNICODE /D_UNICODE /I MinHook\include HookDll.cpp ${{ matrix.lib_minhook }} Shlwapi.lib Shell32.lib /Fe:${{ matrix.name }} || exit 1
+
+        :: 验证 DLL 是否存在
+        if not exist "${{ matrix.name }}" (
+            echo Error: ${{ matrix.name }} was not created!
+            exit 1
+        )
+
+        :: 清理垃圾文件
+        del *.obj *.exp *.lib
+
+    # 上传 DLL 以便下一个 Job 使用
+    - name: Upload Hook DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.name }}
+        path: ${{ matrix.name }}
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第二步：构建 32位 注入器 (YapInjector32.exe)
+  # ==================================================================
+  build-injector:
+    name: Build Injector32 (x86)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC (x86)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86 # 必须是 32位 编译器
+
+    - name: Compile Injector32
+      shell: cmd
+      run: |
+        echo Compiling YapInjector32.exe...
+
+        :: 编译 Injector32.cpp 为 32位 EXE
+        :: 使用 /MT 静态链接 CRT 确保在无 VC++ 运行库的机器上也能运行
+        cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:YapInjector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
+
+        if not exist "YapInjector32.exe" (
+            echo Error: YapInjector32.exe was not created!
+            exit 1
+        )
+
+        del *.obj
+
+    - name: Upload Injector EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: YapInjector32.exe
+        path: YapInjector32.exe
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第三步：构建主程序 EXE 并嵌入 DLL 和 Injector
+  # ==================================================================
+  build-launcher:
+    name: Build Launcher EXE
+    needs: [build-hooks, build-injector] # 等待 DLL 和 Injector 都构建完成
     runs-on: windows-latest
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # 下载所有上游构建的工件 (YapHook32.dll, YapHook64.dll, YapInjector32.exe)
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true # 将所有文件下载到同一根目录
+
+    - name: Verify Dependencies Existence
+      shell: cmd
+      run: |
+        if exist YapHook32.dll ( echo YapHook32.dll found. ) else ( echo Error: YapHook32.dll missing! & exit 1 )
+        if exist YapHook64.dll ( echo YapHook64.dll found. ) else ( echo Error: YapHook64.dll missing! & exit 1 )
+        if exist YapInjector32.exe ( echo YapInjector32.exe found. ) else ( echo Error: YapInjector32.exe missing! & exit 1 )
+
     - name: Setup MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
+      # 默认构建 x64 启动器 (也可以改为 x86 取决于需求)
 
-    # --- 仅构建打包 INI 的版本 ---
-    # 使用 shell: cmd 是为了正确处理 rc.exe 参数中的引号转义
-    - name: Build Full Version (With Embedded INI)
+    - name: Build Full Version (With Embedded INI, DLLs, and Injector)
       shell: cmd
       run: |
         echo Building Full Version...
-        REM 编译资源文件 传入 INI 文件路径宏
-        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /fo launcher.res launcher.rc
 
-        REM 编译 C++ 代码并链接资源
-        cl.exe /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib
+        REM 1. 准备空 INI (如果不存在)
+        if not exist "launcher.ini" echo ;Empty INI > launcher.ini
 
-    # --- 上传 EXE 文件 ---
-    - name: Upload artifacts
+        REM 2. 编译资源文件
+        REM 定义 EMBED_HOOK_DLLS: 包含 YapHook32.dll/YapHook64.dll
+        REM 定义 EMBED_INI_FILE: 包含 launcher.ini
+
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher.res launcher.rc || exit 1
+
+        REM 3. 编译 C++ 代码并链接资源
+        cl.exe /std:c++17 /EHsc /O2 /MT /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
+
+    - name: Upload Final EXE
       uses: actions/upload-artifact@v4
       with:
         name: yaP_Plus
