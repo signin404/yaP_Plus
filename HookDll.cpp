@@ -1,5 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #include <windows.h>
 #include <winternl.h>
 #include <shlwapi.h>
@@ -16,6 +18,7 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -356,8 +359,14 @@ P_NtDeleteFile fpNtDeleteFile = NULL;
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
 
-P_connect fpConnect = NULL;
-P_WSAConnect fpWSAConnect = NULL;
+// ICMP (Ping)
+typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_IcmpSendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_Icmp6SendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PSOCKADDR_IN6, PSOCKADDR_IN6, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+
+// DNS & UDP
+typedef int (WSAAPI* P_GetAddrInfoW)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
+typedef int (WSAAPI* P_sendto)(SOCKET, const char*, int, int, const struct sockaddr*, int);
 
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
@@ -377,6 +386,14 @@ std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
+
+P_connect fpConnect = NULL;
+P_WSAConnect fpWSAConnect = NULL;
+P_IcmpSendEcho fpIcmpSendEcho = NULL;
+P_IcmpSendEcho2 fpIcmpSendEcho2 = NULL;
+P_Icmp6SendEcho2 fpIcmp6SendEcho2 = NULL;
+P_GetAddrInfoW fpGetAddrInfoW = NULL;
+P_sendto fpSendTo = NULL;
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -1347,9 +1364,9 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-        
+
         NTSTATUS status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
-        
+
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
@@ -1387,12 +1404,12 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-        
+
         NTSTATUS status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-        
+
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
-        
+
         if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
              return status;
         }
@@ -2277,6 +2294,55 @@ int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen,
     return SOCKET_ERROR;
 }
 
+// --- ICMP Hooks (拦截 Ping) ---
+DWORD WINAPI Detour_IcmpSendEcho(HANDLE IcmpHandle, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    if (g_BlockNetwork) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return fpIcmpSendEcho(IcmpHandle, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+}
+
+DWORD WINAPI Detour_IcmpSendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    if (g_BlockNetwork) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return fpIcmpSendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+}
+
+DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PSOCKADDR_IN6 SourceAddress, PSOCKADDR_IN6 DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    if (g_BlockNetwork) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return fpIcmp6SendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+}
+
+// --- DNS Hook (拦截域名解析) ---
+int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
+    if (g_BlockNetwork) {
+        // 允许解析 localhost
+        if (pNodeName && (_wcsicmp(pNodeName, L"localhost") == 0 || _wcsicmp(pNodeName, L"127.0.0.1") == 0 || _wcsicmp(pNodeName, L"::1") == 0)) {
+            return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        }
+        return EAI_FAIL; // 返回解析失败
+    }
+    return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+}
+
+// --- UDP Hook (拦截 sendto) ---
+int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen) {
+    if (g_BlockNetwork) {
+        if (IsLoopbackAddress(to)) {
+            return fpSendTo(s, buf, len, flags, to, tolen);
+        }
+        WSASetLastError(WSAEACCES);
+        return SOCKET_ERROR;
+    }
+    return fpSendTo(s, buf, len, flags, to, tolen);
+}
+
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -2456,19 +2522,32 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- 组 C: 网络 Hook (仅当 netblock=1 时挂钩) ---
+    // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
     if (g_BlockNetwork) {
+        // 1. Winsock Hooks (TCP/UDP/DNS)
         HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
         if (hWinsock) {
             void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
             void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
+            void* pGetAddrInfoW = (void*)GetProcAddress(hWinsock, "GetAddrInfoW");
+            void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
 
-            if (pConnect) {
-                MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
-            }
-            if (pWSAConnect) {
-                MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
-            }
+            if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
+            if (pWSAConnect) MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
+            if (pGetAddrInfoW) MH_CreateHook(pGetAddrInfoW, &Detour_GetAddrInfoW, reinterpret_cast<LPVOID*>(&fpGetAddrInfoW));
+            if (pSendTo) MH_CreateHook(pSendTo, &Detour_sendto, reinterpret_cast<LPVOID*>(&fpSendTo));
+        }
+
+        // 2. IP Helper Hooks (ICMP/Ping)
+        HMODULE hIphlpapi = LoadLibraryW(L"iphlpapi.dll");
+        if (hIphlpapi) {
+            void* pIcmpSendEcho = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho");
+            void* pIcmpSendEcho2 = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho2");
+            void* pIcmp6SendEcho2 = (void*)GetProcAddress(hIphlpapi, "Icmp6SendEcho2");
+
+            if (pIcmpSendEcho) MH_CreateHook(pIcmpSendEcho, &Detour_IcmpSendEcho, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho));
+            if (pIcmpSendEcho2) MH_CreateHook(pIcmpSendEcho2, &Detour_IcmpSendEcho2, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2));
+            if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
         }
     }
 
