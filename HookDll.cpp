@@ -76,6 +76,10 @@
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
 #endif
 
+#ifndef STATUS_OBJECT_PATH_NOT_FOUND
+#define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -811,11 +815,8 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
 
     // --- Mode 3: 激进隔离策略 ---
     if (g_HookMode == 3) {
-        // 上面没有匹配到的特殊目录 全部按绝对路径映射 (保留盘符结构)
-        // 例如: C:\Windows\System32 -> Sandbox\C\Windows\System32
-        // 例如: D:\Games -> Sandbox\D\Games
 
-        std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
+        std::wstring relPath = fullNtPath.substr(4);
         std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
 
         // 处理驱动器号冒号 (C: -> C)
@@ -1346,23 +1347,20 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-
+        
         NTSTATUS status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
-
+        
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // [修复] 如果沙盒返回“未找到”类错误，必须回退到真实路径。
-        // 不要只检查 STATUS_SUCCESS，因为可能有其他成功代码。
-        // 只有明确的“未找到”才回退。
+        // [修复] 只有明确的“未找到”才回退
+        // 需确保文件开头已定义 STATUS_OBJECT_PATH_NOT_FOUND
         if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
              return status;
         }
 
         // Mode 3 隐藏逻辑
         if (g_HookMode == 3) {
-            // 检查真实文件是否存在但不可见
-            // 注意：这里直接调用原始函数来探测真实存在性，避免递归
             NTSTATUS realStatus = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
             if (NT_SUCCESS(realStatus)) {
                 if (!IsPathVisible(fullNtPath)) {
@@ -1389,13 +1387,12 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-
+        
         NTSTATUS status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-
+        
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
-
-        // [修复] 同上，只有未找到时才回退
+        
         if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
              return status;
         }
