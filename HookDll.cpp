@@ -758,6 +758,7 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
 // [修改] 检查路径是否需要重定向
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
+    if (g_HookMode == 0) return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
