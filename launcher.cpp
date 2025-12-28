@@ -3994,9 +3994,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // --- 2. 解析 Hook 配置 ---
     std::wstring hookFileVal = GetValueFromIniContent(data->iniContent, L"General", L"hookfile");
     int hookMode = _wtoi(hookFileVal.c_str());
-    bool enableHook = (hookMode > 0); // 只要大于0就启用
 
-    // hookpath 已经支持变量展开 (ExpandVariables)
+    // [新增] 解析网络拦截配置
+    std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
+    bool blockNetwork = (netBlockVal == L"1");
+
+    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
+    bool enableHook = (hookMode > 0 || blockNetwork);
+
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
@@ -4067,8 +4072,16 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (!finalHookPath.empty()) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
-        SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
-        SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
+        SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
+        SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
+
+        // [新增] 读取 hookchild 配置
+        // 1 = 挂钩 (默认), 2 = 不挂钩
+        std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"General", L"hookchild");
+        if (hookChildVal.empty()) {
+            hookChildVal = L"1"; // 默认开启
+        }
+        SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);

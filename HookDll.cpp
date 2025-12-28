@@ -1,3 +1,9 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <wininet.h>
+#include <winhttp.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #include <windows.h>
 #include <winternl.h>
 #include <shlwapi.h>
@@ -13,6 +19,10 @@
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -345,6 +355,35 @@ typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
 
+// --- 函数指针定义 ---
+typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
+typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
+
+// ICMP (Ping)
+typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_IcmpSendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_Icmp6SendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PSOCKADDR_IN6, PSOCKADDR_IN6, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_IcmpSendEcho2Ex)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+
+// DNS & UDP
+typedef int (WSAAPI* P_GetAddrInfoW)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
+typedef int (WSAAPI* P_sendto)(SOCKET, const char*, int, int, const struct sockaddr*, int);
+
+// UDP 高级函数
+typedef int (WSAAPI* P_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+
+// WinINet (IE内核/旧版应用常用)
+typedef HINTERNET (WINAPI* P_InternetConnectW)(HINTERNET, LPCWSTR, INTERNET_PORT, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetConnectA)(HINTERNET, LPCSTR, INTERNET_PORT, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetOpenUrlW)(HINTERNET, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetOpenUrlA)(HINTERNET, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR);
+
+// WinHTTP (服务/更新程序常用)
+typedef HINTERNET (WINAPI* P_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+
+// 旧版 DNS
+typedef struct hostent* (WSAAPI* P_gethostbyname)(const char*);
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -362,6 +401,24 @@ int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
+bool g_BlockNetwork = false; // 网络拦截开关
+bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
+
+P_connect fpConnect = NULL;
+P_WSAConnect fpWSAConnect = NULL;
+P_IcmpSendEcho fpIcmpSendEcho = NULL;
+P_IcmpSendEcho2 fpIcmpSendEcho2 = NULL;
+P_Icmp6SendEcho2 fpIcmp6SendEcho2 = NULL;
+P_IcmpSendEcho2Ex fpIcmpSendEcho2Ex = NULL;
+P_GetAddrInfoW fpGetAddrInfoW = NULL;
+P_sendto fpSendTo = NULL;
+P_WSASendTo fpWSASendTo = NULL;
+P_InternetConnectW fpInternetConnectW = NULL;
+P_WinHttpConnect fpWinHttpConnect = NULL;
+P_InternetConnectA fpInternetConnectA = NULL;
+P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
+P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
+P_gethostbyname fpGethostbyname = NULL;
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -747,6 +804,7 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
 // [修改] 检查路径是否需要重定向
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
+    if (g_HookMode == 0) return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
@@ -799,11 +857,8 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
 
     // --- Mode 3: 激进隔离策略 ---
     if (g_HookMode == 3) {
-        // 上面没有匹配到的特殊目录 全部按绝对路径映射 (保留盘符结构)
-        // 例如: C:\Windows\System32 -> Sandbox\C\Windows\System32
-        // 例如: D:\Games -> Sandbox\D\Games
 
-        std::wstring relPath = fullNtPath.substr(4); // 去掉 \??\
+        std::wstring relPath = fullNtPath.substr(4);
         std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
 
         // 处理驱动器号冒号 (C: -> C)
@@ -2191,6 +2246,308 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     return result;
 }
 
+// --- Winsock Hooks ---
+
+// 辅助：判断是否为内网/私有 IP 地址
+bool IsIntranetIp32(ULONG ipNetworkOrder) {
+    // 将网络字节序转换为主机字节序以便比较
+    ULONG ip = ntohl(ipNetworkOrder);
+
+    // 1. Loopback: 127.0.0.0/8
+    if ((ip & 0xFF000000) == 0x7F000000) return true;
+    // 2. Private: 10.0.0.0/8
+    if ((ip & 0xFF000000) == 0x0A000000) return true;
+    // 3. Private: 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+    if ((ip & 0xFFF00000) == 0xAC100000) return true;
+    // 4. Private: 192.168.0.0/16
+    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+    // 5. Link-Local: 169.254.0.0/16
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
+    // 6. Multicast: 224.0.0.0/4 (组播 常用于局域网发现)
+    if ((ip & 0xF0000000) == 0xE0000000) return true;
+    // 7. Broadcast: 255.255.255.255
+    if (ip == 0xFFFFFFFF) return true;
+
+    return false;
+}
+
+bool IsIntranetAddress(const struct sockaddr* name) {
+    if (!name) return false;
+
+    if (name->sa_family == AF_INET) {
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)name;
+        return IsIntranetIp32(sin->sin_addr.s_addr);
+    }
+    else if (name->sa_family == AF_INET6) {
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
+
+        // Loopback ::1
+        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) return true;
+        // Link-Local fe80::/10
+        if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) return true;
+        // Unique Local fc00::/7 (IPv6 私有地址)
+        const UCHAR* b = sin6->sin6_addr.u.Byte;
+        if ((b[0] & 0xFE) == 0xFC) return true;
+        // Multicast ff00::/8
+        if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) return true;
+
+        return false;
+    }
+    // 对于非 IP 协议（如蓝牙 AF_BTH） 默认放行 或者根据需求拦截
+    return true;
+}
+
+// 辅助：判断字符串是否为有效的 IP 地址 (IPv4 或 IPv6)
+bool IsIpAddressString(PCWSTR str) {
+    if (!str) return false;
+
+    SOCKADDR_STORAGE sa;
+    int len = sizeof(sa);
+
+    // 尝试解析为 IPv4
+    if (WSAStringToAddressW((LPWSTR)str, AF_INET, NULL, (LPSOCKADDR)&sa, &len) == 0) return true;
+
+    // 尝试解析为 IPv6
+    len = sizeof(sa);
+    if (WSAStringToAddressW((LPWSTR)str, AF_INET6, NULL, (LPSOCKADDR)&sa, &len) == 0) return true;
+
+    return false;
+}
+
+// 辅助：解析域名并判断是否解析为内网 IP
+bool IsIntranetHost(LPCWSTR pNodeName) {
+    if (!pNodeName || !*pNodeName) return false;
+
+    // 1. 如果直接是 IP 字符串 判断 IP
+    if (IsIpAddressString(pNodeName)) {
+        // 转换字符串为 IP 结构比较麻烦 这里偷懒：
+        // 让它走下面的 GetAddrInfoW 流程 反正效果一样
+    }
+
+    // 2. 检查 localhost
+    if (_wcsicmp(pNodeName, L"localhost") == 0) return true;
+
+    // 3. 解析域名 (使用原始函数 fpGetAddrInfoW 避免死循环)
+    ADDRINFOW hints = { 0 };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    PADDRINFOW pResult = NULL;
+
+    if (fpGetAddrInfoW && fpGetAddrInfoW(pNodeName, NULL, &hints, &pResult) == 0) {
+        bool isIntranet = false;
+        PADDRINFOW ptr = pResult;
+        while (ptr != NULL) {
+            if (IsIntranetAddress(ptr->ai_addr)) {
+                isIntranet = true;
+                break;
+            }
+            ptr = ptr->ai_next;
+        }
+        FreeAddrInfoW(pResult);
+        return isIntranet;
+    }
+
+    // 如果解析失败 为了安全起见 默认视为外网并拦截
+    return false;
+}
+
+// 辅助：从 URL 中提取主机名
+std::wstring GetHostFromUrl(LPCWSTR url) {
+    if (!url) return L"";
+
+    // 使用 InternetCrackUrl 解析
+    URL_COMPONENTSW urlComp = { 0 };
+    urlComp.dwStructSize = sizeof(urlComp);
+    urlComp.dwHostNameLength = 1; // 设置非0值以指示我们需要获取 HostName
+
+    // 预分配缓冲区
+    wchar_t hostName[2048] = { 0 };
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 2048;
+
+    if (InternetCrackUrlW(url, 0, 0, &urlComp)) {
+        return std::wstring(hostName);
+    }
+    return L"";
+}
+
+int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+    // 放行内网 IP
+    if (IsIntranetAddress(name)) {
+        return fpConnect(s, name, namelen);
+    }
+    // 拦截公网 IP
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
+
+int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
+    if (IsIntranetAddress(name)) {
+        return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
+    }
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
+
+// --- UDP Hook (拦截 sendto) ---
+int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen) {
+    if (IsIntranetAddress(to)) {
+        return fpSendTo(s, buf, len, flags, to, tolen);
+    }
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
+
+// --- UDP 高级拦截 ---
+int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesSent, DWORD dwFlags, const struct sockaddr* lpTo, int iTolen, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+    if (g_BlockNetwork) {
+        // 如果指定了目标地址 必须检查
+        if (lpTo) {
+            if (IsIntranetAddress(lpTo)) {
+                return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+            }
+            WSASetLastError(WSAEACCES);
+            return SOCKET_ERROR;
+        }
+        // 如果 lpTo 为空（已连接的 UDP 套接字） 通常在 connect 时已检查过 放行
+    }
+    return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+}
+
+// --- WinINet 拦截 ---
+HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName, INTERNET_PORT nServerPort, LPCWSTR lpszUserName, LPCWSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(lpszServerName)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetConnectW(hInternet, lpszServerName, nServerPort, lpszUserName, lpszPassword, dwService, dwFlags, dwContext);
+}
+
+// --- WinINet ANSI 拦截 ---
+HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerName, INTERNET_PORT nServerPort, LPCSTR lpszUserName, LPCSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        // 转换为 Wide 字符串进行检查
+        std::wstring serverNameW = AnsiToWide(lpszServerName);
+        if (!IsIntranetHost(serverNameW.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetConnectA(hInternet, lpszServerName, nServerPort, lpszUserName, lpszPassword, dwService, dwFlags, dwContext);
+}
+
+// --- InternetOpenUrl (Unicode) 拦截 ---
+HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        std::wstring host = GetHostFromUrl(lpszUrl);
+        // 如果解析不出主机名 或者主机名不是内网 则拦截
+        if (host.empty() || !IsIntranetHost(host.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetOpenUrlW(hInternet, lpszUrl, lpszHeaders, dwHeadersLength, dwFlags, dwContext);
+}
+
+// --- InternetOpenUrl (ANSI) 拦截 ---
+HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        std::wstring urlW = AnsiToWide(lpszUrl);
+        std::wstring host = GetHostFromUrl(urlW.c_str());
+        if (host.empty() || !IsIntranetHost(host.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetOpenUrlA(hInternet, lpszUrl, lpszHeaders, dwHeadersLength, dwFlags, dwContext);
+}
+
+// --- 旧版 DNS (gethostbyname) 拦截 ---
+struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
+    if (g_BlockNetwork) {
+        std::wstring nameW = AnsiToWide(name);
+        // 允许 localhost
+        if (_wcsicmp(nameW.c_str(), L"localhost") == 0) {
+            return fpGethostbyname(name);
+        }
+
+        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表
+        // 我们无法预知它解析出的是内网还是外网 IP
+        // 策略：
+        // 1. 如果输入的是纯 IP 字符串 放行（让 connect 去拦截）
+        // 2. 如果是域名 直接拦截因为内网域名解析通常走 DNS 而 gethostbyname 是非常老的 API
+        //    现代内网环境（mDNS/LLMNR）它支持不好 且容易泄露隐私
+        //    如果确实需要支持内网旧版域名解析 可以放行 依靠 connect 拦截 IP
+        //    但为了安全 这里默认拦截非 IP 字符串
+
+        if (IsIpAddressString(nameW.c_str())) {
+             return fpGethostbyname(name);
+        }
+
+        WSASetLastError(WSAHOST_NOT_FOUND);
+        return NULL;
+    }
+    return fpGethostbyname(name);
+}
+
+// --- WinHTTP 拦截 ---
+HINTERNET WINAPI Detour_WinHttpConnect(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved) {
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(pswzServerName)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpWinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved);
+}
+
+// --- ICMP Hooks (拦截 Ping) ---
+DWORD WINAPI Detour_IcmpSendEcho(HANDLE IcmpHandle, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    // DestinationAddress 是 ULONG (IPv4)
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho(IcmpHandle, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+DWORD WINAPI Detour_IcmpSendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+// 新增：拦截 IcmpSendEcho2Ex (Windows 8+ ping.exe 使用此函数)
+DWORD WINAPI Detour_IcmpSendEcho2Ex(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, IPAddr SourceAddress, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    // 检查目标地址 (DestinationAddress)
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho2Ex(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+// IPv6 Ping
+DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PSOCKADDR_IN6 SourceAddress, PSOCKADDR_IN6 DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    // 构造 sockaddr 结构以复用 IsIntranetAddress
+    if (IsIntranetAddress((struct sockaddr*)DestinationAddress)) {
+        return fpIcmp6SendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
+// --- DNS Hook (拦截域名解析) ---
+int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
+    // 始终放行 DNS 解析 以便支持内网主机名解析
+    // 真正的拦截由 connect/sendto/IcmpSendEcho 负责（它们会检查解析出来的 IP）
+    return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+}
+
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -2232,10 +2589,26 @@ DWORD WINAPI InitHookThread(LPVOID) {
         CloseHandle(hMap);
     }
 
-    // 3. [新增] 读取 Hook 模式 (默认为 1)
+    // 3. 读取 Hook 模式 (文件重定向)
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
-        if (g_HookMode <= 0) g_HookMode = 1;
+        // 注意：这里允许 g_HookMode 为 0
+    }
+
+    // [新增] 读取子进程挂钩配置
+    wchar_t childBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD", childBuffer, 64) > 0) {
+        int val = _wtoi(childBuffer);
+        // hookchild=2 表示不挂钩子进程
+        if (val == 2) {
+            g_HookChild = false;
+        }
+    }
+
+    // [新增] 读取网络拦截开关
+    wchar_t netBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 64) > 0) {
+        g_BlockNetwork = (_wtoi(netBuffer) == 1);
     }
 
     // 4. [新增] 获取系统盘符并初始化白名单
@@ -2311,51 +2684,123 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
-    // 8. 创建 Hooks
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+    // =======================================================
+    // 分组挂钩逻辑
+    // =======================================================
 
-        fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+    // --- 组 A: 文件系统 Hook (仅当 hookfile > 0 时挂钩) ---
+    if (g_HookMode > 0) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-        void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
-        if (pNtQueryDirectoryFileEx) {
-            MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+            void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
+            if (pNtQueryDirectoryFileEx) {
+                MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            }
+        }
+
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+            if (pGetFinalPathNameByHandleW) {
+                MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+            }
         }
     }
 
-    MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
-    MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+    // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
+    if (g_HookChild && (g_HookMode > 0 || g_BlockNetwork)) {
+        MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
+        MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
-    HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-    if (hAdvapi32) {
-        void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-        if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-        void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-        if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-        void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-        if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-        void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-        if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
-    }
-
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32) {
-        void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
-        if (pGetFinalPathNameByHandleW) {
-             MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
+            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
+            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
+            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
+            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
-    // 9. 启用所有 Hook
+    // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
+    if (g_BlockNetwork) {
+        // 1. Winsock Hooks (TCP/UDP/DNS)
+        HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
+        if (hWinsock) {
+            void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
+            void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
+            void* pGetAddrInfoW = (void*)GetProcAddress(hWinsock, "GetAddrInfoW");
+            void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
+            void* pWSASendTo = (void*)GetProcAddress(hWinsock, "WSASendTo");
+            void* pGethostbyname = (void*)GetProcAddress(hWinsock, "gethostbyname");
+
+            if (pGethostbyname) MH_CreateHook(pGethostbyname, &Detour_gethostbyname, reinterpret_cast<LPVOID*>(&fpGethostbyname));
+            if (pWSASendTo) MH_CreateHook(pWSASendTo, &Detour_WSASendTo, reinterpret_cast<LPVOID*>(&fpWSASendTo));
+            if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
+            if (pWSAConnect) MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
+            if (pGetAddrInfoW) MH_CreateHook(pGetAddrInfoW, &Detour_GetAddrInfoW, reinterpret_cast<LPVOID*>(&fpGetAddrInfoW));
+            if (pSendTo) MH_CreateHook(pSendTo, &Detour_sendto, reinterpret_cast<LPVOID*>(&fpSendTo));
+        }
+
+        // 2. IP Helper Hooks (ICMP/Ping)
+        HMODULE hIphlpapi = LoadLibraryW(L"iphlpapi.dll");
+        if (hIphlpapi) {
+            void* pIcmpSendEcho = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho");
+            void* pIcmpSendEcho2 = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho2");
+            // [新增] 获取 IcmpSendEcho2Ex 地址
+            void* pIcmpSendEcho2Ex = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho2Ex");
+            void* pIcmp6SendEcho2 = (void*)GetProcAddress(hIphlpapi, "Icmp6SendEcho2");
+
+            if (pIcmpSendEcho) MH_CreateHook(pIcmpSendEcho, &Detour_IcmpSendEcho, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho));
+            if (pIcmpSendEcho2) MH_CreateHook(pIcmpSendEcho2, &Detour_IcmpSendEcho2, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2));
+            // [新增] 创建 Hook
+            if (pIcmpSendEcho2Ex) MH_CreateHook(pIcmpSendEcho2Ex, &Detour_IcmpSendEcho2Ex, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2Ex));
+            if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
+        }
+        // 3. [新增] WinINet Hooks
+        HMODULE hWinInet = LoadLibraryW(L"wininet.dll");
+        if (hWinInet) {
+            // 原有 Unicode Connect
+            void* pInternetConnectW = (void*)GetProcAddress(hWinInet, "InternetConnectW");
+            if (pInternetConnectW) MH_CreateHook(pInternetConnectW, &Detour_InternetConnectW, reinterpret_cast<LPVOID*>(&fpInternetConnectW));
+
+            // [新增] ANSI Connect
+            void* pInternetConnectA = (void*)GetProcAddress(hWinInet, "InternetConnectA");
+            if (pInternetConnectA) MH_CreateHook(pInternetConnectA, &Detour_InternetConnectA, reinterpret_cast<LPVOID*>(&fpInternetConnectA));
+
+            // [新增] InternetOpenUrl W & A
+            void* pInternetOpenUrlW = (void*)GetProcAddress(hWinInet, "InternetOpenUrlW");
+            if (pInternetOpenUrlW) MH_CreateHook(pInternetOpenUrlW, &Detour_InternetOpenUrlW, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlW));
+
+            void* pInternetOpenUrlA = (void*)GetProcAddress(hWinInet, "InternetOpenUrlA");
+            if (pInternetOpenUrlA) MH_CreateHook(pInternetOpenUrlA, &Detour_InternetOpenUrlA, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlA));
+        }
+
+        // 4. [新增] WinHTTP Hooks
+        HMODULE hWinHttp = LoadLibraryW(L"winhttp.dll");
+        if (hWinHttp) {
+            void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
+            if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
+        }
+    }
+
+    // 9. 启用所有已创建的 Hook
+    // MinHook 只会启用之前调用过 MH_CreateHook 的函数 未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
     // 10. 通知启动器就绪
