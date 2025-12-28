@@ -83,10 +83,6 @@
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
 #endif
 
-#ifndef STATUS_OBJECT_PATH_NOT_FOUND
-#define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
-#endif
-
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -1082,60 +1078,54 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
-
-        // 判定是否为写入操作
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
+
         if (CreateDisposition == FILE_CREATE || CreateDisposition == FILE_SUPERSEDE || CreateDisposition == FILE_OVERWRITE || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_OPEN_IF) {
             isWrite = true;
         }
 
-        // 1. 检查物理存在性
         bool sandboxExists = NtPathExists(targetNtPath);
-        bool physicalRealExists = NtPathExists(fullNtPath);
-        bool realExists = physicalRealExists;
-        bool isHidden = false;
+        bool realExists = NtPathExists(fullNtPath);
 
-        // [Mode 3] 可见性检查
+        // [新增] Mode 3 可见性检查
+        // 如果真实文件存在 但根据策略不可见 则视为不存在
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
-                isHidden = true;
             }
         }
 
         bool shouldRedirect = false;
 
         if (isDirectory && !isWrite) {
-            // --- 目录读取 ---
-            if (sandboxExists) shouldRedirect = true;
-            else if (realExists) shouldRedirect = false;
-            else shouldRedirect = isHidden; // 如果是隐藏目录则重定向 否则放行
+            shouldRedirect = false;
+            if (!realExists && sandboxExists) {
+                shouldRedirect = true;
+            } else if (realExists) {
+                // 如果真实存在且可见 直接打开真实目录
+                // 目录内容的过滤由 NtQueryDirectoryFile (BuildMergedDirectoryList) 处理
+                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            } else {
+                // 都不存在 (或被隐藏) -> 重定向到沙盒以报错
+                shouldRedirect = true;
+            }
         } else if (isWrite) {
-            // --- 写入操作 (总是重定向) ---
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
                 shouldRedirect = true;
             } else {
-                shouldRedirect = true; // 创建新文件
+                shouldRedirect = true;
             }
         } else {
-            // --- 文件只读访问 (关键路径) ---
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                shouldRedirect = false; // 真实存在 -> 放行
+                shouldRedirect = false;
+                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
-                // --- 都不存在 ---
-                if (isHidden) {
-                    shouldRedirect = true; // 故意隐藏 -> 重定向到沙盒(报错)
-                } else {
-                    // [绝对修复] 物理上真的不存在 -> 绝对不要重定向！
-                    // 必须让 OS 在真实路径上返回 STATUS_OBJECT_NAME_NOT_FOUND
-                    // 任何重定向都可能导致返回 STATUS_OBJECT_PATH_NOT_FOUND (因为沙盒目录结构可能不完整)
-                    shouldRedirect = false;
-                }
+                shouldRedirect = true;
             }
         }
 
@@ -1147,8 +1137,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
-            // 仅在确实需要重定向时才确保目录存在
-            EnsureDirectoryExistsNT(targetNtPath.c_str());
+            if (isWrite || CreateDisposition == FILE_CREATE || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_SUPERSEDE) {
+                EnsureDirectoryExistsNT(targetNtPath.c_str());
+            }
 
             NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             ObjectAttributes->ObjectName = oldName;
@@ -1387,36 +1378,25 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
+        // 1. 优先检查沙盒
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, targetNtPath.c_str());
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-
         NTSTATUS status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
-
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
+        if (status == STATUS_SUCCESS) return status;
 
-        // [修复] 只有明确的“未找到”才回退
-        // 需确保文件开头已定义 STATUS_OBJECT_PATH_NOT_FOUND
-        if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
-             return status;
-        }
-
-        // Mode 3 隐藏逻辑
+        // 2. [新增] 如果沙盒没有 检查真实路径是否被隐藏
         if (g_HookMode == 3) {
-            NTSTATUS realStatus = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
-            if (NT_SUCCESS(realStatus)) {
-                if (!IsPathVisible(fullNtPath)) {
-                    return STATUS_OBJECT_NAME_NOT_FOUND;
-                }
+            if (!IsPathVisible(fullNtPath)) {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
             }
-            return realStatus;
         }
     }
-    // 回退到真实路径
     return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
 }
 
@@ -1433,25 +1413,16 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
-
         NTSTATUS status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
+        if (status == STATUS_SUCCESS) return status;
 
-        if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
-             return status;
-        }
-
-        // Mode 3 隐藏逻辑
+        // [新增] 隐藏检查
         if (g_HookMode == 3) {
-            NTSTATUS realStatus = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-            if (NT_SUCCESS(realStatus)) {
-                if (!IsPathVisible(fullNtPath)) {
-                    return STATUS_OBJECT_NAME_NOT_FOUND;
-                }
+            if (!IsPathVisible(fullNtPath)) {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
             }
-            return realStatus;
         }
     }
     return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
@@ -2636,7 +2607,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];
-    if (GetEnvironmentVariableW(L"YAP_BLOCK_NET", netBuffer, 64) > 0) {
+    if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 64) > 0) {
         g_BlockNetwork = (_wtoi(netBuffer) == 1);
     }
 
