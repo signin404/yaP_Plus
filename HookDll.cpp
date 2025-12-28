@@ -10,9 +10,12 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -345,6 +348,13 @@ typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
 
+// Winsock 函数指针
+typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
+typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
+
+P_connect fpConnect = NULL;
+P_WSAConnect fpWSAConnect = NULL;
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -362,6 +372,7 @@ int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
+bool g_BlockNetwork = false;
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -2191,6 +2202,60 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     return result;
 }
 
+// --- 辅助函数 ---
+// 判断是否为环回地址 (127.0.0.1 ~ 127.255.255.255 或 ::1)
+bool IsLoopbackAddress(const struct sockaddr* name) {
+    if (!name) return false;
+
+    if (name->sa_family == AF_INET) {
+        // IPv4: 检查 127.x.x.x
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)name;
+        // sin->sin_addr.S_un.S_un_b.s_b1 是 127 即为环回
+        return (sin->sin_addr.S_un.S_un_b.s_b1 == 127);
+    }
+    else if (name->sa_family == AF_INET6) {
+        // IPv6: 检查 ::1
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
+        return IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr);
+    }
+    // 对于非 IP 协议 (如 AF_UNIX, AF_BTH 蓝牙等)，默认放行
+    return true;
+}
+
+int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+    // 1. 如果开关未开启，直接放行
+    if (!g_BlockNetwork) {
+        return fpConnect(s, name, namelen);
+    }
+
+    // 2. 如果是环回地址，放行
+    if (IsLoopbackAddress(name)) {
+        return fpConnect(s, name, namelen);
+    }
+
+    // 3. 否则拦截，并记录日志
+    // DebugLog(L"Blocked network connection (connect)"); // 可选：记录日志
+    WSASetLastError(WSAEACCES); // 返回“权限被拒绝”错误
+    return SOCKET_ERROR;
+}
+
+int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
+    // 1. 如果开关未开启，直接放行
+    if (!g_BlockNetwork) {
+        return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
+    }
+
+    // 2. 如果是环回地址，放行
+    if (IsLoopbackAddress(name)) {
+        return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
+    }
+
+    // 3. 否则拦截
+    // DebugLog(L"Blocked network connection (WSAConnect)");
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
+
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -2230,6 +2295,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
             UnmapViewOfFile(pBuf);
         }
         CloseHandle(hMap);
+    }
+
+    // [新增] 读取网络拦截开关
+    wchar_t netBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_BLOCK_NET", netBuffer, 64) > 0) {
+        g_BlockNetwork = (_wtoi(netBuffer) == 1);
     }
 
     // 3. [新增] 读取 Hook 模式 (默认为 1)
@@ -2352,6 +2423,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
         if (pGetFinalPathNameByHandleW) {
              MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        }
+    }
+
+    // [新增] 创建 Winsock Hooks
+    HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
+    if (hWinsock) {
+        void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
+        void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
+
+        if (pConnect) {
+            MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
+        }
+        if (pWSAConnect) {
+            MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
         }
     }
 

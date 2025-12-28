@@ -4000,6 +4000,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
+    // --- [新增] 解析网络拦截配置 ---
+    // 读取 General 下的 hooknet 键 (1=拦截, 0=不拦截)
+    std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
+    bool blockNetwork = (netBlockVal == L"1");
+
     // --- [新增] 解析 Injector 配置 (第三方 DLL) ---
     std::vector<std::wstring> thirdPartyDlls;
     {
@@ -4069,6 +4074,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         }
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
+        SetEnvironmentVariableW(L"YAP_BLOCK_NET", blockNetwork ? L"1" : L"0");
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
