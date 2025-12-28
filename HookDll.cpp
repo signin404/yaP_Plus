@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
 #include <shlwapi.h>
@@ -10,8 +12,6 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
