@@ -363,6 +363,7 @@ typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int na
 typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
 typedef DWORD (WINAPI* P_IcmpSendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
 typedef DWORD (WINAPI* P_Icmp6SendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PSOCKADDR_IN6, PSOCKADDR_IN6, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
+typedef DWORD (WINAPI* P_IcmpSendEcho2Ex)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
 
 // DNS & UDP
 typedef int (WSAAPI* P_GetAddrInfoW)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
@@ -392,6 +393,7 @@ P_WSAConnect fpWSAConnect = NULL;
 P_IcmpSendEcho fpIcmpSendEcho = NULL;
 P_IcmpSendEcho2 fpIcmpSendEcho2 = NULL;
 P_Icmp6SendEcho2 fpIcmp6SendEcho2 = NULL;
+P_IcmpSendEcho2Ex fpIcmpSendEcho2Ex = NULL;
 P_GetAddrInfoW fpGetAddrInfoW = NULL;
 P_sendto fpSendTo = NULL;
 
@@ -2359,6 +2361,16 @@ DWORD WINAPI Detour_IcmpSendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTI
     return 0;
 }
 
+// 新增：拦截 IcmpSendEcho2Ex (Windows 8+ ping.exe 使用此函数)
+DWORD WINAPI Detour_IcmpSendEcho2Ex(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, IPAddr SourceAddress, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
+    // 检查目标地址 (DestinationAddress)
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho2Ex(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    }
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
+}
+
 // IPv6 Ping
 DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PSOCKADDR_IN6 SourceAddress, PSOCKADDR_IN6 DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
     // 构造 sockaddr 结构以复用 IsIntranetAddress
@@ -2576,10 +2588,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hIphlpapi) {
             void* pIcmpSendEcho = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho");
             void* pIcmpSendEcho2 = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho2");
+            // [新增] 获取 IcmpSendEcho2Ex 地址
+            void* pIcmpSendEcho2Ex = (void*)GetProcAddress(hIphlpapi, "IcmpSendEcho2Ex");
             void* pIcmp6SendEcho2 = (void*)GetProcAddress(hIphlpapi, "Icmp6SendEcho2");
 
             if (pIcmpSendEcho) MH_CreateHook(pIcmpSendEcho, &Detour_IcmpSendEcho, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho));
             if (pIcmpSendEcho2) MH_CreateHook(pIcmpSendEcho2, &Detour_IcmpSendEcho2, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2));
+            // [新增] 创建 Hook
+            if (pIcmpSendEcho2Ex) MH_CreateHook(pIcmpSendEcho2Ex, &Detour_IcmpSendEcho2Ex, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2Ex));
             if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
         }
     }
