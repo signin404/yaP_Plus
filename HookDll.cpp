@@ -1027,6 +1027,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
+    // [优化] 快速跳过
+    if (g_HookMode == 0) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
 
@@ -1116,6 +1119,10 @@ NTSTATUS NTAPI Detour_NtOpenFile(
     ULONG ShareAccess,
     ULONG OpenOptions
 ) {
+    // [优化] 快速跳过
+    if (g_HookMode == 0) return fpNtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions);
+
+    // 注意：NtOpenFile 通常直接调用 Detour_NtCreateFile，所以上面的检查其实是双重保险
     return Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, NULL, 0, ShareAccess, FILE_OPEN, OpenOptions, NULL, 0);
 }
 
@@ -1329,8 +1336,13 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_BASIC_INFORMATION FileInformation) {
+    // [优化] 如果未启用文件 Hook，直接放行，不进行任何路径解析
+    if (g_HookMode == 0) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
+
     if (g_IsInHook) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
+
+    // 只有在 g_HookMode > 0 时才执行昂贵的路径解析
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring targetNtPath;
 
@@ -1358,8 +1370,12 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
 }
 
 NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_NETWORK_OPEN_INFORMATION FileInformation) {
+    // [优化] 快速跳过
+    if (g_HookMode == 0) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+
     if (g_IsInHook) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
+
     std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring targetNtPath;
 
@@ -1957,6 +1973,11 @@ BOOL CreateProcessInternal(
     LPPROCESS_INFORMATION lpProcessInformation,
     bool isAnsi
 ) {
+    std::wstring redirectedExe;
+    // 只有在 g_HookMode > 0 时才尝试重定向
+    if (g_HookMode > 0) {
+        redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+    }
     // 1. 处理 ApplicationName (EXE 路径)
     std::wstring exePathW;
     if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
@@ -1980,9 +2001,10 @@ BOOL CreateProcessInternal(
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
 
-    std::string ansiExe, ansiDir; // 保持生命周期
+    std::string ansiExe, ansiDir;
 
     if (!redirectedExe.empty()) {
+        // 只有当成功获取到重定向路径时，才修改 finalAppName
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
         if (isAnsi) {
             ansiExe = WideToAnsi(redirectedExe.c_str());
