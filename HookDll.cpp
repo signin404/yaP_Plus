@@ -1080,7 +1080,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             // --- 目录读取 ---
             if (sandboxExists) shouldRedirect = true;
             else if (realExists) shouldRedirect = false;
-            else shouldRedirect = isHidden; // 如果是隐藏目录则重定向，否则放行
+            else shouldRedirect = isHidden; // 如果是隐藏目录则重定向 否则放行
         } else if (isWrite) {
             // --- 写入操作 (总是重定向) ---
             if (sandboxExists) {
@@ -1103,8 +1103,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                     shouldRedirect = true; // 故意隐藏 -> 重定向到沙盒(报错)
                 } else {
                     // [绝对修复] 物理上真的不存在 -> 绝对不要重定向！
-                    // 必须让 OS 在真实路径上返回 STATUS_OBJECT_NAME_NOT_FOUND。
-                    // 任何重定向都可能导致返回 STATUS_OBJECT_PATH_NOT_FOUND (因为沙盒目录结构可能不完整)。
+                    // 必须让 OS 在真实路径上返回 STATUS_OBJECT_NAME_NOT_FOUND
+                    // 任何重定向都可能导致返回 STATUS_OBJECT_PATH_NOT_FOUND (因为沙盒目录结构可能不完整)
                     shouldRedirect = false;
                 }
             }
@@ -1876,26 +1876,6 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 
 // --- 路径处理辅助函数 ---
 
-// --- 辅助函数 ---
-// 判断是否为环回地址 (127.0.0.1 ~ 127.255.255.255 或 ::1)
-bool IsLoopbackAddress(const struct sockaddr* name) {
-    if (!name) return false;
-
-    if (name->sa_family == AF_INET) {
-        // IPv4: 检查 127.x.x.x
-        const struct sockaddr_in* sin = (const struct sockaddr_in*)name;
-        // sin->sin_addr.S_un.S_un_b.s_b1 是 127 即为环回
-        return (sin->sin_addr.S_un.S_un_b.s_b1 == 127);
-    }
-    else if (name->sa_family == AF_INET6) {
-        // IPv6: 检查 ::1
-        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
-        return IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr);
-    }
-    // 对于非 IP 协议 (如 AF_UNIX, AF_BTH 蓝牙等)，默认放行
-    return true;
-}
-
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
     if (!text) return L"";
@@ -2268,79 +2248,132 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
 
 // --- Winsock Hooks ---
 
-int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+// 辅助：判断是否为内网/私有 IP 地址
+bool IsIntranetIp32(ULONG ipNetworkOrder) {
+    // 将网络字节序转换为主机字节序以便比较
+    ULONG ip = ntohl(ipNetworkOrder);
 
-    // 2. 如果是环回地址，放行
-    if (IsLoopbackAddress(name)) {
+    // 1. Loopback: 127.0.0.0/8
+    if ((ip & 0xFF000000) == 0x7F000000) return true;
+    // 2. Private: 10.0.0.0/8
+    if ((ip & 0xFF000000) == 0x0A000000) return true;
+    // 3. Private: 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+    if ((ip & 0xFFF00000) == 0xAC100000) return true;
+    // 4. Private: 192.168.0.0/16
+    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+    // 5. Link-Local: 169.254.0.0/16
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
+    // 6. Multicast: 224.0.0.0/4 (组播 常用于局域网发现)
+    if ((ip & 0xF0000000) == 0xE0000000) return true;
+    // 7. Broadcast: 255.255.255.255
+    if (ip == 0xFFFFFFFF) return true;
+
+    return false;
+}
+
+bool IsIntranetAddress(const struct sockaddr* name) {
+    if (!name) return false;
+
+    if (name->sa_family == AF_INET) {
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)name;
+        return IsIntranetIp32(sin->sin_addr.s_addr);
+    }
+    else if (name->sa_family == AF_INET6) {
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
+
+        // Loopback ::1
+        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) return true;
+        // Link-Local fe80::/10
+        if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) return true;
+        // Unique Local fc00::/7 (IPv6 私有地址)
+        const UCHAR* b = sin6->sin6_addr.u.Byte;
+        if ((b[0] & 0xFE) == 0xFC) return true;
+        // Multicast ff00::/8
+        if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) return true;
+
+        return false;
+    }
+    // 对于非 IP 协议（如蓝牙 AF_BTH） 默认放行 或者根据需求拦截
+    return true;
+}
+
+// 辅助：判断字符串是否为有效的 IP 地址 (IPv4 或 IPv6)
+bool IsIpAddressString(PCWSTR str) {
+    if (!str) return false;
+
+    SOCKADDR_STORAGE sa;
+    int len = sizeof(sa);
+
+    // 尝试解析为 IPv4
+    if (WSAStringToAddressW((LPWSTR)str, AF_INET, NULL, (LPSOCKADDR)&sa, &len) == 0) return true;
+
+    // 尝试解析为 IPv6
+    len = sizeof(sa);
+    if (WSAStringToAddressW((LPWSTR)str, AF_INET6, NULL, (LPSOCKADDR)&sa, &len) == 0) return true;
+
+    return false;
+}
+
+int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+    // 放行内网 IP
+    if (IsIntranetAddress(name)) {
         return fpConnect(s, name, namelen);
     }
-
-    // 3. 否则拦截，并记录日志
-    // DebugLog(L"Blocked network connection (connect)"); // 可选：记录日志
-    WSASetLastError(WSAEACCES); // 返回“权限被拒绝”错误
+    // 拦截公网 IP
+    WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
 
 int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
-
-    // 2. 如果是环回地址，放行
-    if (IsLoopbackAddress(name)) {
+    if (IsIntranetAddress(name)) {
         return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
 
-    // 3. 否则拦截
-    // DebugLog(L"Blocked network connection (WSAConnect)");
+// --- UDP Hook (拦截 sendto) ---
+int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen) {
+    if (IsIntranetAddress(to)) {
+        return fpSendTo(s, buf, len, flags, to, tolen);
+    }
     WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
 
 // --- ICMP Hooks (拦截 Ping) ---
 DWORD WINAPI Detour_IcmpSendEcho(HANDLE IcmpHandle, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
-    if (g_BlockNetwork) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return 0;
+    // DestinationAddress 是 ULONG (IPv4)
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho(IcmpHandle, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
     }
-    return fpIcmpSendEcho(IcmpHandle, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
 }
 
 DWORD WINAPI Detour_IcmpSendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, IPAddr DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
-    if (g_BlockNetwork) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return 0;
+    if (IsIntranetIp32(DestinationAddress)) {
+        return fpIcmpSendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
     }
-    return fpIcmpSendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
 }
 
+// IPv6 Ping
 DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PSOCKADDR_IN6 SourceAddress, PSOCKADDR_IN6 DestinationAddress, LPVOID RequestData, WORD RequestSize, PIP_OPTION_INFORMATION RequestOptions, LPVOID ReplyBuffer, DWORD ReplySize, DWORD Timeout) {
-    if (g_BlockNetwork) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return 0;
+    // 构造 sockaddr 结构以复用 IsIntranetAddress
+    if (IsIntranetAddress((struct sockaddr*)DestinationAddress)) {
+        return fpIcmp6SendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
     }
-    return fpIcmp6SendEcho2(IcmpHandle, Event, ApcRoutine, ApcContext, SourceAddress, DestinationAddress, RequestData, RequestSize, RequestOptions, ReplyBuffer, ReplySize, Timeout);
+    SetLastError(ERROR_ACCESS_DENIED);
+    return 0;
 }
 
 // --- DNS Hook (拦截域名解析) ---
 int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
-    if (g_BlockNetwork) {
-        // 允许解析 localhost
-        if (pNodeName && (_wcsicmp(pNodeName, L"localhost") == 0 || _wcsicmp(pNodeName, L"127.0.0.1") == 0 || _wcsicmp(pNodeName, L"::1") == 0)) {
-            return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
-        }
-        return EAI_FAIL; // 返回解析失败
-    }
+    // 始终放行 DNS 解析 以便支持内网主机名解析
+    // 真正的拦截由 connect/sendto/IcmpSendEcho 负责（它们会检查解析出来的 IP）
     return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
-}
-
-// --- UDP Hook (拦截 sendto) ---
-int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen) {
-    if (g_BlockNetwork) {
-        if (IsLoopbackAddress(to)) {
-            return fpSendTo(s, buf, len, flags, to, tolen);
-        }
-        WSASetLastError(WSAEACCES);
-        return SOCKET_ERROR;
-    }
-    return fpSendTo(s, buf, len, flags, to, tolen);
 }
 
 // --- 初始化 ---
@@ -2504,7 +2537,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- 组 B: 进程创建 Hook (只要启用了任意功能，就需要挂钩以实现子进程注入) ---
+    // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
     if (g_HookMode > 0 || g_BlockNetwork) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
@@ -2552,7 +2585,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // 9. 启用所有已创建的 Hook
-    // MinHook 只会启用之前调用过 MH_CreateHook 的函数，未创建的会被忽略
+    // MinHook 只会启用之前调用过 MH_CreateHook 的函数 未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
     // 10. 通知启动器就绪
