@@ -1894,6 +1894,32 @@ std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
         if (end != std::wstring::npos) exePath = cmd.substr(0, end);
         else exePath = cmd;
     }
+    
+    // [新增] 如果不是绝对路径,在 PATH 中搜索
+    if (!exePath.empty() && exePath.find(L':') == std::wstring::npos && 
+        exePath.find(L'\\') == std::wstring::npos && exePath.find(L'/') == std::wstring::npos) {
+        
+        // 检查是否已有扩展名
+        bool hasExtension = (exePath.find(L'.') != std::wstring::npos);
+        
+        wchar_t fullPath[MAX_PATH] = {0};
+        
+        if (hasExtension) {
+            // 已有扩展名,直接搜索
+            if (SearchPathW(NULL, exePath.c_str(), NULL, MAX_PATH, fullPath, NULL) > 0) {
+                return fullPath;
+            }
+        } else {
+            // 没有扩展名,按 PATHEXT 顺序尝试
+            const wchar_t* extensions[] = {L".exe", L".com", L".bat", L".cmd"};
+            for (int i = 0; i < 4; i++) {
+                if (SearchPathW(NULL, exePath.c_str(), extensions[i], MAX_PATH, fullPath, NULL) > 0) {
+                    return fullPath;
+                }
+            }
+        }
+    }
+    
     return exePath;
 }
 
@@ -1982,14 +2008,23 @@ BOOL CreateProcessInternal(
     std::string ansiExe, ansiDir; // 保持生命周期
 
     if (!redirectedExe.empty()) {
-        DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-        if (isAnsi) {
-            ansiExe = WideToAnsi(redirectedExe.c_str());
-            finalAppName = ansiExe.c_str();
-        } else {
-            finalAppName = redirectedExe.c_str();
-        }
+    DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
+    if (isAnsi) {
+        ansiExe = WideToAnsi(redirectedExe.c_str());
+        finalAppName = ansiExe.c_str();
+    } else {
+        finalAppName = redirectedExe.c_str();
     }
+} else if (!targetExe.empty()) {
+    // [新增] 如果重定向失败，但原始路径有效，使用原始路径
+    DebugLog(L"CreateProcess No Redirect, using original: %s", targetExe.c_str());
+    if (isAnsi) {
+        ansiExe = WideToAnsi(targetExe.c_str());
+        finalAppName = ansiExe.c_str();
+    } else {
+        finalAppName = targetExe.c_str();
+    }
+}
 
     if (!redirectedDir.empty()) {
         DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
