@@ -406,6 +406,7 @@ std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
+bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -2346,16 +2347,16 @@ bool IsIpAddressString(PCWSTR str) {
 bool IsIntranetHost(LPCWSTR pNodeName) {
     if (!pNodeName || !*pNodeName) return false;
 
-    // 1. 如果直接是 IP 字符串，判断 IP
+    // 1. 如果直接是 IP 字符串 判断 IP
     if (IsIpAddressString(pNodeName)) {
-        // 转换字符串为 IP 结构比较麻烦，这里偷懒：
-        // 让它走下面的 GetAddrInfoW 流程，反正效果一样
+        // 转换字符串为 IP 结构比较麻烦 这里偷懒：
+        // 让它走下面的 GetAddrInfoW 流程 反正效果一样
     }
 
     // 2. 检查 localhost
     if (_wcsicmp(pNodeName, L"localhost") == 0) return true;
 
-    // 3. 解析域名 (使用原始函数 fpGetAddrInfoW，避免死循环)
+    // 3. 解析域名 (使用原始函数 fpGetAddrInfoW 避免死循环)
     ADDRINFOW hints = { 0 };
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -2375,7 +2376,7 @@ bool IsIntranetHost(LPCWSTR pNodeName) {
         return isIntranet;
     }
 
-    // 如果解析失败，为了安全起见，默认视为外网并拦截
+    // 如果解析失败 为了安全起见 默认视为外网并拦截
     return false;
 }
 
@@ -2429,7 +2430,7 @@ int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const st
 // --- UDP 高级拦截 ---
 int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesSent, DWORD dwFlags, const struct sockaddr* lpTo, int iTolen, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
     if (g_BlockNetwork) {
-        // 如果指定了目标地址，必须检查
+        // 如果指定了目标地址 必须检查
         if (lpTo) {
             if (IsIntranetAddress(lpTo)) {
                 return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
@@ -2437,7 +2438,7 @@ int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, L
             WSASetLastError(WSAEACCES);
             return SOCKET_ERROR;
         }
-        // 如果 lpTo 为空（已连接的 UDP 套接字），通常在 connect 时已检查过，放行
+        // 如果 lpTo 为空（已连接的 UDP 套接字） 通常在 connect 时已检查过 放行
     }
     return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
 }
@@ -2470,7 +2471,7 @@ HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerN
 HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
     if (g_BlockNetwork) {
         std::wstring host = GetHostFromUrl(lpszUrl);
-        // 如果解析不出主机名，或者主机名不是内网，则拦截
+        // 如果解析不出主机名 或者主机名不是内网 则拦截
         if (host.empty() || !IsIntranetHost(host.c_str())) {
             SetLastError(ERROR_ACCESS_DENIED);
             return NULL;
@@ -2501,14 +2502,14 @@ struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
             return fpGethostbyname(name);
         }
 
-        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表。
-        // 我们无法预知它解析出的是内网还是外网 IP。
+        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表
+        // 我们无法预知它解析出的是内网还是外网 IP
         // 策略：
-        // 1. 如果输入的是纯 IP 字符串，放行（让 connect 去拦截）。
-        // 2. 如果是域名，直接拦截。因为内网域名解析通常走 DNS，而 gethostbyname 是非常老的 API，
-        //    现代内网环境（mDNS/LLMNR）它支持不好，且容易泄露隐私。
-        //    如果确实需要支持内网旧版域名解析，可以放行，依靠 connect 拦截 IP。
-        //    但为了安全，这里默认拦截非 IP 字符串。
+        // 1. 如果输入的是纯 IP 字符串 放行（让 connect 去拦截）
+        // 2. 如果是域名 直接拦截因为内网域名解析通常走 DNS 而 gethostbyname 是非常老的 API
+        //    现代内网环境（mDNS/LLMNR）它支持不好 且容易泄露隐私
+        //    如果确实需要支持内网旧版域名解析 可以放行 依靠 connect 拦截 IP
+        //    但为了安全 这里默认拦截非 IP 字符串
 
         if (IsIpAddressString(nameW.c_str())) {
              return fpGethostbyname(name);
@@ -2621,6 +2622,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
         // 注意：这里允许 g_HookMode 为 0
+    }
+
+    // [新增] 读取子进程挂钩配置
+    wchar_t childBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD", childBuffer, 64) > 0) {
+        int val = _wtoi(childBuffer);
+        // hookchild=2 表示不挂钩子进程
+        if (val == 2) {
+            g_HookChild = false;
+        }
     }
 
     // [新增] 读取网络拦截开关
@@ -2738,7 +2749,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
-    if (g_HookMode > 0 || g_BlockNetwork) {
+    if (g_HookChild && (g_HookMode > 0 || g_BlockNetwork)) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
