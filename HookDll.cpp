@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
 #include <shlwapi.h>
@@ -13,6 +15,7 @@
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -345,6 +348,13 @@ typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
 
+// --- 函数指针定义 ---
+typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
+typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
+
+P_connect fpConnect = NULL;
+P_WSAConnect fpWSAConnect = NULL;
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -362,6 +372,7 @@ int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
+bool g_BlockNetwork = false; // 网络拦截开关
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -747,6 +758,7 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
 // [修改] 检查路径是否需要重定向
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
+    if (g_HookMode == 0) return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
 
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
@@ -1053,21 +1065,32 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             else shouldRedirect = isHidden; // 如果是隐藏目录则重定向，否则放行
         } else if (isWrite) {
             // --- 写入操作 (总是重定向) ---
-            shouldRedirect = true;
+            if (sandboxExists) {
+                shouldRedirect = true;
+            } else if (realExists) {
+                PerformCopyOnWrite(fullNtPath, targetNtPath);
+                shouldRedirect = true;
+            } else {
+                shouldRedirect = true; // 创建新文件
+            }
         } else {
             // --- 文件只读访问 (关键路径) ---
             if (sandboxExists) {
-        shouldRedirect = true;
-    } else if (realExists) {
-        shouldRedirect = false;
-        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-    } else {
-        // [修复] 文件都不存在时,直接尝试打开原始路径让系统返回错误
-        // 不要重定向到沙箱,因为这样会隐藏系统文件
-        shouldRedirect = false;
-        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-    }
-}
+                shouldRedirect = true;
+            } else if (realExists) {
+                shouldRedirect = false; // 真实存在 -> 放行
+            } else {
+                // --- 都不存在 ---
+                if (isHidden) {
+                    shouldRedirect = true; // 故意隐藏 -> 重定向到沙盒(报错)
+                } else {
+                    // [绝对修复] 物理上真的不存在 -> 绝对不要重定向！
+                    // 必须让 OS 在真实路径上返回 STATUS_OBJECT_NAME_NOT_FOUND。
+                    // 任何重定向都可能导致返回 STATUS_OBJECT_PATH_NOT_FOUND (因为沙盒目录结构可能不完整)。
+                    shouldRedirect = false;
+                }
+            }
+        }
 
         if (shouldRedirect) {
             UNICODE_STRING uStr;
@@ -1317,7 +1340,6 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
-        // 1. 尝试检查沙盒
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, targetNtPath.c_str());
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
@@ -1330,22 +1352,27 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // [修复] 只有成功时才返回。
-        // 如果失败（例如沙盒目录不存在导致的 PATH_NOT_FOUND），必须忽略，继续检查真实路径。
-        if (status == STATUS_SUCCESS) return status;
+        // [修复] 如果沙盒返回“未找到”类错误，必须回退到真实路径。
+        // 不要只检查 STATUS_SUCCESS，因为可能有其他成功代码。
+        // 只有明确的“未找到”才回退。
+        if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
+             return status;
+        }
 
-        // 2. 检查真实路径 (Mode 3 隐藏逻辑)
+        // Mode 3 隐藏逻辑
         if (g_HookMode == 3) {
-            // 如果真实路径存在但不可见，则伪造“未找到”
-            // 注意：这里我们先不调用 NtPathExists，而是让下面的原始调用去跑，
-            // 如果原始调用成功了，我们再检查可见性并决定是否覆盖结果。
-            // 但为了性能和逻辑一致性，这里预先检查：
-            if (NtPathExists(fullNtPath) && !IsPathVisible(fullNtPath)) {
-                return STATUS_OBJECT_NAME_NOT_FOUND;
+            // 检查真实文件是否存在但不可见
+            // 注意：这里直接调用原始函数来探测真实存在性，避免递归
+            NTSTATUS realStatus = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
+            if (NT_SUCCESS(realStatus)) {
+                if (!IsPathVisible(fullNtPath)) {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
             }
+            return realStatus;
         }
     }
-    // 3. 回退到真实路径
+    // 回退到真实路径
     return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
 }
 
@@ -1368,13 +1395,20 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        if (status == STATUS_SUCCESS) return status;
+        // [修复] 同上，只有未找到时才回退
+        if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND) {
+             return status;
+        }
 
         // Mode 3 隐藏逻辑
         if (g_HookMode == 3) {
-            if (NtPathExists(fullNtPath) && !IsPathVisible(fullNtPath)) {
-                return STATUS_OBJECT_NAME_NOT_FOUND;
+            NTSTATUS realStatus = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+            if (NT_SUCCESS(realStatus)) {
+                if (!IsPathVisible(fullNtPath)) {
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
             }
+            return realStatus;
         }
     }
     return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
@@ -1828,6 +1862,26 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 
 // --- 路径处理辅助函数 ---
 
+// --- 辅助函数 ---
+// 判断是否为环回地址 (127.0.0.1 ~ 127.255.255.255 或 ::1)
+bool IsLoopbackAddress(const struct sockaddr* name) {
+    if (!name) return false;
+
+    if (name->sa_family == AF_INET) {
+        // IPv4: 检查 127.x.x.x
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)name;
+        // sin->sin_addr.S_un.S_un_b.s_b1 是 127 即为环回
+        return (sin->sin_addr.S_un.S_un_b.s_b1 == 127);
+    }
+    else if (name->sa_family == AF_INET6) {
+        // IPv6: 检查 ::1
+        const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
+        return IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr);
+    }
+    // 对于非 IP 协议 (如 AF_UNIX, AF_BTH 蓝牙等)，默认放行
+    return true;
+}
+
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
     if (!text) return L"";
@@ -1890,32 +1944,6 @@ std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
         if (end != std::wstring::npos) exePath = cmd.substr(0, end);
         else exePath = cmd;
     }
-    
-    // [新增] 如果不是绝对路径,在 PATH 中搜索
-    if (!exePath.empty() && exePath.find(L':') == std::wstring::npos && 
-        exePath.find(L'\\') == std::wstring::npos && exePath.find(L'/') == std::wstring::npos) {
-        
-        // 检查是否已有扩展名
-        bool hasExtension = (exePath.find(L'.') != std::wstring::npos);
-        
-        wchar_t fullPath[MAX_PATH] = {0};
-        
-        if (hasExtension) {
-            // 已有扩展名,直接搜索
-            if (SearchPathW(NULL, exePath.c_str(), NULL, MAX_PATH, fullPath, NULL) > 0) {
-                return fullPath;
-            }
-        } else {
-            // 没有扩展名,按 PATHEXT 顺序尝试
-            const wchar_t* extensions[] = {L".exe", L".com", L".bat", L".cmd"};
-            for (int i = 0; i < 4; i++) {
-                if (SearchPathW(NULL, exePath.c_str(), extensions[i], MAX_PATH, fullPath, NULL) > 0) {
-                    return fullPath;
-                }
-            }
-        }
-    }
-    
     return exePath;
 }
 
@@ -1999,83 +2027,42 @@ BOOL CreateProcessInternal(
 
     // 3. 准备新的参数
     const void* finalAppName = lpApplicationName;
-const void* finalCurDir = lpCurrentDirectory;
-CharType* finalCommandLine = lpCommandLine; // 新增
+    const void* finalCurDir = lpCurrentDirectory;
 
-std::string ansiExe, ansiDir, ansiCmd; // 保持生命周期
-std::wstring wideCmd; // 新增
+    std::string ansiExe, ansiDir; // 保持生命周期
 
-if (!redirectedExe.empty()) {
-    DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-    if (isAnsi) {
-        ansiExe = WideToAnsi(redirectedExe.c_str());
-        finalAppName = ansiExe.c_str();
-    } else {
-        finalAppName = redirectedExe.c_str();
-    }
-} else if (!targetExe.empty()) {
-    // 如果重定向失败，但原始路径有效，使用原始路径
-    DebugLog(L"CreateProcess No Redirect, using original: %s", targetExe.c_str());
-    if (isAnsi) {
-        ansiExe = WideToAnsi(targetExe.c_str());
-        finalAppName = ansiExe.c_str();
-    } else {
-        finalAppName = targetExe.c_str();
-    }
-}
-
-// [新增] 如果 lpApplicationName 为 NULL 但我们找到了完整路径，需要修改 lpCommandLine
-if (!lpApplicationName && finalAppName && lpCommandLine) {
-    // 构建新的命令行：用完整路径替换原始命令
-    if (isAnsi) {
-        std::string cmdA = (LPCSTR)lpCommandLine;
-        std::string exeA = ansiExe.empty() ? WideToAnsi(targetExe.c_str()) : ansiExe;
-        
-        // 找到第一个空格或结束位置
-        size_t spacePos = cmdA.find(' ');
-        if (spacePos != std::string::npos) {
-            ansiCmd = "\"" + exeA + "\"" + cmdA.substr(spacePos);
+    if (!redirectedExe.empty()) {
+        DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
+        if (isAnsi) {
+            ansiExe = WideToAnsi(redirectedExe.c_str());
+            finalAppName = ansiExe.c_str();
         } else {
-            ansiCmd = "\"" + exeA + "\"";
+            finalAppName = redirectedExe.c_str();
         }
-        finalCommandLine = (CharType*)ansiCmd.c_str();
-    } else {
-        std::wstring cmdW = (LPWSTR)lpCommandLine;
-        std::wstring exeW = redirectedExe.empty() ? targetExe : redirectedExe;
-        
-        // 找到第一个空格或结束位置
-        size_t spacePos = cmdW.find(L' ');
-        if (spacePos != std::wstring::npos) {
-            wideCmd = L"\"" + exeW + L"\"" + cmdW.substr(spacePos);
+    }
+
+    if (!redirectedDir.empty()) {
+        DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
+        if (isAnsi) {
+            ansiDir = WideToAnsi(redirectedDir.c_str());
+            finalCurDir = ansiDir.c_str();
         } else {
-            wideCmd = L"\"" + exeW + L"\"";
+            finalCurDir = redirectedDir.c_str();
         }
-        finalCommandLine = (CharType*)wideCmd.c_str();
     }
-}
 
-if (!redirectedDir.empty()) {
-    DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
+    // 4. 调用原始函数
+    PROCESS_INFORMATION localPI = { 0 };
+    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+
+    BOOL result;
     if (isAnsi) {
-        ansiDir = WideToAnsi(redirectedDir.c_str());
-        finalCurDir = ansiDir.c_str();
+        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
     } else {
-        finalCurDir = redirectedDir.c_str();
+        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
     }
-}
-
-// 4. 调用原始函数
-PROCESS_INFORMATION localPI = { 0 };
-LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-BOOL result;
-if (isAnsi) {
-    result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
-} else {
-    result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
-}
 
     // 5. 注入与恢复
     if (result) {
@@ -2265,6 +2252,34 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     return result;
 }
 
+// --- Winsock Hooks ---
+
+int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
+
+    // 2. 如果是环回地址，放行
+    if (IsLoopbackAddress(name)) {
+        return fpConnect(s, name, namelen);
+    }
+
+    // 3. 否则拦截，并记录日志
+    // DebugLog(L"Blocked network connection (connect)"); // 可选：记录日志
+    WSASetLastError(WSAEACCES); // 返回“权限被拒绝”错误
+    return SOCKET_ERROR;
+}
+
+int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
+
+    // 2. 如果是环回地址，放行
+    if (IsLoopbackAddress(name)) {
+        return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
+    }
+
+    // 3. 否则拦截
+    // DebugLog(L"Blocked network connection (WSAConnect)");
+    WSASetLastError(WSAEACCES);
+    return SOCKET_ERROR;
+}
+
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -2306,10 +2321,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
         CloseHandle(hMap);
     }
 
-    // 3. [新增] 读取 Hook 模式 (默认为 1)
+    // 3. 读取 Hook 模式 (文件重定向)
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
-        if (g_HookMode <= 0) g_HookMode = 1;
+        // 注意：这里允许 g_HookMode 为 0
+    }
+
+    // [新增] 读取网络拦截开关
+    wchar_t netBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_BLOCK_NET", netBuffer, 64) > 0) {
+        g_BlockNetwork = (_wtoi(netBuffer) == 1);
     }
 
     // 4. [新增] 获取系统盘符并初始化白名单
@@ -2385,51 +2406,77 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
-    // 8. 创建 Hooks
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+    // =======================================================
+    // 分组挂钩逻辑
+    // =======================================================
 
-        fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+    // --- 组 A: 文件系统 Hook (仅当 hookfile > 0 时挂钩) ---
+    if (g_HookMode > 0) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-        void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
-        if (pNtQueryDirectoryFileEx) {
-            MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+            void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
+            if (pNtQueryDirectoryFileEx) {
+                MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            }
+        }
+
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+            if (pGetFinalPathNameByHandleW) {
+                MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+            }
         }
     }
 
-    MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
-    MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+    // --- 组 B: 进程创建 Hook (只要启用了任意功能，就需要挂钩以实现子进程注入) ---
+    if (g_HookMode > 0 || g_BlockNetwork) {
+        MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
+        MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
-    HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-    if (hAdvapi32) {
-        void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-        if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-        void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-        if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-        void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-        if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-        void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-        if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
-    }
-
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32) {
-        void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
-        if (pGetFinalPathNameByHandleW) {
-             MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
+            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
+            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
+            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
+            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
-    // 9. 启用所有 Hook
+    // --- 组 C: 网络 Hook (仅当 netblock=1 时挂钩) ---
+    if (g_BlockNetwork) {
+        HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
+        if (hWinsock) {
+            void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
+            void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
+
+            if (pConnect) {
+                MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
+            }
+            if (pWSAConnect) {
+                MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
+            }
+        }
+    }
+
+    // 9. 启用所有已创建的 Hook
+    // MinHook 只会启用之前调用过 MH_CreateHook 的函数，未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
     // 10. 通知启动器就绪
