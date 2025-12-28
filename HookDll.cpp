@@ -2218,40 +2218,28 @@ bool IsLoopbackAddress(const struct sockaddr* name) {
         const struct sockaddr_in6* sin6 = (const struct sockaddr_in6*)name;
         return IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr);
     }
-    // 对于非 IP 协议 (如 AF_UNIX, AF_BTH 蓝牙等)，默认放行
+    // 对于非 IP 协议 (如 AF_UNIX, AF_BTH 蓝牙等) 默认放行
     return true;
 }
 
 int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
-    // 1. 如果开关未开启，直接放行
-    if (!g_BlockNetwork) {
-        return fpConnect(s, name, namelen);
-    }
-
-    // 2. 如果是环回地址，放行
+    // 如果是环回地址 放行
     if (IsLoopbackAddress(name)) {
         return fpConnect(s, name, namelen);
     }
 
-    // 3. 否则拦截，并记录日志
-    // DebugLog(L"Blocked network connection (connect)"); // 可选：记录日志
-    WSASetLastError(WSAEACCES); // 返回“权限被拒绝”错误
+    // 否则拦截
+    WSASetLastError(WSAEACCES); // 返回权限被拒绝错误
     return SOCKET_ERROR;
 }
 
 int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS) {
-    // 1. 如果开关未开启，直接放行
-    if (!g_BlockNetwork) {
-        return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
-    }
-
-    // 2. 如果是环回地址，放行
+    // 如果是环回地址 放行
     if (IsLoopbackAddress(name)) {
         return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
 
-    // 3. 否则拦截
-    // DebugLog(L"Blocked network connection (WSAConnect)");
+    // 否则拦截
     WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
@@ -2297,16 +2285,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
         CloseHandle(hMap);
     }
 
+    // 3. 读取 Hook 模式 (文件重定向)
+    if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
+        g_HookMode = _wtoi(buffer);
+        // 注意：这里允许 g_HookMode 为 0
+    }
+
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_BLOCK_NET", netBuffer, 64) > 0) {
         g_BlockNetwork = (_wtoi(netBuffer) == 1);
-    }
-
-    // 3. [新增] 读取 Hook 模式 (默认为 1)
-    if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
-        g_HookMode = _wtoi(buffer);
-        if (g_HookMode <= 0) g_HookMode = 1;
     }
 
     // 4. [新增] 获取系统盘符并初始化白名单
@@ -2382,65 +2370,77 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
-    // 8. 创建 Hooks
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+    // =======================================================
+    // 分组挂钩逻辑
+    // =======================================================
 
-        fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+    // --- 组 A: 文件系统 Hook (仅当 hookfile > 0 时挂钩) ---
+    if (g_HookMode > 0) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-        void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
-        if (pNtQueryDirectoryFileEx) {
-            MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+            void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
+            if (pNtQueryDirectoryFileEx) {
+                MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            }
+        }
+
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+            if (pGetFinalPathNameByHandleW) {
+                MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+            }
         }
     }
 
-    MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
-    MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+    // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
+    if (g_HookMode > 0 || g_BlockNetwork) {
+        MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
+        MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
-    HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-    if (hAdvapi32) {
-        void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-        if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-        void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-        if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-        void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-        if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-        void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-        if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
-    }
-
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32) {
-        void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
-        if (pGetFinalPathNameByHandleW) {
-             MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
+            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
+            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
+            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
+            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
-    // [新增] 创建 Winsock Hooks
-    HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
-    if (hWinsock) {
-        void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
-        void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
+    // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
+    if (g_BlockNetwork) {
+        HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
+        if (hWinsock) {
+            void* pConnect = (void*)GetProcAddress(hWinsock, "connect");
+            void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
 
-        if (pConnect) {
-            MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
-        }
-        if (pWSAConnect) {
-            MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
+            if (pConnect) {
+                MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
+            }
+            if (pWSAConnect) {
+                MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
+            }
         }
     }
 
-    // 9. 启用所有 Hook
+    // 9. 启用所有已创建的 Hook
+    // MinHook 只会启用之前调用过 MH_CreateHook 的函数 未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
     // 10. 通知启动器就绪
