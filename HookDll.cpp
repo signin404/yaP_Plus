@@ -2003,11 +2003,13 @@ BOOL CreateProcessInternal(
 
     // 3. 准备新的参数
     const void* finalAppName = lpApplicationName;
-    const void* finalCurDir = lpCurrentDirectory;
+const void* finalCurDir = lpCurrentDirectory;
+CharType* finalCommandLine = lpCommandLine; // 新增
 
-    std::string ansiExe, ansiDir; // 保持生命周期
+std::string ansiExe, ansiDir, ansiCmd; // 保持生命周期
+std::wstring wideCmd; // 新增
 
-    if (!redirectedExe.empty()) {
+if (!redirectedExe.empty()) {
     DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
     if (isAnsi) {
         ansiExe = WideToAnsi(redirectedExe.c_str());
@@ -2016,7 +2018,7 @@ BOOL CreateProcessInternal(
         finalAppName = redirectedExe.c_str();
     }
 } else if (!targetExe.empty()) {
-    // [新增] 如果重定向失败，但原始路径有效，使用原始路径
+    // 如果重定向失败，但原始路径有效，使用原始路径
     DebugLog(L"CreateProcess No Redirect, using original: %s", targetExe.c_str());
     if (isAnsi) {
         ansiExe = WideToAnsi(targetExe.c_str());
@@ -2026,28 +2028,58 @@ BOOL CreateProcessInternal(
     }
 }
 
-    if (!redirectedDir.empty()) {
-        DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
-        if (isAnsi) {
-            ansiDir = WideToAnsi(redirectedDir.c_str());
-            finalCurDir = ansiDir.c_str();
-        } else {
-            finalCurDir = redirectedDir.c_str();
-        }
-    }
-
-    // 4. 调用原始函数
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result;
+// [新增] 如果 lpApplicationName 为 NULL 但我们找到了完整路径，需要修改 lpCommandLine
+if (!lpApplicationName && finalAppName && lpCommandLine) {
+    // 构建新的命令行：用完整路径替换原始命令
     if (isAnsi) {
-        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
+        std::string cmdA = (LPCSTR)lpCommandLine;
+        std::string exeA = ansiExe.empty() ? WideToAnsi(targetExe.c_str()) : ansiExe;
+        
+        // 找到第一个空格或结束位置
+        size_t spacePos = cmdA.find(' ');
+        if (spacePos != std::string::npos) {
+            ansiCmd = "\"" + exeA + "\"" + cmdA.substr(spacePos);
+        } else {
+            ansiCmd = "\"" + exeA + "\"";
+        }
+        finalCommandLine = (CharType*)ansiCmd.c_str();
     } else {
-        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
+        std::wstring cmdW = (LPWSTR)lpCommandLine;
+        std::wstring exeW = redirectedExe.empty() ? targetExe : redirectedExe;
+        
+        // 找到第一个空格或结束位置
+        size_t spacePos = cmdW.find(L' ');
+        if (spacePos != std::wstring::npos) {
+            wideCmd = L"\"" + exeW + L"\"" + cmdW.substr(spacePos);
+        } else {
+            wideCmd = L"\"" + exeW + L"\"";
+        }
+        finalCommandLine = (CharType*)wideCmd.c_str();
     }
+}
+
+if (!redirectedDir.empty()) {
+    DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
+    if (isAnsi) {
+        ansiDir = WideToAnsi(redirectedDir.c_str());
+        finalCurDir = ansiDir.c_str();
+    } else {
+        finalCurDir = redirectedDir.c_str();
+    }
+}
+
+// 4. 调用原始函数
+PROCESS_INFORMATION localPI = { 0 };
+LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+
+BOOL result;
+if (isAnsi) {
+    result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
+} else {
+    result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
+}
 
     // 5. 注入与恢复
     if (result) {
