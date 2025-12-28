@@ -399,6 +399,7 @@ wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 int g_HookMode = 1; // [新增] 默认模式 1
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
+std::wstring g_SystemDriveLetter; // [新增] 系统盘符 DOS 路径 (如 C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
@@ -995,21 +996,19 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
             if (isWow64) {
                 // 逻辑：
-                // 1. 如果 realPath 包含 "System32" 说明句柄指向的是真实的 System32 目录
-                //    (这意味着应用程序可能已经禁用了重定向 或者通过 Sysnative 访问)
-                //    此时我们需要禁用重定向 以便 FindFirstFile 能看到真实的 System32
-                // 2. 如果 realPath 包含 "SysWOW64" 说明句柄已经被重定向过了
-                //    此时我们不需要禁用重定向 FindFirstFile 默认就会看 SysWOW64
-
+                // 1. 句柄指向的路径包含 "System32" (说明未被重定向到 SysWOW64)
+                // 2. 路径位于系统盘 (避免误伤 Z:\Windows\System32)
                 if (StrStrIW(realPath.c_str(), L"System32") != NULL) {
-                    needDisable = true;
+                    if (!g_SystemDriveLetter.empty() &&
+                        _wcsnicmp(realPath.c_str(), g_SystemDriveLetter.c_str(), g_SystemDriveLetter.length()) == 0) {
+                        needDisable = true;
+                    }
                 }
             }
 
             if (needDisable) {
                 Wow64DisableWow64FsRedirection(&oldRedirectionValue);
             }
-            // -------------------------------------------------------
 
             HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
 
@@ -1017,7 +1016,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
             if (needDisable) {
                 Wow64RevertWow64FsRedirection(oldRedirectionValue);
             }
-            // -------------------------------------------------------
 
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
@@ -2607,9 +2605,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         // buffer 类似于 "C:\Windows\System32"
         buffer[2] = L'\0'; // 截断为 "C:"
+        g_SystemDriveLetter = buffer; // [新增] 保存 "C:"
         g_SystemDriveNt = L"\\??\\";
         g_SystemDriveNt += buffer; // 结果: \??\C:
-        InitSystemWhitelist(); // 初始化白名单 (Mode 3 依赖)
+        InitSystemWhitelist();
     }
 
     // 5. 环境变量回退 (如果内存映射没读到)
