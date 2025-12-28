@@ -585,7 +585,7 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"PIPE\\")) return true;
     if (wcsstr(path, L"pipe\\")) return true;
     if (wcsstr(path, L"Mailslot")) return true;
-    if (wcsstr(path, L"RPC Control")) return true; // 关键：RPC/ALPC 端口
+    if (wcsstr(path, L"RPC Control")) return true;
 
     // --- 2. 控制台/终端 ---
     if (wcsstr(path, L"ConDrv")) return true;
@@ -593,38 +593,45 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"CONOUT$")) return true;
     if (wcsstr(path, L"\\??\\CON")) return true;
 
-    // --- 3. 关键系统驱动 (必须排除 否则网络/加密挂掉) ---
-    if (wcsstr(path, L"Afd")) return true;        // 关键：Winsock 网络驱动
+    // --- 3. 关键系统驱动 ---
+    if (wcsstr(path, L"Afd")) return true;        // Winsock
     if (wcsstr(path, L"AFD")) return true;
-    if (wcsstr(path, L"KsecDD")) return true;     // 关键：加密服务
+    if (wcsstr(path, L"KsecDD")) return true;     // 加密服务
     if (wcsstr(path, L"MountPointManager")) return true;
 
+    // [新增] 关键修复：网络存储接口 (NSI)
+    // 缺少这个会导致文件选择框无法弹出
+    if (wcsstr(path, L"Nsi")) return true;
+    if (wcsstr(path, L"NSI")) return true;
+
+    // [新增] 分布式文件系统 (DFS)
+    if (wcsstr(path, L"Dfs")) return true;
+
     // --- 4. 硬件设备接口 (PnP 设备) ---
-    // HID (键盘鼠标)
     if (wcsstr(path, L"hid#")) return true;
     if (wcsstr(path, L"HID#")) return true;
-    // USB 设备
     if (wcsstr(path, L"usb#")) return true;
     if (wcsstr(path, L"USB#")) return true;
-    // PCI 设备
     if (wcsstr(path, L"pci#")) return true;
     if (wcsstr(path, L"PCI#")) return true;
-    // 其他常见硬件
-    if (wcsstr(path, L"acpi#")) return true;      // 电源管理
-    if (wcsstr(path, L"scsi#")) return true;      // 存储控制器
+    if (wcsstr(path, L"acpi#")) return true;
+    if (wcsstr(path, L"scsi#")) return true;
     if (wcsstr(path, L"storage#")) return true;
     if (wcsstr(path, L"display#")) return true;
     if (wcsstr(path, L"monitor#")) return true;
-    if (wcsstr(path, L"hdaudio#")) return true;   // 音频
-    if (wcsstr(path, L"root#")) return true;      // 虚拟根设备
+    if (wcsstr(path, L"hdaudio#")) return true;
+    if (wcsstr(path, L"root#")) return true;
 
     // --- 5. 网络路径 (UNC) ---
-    // NT 路径中 网络共享通常以 \??\UNC\ 开头 或者由 Mup (Multiple UNC Provider) 处理
     if (wcsstr(path, L"\\UNC\\")) return true;
     if (wcsstr(path, L"\\Mup\\")) return true;
 
     // --- 6. 直接卷访问 ---
     if (wcsstr(path, L"Volume{")) return true;
+
+    // [新增] 虚拟磁盘/光驱驱动
+    if (wcsstr(path, L"CdRom")) return true;
+    if (wcsstr(path, L"Harddisk")) return true;
 
     return false;
 }
@@ -807,6 +814,10 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (g_HookMode == 0) return false;
     if (IsPipeOrDevice(fullNtPath.c_str())) return false;
+    // [新增] 过滤 Shell Namespace GUID (例如 ::{20D04FE0...})
+    // 这些是虚拟路径 重定向会导致文件对话框崩溃或无反应
+    if (wcsstr(fullNtPath.c_str(), L"::{") != NULL) return false;
+    if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
