@@ -378,9 +378,15 @@ typedef int (WSAAPI* P_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const
 
 // WinINet (IE内核/旧版应用常用)
 typedef HINTERNET (WINAPI* P_InternetConnectW)(HINTERNET, LPCWSTR, INTERNET_PORT, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetConnectA)(HINTERNET, LPCSTR, INTERNET_PORT, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetOpenUrlW)(HINTERNET, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+typedef HINTERNET (WINAPI* P_InternetOpenUrlA)(HINTERNET, LPCSTR, LPCSTR, DWORD, DWORD, DWORD_PTR);
 
 // WinHTTP (服务/更新程序常用)
 typedef HINTERNET (WINAPI* P_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+
+// 旧版 DNS
+typedef struct hostent* (WSAAPI* P_gethostbyname)(const char*);
 
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
@@ -412,6 +418,10 @@ P_sendto fpSendTo = NULL;
 P_WSASendTo fpWSASendTo = NULL;
 P_InternetConnectW fpInternetConnectW = NULL;
 P_WinHttpConnect fpWinHttpConnect = NULL;
+P_InternetConnectA fpInternetConnectA = NULL;
+P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
+P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
+P_gethostbyname fpGethostbyname = NULL;
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -2369,6 +2379,26 @@ bool IsIntranetHost(LPCWSTR pNodeName) {
     return false;
 }
 
+// 辅助：从 URL 中提取主机名
+std::wstring GetHostFromUrl(LPCWSTR url) {
+    if (!url) return L"";
+
+    // 使用 InternetCrackUrl 解析
+    URL_COMPONENTSW urlComp = { 0 };
+    urlComp.dwStructSize = sizeof(urlComp);
+    urlComp.dwHostNameLength = 1; // 设置非0值以指示我们需要获取 HostName
+
+    // 预分配缓冲区
+    wchar_t hostName[2048] = { 0 };
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 2048;
+
+    if (InternetCrackUrlW(url, 0, 0, &urlComp)) {
+        return std::wstring(hostName);
+    }
+    return L"";
+}
+
 int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
     // 放行内网 IP
     if (IsIntranetAddress(name)) {
@@ -2421,6 +2451,73 @@ HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServer
         }
     }
     return fpInternetConnectW(hInternet, lpszServerName, nServerPort, lpszUserName, lpszPassword, dwService, dwFlags, dwContext);
+}
+
+// --- WinINet ANSI 拦截 ---
+HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerName, INTERNET_PORT nServerPort, LPCSTR lpszUserName, LPCSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        // 转换为 Wide 字符串进行检查
+        std::wstring serverNameW = AnsiToWide(lpszServerName);
+        if (!IsIntranetHost(serverNameW.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetConnectA(hInternet, lpszServerName, nServerPort, lpszUserName, lpszPassword, dwService, dwFlags, dwContext);
+}
+
+// --- InternetOpenUrl (Unicode) 拦截 ---
+HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        std::wstring host = GetHostFromUrl(lpszUrl);
+        // 如果解析不出主机名，或者主机名不是内网，则拦截
+        if (host.empty() || !IsIntranetHost(host.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetOpenUrlW(hInternet, lpszUrl, lpszHeaders, dwHeadersLength, dwFlags, dwContext);
+}
+
+// --- InternetOpenUrl (ANSI) 拦截 ---
+HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        std::wstring urlW = AnsiToWide(lpszUrl);
+        std::wstring host = GetHostFromUrl(urlW.c_str());
+        if (host.empty() || !IsIntranetHost(host.c_str())) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetOpenUrlA(hInternet, lpszUrl, lpszHeaders, dwHeadersLength, dwFlags, dwContext);
+}
+
+// --- 旧版 DNS (gethostbyname) 拦截 ---
+struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
+    if (g_BlockNetwork) {
+        std::wstring nameW = AnsiToWide(name);
+        // 允许 localhost
+        if (_wcsicmp(nameW.c_str(), L"localhost") == 0) {
+            return fpGethostbyname(name);
+        }
+
+        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表。
+        // 我们无法预知它解析出的是内网还是外网 IP。
+        // 策略：
+        // 1. 如果输入的是纯 IP 字符串，放行（让 connect 去拦截）。
+        // 2. 如果是域名，直接拦截。因为内网域名解析通常走 DNS，而 gethostbyname 是非常老的 API，
+        //    现代内网环境（mDNS/LLMNR）它支持不好，且容易泄露隐私。
+        //    如果确实需要支持内网旧版域名解析，可以放行，依靠 connect 拦截 IP。
+        //    但为了安全，这里默认拦截非 IP 字符串。
+
+        if (IsIpAddressString(nameW.c_str())) {
+             return fpGethostbyname(name);
+        }
+
+        WSASetLastError(WSAHOST_NOT_FOUND);
+        return NULL;
+    }
+    return fpGethostbyname(name);
 }
 
 // --- WinHTTP 拦截 ---
@@ -2668,7 +2765,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pGetAddrInfoW = (void*)GetProcAddress(hWinsock, "GetAddrInfoW");
             void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
             void* pWSASendTo = (void*)GetProcAddress(hWinsock, "WSASendTo");
+            void* pGethostbyname = (void*)GetProcAddress(hWinsock, "gethostbyname");
 
+            if (pGethostbyname) MH_CreateHook(pGethostbyname, &Detour_gethostbyname, reinterpret_cast<LPVOID*>(&fpGethostbyname));
             if (pWSASendTo) MH_CreateHook(pWSASendTo, &Detour_WSASendTo, reinterpret_cast<LPVOID*>(&fpWSASendTo));
             if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
             if (pWSAConnect) MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
@@ -2694,8 +2793,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // 3. [新增] WinINet Hooks
         HMODULE hWinInet = LoadLibraryW(L"wininet.dll");
         if (hWinInet) {
+            // 原有 Unicode Connect
             void* pInternetConnectW = (void*)GetProcAddress(hWinInet, "InternetConnectW");
             if (pInternetConnectW) MH_CreateHook(pInternetConnectW, &Detour_InternetConnectW, reinterpret_cast<LPVOID*>(&fpInternetConnectW));
+
+            // [新增] ANSI Connect
+            void* pInternetConnectA = (void*)GetProcAddress(hWinInet, "InternetConnectA");
+            if (pInternetConnectA) MH_CreateHook(pInternetConnectA, &Detour_InternetConnectA, reinterpret_cast<LPVOID*>(&fpInternetConnectA));
+
+            // [新增] InternetOpenUrl W & A
+            void* pInternetOpenUrlW = (void*)GetProcAddress(hWinInet, "InternetOpenUrlW");
+            if (pInternetOpenUrlW) MH_CreateHook(pInternetOpenUrlW, &Detour_InternetOpenUrlW, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlW));
+
+            void* pInternetOpenUrlA = (void*)GetProcAddress(hWinInet, "InternetOpenUrlA");
+            if (pInternetOpenUrlA) MH_CreateHook(pInternetOpenUrlA, &Detour_InternetOpenUrlA, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlA));
         }
 
         // 4. [新增] WinHTTP Hooks
