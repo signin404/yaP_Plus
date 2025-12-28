@@ -1,5 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wininet.h>
+#include <winhttp.h>
 #include <iphlpapi.h>
 #include <icmpapi.h>
 #include <windows.h>
@@ -19,6 +21,8 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -369,6 +373,15 @@ typedef DWORD (WINAPI* P_IcmpSendEcho2Ex)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID
 typedef int (WSAAPI* P_GetAddrInfoW)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
 typedef int (WSAAPI* P_sendto)(SOCKET, const char*, int, int, const struct sockaddr*, int);
 
+// UDP 高级函数
+typedef int (WSAAPI* P_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+
+// WinINet (IE内核/旧版应用常用)
+typedef HINTERNET (WINAPI* P_InternetConnectW)(HINTERNET, LPCWSTR, INTERNET_PORT, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD_PTR);
+
+// WinHTTP (服务/更新程序常用)
+typedef HINTERNET (WINAPI* P_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -396,6 +409,9 @@ P_Icmp6SendEcho2 fpIcmp6SendEcho2 = NULL;
 P_IcmpSendEcho2Ex fpIcmpSendEcho2Ex = NULL;
 P_GetAddrInfoW fpGetAddrInfoW = NULL;
 P_sendto fpSendTo = NULL;
+P_WSASendTo fpWSASendTo = NULL;
+P_InternetConnectW fpInternetConnectW = NULL;
+P_WinHttpConnect fpWinHttpConnect = NULL;
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
@@ -2316,6 +2332,43 @@ bool IsIpAddressString(PCWSTR str) {
     return false;
 }
 
+// 辅助：解析域名并判断是否解析为内网 IP
+bool IsIntranetHost(LPCWSTR pNodeName) {
+    if (!pNodeName || !*pNodeName) return false;
+
+    // 1. 如果直接是 IP 字符串，判断 IP
+    if (IsIpAddressString(pNodeName)) {
+        // 转换字符串为 IP 结构比较麻烦，这里偷懒：
+        // 让它走下面的 GetAddrInfoW 流程，反正效果一样
+    }
+
+    // 2. 检查 localhost
+    if (_wcsicmp(pNodeName, L"localhost") == 0) return true;
+
+    // 3. 解析域名 (使用原始函数 fpGetAddrInfoW，避免死循环)
+    ADDRINFOW hints = { 0 };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    PADDRINFOW pResult = NULL;
+
+    if (fpGetAddrInfoW && fpGetAddrInfoW(pNodeName, NULL, &hints, &pResult) == 0) {
+        bool isIntranet = false;
+        PADDRINFOW ptr = pResult;
+        while (ptr != NULL) {
+            if (IsIntranetAddress(ptr->ai_addr)) {
+                isIntranet = true;
+                break;
+            }
+            ptr = ptr->ai_next;
+        }
+        FreeAddrInfoW(pResult);
+        return isIntranet;
+    }
+
+    // 如果解析失败，为了安全起见，默认视为外网并拦截
+    return false;
+}
+
 int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
     // 放行内网 IP
     if (IsIntranetAddress(name)) {
@@ -2341,6 +2394,44 @@ int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const st
     }
     WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
+}
+
+// --- UDP 高级拦截 ---
+int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesSent, DWORD dwFlags, const struct sockaddr* lpTo, int iTolen, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+    if (g_BlockNetwork) {
+        // 如果指定了目标地址，必须检查
+        if (lpTo) {
+            if (IsIntranetAddress(lpTo)) {
+                return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+            }
+            WSASetLastError(WSAEACCES);
+            return SOCKET_ERROR;
+        }
+        // 如果 lpTo 为空（已连接的 UDP 套接字），通常在 connect 时已检查过，放行
+    }
+    return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+}
+
+// --- WinINet 拦截 ---
+HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName, INTERNET_PORT nServerPort, LPCWSTR lpszUserName, LPCWSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(lpszServerName)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpInternetConnectW(hInternet, lpszServerName, nServerPort, lpszUserName, lpszPassword, dwService, dwFlags, dwContext);
+}
+
+// --- WinHTTP 拦截 ---
+HINTERNET WINAPI Detour_WinHttpConnect(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved) {
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(pswzServerName)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return NULL;
+        }
+    }
+    return fpWinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved);
 }
 
 // --- ICMP Hooks (拦截 Ping) ---
@@ -2576,7 +2667,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pWSAConnect = (void*)GetProcAddress(hWinsock, "WSAConnect");
             void* pGetAddrInfoW = (void*)GetProcAddress(hWinsock, "GetAddrInfoW");
             void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
+            void* pWSASendTo = (void*)GetProcAddress(hWinsock, "WSASendTo");
 
+            if (pWSASendTo) MH_CreateHook(pWSASendTo, &Detour_WSASendTo, reinterpret_cast<LPVOID*>(&fpWSASendTo));
             if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
             if (pWSAConnect) MH_CreateHook(pWSAConnect, &Detour_WSAConnect, reinterpret_cast<LPVOID*>(&fpWSAConnect));
             if (pGetAddrInfoW) MH_CreateHook(pGetAddrInfoW, &Detour_GetAddrInfoW, reinterpret_cast<LPVOID*>(&fpGetAddrInfoW));
@@ -2597,6 +2690,19 @@ DWORD WINAPI InitHookThread(LPVOID) {
             // [新增] 创建 Hook
             if (pIcmpSendEcho2Ex) MH_CreateHook(pIcmpSendEcho2Ex, &Detour_IcmpSendEcho2Ex, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2Ex));
             if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
+        }
+        // 3. [新增] WinINet Hooks
+        HMODULE hWinInet = LoadLibraryW(L"wininet.dll");
+        if (hWinInet) {
+            void* pInternetConnectW = (void*)GetProcAddress(hWinInet, "InternetConnectW");
+            if (pInternetConnectW) MH_CreateHook(pInternetConnectW, &Detour_InternetConnectW, reinterpret_cast<LPVOID*>(&fpInternetConnectW));
+        }
+
+        // 4. [新增] WinHTTP Hooks
+        HMODULE hWinHttp = LoadLibraryW(L"winhttp.dll");
+        if (hWinHttp) {
+            void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
+            if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
         }
     }
 
