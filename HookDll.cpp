@@ -1029,48 +1029,64 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             isWrite = true;
         }
 
+        // 1. 检查物理存在性
         bool sandboxExists = NtPathExists(targetNtPath);
-        bool realExists = NtPathExists(fullNtPath);
+        bool physicalRealExists = NtPathExists(fullNtPath); // 真实物理存在
+        bool realExists = physicalRealExists;               // 逻辑存在 (受 Mode 3 影响)
+        bool isHidden = false;
 
-        // [新增] Mode 3 可见性检查
-        // 如果真实文件存在 但根据策略不可见 则视为不存在
+        // [Mode 3] 可见性检查
+        // 如果物理存在，但根据规则不可见，则视为逻辑不存在，并标记为隐藏
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
+                isHidden = true;
             }
         }
 
         bool shouldRedirect = false;
 
         if (isDirectory && !isWrite) {
+            // --- 目录读取 ---
             shouldRedirect = false;
             if (!realExists && sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                // 如果真实存在且可见 直接打开真实目录
-                // 目录内容的过滤由 NtQueryDirectoryFile (BuildMergedDirectoryList) 处理
-                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                // 真实存在且可见 -> 直接访问真实目录
+                // (NtQueryDirectoryFile 会处理内容合并)
             } else {
-                // 都不存在 (或被隐藏) -> 重定向到沙盒以报错
-                shouldRedirect = true;
+                // 都不存在
+                if (isHidden) shouldRedirect = true; // 隐藏目录 -> 重定向到沙盒报错
+                else shouldRedirect = false;         // 真的不存在 -> 访问真实路径报错
             }
         } else if (isWrite) {
+            // --- 写入操作 (总是重定向) ---
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
                 shouldRedirect = true;
             } else {
-                shouldRedirect = true;
+                shouldRedirect = true; // 创建新文件
             }
         } else {
+            // --- 文件只读访问 ---
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                shouldRedirect = false;
+                shouldRedirect = false; // 访问真实文件
                 return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
             } else {
-                shouldRedirect = true;
+                // --- 都不存在 ---
+                if (isHidden) {
+                    // 如果是 Mode 3 隐藏文件，必须重定向到沙盒，假装它不存在
+                    shouldRedirect = true;
+                } else {
+                    // [关键修复] 如果物理上真的不存在，不要重定向！
+                    // 让系统访问真实路径，从而返回正确的 STATUS_OBJECT_NAME_NOT_FOUND。
+                    // 这样 cmd 才会继续尝试下一个扩展名 (.exe)。
+                    shouldRedirect = false;
+                }
             }
         }
 
@@ -1082,6 +1098,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
+            // 仍然保留这个修复，以防万一需要重定向（如写入或隐藏文件）时沙盒目录不存在
             EnsureDirectoryExistsNT(targetNtPath.c_str());
 
             NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
@@ -1881,18 +1898,6 @@ std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
         if (end != std::wstring::npos) exePath = cmd.substr(0, end);
         else exePath = cmd;
     }
-
-    // [新增] 如果不是绝对路径,在 PATH 中搜索
-    if (!exePath.empty() && exePath.find(L':') == std::wstring::npos &&
-        exePath.find(L'\\') == std::wstring::npos && exePath.find(L'/') == std::wstring::npos) {
-
-        // 尝试在 PATH 中搜索
-        wchar_t fullPath[MAX_PATH] = {0};
-        if (SearchPathW(NULL, exePath.c_str(), L".exe", MAX_PATH, fullPath, NULL) > 0) {
-            return fullPath;
-        }
-    }
-
     return exePath;
 }
 
