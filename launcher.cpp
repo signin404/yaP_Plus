@@ -4072,7 +4072,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (!finalHookPath.empty()) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
-        SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
+        SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_ENABLE", L"1");
         SetEnvironmentVariableW(L"YAP_BLOCK_NET", blockNetwork ? L"1" : L"0");
 
