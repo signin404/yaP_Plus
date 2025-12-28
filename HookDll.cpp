@@ -977,8 +977,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
     // 1. 扫描真实目录 (增加过滤)
     if (!realPath.empty()) {
-        // [新增] 如果真实目录本身不可见 则不扫描真实目录
-        // 注意：realPath 是 DOS 路径 需要转 NT 路径判断
         std::wstring realNtPath = L"\\??\\" + realPath;
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
 
@@ -987,19 +985,51 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
             searchPath += pattern;
 
             WIN32_FIND_DATAW fd;
+
+            // --- [修改] 智能 WOW64 重定向控制 ---
+            PVOID oldRedirectionValue = NULL;
+            BOOL isWow64 = FALSE;
+            bool needDisable = false;
+
+            IsWow64Process(GetCurrentProcess(), &isWow64);
+
+            if (isWow64) {
+                // 逻辑：
+                // 1. 如果 realPath 包含 "System32" 说明句柄指向的是真实的 System32 目录
+                //    (这意味着应用程序可能已经禁用了重定向 或者通过 Sysnative 访问)
+                //    此时我们需要禁用重定向 以便 FindFirstFile 能看到真实的 System32
+                // 2. 如果 realPath 包含 "SysWOW64" 说明句柄已经被重定向过了
+                //    此时我们不需要禁用重定向 FindFirstFile 默认就会看 SysWOW64
+
+                if (StrStrIW(realPath.c_str(), L"System32") != NULL) {
+                    needDisable = true;
+                }
+            }
+
+            if (needDisable) {
+                Wow64DisableWow64FsRedirection(&oldRedirectionValue);
+            }
+            // -------------------------------------------------------
+
             HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+            // --- 恢复重定向 ---
+            if (needDisable) {
+                Wow64RevertWow64FsRedirection(oldRedirectionValue);
+            }
+            // -------------------------------------------------------
+
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
                     if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-                    // [新增] Mode 3 子项可见性检查
                     if (g_HookMode == 3) {
                         std::wstring childNtPath = realNtPath;
                         if (childNtPath.back() != L'\\') childNtPath += L"\\";
                         childNtPath += fd.cFileName;
 
                         if (!IsPathVisible(childNtPath)) {
-                            continue; // 跳过不可见文件
+                            continue;
                         }
                     }
 
@@ -1011,44 +1041,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
             }
         }
     }
-
-    // 2. 扫描沙盒目录 (保持不变 沙盒内容始终可见)
-    if (!sandboxPath.empty()) {
-        std::wstring searchPath = sandboxPath;
-        if (searchPath.back() != L'\\') searchPath += L"\\";
-        searchPath += pattern;
-
-        WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                std::wstring key = fd.cFileName;
-                std::transform(key.begin(), key.end(), key.begin(), towlower);
-                mergedMap[key] = ConvertFindData(fd); // 直接覆盖
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
-        }
-    }
-
-    // 3. 添加 . 和 ..
-    if (!IsDriveRoot(realPath)) {
-        CachedDirEntry dotEntry = {};
-        dotEntry.FileName = L".";
-        dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-        outList.push_back(dotEntry);
-
-        CachedDirEntry dotDotEntry = {};
-        dotDotEntry.FileName = L"..";
-        dotDotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-        outList.push_back(dotDotEntry);
-    }
-
-    // 4. 转为 Vector
-    for (const auto& pair : mergedMap) {
-        outList.push_back(pair.second);
-    }
-}
 
 // 辅助：检查 NT 路径对应的文件是否存在
 bool NtPathExists(const std::wstring& ntPath) {
