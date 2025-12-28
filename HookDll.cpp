@@ -1057,21 +1057,17 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         } else {
             // --- 文件只读访问 (关键路径) ---
             if (sandboxExists) {
-                shouldRedirect = true;
-            } else if (realExists) {
-                shouldRedirect = false; // 真实存在 -> 放行
-            } else {
-                // --- 都不存在 ---
-                if (isHidden) {
-                    shouldRedirect = true; // 故意隐藏 -> 重定向到沙盒(报错)
-                } else {
-                    // [绝对修复] 物理上真的不存在 -> 绝对不要重定向！
-                    // 必须让 OS 在真实路径上返回 STATUS_OBJECT_NAME_NOT_FOUND。
-                    // 任何重定向都可能导致返回 STATUS_OBJECT_PATH_NOT_FOUND (因为沙盒目录结构可能不完整)。
-                    shouldRedirect = false;
-                }
-            }
-        }
+        shouldRedirect = true;
+    } else if (realExists) {
+        shouldRedirect = false;
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    } else {
+        // [修复] 文件都不存在时,直接尝试打开原始路径让系统返回错误
+        // 不要重定向到沙箱,因为这样会隐藏系统文件
+        shouldRedirect = false;
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+}
 
         if (shouldRedirect) {
             UNICODE_STRING uStr;
