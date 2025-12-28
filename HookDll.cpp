@@ -1040,6 +1040,44 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
+    // 2. 扫描沙盒目录 (保持不变 沙盒内容始终可见)
+    if (!sandboxPath.empty()) {
+        std::wstring searchPath = sandboxPath;
+        if (searchPath.back() != L'\\') searchPath += L"\\";
+        searchPath += pattern;
+
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                std::wstring key = fd.cFileName;
+                std::transform(key.begin(), key.end(), key.begin(), towlower);
+                mergedMap[key] = ConvertFindData(fd); // 直接覆盖
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    // 3. 添加 . 和 ..
+    if (!IsDriveRoot(realPath)) {
+        CachedDirEntry dotEntry = {};
+        dotEntry.FileName = L".";
+        dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        outList.push_back(dotEntry);
+
+        CachedDirEntry dotDotEntry = {};
+        dotDotEntry.FileName = L"..";
+        dotDotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        outList.push_back(dotDotEntry);
+    }
+
+    // 4. 转为 Vector
+    for (const auto& pair : mergedMap) {
+        outList.push_back(pair.second);
+    }
+}
+
 // 辅助：检查 NT 路径对应的文件是否存在
 bool NtPathExists(const std::wstring& ntPath) {
     std::wstring dosPath = NtPathToDosPath(ntPath);
