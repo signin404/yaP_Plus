@@ -1957,6 +1957,13 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
 
 // --- CreateProcess Hooks ---
 
+// 辅助：检查是否为浏览器子进程 (Renderer/GPU 等)
+bool IsBrowserSubProcess(const std::wstring& cmdLine) {
+    if (cmdLine.empty()) return false;
+    if (wcsstr(cmdLine.c_str(), L"--type=")) return true;
+    return false;
+}
+
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -1973,11 +1980,6 @@ BOOL CreateProcessInternal(
     LPPROCESS_INFORMATION lpProcessInformation,
     bool isAnsi
 ) {
-    std::wstring redirectedExe;
-    // 只有在 g_HookMode > 0 时才尝试重定向
-    if (g_HookMode > 0) {
-        redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-    }
     // 1. 处理 ApplicationName (EXE 路径)
     std::wstring exePathW;
     if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
@@ -1987,24 +1989,35 @@ BOOL CreateProcessInternal(
     if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
     else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
+    // [新增] 检查是否需要跳过注入 (针对 Chrome/Edge 子进程)
+    bool skipInjection = IsBrowserSubProcess(cmdLineW);
+
+    // [修复] 必须先定义 targetExe
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+
+    // [修改] 只有在 hookfile 模式开启时才尝试重定向路径
+    std::wstring redirectedExe;
+    if (g_HookMode > 0) {
+        redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+    }
 
     // 2. 处理 CurrentDirectory (工作目录)
     std::wstring curDirW;
     if (isAnsi) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
     else curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
 
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+    std::wstring redirectedDir;
+    if (g_HookMode > 0) {
+        redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+    }
 
     // 3. 准备新的参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
 
-    std::string ansiExe, ansiDir;
+    std::string ansiExe, ansiDir; // 保持生命周期
 
     if (!redirectedExe.empty()) {
-        // 只有当成功获取到重定向路径时，才修改 finalAppName
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
         if (isAnsi) {
             ansiExe = WideToAnsi(redirectedExe.c_str());
@@ -2027,8 +2040,14 @@ BOOL CreateProcessInternal(
     // 4. 调用原始函数
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+
+    // [修改] 如果跳过注入，则不需要强制挂起 (除非调用者本来就要求挂起)
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+    DWORD newCreationFlags = dwCreationFlags;
+
+    if (!skipInjection) {
+        newCreationFlags |= CREATE_SUSPENDED;
+    }
 
     BOOL result;
     if (isAnsi) {
@@ -2039,8 +2058,11 @@ BOOL CreateProcessInternal(
 
     // 5. 注入与恢复
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
+        if (!skipInjection) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+            if (!callerWantedSuspended) ResumeThread(pPI->hThread);
+        }
+
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
 
