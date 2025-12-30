@@ -2324,15 +2324,6 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFileEx(
     return status;
 }
 
-NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
-    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass
-) {
-    if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-    RecursionGuard guard;
-    return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-}
-
 NTSTATUS NTAPI Detour_NtQueryObject(
     HANDLE Handle,
     OBJECT_INFORMATION_CLASS ObjectInformationClass,
