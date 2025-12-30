@@ -461,6 +461,25 @@ void DebugLog(const wchar_t* format, ...) {
     SetLastError(lastErr);
 }
 
+// [新增] 线程局部存储 (TLS) 结构体 对应 Sandboxie 的 THREAD_DATA
+struct HookTlsData {
+    int NtCreateFile_LockCount;      // 对应 file_NtCreateFile_lock
+    int DontStripWriteAccess;        // 对应 file_dont_strip_write_access
+    int InRenameOperation;           // 标记当前是否处于重命名逻辑中
+
+    // 构造函数初始化
+    HookTlsData() : NtCreateFile_LockCount(0), DontStripWriteAccess(0), InRenameOperation(0) {}
+};
+
+// 使用 C++11 thread_local 替代复杂的 TlsAlloc/TlsGetValue
+thread_local HookTlsData g_Tls;
+
+// [新增] 专用的 RAII 锁辅助类
+struct NtCreateFileGuard {
+    NtCreateFileGuard() { g_Tls.NtCreateFile_LockCount++; }
+    ~NtCreateFileGuard() { g_Tls.NtCreateFile_LockCount--; }
+};
+
 // [新增] 进程类型枚举
 enum ProcessType {
     ProcType_Generic = 0,
@@ -1348,8 +1367,14 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-    RecursionGuard guard;
+    // [修改] 使用细粒度锁
+    // 如果锁计数 > 0 说明是 Hook 内部发起的调用 直接放行给原始函数
+    if (g_Tls.NtCreateFile_LockCount > 0) {
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+
+    // 建立锁保护 (RAII)
+    NtCreateFileGuard tlsGuard;
 
     // 1. 路径解析与规范化
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
@@ -1382,8 +1407,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     // [Explorer] 移除只读文件的写属性请求
     if (g_CurrentProcessType == ProcType_Explorer && CreateDisposition == FILE_OPEN) {
-        if ((DesiredAccess & FILE_WRITE_ATTRIBUTES) && !(DesiredAccess & (FILE_WRITE_DATA | DELETE))) {
-             DesiredAccess &= ~FILE_WRITE_ATTRIBUTES;
+        // 只有当 TLS 标志未设置时 才剥离权限
+        if (g_Tls.DontStripWriteAccess == 0) {
+            if ((DesiredAccess & FILE_WRITE_ATTRIBUTES) && !(DesiredAccess & (FILE_WRITE_DATA | DELETE))) {
+                 DesiredAccess &= ~FILE_WRITE_ATTRIBUTES;
+            }
         }
     }
 
