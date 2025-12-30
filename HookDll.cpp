@@ -83,10 +83,6 @@
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
 #endif
 
-#ifndef STATUS_NO_SUCH_FILE
-#define STATUS_NO_SUCH_FILE ((NTSTATUS)0xC000000FL)
-#endif
-
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -125,6 +121,17 @@ bool IsTombstone(DWORD attrs) {
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+#ifndef FileLinkInformation
+#define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
+#endif
+
+typedef struct _FILE_LINK_INFORMATION {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_LINK_INFORMATION, *PFILE_LINK_INFORMATION;
 
 #ifndef FileEndOfFileInformation
 #define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
@@ -408,8 +415,7 @@ std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
 bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
-std::mutex g_DeviceMapMutex;
-bool g_DeviceMapInitialized = false;
+std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -496,15 +502,17 @@ P_NtClose fpNtClose = NULL;
 std::vector<std::pair<std::wstring, std::wstring>> g_DeviceMap;
 
 void RefreshDeviceMap() {
-    // 注意：移除函数内部的 g_DeviceMap.clear()，由调用者负责或确保只调一次
+    g_DeviceMap.clear();
     wchar_t drives[512];
     if (GetLogicalDriveStringsW(512, drives)) {
         wchar_t* drive = drives;
         while (*drive) {
+            // drive 是 "C:\" 我们需要 "C:"
             std::wstring driveStr = drive;
             if (!driveStr.empty() && driveStr.back() == L'\\') driveStr.pop_back();
 
             wchar_t devicePath[MAX_PATH];
+            // QueryDosDeviceW("C:", ...) -> "\Device\HarddiskVolume1"
             if (QueryDosDeviceW(driveStr.c_str(), devicePath, MAX_PATH)) {
                 g_DeviceMap.push_back({ std::wstring(devicePath), driveStr });
             }
@@ -513,31 +521,17 @@ void RefreshDeviceMap() {
     }
 }
 
-// [新增] 线程安全的初始化函数
-void EnsureDeviceMapInitialized() {
-    std::lock_guard<std::mutex> lock(g_DeviceMapMutex);
-    if (g_DeviceMapInitialized) return;
-    
-    RefreshDeviceMap();
-    g_DeviceMapInitialized = true;
-}
-
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // [修复] 确保映射表已初始化，防止 PowerShell 启动初期找不到路径
-    EnsureDeviceMapInitialized();
-
+    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
+    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
     if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
         const std::wstring& devPrefix = pair.first;
         const std::wstring& driveLetter = pair.second;
 
-        // [修改] 使用不区分大小写的比较
-        if (devicePath.length() >= devPrefix.length() &&
-            _wcsnicmp(devicePath.c_str(), devPrefix.c_str(), devPrefix.length()) == 0) {
-            
-            // 确保匹配的是完整前缀 (后面是结束符或反斜杠)
+        if (devicePath.find(devPrefix) == 0) {
             if (devicePath.length() == devPrefix.length() || devicePath[devPrefix.length()] == L'\\') {
                 std::wstring suffix = devicePath.substr(devPrefix.length());
                 return L"\\??\\" + driveLetter + suffix;
@@ -593,9 +587,30 @@ void DebugLog(const wchar_t* format, ...) {
 
 // --- 辅助工具 ---
 
+// [新增] 移除 NTFS 交换数据流 (ADS) 后缀
+// 逻辑参考 file.c: File_MatchPath2
+std::wstring StripAds(const std::wstring& path) {
+    size_t lastBackslash = path.rfind(L'\\');
+    if (lastBackslash != std::wstring::npos) {
+        size_t colonPos = path.find(L':', lastBackslash + 1);
+        if (colonPos != std::wstring::npos) {
+            return path.substr(0, colonPos);
+        }
+    }
+    return path;
+}
+
 // 辅助：判断是否为特殊设备、管道、网络驱动等 不应被重定向
 bool IsPipeOrDevice(LPCWSTR path) {
     if (!path) return false;
+
+    // [新增] 自身镜像保护 (防止重定向自身 EXE)
+    if (!g_CurrentProcessPathNt.empty()) {
+        if (_wcsicmp(path, g_CurrentProcessPathNt.c_str()) == 0) return true;
+    }
+
+    // [新增] 虚拟别名 SysNative (32位程序访问64位系统目录)
+    if (wcsstr(path, L"SysNative")) return true;
 
     // --- 1. IPC (进程间通信) ---
     if (wcsstr(path, L"NamedPipe")) return true;
@@ -604,6 +619,8 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"pipe\\")) return true;
     if (wcsstr(path, L"Mailslot")) return true;
     if (wcsstr(path, L"RPC Control")) return true;
+    // [新增] Outlook 特殊 IPC
+    if (wcsstr(path, L"OICE_")) return true;
 
     // --- 2. 控制台/终端 ---
     if (wcsstr(path, L"ConDrv")) return true;
@@ -612,20 +629,35 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"\\??\\CON")) return true;
 
     // --- 3. 关键系统驱动 ---
-    if (wcsstr(path, L"Afd")) return true;        // Winsock
+    if (wcsstr(path, L"Afd")) return true;
     if (wcsstr(path, L"AFD")) return true;
-    if (wcsstr(path, L"KsecDD")) return true;     // 加密服务
+    if (wcsstr(path, L"KsecDD")) return true;
     if (wcsstr(path, L"MountPointManager")) return true;
-
-    // [新增] 关键修复：网络存储接口 (NSI)
-    // 缺少这个会导致文件选择框无法弹出
     if (wcsstr(path, L"Nsi")) return true;
     if (wcsstr(path, L"NSI")) return true;
 
-    // [新增] 分布式文件系统 (DFS)
-    if (wcsstr(path, L"Dfs")) return true;
+    // [新增] 补充 file.c.txt 中遗漏的系统目录
+    if (wcsstr(path, L"catroot2")) return true;
+    if (wcsstr(path, L"drivers\\etc")) return true;
 
-    // --- 4. 硬件设备接口 (PnP 设备) ---
+    // --- 4. 网络与共享 (Network & Redirectors) ---
+    if (wcsstr(path, L"Dfs")) return true;
+    if (wcsstr(path, L"\\UNC\\")) return true;
+    if (wcsstr(path, L"\\Mup\\")) return true;
+    // [新增] 关键重定向器
+    if (wcsstr(path, L"LanmanRedirector")) return true; // SMB
+    if (wcsstr(path, L"hgfs")) return true;             // VMware Shared Folders
+    // [新增] 网络重定向器前缀格式 (如 \Device\Mup\;LanmanRedirector)
+    if (wcsstr(path, L";LanmanRedirector")) return true;
+
+    // --- 5. 硬件与磁盘 (Hardware & Raw Disk) ---
+    if (wcsstr(path, L"Volume{")) return true;
+    if (wcsstr(path, L"CdRom")) return true;
+    if (wcsstr(path, L"Harddisk")) return true;
+    // [新增] 物理驱动器
+    if (wcsstr(path, L"PhysicalDrive")) return true;
+
+    // PnP 设备标识
     if (wcsstr(path, L"hid#")) return true;
     if (wcsstr(path, L"HID#")) return true;
     if (wcsstr(path, L"usb#")) return true;
@@ -640,16 +672,11 @@ bool IsPipeOrDevice(LPCWSTR path) {
     if (wcsstr(path, L"hdaudio#")) return true;
     if (wcsstr(path, L"root#")) return true;
 
-    // --- 5. 网络路径 (UNC) ---
-    if (wcsstr(path, L"\\UNC\\")) return true;
-    if (wcsstr(path, L"\\Mup\\")) return true;
-
-    // --- 6. 直接卷访问 ---
-    if (wcsstr(path, L"Volume{")) return true;
-
-    // [新增] 虚拟磁盘/光驱驱动
-    if (wcsstr(path, L"CdRom")) return true;
-    if (wcsstr(path, L"Harddisk")) return true;
+    // --- 6. [新增] 必须直通的系统特殊目录 (源自 File_GetName_SkipWow64Link) ---
+    if (wcsstr(path, L"spool")) return true;        // 打印机
+    if (wcsstr(path, L"driverstore")) return true;  // 驱动存储
+    if (wcsstr(path, L"catroot")) return true;      // 签名目录
+    if (wcsstr(path, L"logfiles")) return true;     // 系统日志
 
     return false;
 }
@@ -683,9 +710,10 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
     }
-    // 兜底：如果映射真的失败了，尝试使用 GLOBALROOT
+    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
+    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
     if (ntPath.find(L"\\Device\\") == 0) {
-        return L"\\\\?\\GLOBALROOT" + ntPath;
+        return L"";
     }
     return ntPath;
 }
@@ -830,11 +858,14 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (g_SandboxRoot[0] == L'\0') return false;
     if (g_HookMode == 0) return false;
-    if (IsPipeOrDevice(fullNtPath.c_str())) return false;
+
+    // [新增] ADS 处理：使用剥离流名称后的路径进行判断
+    std::wstring pathToCheck = StripAds(fullNtPath);
+
+    if (IsPipeOrDevice(pathToCheck.c_str())) return false;
+
     // [新增] 过滤 Shell Namespace GUID (例如 ::{20D04FE0...})
-    // 这些是虚拟路径 重定向会导致文件对话框崩溃或无反应
-    if (wcsstr(fullNtPath.c_str(), L"::{") != NULL) return false;
-    if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
+    if (wcsstr(pathToCheck.c_str(), L"::{") != NULL) return false;
 
     if (fullNtPath.rfind(L"\\??\\", 0) != 0) return false;
 
@@ -907,15 +938,7 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         if (!g_SystemDriveNt.empty()) {
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘 -> 不重定向
-                return false;
-            }
-
-            // [新增] 关键修复：在 Mode 1 下排除 System32 和 SysWOW64
-            // 防止 PowerShell 等工具因目录扫描差异导致找不到 ping.exe 等系统命令
-            // 这些目录通常是只读的，重定向的意义不大，但风险极高
-            if (ContainsCaseInsensitive(fullNtPath, L"\\Windows\\System32") ||
-                ContainsCaseInsensitive(fullNtPath, L"\\Windows\\SysWOW64")) {
+                // 不是系统盘 -> 不重定向 (直接读写原路径)
                 return false;
             }
         }
@@ -1137,7 +1160,13 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
 
-    std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    // [修改] 增加路径规范化步骤
+    // 解决 C:\PROGRA~1 与 C:\Program Files 不匹配导致重定向失效的问题
+    // 解决 Junction (如 C:\Documents and Settings -> C:\Users) 导致路径判断错误的问题
+    std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
@@ -1254,11 +1283,14 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
     RecursionGuard guard;
 
-    std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
 
-    if (fullNtPath.find(L"\\Device\\") == 0) {
-        fullNtPath = DevicePathToNtPath(fullNtPath);
+    if (rawNtPath.find(L"\\Device\\") == 0) {
+        rawNtPath = DevicePathToNtPath(rawNtPath);
     }
+
+    // [修改] 增加路径规范化，确保删除操作也能正确识别短文件名和链接
+    std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
     std::wstring targetNtPath;
 
@@ -1374,6 +1406,23 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
+    // [新增] 拦截硬链接创建 (FileLinkInformation)
+    // Sandboxie 逻辑：不支持在沙盒内创建指向外部的硬链接，也不支持沙盒内硬链接
+    // 返回 STATUS_INVALID_DEVICE_REQUEST 会迫使大多数程序（如 cmd, msi）回退到 CopyFile
+    if (FileInformationClass == FileLinkInformation) {
+        // 可选：检查是否真的涉及沙盒路径，为了简化和安全，全局拦截或仅拦截涉及重定向的句柄
+        // 这里采用安全策略：如果句柄指向的文件在重定向范围内，则拦截
+        std::wstring rawPath = GetPathFromHandle(FileHandle);
+        if (!rawPath.empty()) {
+            std::wstring ntPath = DevicePathToNtPath(rawPath);
+            std::wstring targetPath;
+            if (ShouldRedirect(ntPath, targetPath)) {
+                DebugLog(L"Blocked HardLink creation for: %s", ntPath.c_str());
+                return STATUS_INVALID_DEVICE_REQUEST;
+            }
+        }
+    }
+
     // 1. 检查是否为删除操作
     bool isDelete = false;
     if (FileInformationClass == FileDispositionInformation) {
@@ -1438,7 +1487,11 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_BASIC_INFORMATION FileInformation) {
     if (g_IsInHook) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
-    std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    // [修改] 规范化路径
+    std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
@@ -1843,16 +1896,8 @@ NTSTATUS HandleDirectoryQuery(
         *(ULONG*)prevEntryPtr = 0;
     }
 
-    // 如果没有写入任何字节
+    // 如果没有写入任何字节 说明没有更多文件了 (或者过滤后没有匹配项)
     if (bytesWritten == 0) {
-        // [修复] 如果是重新扫描(或第一次扫描)且没找到任何匹配项，返回 STATUS_NO_SUCH_FILE
-        // 否则返回 STATUS_NO_MORE_FILES (表示迭代结束)
-        if (RestartScan) {
-             IoStatusBlock->Status = STATUS_NO_SUCH_FILE;
-             IoStatusBlock->Information = 0;
-             return STATUS_NO_SUCH_FILE;
-        }
-        
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
         return STATUS_NO_MORE_FILES;
@@ -1947,6 +1992,52 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 }
 
 // --- 路径处理辅助函数 ---
+
+// [新增] 路径规范化：解析短文件名、符号链接、Junction
+// 对应 Sandboxie 的 File_GetName_ExpandShortNames 和 File_GetName_TranslateSymlinks
+std::wstring NormalizeNtPath(const std::wstring& ntPath) {
+    if (ntPath.empty()) return ntPath;
+
+    // 1. 转换为 DOS 路径以便使用 Win32 API
+    std::wstring dosPath = NtPathToDosPath(ntPath);
+    if (dosPath.empty()) return ntPath; // 无法转换，保持原样
+
+    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
+    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
+    HANDLE hFile = CreateFileW(dosPath.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        wchar_t finalPath[MAX_PATH];
+        // VOLUME_NAME_DOS 返回 \\?\C:\Path 格式
+        DWORD len = GetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, VOLUME_NAME_DOS);
+        CloseHandle(hFile);
+
+        if (len > 0 && len < MAX_PATH) {
+            std::wstring res = finalPath;
+            // 将 \\?\ 转换为 NT 格式 \??\
+            if (res.rfind(L"\\\\?\\", 0) == 0) {
+                return L"\\??\\" + res.substr(4);
+            }
+            return res; // 理论上不应到此，除非是 UNC
+        }
+    }
+    else {
+        // 3. 文件不存在 (可能是创建新文件)，尝试展开短文件名
+        // GetLongPathNameW 即使文件不存在，只要路径组件存在也能工作
+        wchar_t longPath[MAX_PATH];
+        if (GetLongPathNameW(dosPath.c_str(), longPath, MAX_PATH) > 0) {
+            return L"\\??\\" + std::wstring(longPath);
+        }
+    }
+
+    return ntPath;
+}
 
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
@@ -2641,8 +2732,8 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
-    // 1. 刷新设备映射 (改为线程安全调用)
-    EnsureDeviceMapInitialized();
+    // 1. 刷新设备映射
+    RefreshDeviceMap();
 
     wchar_t buffer[MAX_PATH] = { 0 };
 
@@ -2685,12 +2776,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
-        // buffer 类似于 "C:\Windows\System32"
         buffer[2] = L'\0'; // 截断为 "C:"
-        g_SystemDriveLetter = buffer; // [新增] 保存 "C:"
+        g_SystemDriveLetter = buffer;
         g_SystemDriveNt = L"\\??\\";
-        g_SystemDriveNt += buffer; // 结果: \??\C:
+        g_SystemDriveNt += buffer;
         InitSystemWhitelist();
+    }
+
+    // [新增] 获取当前进程路径用于自身保护
+    if (GetModuleFileNameW(NULL, buffer, MAX_PATH) > 0) {
+        std::wstring dosPath = buffer;
+        // 转换为 NT 路径: C:\Ex.exe -> \??\C:\Ex.exe
+        g_CurrentProcessPathNt = L"\\??\\" + dosPath;
     }
 
     // 5. 环境变量回退 (如果内存映射没读到)
