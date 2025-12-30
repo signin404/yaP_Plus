@@ -408,6 +408,8 @@ std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
 bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
+std::mutex g_DeviceMapMutex;
+bool g_DeviceMapInitialized = false;
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -494,17 +496,15 @@ P_NtClose fpNtClose = NULL;
 std::vector<std::pair<std::wstring, std::wstring>> g_DeviceMap;
 
 void RefreshDeviceMap() {
-    g_DeviceMap.clear();
+    // 注意：移除函数内部的 g_DeviceMap.clear()，由调用者负责或确保只调一次
     wchar_t drives[512];
     if (GetLogicalDriveStringsW(512, drives)) {
         wchar_t* drive = drives;
         while (*drive) {
-            // drive 是 "C:\" 我们需要 "C:"
             std::wstring driveStr = drive;
             if (!driveStr.empty() && driveStr.back() == L'\\') driveStr.pop_back();
 
             wchar_t devicePath[MAX_PATH];
-            // QueryDosDeviceW("C:", ...) -> "\Device\HarddiskVolume1"
             if (QueryDosDeviceW(driveStr.c_str(), devicePath, MAX_PATH)) {
                 g_DeviceMap.push_back({ std::wstring(devicePath), driveStr });
             }
@@ -513,8 +513,20 @@ void RefreshDeviceMap() {
     }
 }
 
+// [新增] 线程安全的初始化函数
+void EnsureDeviceMapInitialized() {
+    std::lock_guard<std::mutex> lock(g_DeviceMapMutex);
+    if (g_DeviceMapInitialized) return;
+    
+    RefreshDeviceMap();
+    g_DeviceMapInitialized = true;
+}
+
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
+    // [修复] 确保映射表已初始化，防止 PowerShell 启动初期找不到路径
+    EnsureDeviceMapInitialized();
+
     if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
@@ -671,14 +683,10 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
     }
-    
-    // [修复] 处理 \Device\HarddiskVolumeX 格式
-    // 不要返回空字符串，而是转换为 \\?\GLOBALROOT\Device\... 格式
-    // 这样 FindFirstFileW 仍然可以正常工作
+    // 兜底：如果映射真的失败了，尝试使用 GLOBALROOT
     if (ntPath.find(L"\\Device\\") == 0) {
         return L"\\\\?\\GLOBALROOT" + ntPath;
     }
-    
     return ntPath;
 }
 
@@ -2625,8 +2633,8 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
-    // 1. 刷新设备映射
-    RefreshDeviceMap();
+    // 1. 刷新设备映射 (改为线程安全调用)
+    EnsureDeviceMapInitialized();
 
     wchar_t buffer[MAX_PATH] = { 0 };
 
