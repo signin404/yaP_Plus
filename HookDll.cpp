@@ -130,6 +130,10 @@
 #define FileInternalInformation ((FILE_INFORMATION_CLASS)6)
 #endif
 
+#ifndef FileNormalizedNameInformation
+#define FileNormalizedNameInformation ((FILE_INFORMATION_CLASS)48)
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -2573,11 +2577,16 @@ NTSTATUS NTAPI Detour_NtQueryObject(
     return status;
 }
 
+// [新增] 补充枚举值
+#ifndef FileNormalizedNameInformation
+#define FileNormalizedNameInformation ((FILE_INFORMATION_CLASS)48)
+#endif
+
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
+    HANDLE FileHandle, 
+    PIO_STATUS_BLOCK IoStatusBlock, 
     PVOID FileInformation,
-    ULONG Length,
+    ULONG Length, 
     FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
@@ -2587,50 +2596,54 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (NT_SUCCESS(status)) {
-
-        // =========================================================
-        // [新增] File ID 混淆逻辑
-        // =========================================================
+        
+        // [新增] File ID 混淆 (保持之前的逻辑)
         PLARGE_INTEGER pFileId = NULL;
-
-        if (FileInformationClass == FileInternalInformation) {
-            if (Length >= sizeof(FILE_INTERNAL_INFORMATION)) {
-                pFileId = &((PFILE_INTERNAL_INFORMATION)FileInformation)->IndexNumber;
-            }
+        if (FileInformationClass == FileInternalInformation && Length >= sizeof(FILE_INTERNAL_INFORMATION)) {
+            pFileId = &((PFILE_INTERNAL_INFORMATION)FileInformation)->IndexNumber;
         }
-        else if (FileInformationClass == FileAllInformation) {
-            if (Length >= sizeof(FILE_ALL_INFORMATION)) {
-                pFileId = &((PFILE_ALL_INFORMATION)FileInformation)->InternalInformation.IndexNumber;
-            }
+        else if (FileInformationClass == FileAllInformation && Length >= sizeof(FILE_ALL_INFORMATION)) {
+            pFileId = &((PFILE_ALL_INFORMATION)FileInformation)->InternalInformation.IndexNumber;
         }
-
-        // 如果获取到了 ID 指针，且文件位于沙盒内，则进行混淆
         if (pFileId && IsHandleInSandbox(FileHandle)) {
             ToggleFileIdScramble(pFileId);
         }
 
         // =========================================================
-        // [原有] 文件名欺骗逻辑 (保持不变)
+        // [关键修复] 路径欺骗逻辑 (增加 FileNormalizedNameInformation)
         // =========================================================
         PFILE_NAME_INFORMATION pNameInfo = NULL;
-        if (FileInformationClass == (FILE_INFORMATION_CLASS)9 /*FileNameInformation*/) {
+
+        if (FileInformationClass == FileNameInformation || 
+            FileInformationClass == FileNormalizedNameInformation) { // [新增] 处理 NormalizedName
             pNameInfo = (PFILE_NAME_INFORMATION)FileInformation;
         }
-        else if (FileInformationClass == (FILE_INFORMATION_CLASS)18 /*FileAllInformation*/) {
+        else if (FileInformationClass == FileAllInformation) {
             pNameInfo = &((PFILE_ALL_INFORMATION)FileInformation)->NameInformation;
         }
 
         if (pNameInfo && pNameInfo->FileNameLength > 0) {
             std::wstring currentPath(pNameInfo->FileName, pNameInfo->FileNameLength / sizeof(wchar_t));
-            if (!g_SandboxRelativePath.empty() &&
+            
+            // 检查是否以沙盒相对路径开头 (例如 \Sandbox\C\New)
+            if (!g_SandboxRelativePath.empty() && 
                 currentPath.size() > g_SandboxRelativePath.size() &&
                 _wcsnicmp(currentPath.c_str(), g_SandboxRelativePath.c_str(), g_SandboxRelativePath.size()) == 0) {
-
+                
                 size_t relLen = g_SandboxRelativePath.size();
+                // 确保匹配完整目录: \Sandbox + \ + C + \ ...
                 if (currentPath[relLen] == L'\\' && currentPath[relLen + 2] == L'\\') {
+                    
+                    // 提取真实相对路径: \Sandbox\C\New -> \New
+                    // 跳过 "\Sandbox\C" (长度 = relLen + 1 + 1)
+                    // 但我们要保留开头的 '\'，所以跳过 relLen + 2
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
-                    memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
-                    pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
+                    
+                    // 原地修改缓冲区
+                    if (spoofedPath.length() * sizeof(wchar_t) <= Length - FIELD_OFFSET(FILE_NAME_INFORMATION, FileName)) {
+                        memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
+                        pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
+                    }
                 }
             }
         }
@@ -3000,44 +3013,57 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     
     DWORD lastErr = GetLastError();
     
-    // 1. 调用原始函数获取真实路径 (例如 \\?\Z:\Sandbox\C\New)
+    // 1. 调用原始函数
     DWORD result = fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
     
     if (result > 0 && result < cchFilePath) {
-        
-        // 2. 检查是否包含沙盒根目录
-        // g_SandboxRoot 格式如 Z:\Sandbox
-        // GetFinalPathNameByHandleW 返回格式通常是 \\?\Z:\Sandbox\...
-        
         std::wstring finalPath = lpszFilePath;
-        
-        // 构造匹配前缀: \\?\ + g_SandboxRoot
-        std::wstring sandboxPrefix = L"\\\\?\\" + std::wstring(g_SandboxRoot);
-        
-        // 不区分大小写比较
-        if (finalPath.size() >= sandboxPrefix.size() &&
-            _wcsnicmp(finalPath.c_str(), sandboxPrefix.c_str(), sandboxPrefix.size()) == 0) {
+        DWORD type = dwFlags & 0x7; // 提取类型标志
+
+        // --- 情况 A: DOS 路径 (\\?\Z:\Sandbox\C\New) ---
+        if (type == VOLUME_NAME_DOS || type == VOLUME_NAME_GUID) { // GUID 路径通常也以 \\?\ 开头
+            std::wstring sandboxPrefix = L"\\\\?\\" + std::wstring(g_SandboxRoot);
             
-            // 3. 执行反向映射 (去除沙盒前缀)
-            // 原始: \\?\Z:\Sandbox\C\New
-            // 目标: \\?\C:\New
-            
-            // 提取相对路径: \C\New
-            std::wstring relPath = finalPath.substr(sandboxPrefix.size());
-            
-            // 处理盘符结构
-            // 如果 relPath 是 \C\New，我们需要把它变成 C:\New
-            if (relPath.length() >= 2 && relPath[0] == L'\\') {
+            if (finalPath.size() >= sandboxPrefix.size() &&
+                _wcsnicmp(finalPath.c_str(), sandboxPrefix.c_str(), sandboxPrefix.size()) == 0) {
                 
-                std::wstring driveLetter(1, relPath[1]); // C
-                std::wstring remaining = relPath.substr(2); // \New
+                // \C\New
+                std::wstring relPath = finalPath.substr(sandboxPrefix.size());
+                if (relPath.length() >= 2 && relPath[0] == L'\\') {
+                    std::wstring driveLetter(1, relPath[1]); 
+                    std::wstring remaining = relPath.substr(2); 
+                    std::wstring spoofedPath = L"\\\\?\\" + driveLetter + L":" + remaining;
+                    
+                    if (spoofedPath.length() < cchFilePath) {
+                        wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
+                        result = (DWORD)spoofedPath.length();
+                    }
+                }
+            }
+        }
+        // --- [新增] 情况 B: NT 设备路径 (\Device\HarddiskVolumeZ\Sandbox\C\New) ---
+        else if (type == VOLUME_NAME_NT) {
+            // g_SandboxDevicePath 在 InitSpoofing 中初始化 (如 \Device\HarddiskVolume2\Sandbox)
+            if (!g_SandboxDevicePath.empty() && 
+                finalPath.size() >= g_SandboxDevicePath.size() &&
+                _wcsnicmp(finalPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
                 
-                std::wstring spoofedPath = L"\\\\?\\" + driveLetter + L":" + remaining;
-                
-                // 4. 写回缓冲区
-                if (spoofedPath.length() < cchFilePath) {
-                    wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
-                    result = (DWORD)spoofedPath.length();
+                // \C\New
+                std::wstring relPath = finalPath.substr(g_SandboxDevicePath.size());
+                if (relPath.length() >= 2 && relPath[0] == L'\\') {
+                    wchar_t driveLetter = relPath[1];
+                    // 获取真实 C 盘的设备路径 (\Device\HarddiskVolume1)
+                    std::wstring realDevPrefix = GetDevicePathByDrive(driveLetter);
+                    
+                    if (!realDevPrefix.empty()) {
+                        std::wstring remaining = relPath.substr(2);
+                        std::wstring spoofedPath = realDevPrefix + remaining;
+                        
+                        if (spoofedPath.length() < cchFilePath) {
+                            wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
+                            result = (DWORD)spoofedPath.length();
+                        }
+                    }
                 }
             }
         }
