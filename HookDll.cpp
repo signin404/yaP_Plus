@@ -805,15 +805,25 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
 }
 
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
+    if (ntPath.empty()) return L"";
+
+    // 标准 NT 路径 \??\C:\Path
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
     }
-    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
-    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
+    // 系统设备路径 \Device\HarddiskVolumeX\Path -> 尝试映射
     if (ntPath.find(L"\\Device\\") == 0) {
+        // 尝试使用 DevicePathToNtPath 转换，然后再转 DOS
+        // 注意：DevicePathToNtPath 返回的是 \??\C:\Path
+        std::wstring dosNt = DevicePathToNtPath(ntPath);
+        if (dosNt.rfind(L"\\??\\", 0) == 0) {
+            return dosNt.substr(4);
+        }
+        // 如果转换失败（没有盘符映射），返回空，避免错误操作
         return L"";
     }
-    return ntPath;
+    // 其他情况（如 \SystemRoot\），暂不支持，返回空
+    return L"";
 }
 
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
@@ -821,12 +831,13 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     if (ntPath.empty()) return ntPath;
 
-    // 1. 转换为 DOS 路径以便使用 Win32 API
+    // 1. 转换为 DOS 路径
     std::wstring dosPath = NtPathToDosPath(ntPath);
-    if (dosPath.empty()) return ntPath; // 无法转换，保持原样
 
-    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
-    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
+    // [修复] 如果转换失败（例如是网络路径或无盘符路径），直接返回原路径，不要尝试打开
+    if (dosPath.empty()) return ntPath;
+
+    // 2. 尝试打开文件 (保持原有逻辑)
     HANDLE hFile = CreateFileW(dosPath.c_str(),
         0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1354,13 +1365,25 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    // 递归守卫：防止 Hook 内部调用 API 导致死循环
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
 
-    // 1. 路径解析与规范化
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
-    std::wstring fullNtPath = NormalizeNtPath(rawNtPath); // 解析短文件名、符号链接
+
+    // [关键修复] 1. 优先检查特殊设备/管道，直接放行，绝对不要尝试规范化或重定向
+    // 这解决了程序启动卡死或崩溃的核心问题
+    if (IsPipeOrDevice(rawNtPath.c_str())) {
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+
+    // [关键修复] 2. 仅对看起来像驱动器路径的字符串进行规范化
+    // 避免对 \??\UNC\... 或其他奇怪格式调用 CreateFileW
+    std::wstring fullNtPath;
+    if (rawNtPath.length() >= 6 && rawNtPath.substr(0, 4) == L"\\??\\" && rawNtPath[5] == L':') {
+        fullNtPath = NormalizeNtPath(rawNtPath);
+    } else {
+        fullNtPath = rawNtPath;
+    }
 
     // [兼容性补丁 - 预处理]
     // [MSI Installer] 移除 ACCESS_SYSTEM_SECURITY
