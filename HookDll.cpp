@@ -397,6 +397,25 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 #define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
 #endif
 
+// [新增] 定义 FS_INFORMATION_CLASS 枚举 (必须在函数指针定义之前)
+typedef enum _FS_INFORMATION_CLASS {
+    FileFsVolumeInformation = 1,
+    FileFsLabelInformation,
+    FileFsSizeInformation,
+    FileFsDeviceInformation,
+    FileFsAttributeInformation,
+    FileFsControlInformation,
+    FileFsFullSizeInformation,
+    FileFsObjectIdInformation,
+    FileFsDriverPathInformation,
+    FileFsVolumeFlagsInformation,
+    FileFsSectorSizeInformation,
+    FileFsDataCopyInformation,
+    FileFsMetadataSizeInformation,
+    FileFsFullSizeInformationEx,
+    FileFsMaximumInformation
+} FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
+
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
@@ -2715,21 +2734,18 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     if (NT_SUCCESS(status)) {
         
         // 2. 检查句柄是否指向沙盒内
-        // 只有沙盒内的文件才需要欺骗卷信息
         if (IsHandleInSandbox(FileHandle)) {
             
-            // 3. 解析出它应该属于哪个盘
-            // 路径格式: \Device\HarddiskVolumeZ\Sandbox\C\New
-            // 我们需要提取 'C'
             std::wstring rawPath = GetPathFromHandle(FileHandle);
             if (!rawPath.empty() && !g_SandboxDevicePath.empty()) {
                 
-                // 检查前缀匹配
                 if (rawPath.size() > g_SandboxDevicePath.size() &&
                     _wcsnicmp(rawPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
                     
-                    // g_SandboxDevicePath 结尾没有斜杠，rawPath 紧接着应该是 \C\
+                    // [修复] 移除了注释末尾的反斜杠，防止吃掉下一行代码
+                    // g_SandboxDevicePath 结尾没有斜杠，rawPath 紧接着应该是 \C\ 
                     size_t devLen = g_SandboxDevicePath.size();
+                    
                     if (rawPath[devLen] == L'\\' && rawPath[devLen + 2] == L'\\') {
                         wchar_t targetDrive = rawPath[devLen + 1]; // 'C'
                         
@@ -2741,11 +2757,8 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
                             ULONG realSerial = GetRealVolumeSerial(targetDrive);
                             if (realSerial != 0) {
                                 pVolInfo->VolumeSerialNumber = realSerial;
-                                // 可选：如果需要，也可以欺骗 VolumeLabel
-                                // 但通常序列号是 Explorer 检查的关键
                             }
                         }
-                        // FileFsAttributeInformation 通常不需要欺骗，除非文件系统类型不同(如 FAT32 vs NTFS)
                     }
                 }
             }
