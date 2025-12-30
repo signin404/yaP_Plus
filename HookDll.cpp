@@ -3367,8 +3367,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
     wchar_t childBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD", childBuffer, 64) > 0) {
         int val = _wtoi(childBuffer);
-        // hookchild=2 表示不挂钩子进程
-        if (val == 2) {
+        // hookchild=0 表示不挂钩子进程
+        if (val == 0) {
             g_HookChild = false;
         }
     }

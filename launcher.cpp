@@ -4076,7 +4076,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
 
         // [新增] 读取 hookchild 配置
-        // 1 = 挂钩 (默认), 2 = 不挂钩
+        // 1 = 挂钩 (默认) 0 = 不挂钩
         std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"General", L"hookchild");
         if (hookChildVal.empty()) {
             hookChildVal = L"1"; // 默认开启
