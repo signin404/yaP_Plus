@@ -1666,13 +1666,22 @@ NTSTATUS HandleDirectoryQuery(
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        // [修改] 使用 WildcardMatch 替换 PathMatchSpecW
+        // [修改] 增强的匹配逻辑
         bool isMatch = false;
         if (ctx->SearchPattern.empty() || ctx->SearchPattern == L"*") {
             isMatch = true;
         } else {
-            // 使用我们自己实现的通配符匹配
-            isMatch = WildcardMatch(entry.FileName.c_str(), ctx->SearchPattern.c_str());
+            // PathMatchSpecW 支持 * 和 ? 通配符
+            isMatch = PathMatchSpecW(entry.FileName.c_str(), ctx->SearchPattern.c_str());
+            
+            // [新增] 针对 PowerShell 的特殊处理
+            // PowerShell 有时会请求 "ping.exe" 但 PathMatchSpecW 可能对大小写或特定字符敏感
+            // 如果第一次没匹配，尝试精确匹配 (忽略大小写)
+            if (!isMatch) {
+                if (_wcsicmp(entry.FileName.c_str(), ctx->SearchPattern.c_str()) == 0) {
+                    isMatch = true;
+                }
+            }
         }
 
         if (!isMatch) {
@@ -2082,9 +2091,9 @@ BOOL CreateProcessInternal(
     const CharType* lpCurrentDirectory,
     LPVOID lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation,
-    bool isAnsi
+    bool isAnsi // 这个参数现在主要用于决定如何转换输入参数
 ) {
-    // 1. 转换输入参数为 Wide String
+    // 1. 统一转换为 Wide String 以便内部处理
     std::wstring exePathW;
     if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
     else exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
@@ -2093,63 +2102,26 @@ BOOL CreateProcessInternal(
     if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
     else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
-    // 获取目标 EXE 路径
+    // 获取目标 EXE 路径 (从 AppName 或 CommandLine 提取)
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
 
-    // --- 路径处理逻辑 ---
-    std::wstring finalExePath;
-    bool needsRewrite = false; // 是否需要重写命令行
+    // 判断是否为无路径的纯文件名
+    bool isBareFilename = (targetExe.find(L'\\') == std::wstring::npos && targetExe.find(L'/') == std::wstring::npos);
+    bool wasResolved = false;
 
-    // 1. 如果 lpApplicationName 不为空，直接使用它，不进行任何修改
-    if (lpApplicationName && *lpApplicationName) {
-        finalExePath = exePathW;
-        needsRewrite = false; // 不重写命令行
-    } 
-    // 2. 如果 lpApplicationName 为空，尝试从 CommandLine 解析
-    else {
-        // 提取第一个 token
-        LPCWSTR firstToken = cmdLineW.c_str();
-        if (firstToken && *firstToken) {
-            // 跳过开头的空格
-            while (*firstToken && iswspace(*firstToken)) firstToken++;
-            
-            // 如果是带引号的路径
-            if (*firstToken == L'"') {
-                const wchar_t* endQuote = wcschr(firstToken + 1, L'"');
-                if (endQuote) {
-                    targetExe = std::wstring(firstToken + 1, endQuote - (firstToken + 1));
-                } else {
-                    targetExe = std::wstring(firstToken); // 即使没有闭合引号，也尝试使用
-                }
-            } else {
-                // 查找第一个空格或分隔符
-                const wchar_t* space = wcschr(firstToken, L' ');
-                if (space) {
-                    targetExe = std::wstring(firstToken, space - firstToken);
-                } else {
-                    targetExe = firstToken; // 整个命令行都是文件名
-                }
-            }
-
-            // 尝试解析路径 (如果它只是一个文件名)
-            if (targetExe.find(L'\\') == std::wstring::npos && targetExe.find(L'/') == std::wstring::npos) {
-                std::wstring resolvedPath;
-                if (ResolveCmdPath(targetExe, resolvedPath)) {
-                    targetExe = resolvedPath; // 使用解析出的全路径
-                    wasResolved = true;
-                }
-            }
-
-            // 只有当我们成功解析或找到了一个有效的路径时，才需要重写
-            if (!targetExe.empty()) {
-                needsRewrite = true;
-            }
+    // --- 自动解析无路径的命令 ---
+    if (isBareFilename) {
+        std::wstring resolvedPath;
+        if (ResolveCmdPath(targetExe, resolvedPath)) {
+            targetExe = resolvedPath; // 更新为全路径 (如 C:\Windows\System32\PING.EXE)
+            isBareFilename = false;
+            wasResolved = true;
         }
     }
 
-    // --- 计算重定向 ---
+    // --- 计算重定向路径 ---
     std::wstring redirectedExe;
-    if (!targetExe.empty() && !isBareFilename) { // 只有当 targetExe 是有效路径时才重定向
+    if (!isBareFilename) {
         redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
     }
 
@@ -2160,62 +2132,73 @@ BOOL CreateProcessInternal(
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
     // --- 构造最终参数 ---
-    const void* finalAppName = lpApplicationName; // 默认保持不变
-    const void* finalCurDir = lpCurrentDirectory;
-    void* finalCommandLine = lpCommandLine;
+    
+    // 默认使用原始参数
+    const CharType* finalAppName = lpApplicationName;
+    const CharType* finalCurDir = lpCurrentDirectory;
+    CharType* finalCommandLine = lpCommandLine;
 
+    // 临时变量，用于保持重组后的字符串生命周期
     std::wstring newCmdLineW;
     std::string newCmdLineA;
     std::string ansiDir;
 
-    // 如果需要重写命令行 (因为重定向或路径解析)
-    if (needsRewrite) {
+    // 判定是否需要重组命令行
+    bool forceRewrite = !redirectedExe.empty() || wasResolved;
+
+    if (forceRewrite) {
         std::wstring finalExePath = !redirectedExe.empty() ? redirectedExe : targetExe;
-        
-        DebugLog(L"CreateProcess Rewrite: Target=%s, Resolved=%s, Redirected=%s, Final=%s", 
-                 targetExe.c_str(), wasResolved ? L"Yes" : L"No", redirectedExe.empty() ? L"No" : redirectedExe.c_str(), finalExePath.c_str());
+        DebugLog(L"CreateProcess Rewrite: %s -> %s", targetExe.c_str(), finalExePath.c_str());
 
         LPCWSTR originalArgs = PathGetArgsW(cmdLineW.c_str());
         
+        // 重组命令行: "FinalExePath" OriginalArgs
         newCmdLineW = L"\"" + finalExePath + L"\"";
         if (originalArgs && *originalArgs) {
             newCmdLineW += L" ";
             newCmdLineW += originalArgs;
         }
 
-        // 强制清空 AppName，因为我们已经把全路径放到了命令行里
-        finalAppName = NULL;
-
+        // ！！！关键修复：清空 lpApplicationName，并使用重组后的命令行！！！
+        finalAppName = NULL; 
+        
         if (isAnsi) {
             newCmdLineA = WideToAnsi(newCmdLineW.c_str());
-            finalCommandLine = (void*)newCmdLineA.c_str();
+            finalCommandLine = (CharType*)newCmdLineA.c_str(); // 强制转换
         } else {
-            finalCommandLine = (void*)newCmdLineW.c_str();
+            finalCommandLine = (CharType*)newCmdLineW.c_str(); // 强制转换
         }
     }
 
-    // 处理工作目录重定向
     if (!redirectedDir.empty()) {
         if (isAnsi) {
             ansiDir = WideToAnsi(redirectedDir.c_str());
-            finalCurDir = ansiDir.c_str();
+            finalCurDir = (const CharType*)ansiDir.c_str(); // 强制转换
         } else {
-            finalCurDir = redirectedDir.c_str();
+            finalCurDir = (const CharType*)redirectedDir.c_str(); // 强制转换
         }
     }
 
-    // 调用原始函数
+    // 4. 调用原始函数 (始终使用宽字符版本 CreateProcessW)
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
     BOOL result;
-    if (isAnsi) {
-        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
-    } else {
-        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
-    }
+    // ！！！关键修复：始终调用 CreateProcessW ！！！
+    result = fpCreateProcessW(
+        (LPCWSTR)finalAppName, 
+        (LPWSTR)finalCommandLine, 
+        lpProcessAttributes, 
+        lpThreadAttributes, 
+        bInheritHandles, 
+        newCreationFlags, 
+        lpEnvironment, 
+        (LPCWSTR)finalCurDir, 
+        (LPSTARTUPINFOW)lpStartupInfo, 
+        pPI
+    );
 
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
