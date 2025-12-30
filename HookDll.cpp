@@ -126,20 +126,9 @@
 #define FileIdBothDirectoryInformation ((FILE_INFORMATION_CLASS)37)
 #endif
 
-#ifndef FileInternalInformation
-#define FileInternalInformation ((FILE_INFORMATION_CLASS)6)
-#endif
-
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
-
-typedef struct _FILE_RENAME_INFORMATION {
-    BOOLEAN ReplaceIfExists;
-    HANDLE RootDirectory;
-    ULONG FileNameLength;
-    WCHAR FileName[1];
-} FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
 #ifndef FileLinkInformation
 #define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
@@ -435,8 +424,6 @@ std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
 bool g_BlockNetwork = false; // 网络拦截开关
 bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
-std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
-std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -706,74 +693,6 @@ std::string WideToAnsi(LPCWSTR text) {
     std::string res(size - 1, 0);
     WideCharToMultiByte(CP_ACP, 0, text, -1, &res[0], size, NULL, NULL);
     return res;
-}
-
-// [新增] 初始化路径欺骗缓存 (在 InitHookThread 中调用)
-void InitSpoofing() {
-    if (g_SandboxRoot[0] == L'\0') return;
-
-    // 1. 计算相对路径 (\Sandbox)
-    // g_SandboxRoot 格式如 Z:\Sandbox
-    const wchar_t* pColon = wcschr(g_SandboxRoot, L':');
-    if (pColon && pColon[1] == L'\\') {
-        g_SandboxRelativePath = pColon + 1; // \Sandbox
-        // 移除末尾斜杠
-        if (g_SandboxRelativePath.length() > 1 && g_SandboxRelativePath.back() == L'\\') {
-            g_SandboxRelativePath.pop_back();
-        }
-    }
-
-    // 2. 计算设备路径 (\Device\HarddiskVolumeX\Sandbox)
-    std::wstring driveStr(g_SandboxRoot, 2); // Z:
-    wchar_t deviceBuf[MAX_PATH];
-    if (QueryDosDeviceW(driveStr.c_str(), deviceBuf, MAX_PATH)) {
-        g_SandboxDevicePath = deviceBuf;
-        g_SandboxDevicePath += g_SandboxRelativePath;
-    }
-
-    DebugLog(L"Spoof Init: Device='%s', Rel='%s'", g_SandboxDevicePath.c_str(), g_SandboxRelativePath.c_str());
-}
-
-// 辅助：获取文件句柄对应的路径
-std::wstring GetPathFromHandle(HANDLE hFile) {
-    ULONG len = 0;
-    fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
-    if (len == 0) return L"";
-
-    std::vector<BYTE> buffer(len);
-    if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
-
-    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-    if (!nameInfo->Name.Buffer) return L"";
-
-    return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-}
-
-// [新增] 判断句柄是否指向沙盒内对象
-// 依赖 g_SandboxDevicePath (由 InitSpoofing 初始化)
-bool IsHandleInSandbox(HANDLE hFile) {
-    if (!hFile || hFile == INVALID_HANDLE_VALUE) return false;
-    if (g_SandboxDevicePath.empty()) return false;
-
-    std::wstring path = GetPathFromHandle(hFile);
-    if (path.empty()) return false;
-
-    // 检查路径前缀是否匹配沙盒设备路径
-    // 例如: \Device\HarddiskVolume2\Sandbox
-    if (path.size() >= g_SandboxDevicePath.size() &&
-        _wcsnicmp(path.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
-        return true;
-    }
-    return false;
-}
-
-// [新增] File ID 混淆/还原算法 (XOR 翻转)
-// 移植自 file.c: IS_DELETE_MARK 附近的逻辑
-void ToggleFileIdScramble(PLARGE_INTEGER pId) {
-    if (pId) {
-        pId->LowPart ^= 0xFFFFFFFF;
-        pId->HighPart ^= 0xFFFFFFFF;
-    }
 }
 
 // [新增] 移除 NTFS 交换数据流 (ADS) 后缀
@@ -1500,48 +1419,16 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    // 锁检查 (使用之前移植的 TLS 锁)
+    // [修改] 使用细粒度锁
+    // 如果锁计数 > 0 说明是 Hook 内部发起的调用 直接放行给原始函数
     if (g_Tls.NtCreateFile_LockCount > 0) {
         return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     }
+
+    // 建立锁保护 (RAII)
     NtCreateFileGuard tlsGuard;
 
-    // [新增] 处理按 ID 打开 (FILE_OPEN_BY_FILE_ID)
-    // 移植自 file.c: File_GetName_FromFileId
-    if (CreateOptions & FILE_OPEN_BY_FILE_ID) {
-        // 这种模式下，RootDirectory 必须存在，且 ObjectName 是一个 8 字节的 File ID
-        if (ObjectAttributes && ObjectAttributes->RootDirectory && ObjectAttributes->ObjectName) {
-
-            // 检查父目录句柄是否在沙盒内
-            if (IsHandleInSandbox(ObjectAttributes->RootDirectory)) {
-
-                // 如果父目录在沙盒内，说明传入的 ID 很可能是我们之前混淆过的
-                // 我们需要将其还原 (Unscramble) 才能让系统找到真实文件
-
-                if (ObjectAttributes->ObjectName->Length == sizeof(LARGE_INTEGER)) {
-                    // 1. 复制 ObjectAttributes (避免修改调用者的只读内存)
-                    OBJECT_ATTRIBUTES oa = *ObjectAttributes;
-                    UNICODE_STRING objName = *ObjectAttributes->ObjectName;
-                    LARGE_INTEGER fileId;
-
-                    // 2. 复制并还原 ID
-                    memcpy(&fileId, objName.Buffer, sizeof(LARGE_INTEGER));
-                    ToggleFileIdScramble(&fileId);
-
-                    // 3. 指向还原后的 ID
-                    objName.Buffer = (PWSTR)&fileId;
-                    oa.ObjectName = &objName;
-
-                    // 4. 调用原始函数
-                    return fpNtCreateFile(FileHandle, DesiredAccess, &oa, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-                }
-            }
-        }
-        // 如果不是沙盒内的 ID 打开，直接透传
-        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-    }
-
-    // 1. 路径解析与规范化 (后续原有逻辑)
+    // 1. 路径解析与规范化
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
@@ -1730,6 +1617,21 @@ NTSTATUS NTAPI Detour_NtOpenFile(
     return Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, NULL, 0, ShareAccess, FILE_OPEN, OpenOptions, NULL, 0);
 }
 
+// 辅助：获取文件句柄对应的路径
+std::wstring GetPathFromHandle(HANDLE hFile) {
+    ULONG len = 0;
+    fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
+    if (len == 0) return L"";
+
+    std::vector<BYTE> buffer(len);
+    if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
+
+    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+    if (!nameInfo->Name.Buffer) return L"";
+
+    return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+}
+
 // [新增] 创建一个空的占位文件
 void CreateDummyFile(const std::wstring& path) {
     HANDLE hFile = CreateFileW(path.c_str(), 0, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1866,51 +1768,19 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // ==============================================================================
-    // [新增] 修复重命名时的 "无效设备" (跨卷移动) 错误
-    // ==============================================================================
-    if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
-
-        PFILE_RENAME_INFORMATION pRename = (PFILE_RENAME_INFORMATION)FileInformation;
-        std::wstring targetName(pRename->FileName, pRename->FileNameLength / sizeof(wchar_t));
-
-        // 检查目标路径是否是绝对路径 (以 \ 开头)
-        // 如果是相对路径 (如 "NewName")，通常不需要处理，系统会自动基于 FileHandle 处理
-        if (targetName.length() > 0 && targetName[0] == L'\\') {
-
-            // 1. 规范化目标路径
-            std::wstring fullTargetNt = NormalizeNtPath(targetName);
-            std::wstring redirectedTargetNt;
-
-            // 2. 检查目标路径是否需要重定向
-            if (ShouldRedirect(fullTargetNt, redirectedTargetNt)) {
-
-                // 3. 构造新的重命名结构体
-                // 我们需要分配一个新的缓冲区，因为重定向后的路径可能比原路径长
-                ULONG newSize = Length + (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t)) + 128;
-                PFILE_RENAME_INFORMATION pNewRename = (PFILE_RENAME_INFORMATION)new(char[newSize]);
-
-                if (pNewRename) {
-                    memset(pNewRename, 0, newSize);
-
-                    // 复制头部信息
-                    pNewRename->ReplaceIfExists = pRename->ReplaceIfExists;
-                    pNewRename->RootDirectory = pRename->RootDirectory;
-
-                    if (FileInformationClass == FileRenameInformationEx) {
-                         ((PFILE_DISPOSITION_INFORMATION_EX)pNewRename)->Flags = ((PFILE_DISPOSITION_INFORMATION_EX)pRename)->Flags;
-                    }
-
-                    // 填入重定向后的沙盒路径
-                    pNewRename->FileNameLength = (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t));
-                    memcpy(pNewRename->FileName, redirectedTargetNt.c_str(), pNewRename->FileNameLength);
-
-                    // 4. 调用原始函数
-                    NTSTATUS status = fpNtSetInformationFile(FileHandle, IoStatusBlock, pNewRename, newSize, FileInformationClass);
-
-                    delete[] (char*)pNewRename;
-                    return status;
-                }
+    // [新增] 拦截硬链接创建 (FileLinkInformation)
+    // Sandboxie 逻辑：不支持在沙盒内创建指向外部的硬链接 也不支持沙盒内硬链接
+    // 返回 STATUS_INVALID_DEVICE_REQUEST 会迫使大多数程序（如 cmd, msi）回退到 CopyFile
+    if (FileInformationClass == FileLinkInformation) {
+        // 可选：检查是否真的涉及沙盒路径 为了简化和安全 全局拦截或仅拦截涉及重定向的句柄
+        // 这里采用安全策略：如果句柄指向的文件在重定向范围内 则拦截
+        std::wstring rawPath = GetPathFromHandle(FileHandle);
+        if (!rawPath.empty()) {
+            std::wstring ntPath = DevicePathToNtPath(rawPath);
+            std::wstring targetPath;
+            if (ShouldRedirect(ntPath, targetPath)) {
+                DebugLog(L"Blocked HardLink creation for: %s", ntPath.c_str());
+                return STATUS_INVALID_DEVICE_REQUEST;
             }
         }
     }
@@ -2504,7 +2374,6 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
-
     return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
@@ -2866,8 +2735,15 @@ BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain,
 DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags) {
     if (g_IsInHook) return fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
     RecursionGuard guard;
-
-    return fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    DWORD lastErr = GetLastError();
+    DWORD result = fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    if (result > 0 && result < cchFilePath) {
+        if (wcsstr(lpszFilePath, g_SandboxRoot)) {
+            // 暂时不处理反向映射
+        }
+    }
+    SetLastError(lastErr);
+    return result;
 }
 
 // --- Winsock Hooks ---
@@ -3311,8 +3187,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         g_PublicNt = L"\\??\\";
         g_PublicNt += buffer;
     }
-
-    InitSpoofing();
 
     DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
 
