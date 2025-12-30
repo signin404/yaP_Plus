@@ -91,6 +91,14 @@
 #define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BBL)
 #endif
 
+#ifndef FileNameInformation
+#define FileNameInformation ((FILE_INFORMATION_CLASS)9)
+#endif
+
+#ifndef FileAllInformation
+#define FileAllInformation ((FILE_INFORMATION_CLASS)18)
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -441,6 +449,19 @@ P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 
+// --- 调试日志 ---
+void DebugLog(const wchar_t* format, ...) {
+    DWORD lastErr = GetLastError();
+    wchar_t buffer[2048];
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf_s(buffer, _countof(buffer), _TRUNCATE, format, args);
+    va_end(args);
+
+    OutputDebugStringW(buffer);
+    SetLastError(lastErr);
+}
+
 // [新增] 进程类型枚举
 enum ProcessType {
     ProcType_Generic = 0,
@@ -641,19 +662,6 @@ P_CreateProcessAsUserA fpCreateProcessAsUserA = NULL;
 P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
 P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
 P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
-
-// --- 调试日志 ---
-void DebugLog(const wchar_t* format, ...) {
-    DWORD lastErr = GetLastError();
-    wchar_t buffer[2048];
-    va_list args;
-    va_start(args, format);
-    _vsnwprintf_s(buffer, _countof(buffer), _TRUNCATE, format, args);
-    va_end(args);
-
-    OutputDebugStringW(buffer);
-    SetLastError(lastErr);
-}
 
 // --- 辅助工具 ---
 
