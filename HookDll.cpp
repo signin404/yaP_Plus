@@ -398,6 +398,13 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 #endif
 
 // [新增] 定义 FS_INFORMATION_CLASS 枚举 (必须在函数指针定义之前)
+#ifdef FileFsVolumeInformation
+#undef FileFsVolumeInformation
+#endif
+#ifdef FileFsAttributeInformation
+#undef FileFsAttributeInformation
+#endif
+
 typedef enum _FS_INFORMATION_CLASS {
     FileFsVolumeInformation = 1,
     FileFsLabelInformation,
