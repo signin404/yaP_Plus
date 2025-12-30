@@ -1155,6 +1155,41 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     return true;
 }
 
+// [新增] 复制文件时间戳 (Creation, Access, Write)
+bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
+    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hSrc == INVALID_HANDLE_VALUE) return false;
+
+    FILETIME ftCreate, ftAccess, ftWrite;
+    bool result = false;
+    if (GetFileTime(hSrc, &ftCreate, &ftAccess, &ftWrite)) {
+        HANDLE hDest = CreateFileW(destPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (hDest != INVALID_HANDLE_VALUE) {
+            if (SetFileTime(hDest, &ftCreate, &ftAccess, &ftWrite)) {
+                result = true;
+            }
+            CloseHandle(hDest);
+        }
+    }
+    CloseHandle(hSrc);
+    return result;
+}
+
+// [新增] 复制文件属性 (Hidden, System 等) 并剥离 ReadOnly
+bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
+    DWORD srcAttrs = GetFileAttributesW(srcPath);
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
+
+    // 核心逻辑：剥离只读属性
+    // 如果源文件是只读的 复制到沙盒后必须变为可写 否则 CoW 失去意义
+    DWORD destAttrs = srcAttrs & ~FILE_ATTRIBUTE_READONLY;
+
+    // 确保至少有一个属性 (防止为 0)
+    if (destAttrs == 0) destAttrs = FILE_ATTRIBUTE_NORMAL;
+
+    return SetFileAttributesW(destPath, destAttrs) != FALSE;
+}
+
 // [重写] 执行写时复制 (Migration)
 // 移植自 file.c: File_MigrateFile 和 File_CreatePath
 bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath) {
@@ -2512,42 +2547,6 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 }
 
 // --- 路径处理辅助函数 ---
-
-// [新增] 复制文件时间戳 (Creation, Access, Write)
-bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
-    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (hSrc == INVALID_HANDLE_VALUE) return false;
-
-    FILETIME ftCreate, ftAccess, ftWrite;
-    bool result = false;
-    if (GetFileTime(hSrc, &ftCreate, &ftAccess, &ftWrite)) {
-        HANDLE hDest = CreateFileW(destPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (hDest != INVALID_HANDLE_VALUE) {
-            if (SetFileTime(hDest, &ftCreate, &ftAccess, &ftWrite)) {
-                result = true;
-            }
-            CloseHandle(hDest);
-        }
-    }
-    CloseHandle(hSrc);
-    return result;
-}
-
-// [新增] 复制文件属性 (Hidden, System 等) 并剥离 ReadOnly
-// 对应 file.c: File_SetAttributes / File_CheckCreateParameters 中的逻辑
-bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
-    DWORD srcAttrs = GetFileAttributesW(srcPath);
-    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
-
-    // 核心逻辑：剥离只读属性
-    // 如果源文件是只读的 复制到沙盒后必须变为可写 否则 CoW 失去意义
-    DWORD destAttrs = srcAttrs & ~FILE_ATTRIBUTE_READONLY;
-
-    // 确保至少有一个属性 (防止为 0)
-    if (destAttrs == 0) destAttrs = FILE_ATTRIBUTE_NORMAL;
-
-    return SetFileAttributesW(destPath, destAttrs) != FALSE;
-}
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
 // 如果不需要重定向或重定向后文件/目录不存在 返回空字符串
