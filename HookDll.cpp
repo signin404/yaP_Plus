@@ -2077,7 +2077,7 @@ BOOL CreateProcessInternal(
     LPPROCESS_INFORMATION lpProcessInformation,
     bool isAnsi
 ) {
-    // 1. 转换输入参数为 Wide String 以便处理
+    // 1. 转换输入参数为 Wide String
     std::wstring exePathW;
     if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
     else exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
@@ -2086,7 +2086,7 @@ BOOL CreateProcessInternal(
     if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
     else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
-    // 获取目标 EXE 路径 (从 AppName 或 CommandLine 提取)
+    // 获取目标 EXE 路径
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
 
     // 判断是否为无路径的纯文件名
@@ -2096,10 +2096,11 @@ BOOL CreateProcessInternal(
     // --- 自动解析无路径的命令 ---
     if (isBareFilename) {
         std::wstring resolvedPath;
+        // 使用 ResolveCmdPath (需确保已添加此辅助函数)
         if (ResolveCmdPath(targetExe, resolvedPath)) {
             targetExe = resolvedPath; // 更新为全路径 (如 C:\Windows\System32\PING.EXE)
             isBareFilename = false;
-            wasResolved = true;
+            wasResolved = true;       // 标记：我们主动修改了路径
         }
     }
 
@@ -2117,19 +2118,17 @@ BOOL CreateProcessInternal(
 
     // --- 3. 构造最终参数 ---
 
-    // 默认使用原始参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
-    // 注意：lpCommandLine 不是 const，我们需要根据情况替换它
     void* finalCommandLine = lpCommandLine;
 
-    // 临时变量，用于保持重组后的字符串生命周期
+    // 临时变量保持生命周期
     std::wstring newCmdLineW;
     std::string newCmdLineA;
     std::string ansiDir;
 
-    // [核心修复] 如果发生了重定向 或者 我们主动解析了路径
-    // 我们必须重组命令行，并清空 AppName，以避免 argv[0] 不匹配的问题
+    // [核心修复] 只要路径发生了变化（重定向了，或者被我们解析补全了）
+    // 就必须重组命令行，并清空 AppName，确保 argv[0] 与实际执行文件一致！
     if (!redirectedExe.empty() || (wasResolved && lpApplicationName == NULL)) {
 
         // 确定最终使用的 EXE 路径
@@ -2138,6 +2137,7 @@ BOOL CreateProcessInternal(
         DebugLog(L"CreateProcess Rewrite: %s -> %s", targetExe.c_str(), finalExePath.c_str());
 
         // 提取原始命令行中的参数部分 (跳过第一个 token)
+        // 注意：PathGetArgsW 会自动处理引号
         LPCWSTR originalArgs = PathGetArgsW(cmdLineW.c_str());
 
         // 重组命令行: "FinalExePath" OriginalArgs
@@ -2147,10 +2147,11 @@ BOOL CreateProcessInternal(
             newCmdLineW += originalArgs;
         }
 
-        // 强制清空 AppName，让系统完全依赖我们重组的 CommandLine
+        // ！！！关键点：强制清空 AppName ！！！
+        // 让 CreateProcess 完全依赖我们构造的正确命令行
         finalAppName = NULL;
 
-        // 根据字符集设置 finalCommandLine
+        // 设置 finalCommandLine
         if (isAnsi) {
             newCmdLineA = WideToAnsi(newCmdLineW.c_str());
             finalCommandLine = (void*)newCmdLineA.c_str();
@@ -2161,7 +2162,6 @@ BOOL CreateProcessInternal(
 
     // 处理工作目录重定向
     if (!redirectedDir.empty()) {
-        DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
         if (isAnsi) {
             ansiDir = WideToAnsi(redirectedDir.c_str());
             finalCurDir = ansiDir.c_str();
@@ -2183,7 +2183,6 @@ BOOL CreateProcessInternal(
         result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)finalCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
     }
 
-    // 5. 注入与恢复
     if (result) {
         RequestInjectionFromLauncher(pPI->dwProcessId);
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
