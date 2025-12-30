@@ -739,6 +739,33 @@ std::wstring GetDevicePathByDrive(wchar_t driveLetter) {
     return L"";
 }
 
+// [新增] 判断句柄是否指向沙盒内对象
+// 依赖 g_SandboxDevicePath (由 InitSpoofing 初始化)
+bool IsHandleInSandbox(HANDLE hFile) {
+    if (!hFile || hFile == INVALID_HANDLE_VALUE) return false;
+    if (g_SandboxDevicePath.empty()) return false;
+
+    std::wstring path = GetPathFromHandle(hFile);
+    if (path.empty()) return false;
+
+    // 检查路径前缀是否匹配沙盒设备路径
+    // 例如: \Device\HarddiskVolume2\Sandbox
+    if (path.size() >= g_SandboxDevicePath.size() &&
+        _wcsnicmp(path.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+        return true;
+    }
+    return false;
+}
+
+// [新增] File ID 混淆/还原算法 (XOR 翻转)
+// 移植自 file.c: IS_DELETE_MARK 附近的逻辑
+void ToggleFileIdScramble(PLARGE_INTEGER pId) {
+    if (pId) {
+        pId->LowPart ^= 0xFFFFFFFF;
+        pId->HighPart ^= 0xFFFFFFFF;
+    }
+}
+
 // [新增] 移除 NTFS 交换数据流 (ADS) 后缀
 // 逻辑参考 file.c: File_MatchPath2
 std::wstring StripAds(const std::wstring& path) {
@@ -1463,16 +1490,48 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    // [修改] 使用细粒度锁
-    // 如果锁计数 > 0 说明是 Hook 内部发起的调用 直接放行给原始函数
+    // 锁检查 (使用之前移植的 TLS 锁)
     if (g_Tls.NtCreateFile_LockCount > 0) {
         return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     }
-
-    // 建立锁保护 (RAII)
     NtCreateFileGuard tlsGuard;
 
-    // 1. 路径解析与规范化
+    // [新增] 处理按 ID 打开 (FILE_OPEN_BY_FILE_ID)
+    // 移植自 file.c: File_GetName_FromFileId
+    if (CreateOptions & FILE_OPEN_BY_FILE_ID) {
+        // 这种模式下，RootDirectory 必须存在，且 ObjectName 是一个 8 字节的 File ID
+        if (ObjectAttributes && ObjectAttributes->RootDirectory && ObjectAttributes->ObjectName) {
+            
+            // 检查父目录句柄是否在沙盒内
+            if (IsHandleInSandbox(ObjectAttributes->RootDirectory)) {
+                
+                // 如果父目录在沙盒内，说明传入的 ID 很可能是我们之前混淆过的
+                // 我们需要将其还原 (Unscramble) 才能让系统找到真实文件
+                
+                if (ObjectAttributes->ObjectName->Length == sizeof(LARGE_INTEGER)) {
+                    // 1. 复制 ObjectAttributes (避免修改调用者的只读内存)
+                    OBJECT_ATTRIBUTES oa = *ObjectAttributes;
+                    UNICODE_STRING objName = *ObjectAttributes->ObjectName;
+                    LARGE_INTEGER fileId;
+                    
+                    // 2. 复制并还原 ID
+                    memcpy(&fileId, objName.Buffer, sizeof(LARGE_INTEGER));
+                    ToggleFileIdScramble(&fileId);
+                    
+                    // 3. 指向还原后的 ID
+                    objName.Buffer = (PWSTR)&fileId;
+                    oa.ObjectName = &objName;
+                    
+                    // 4. 调用原始函数
+                    return fpNtCreateFile(FileHandle, DesiredAccess, &oa, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                }
+            }
+        }
+        // 如果不是沙盒内的 ID 打开，直接透传
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+
+    // 1. 路径解析与规范化 (后续原有逻辑)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
@@ -2472,25 +2531,45 @@ NTSTATUS NTAPI Detour_NtQueryObject(
 }
 
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
+    HANDLE FileHandle, 
+    PIO_STATUS_BLOCK IoStatusBlock, 
     PVOID FileInformation,
-    ULONG Length,
+    ULONG Length, 
     FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
+    // 1. 调用原始函数
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
-    // 仅处理成功的情况
     if (NT_SUCCESS(status)) {
+        
+        // =========================================================
+        // [新增] File ID 混淆逻辑
+        // =========================================================
+        PLARGE_INTEGER pFileId = NULL;
 
-        // 1. 处理 FileNameInformation (返回相对路径 如 \Sandbox\C\Windows\...)
-        // 2. 处理 FileAllInformation (包含 FileNameInformation)
+        if (FileInformationClass == FileInternalInformation) {
+            if (Length >= sizeof(FILE_INTERNAL_INFORMATION)) {
+                pFileId = &((PFILE_INTERNAL_INFORMATION)FileInformation)->IndexNumber;
+            }
+        }
+        else if (FileInformationClass == FileAllInformation) {
+            if (Length >= sizeof(FILE_ALL_INFORMATION)) {
+                pFileId = &((PFILE_ALL_INFORMATION)FileInformation)->InternalInformation.IndexNumber;
+            }
+        }
 
+        // 如果获取到了 ID 指针，且文件位于沙盒内，则进行混淆
+        if (pFileId && IsHandleInSandbox(FileHandle)) {
+            ToggleFileIdScramble(pFileId);
+        }
+
+        // =========================================================
+        // [原有] 文件名欺骗逻辑 (保持不变)
+        // =========================================================
         PFILE_NAME_INFORMATION pNameInfo = NULL;
-
         if (FileInformationClass == (FILE_INFORMATION_CLASS)9 /*FileNameInformation*/) {
             pNameInfo = (PFILE_NAME_INFORMATION)FileInformation;
         }
@@ -2499,28 +2578,14 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
         }
 
         if (pNameInfo && pNameInfo->FileNameLength > 0) {
-
-            // 获取当前路径
-            // 例如: \Sandbox\C\Windows\System32\notepad.exe
             std::wstring currentPath(pNameInfo->FileName, pNameInfo->FileNameLength / sizeof(wchar_t));
-
-            // 检查是否以沙盒相对路径开头
-            if (!g_SandboxRelativePath.empty() &&
+            if (!g_SandboxRelativePath.empty() && 
                 currentPath.size() > g_SandboxRelativePath.size() &&
                 _wcsnicmp(currentPath.c_str(), g_SandboxRelativePath.c_str(), g_SandboxRelativePath.size()) == 0) {
-
-                // 检查结构: \Sandbox + \ + C + \ ...
+                
                 size_t relLen = g_SandboxRelativePath.size();
                 if (currentPath[relLen] == L'\\' && currentPath[relLen + 2] == L'\\') {
-
-                    // 提取真实相对路径
-                    // \Windows\System32\notepad.exe
-                    // 跳过 \Sandbox\C (长度为 relLen + 1 + 1)
-                    // 但我们需要保留开头的 '\' 所以跳过 relLen + 2
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
-
-                    // 原地修改缓冲区
-                    // 欺骗后的路径肯定比原路径短 直接覆盖即可
                     memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
                     pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
                 }
