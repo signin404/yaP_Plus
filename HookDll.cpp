@@ -907,7 +907,15 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
         if (!g_SystemDriveNt.empty()) {
             if (fullNtPath.size() < g_SystemDriveNt.size() ||
                 _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) != 0) {
-                // 不是系统盘 -> 不重定向 (直接读写原路径)
+                // 不是系统盘 -> 不重定向
+                return false;
+            }
+
+            // [新增] 关键修复：在 Mode 1 下排除 System32 和 SysWOW64
+            // 防止 PowerShell 等工具因目录扫描差异导致找不到 ping.exe 等系统命令
+            // 这些目录通常是只读的，重定向的意义不大，但风险极高
+            if (ContainsCaseInsensitive(fullNtPath, L"\\Windows\\System32") ||
+                ContainsCaseInsensitive(fullNtPath, L"\\Windows\\SysWOW64")) {
                 return false;
             }
         }
