@@ -1875,19 +1875,51 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // [新增] 拦截硬链接创建 (FileLinkInformation)
-    // Sandboxie 逻辑：不支持在沙盒内创建指向外部的硬链接 也不支持沙盒内硬链接
-    // 返回 STATUS_INVALID_DEVICE_REQUEST 会迫使大多数程序（如 cmd, msi）回退到 CopyFile
-    if (FileInformationClass == FileLinkInformation) {
-        // 可选：检查是否真的涉及沙盒路径 为了简化和安全 全局拦截或仅拦截涉及重定向的句柄
-        // 这里采用安全策略：如果句柄指向的文件在重定向范围内 则拦截
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
-            std::wstring targetPath;
-            if (ShouldRedirect(ntPath, targetPath)) {
-                DebugLog(L"Blocked HardLink creation for: %s", ntPath.c_str());
-                return STATUS_INVALID_DEVICE_REQUEST;
+    // ==============================================================================
+    // [新增] 修复重命名时的 "无效设备" (跨卷移动) 错误
+    // ==============================================================================
+    if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
+        
+        PFILE_RENAME_INFORMATION pRename = (PFILE_RENAME_INFORMATION)FileInformation;
+        std::wstring targetName(pRename->FileName, pRename->FileNameLength / sizeof(wchar_t));
+
+        // 检查目标路径是否是绝对路径 (以 \ 开头)
+        // 如果是相对路径 (如 "NewName")，通常不需要处理，系统会自动基于 FileHandle 处理
+        if (targetName.length() > 0 && targetName[0] == L'\\') {
+            
+            // 1. 规范化目标路径
+            std::wstring fullTargetNt = NormalizeNtPath(targetName);
+            std::wstring redirectedTargetNt;
+
+            // 2. 检查目标路径是否需要重定向
+            if (ShouldRedirect(fullTargetNt, redirectedTargetNt)) {
+                
+                // 3. 构造新的重命名结构体
+                // 我们需要分配一个新的缓冲区，因为重定向后的路径可能比原路径长
+                ULONG newSize = Length + (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t)) + 128;
+                PFILE_RENAME_INFORMATION pNewRename = (PFILE_RENAME_INFORMATION)new(char[newSize]);
+                
+                if (pNewRename) {
+                    memset(pNewRename, 0, newSize);
+                    
+                    // 复制头部信息
+                    pNewRename->ReplaceIfExists = pRename->ReplaceIfExists;
+                    pNewRename->RootDirectory = pRename->RootDirectory;
+                    
+                    if (FileInformationClass == FileRenameInformationEx) {
+                         ((PFILE_DISPOSITION_INFORMATION_EX)pNewRename)->Flags = ((PFILE_DISPOSITION_INFORMATION_EX)pRename)->Flags;
+                    }
+
+                    // 填入重定向后的沙盒路径
+                    pNewRename->FileNameLength = (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t));
+                    memcpy(pNewRename->FileName, redirectedTargetNt.c_str(), pNewRename->FileNameLength);
+
+                    // 4. 调用原始函数
+                    NTSTATUS status = fpNtSetInformationFile(FileHandle, IoStatusBlock, pNewRename, newSize, FileInformationClass);
+                    
+                    delete[] (char*)pNewRename;
+                    return status;
+                }
             }
         }
     }
@@ -2958,13 +2990,52 @@ BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain,
 DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags) {
     if (g_IsInHook) return fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
     RecursionGuard guard;
+    
     DWORD lastErr = GetLastError();
+    
+    // 1. 调用原始函数获取真实路径 (例如 \\?\Z:\Sandbox\C\New)
     DWORD result = fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    
     if (result > 0 && result < cchFilePath) {
-        if (wcsstr(lpszFilePath, g_SandboxRoot)) {
-            // 暂时不处理反向映射
+        
+        // 2. 检查是否包含沙盒根目录
+        // g_SandboxRoot 格式如 Z:\Sandbox
+        // GetFinalPathNameByHandleW 返回格式通常是 \\?\Z:\Sandbox\...
+        
+        std::wstring finalPath = lpszFilePath;
+        
+        // 构造匹配前缀: \\?\ + g_SandboxRoot
+        std::wstring sandboxPrefix = L"\\\\?\\" + std::wstring(g_SandboxRoot);
+        
+        // 不区分大小写比较
+        if (finalPath.size() >= sandboxPrefix.size() &&
+            _wcsnicmp(finalPath.c_str(), sandboxPrefix.c_str(), sandboxPrefix.size()) == 0) {
+            
+            // 3. 执行反向映射 (去除沙盒前缀)
+            // 原始: \\?\Z:\Sandbox\C\New
+            // 目标: \\?\C:\New
+            
+            // 提取相对路径: \C\New
+            std::wstring relPath = finalPath.substr(sandboxPrefix.size());
+            
+            // 处理盘符结构
+            // 如果 relPath 是 \C\New，我们需要把它变成 C:\New
+            if (relPath.length() >= 2 && relPath[0] == L'\\') {
+                
+                std::wstring driveLetter(1, relPath[1]); // C
+                std::wstring remaining = relPath.substr(2); // \New
+                
+                std::wstring spoofedPath = L"\\\\?\\" + driveLetter + L":" + remaining;
+                
+                // 4. 写回缓冲区
+                if (spoofedPath.length() < cchFilePath) {
+                    wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
+                    result = (DWORD)spoofedPath.length();
+                }
+            }
         }
     }
+    
     SetLastError(lastErr);
     return result;
 }
