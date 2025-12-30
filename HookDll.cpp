@@ -441,6 +441,68 @@ P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 
+// [新增] 进程类型枚举
+enum ProcessType {
+    ProcType_Generic = 0,
+    ProcType_Msi_Installer,
+    ProcType_Office_Outlook,
+    ProcType_Mozilla_Firefox,
+    ProcType_Explorer,
+    // [新增]
+    ProcType_TiWorker,          // TiWorker.exe (Windows Modules Installer Worker)
+    ProcType_WMP,               // wmplayer.exe
+    ProcType_SvcHost,           // svchost.exe (用于 Windows Update 等)
+    ProcType_DllHost            // dllhost.exe (用于 WebCache)
+};
+
+// [新增] 当前进程类型
+ProcessType g_CurrentProcessType = ProcType_Generic;
+
+// [新增] 初始化进程类型 (在 InitHookThread 中调用)
+void InitProcessType() {
+    if (g_CurrentProcessPathNt.empty()) return;
+
+    // 获取文件名部分
+    size_t lastSlash = g_CurrentProcessPathNt.find_last_of(L'\\');
+    std::wstring exeName = (lastSlash != std::wstring::npos) ?
+                           g_CurrentProcessPathNt.substr(lastSlash + 1) : g_CurrentProcessPathNt;
+
+    std::transform(exeName.begin(), exeName.end(), exeName.begin(), towlower);
+
+    if (exeName == L"msiexec.exe") {
+        g_CurrentProcessType = ProcType_Msi_Installer;
+        DebugLog(L"Compat: Detected MSI Installer");
+    }
+    else if (exeName == L"outlook.exe") {
+        g_CurrentProcessType = ProcType_Office_Outlook;
+        DebugLog(L"Compat: Detected Outlook");
+    }
+    else if (exeName == L"firefox.exe") {
+        g_CurrentProcessType = ProcType_Mozilla_Firefox;
+        DebugLog(L"Compat: Detected Firefox");
+    }
+    else if (exeName == L"explorer.exe") {
+        g_CurrentProcessType = ProcType_Explorer;
+        DebugLog(L"Compat: Detected Explorer");
+    }
+    else if (exeName == L"tiworker.exe") {
+        g_CurrentProcessType = ProcType_TiWorker;
+        DebugLog(L"Compat: Detected TiWorker");
+    }
+    else if (exeName == L"wmplayer.exe") {
+        g_CurrentProcessType = ProcType_WMP;
+        DebugLog(L"Compat: Detected Windows Media Player");
+    }
+    else if (exeName == L"svchost.exe") {
+        g_CurrentProcessType = ProcType_SvcHost;
+        DebugLog(L"Compat: Detected SvcHost");
+    }
+    else if (exeName == L"dllhost.exe") {
+        g_CurrentProcessType = ProcType_DllHost;
+        DebugLog(L"Compat: Detected DllHost");
+    }
+}
+
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
 void InitSystemWhitelist() {
     if (g_SystemDriveNt.empty()) return;
@@ -757,12 +819,12 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
 
     // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
     // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
-    HANDLE hFile = CreateFileW(dosPath.c_str(), 
-        0, 
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
-        NULL, 
-        OPEN_EXISTING, 
-        FILE_FLAG_BACKUP_SEMANTICS, 
+    HANDLE hFile = CreateFileW(dosPath.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
         NULL);
 
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -777,9 +839,9 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
             if (res.rfind(L"\\\\?\\", 0) == 0) {
                 return L"\\??\\" + res.substr(4);
             }
-            return res; 
+            return res;
         }
-    } 
+    }
     else {
         // 3. 文件不存在 (可能是创建新文件)，尝试展开短文件名
         // GetLongPathNameW 即使文件不存在，只要路径组件存在也能工作
@@ -1049,10 +1111,24 @@ void PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
 
     // 2. 根据类型处理
     if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
-        // 如果是目录 直接在沙盒创建空目录即可
-        // 不需要复制内容 因为后续访问内容时会通过 BuildMergedDirectoryList 合并显示
         CreateDirectoryW(targetDos.c_str(), NULL);
     } else {
+        // [新增] Windows Media Player 补丁
+        // file.c: Dll_ImageType == DLL_IMAGE_WINDOWS_MEDIA_PLAYER
+        // 不复制 .wmdb 文件的内容，因为它们太大且会被重建
+        if (g_CurrentProcessType == ProcType_WMP) {
+            if (sourceDos.length() > 5 &&
+                _wcsicmp(sourceDos.c_str() + sourceDos.length() - 5, L".wmdb") == 0) {
+
+                // 仅创建空文件，不复制内容
+                HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, srcAttrs, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+
+                DebugLog(L"Compat: WMP - Skipped content copy for %s", sourceDos.c_str());
+                return;
+            }
+        }
+
         // 如果是文件 执行复制
         DebugLog(L"Migrating: %s -> %s", sourceDos.c_str(), targetDos.c_str());
         CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE);
@@ -1109,7 +1185,7 @@ bool IsDriveRoot(const std::wstring& path) {
 void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& sandboxPath, const std::wstring& pattern, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
-    // 1. 扫描真实目录 (增加过滤)
+    // 1. 扫描真实目录 (保持不变)
     if (!realPath.empty()) {
         std::wstring realNtPath = L"\\??\\" + realPath;
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
@@ -1120,7 +1196,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
             WIN32_FIND_DATAW fd;
 
-            // --- [修改] 智能 WOW64 重定向控制 ---
+            // --- 智能 WOW64 重定向控制 ---
             PVOID oldRedirectionValue = NULL;
             BOOL isWow64 = FALSE;
             bool needDisable = false;
@@ -1128,9 +1204,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
             IsWow64Process(GetCurrentProcess(), &isWow64);
 
             if (isWow64) {
-                // 逻辑：
-                // 1. 句柄指向的路径包含 "System32" (说明未被重定向到 SysWOW64)
-                // 2. 路径位于系统盘 (避免误伤 Z:\Windows\System32)
                 if (StrStrIW(realPath.c_str(), L"System32") != NULL) {
                     if (!g_SystemDriveLetter.empty() &&
                         _wcsnicmp(realPath.c_str(), g_SystemDriveLetter.c_str(), g_SystemDriveLetter.length()) == 0) {
@@ -1145,7 +1218,6 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
 
             HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
 
-            // --- 恢复重定向 ---
             if (needDisable) {
                 Wow64RevertWow64FsRedirection(oldRedirectionValue);
             }
@@ -1173,7 +1245,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 2. 扫描沙盒目录 (保持不变 沙盒内容始终可见)
+    // 2. 扫描沙盒目录 (标准路径)
     if (!sandboxPath.empty()) {
         std::wstring searchPath = sandboxPath;
         if (searchPath.back() != L'\\') searchPath += L"\\";
@@ -1192,7 +1264,50 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         }
     }
 
-    // 3. 添加 . 和 ..
+    // [新增] 3. 扫描沙盒内的 Sysnative 目录 (解决 WOW64 下 drivers 等目录的分离问题)
+    BOOL isWow64 = FALSE;
+    IsWow64Process(GetCurrentProcess(), &isWow64);
+
+    // 仅当是 32 位进程，且沙盒路径中包含 System32 时才触发
+    if (isWow64 && !sandboxPath.empty()) {
+        // 查找 System32 (不区分大小写)
+        const wchar_t* pSys32 = StrStrIW(sandboxPath.c_str(), L"\\System32");
+        if (pSys32) {
+            // 构造 Sysnative 路径
+            // 例如: ...\Sandbox\C\Windows\System32\drivers -> ...\Sandbox\C\Windows\Sysnative\drivers
+            std::wstring sysnativePath = sandboxPath;
+            size_t pos = pSys32 - sandboxPath.c_str();
+
+            // 替换 System32 为 Sysnative
+            sysnativePath.replace(pos + 1, 8, L"Sysnative");
+
+            // 检查该目录是否存在
+            DWORD attrs = GetFileAttributesW(sysnativePath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+
+                std::wstring searchPath = sysnativePath;
+                if (searchPath.back() != L'\\') searchPath += L"\\";
+                searchPath += pattern;
+
+                WIN32_FIND_DATAW fd;
+                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                        std::wstring key = fd.cFileName;
+                        std::transform(key.begin(), key.end(), key.begin(), towlower);
+
+                        // [策略] 如果 Sysnative 里有文件，也合并进来
+                        // 通常 Sysnative 里的文件优先级更高（代表真实的64位文件）
+                        mergedMap[key] = ConvertFindData(fd);
+                    } while (FindNextFileW(hFind, &fd));
+                    FindClose(hFind);
+                }
+            }
+        }
+    }
+
+    // 4. 添加 . 和 ..
     if (!IsDriveRoot(realPath)) {
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
@@ -1205,7 +1320,7 @@ void BuildMergedDirectoryList(const std::wstring& realPath, const std::wstring& 
         outList.push_back(dotDotEntry);
     }
 
-    // 4. 转为 Vector
+    // 5. 转为 Vector
     for (const auto& pair : mergedMap) {
         outList.push_back(pair.second);
     }
@@ -1231,22 +1346,90 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
+    // 递归守卫：防止 Hook 内部调用 API 导致死循环
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
 
+    // 1. 路径解析与规范化
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring fullNtPath = NormalizeNtPath(rawNtPath); // 解析短文件名、符号链接
 
-    // [修改] 增加路径规范化步骤
-    // 解决 C:\PROGRA~1 与 C:\Program Files 不匹配导致重定向失效的问题
-    // 解决 Junction (如 C:\Documents and Settings -> C:\Users) 导致路径判断错误的问题
-    std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+    // [兼容性补丁 - 预处理]
+    // [MSI Installer] 移除 ACCESS_SYSTEM_SECURITY
+    // MSI 访问 .msi 文件时常请求此权限导致失败
+    if (g_CurrentProcessType == ProcType_Msi_Installer) {
+        if (DesiredAccess & ACCESS_SYSTEM_SECURITY) {
+            if (fullNtPath.length() > 4 &&
+                _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 4, L".msi") == 0) {
+                DesiredAccess &= ~ACCESS_SYSTEM_SECURITY;
+                DebugLog(L"Compat: MSI - Stripped ACCESS_SYSTEM_SECURITY for %s", fullNtPath.c_str());
+            }
+        }
+    }
 
+    // [TiWorker] 移除 ACCESS_SYSTEM_SECURITY
+    // Windows 更新进程通常没有权限获取 SACL
+    if (g_CurrentProcessType == ProcType_TiWorker) {
+        if (DesiredAccess & ACCESS_SYSTEM_SECURITY) {
+            DesiredAccess &= ~ACCESS_SYSTEM_SECURITY;
+            DebugLog(L"Compat: TiWorker - Stripped ACCESS_SYSTEM_SECURITY");
+        }
+    }
+
+    // [Firefox] 移除插件 EXE 的 GENERIC_WRITE
+    // Firefox 106+ 尝试写权限打开插件 EXE
+    if (g_CurrentProcessType == ProcType_Mozilla_Firefox) {
+        if (DesiredAccess & GENERIC_WRITE) {
+            if (fullNtPath.length() > 4 &&
+                _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 4, L".exe") == 0) {
+                DesiredAccess &= ~GENERIC_WRITE;
+                DebugLog(L"Compat: Firefox - Stripped GENERIC_WRITE for %s", fullNtPath.c_str());
+            }
+        }
+    }
+
+    // [Explorer] 移除只读文件的写属性请求
+    // 资源管理器右键属性时常请求写权限
+    if (g_CurrentProcessType == ProcType_Explorer && CreateDisposition == FILE_OPEN) {
+        if ((DesiredAccess & FILE_WRITE_ATTRIBUTES) && !(DesiredAccess & (FILE_WRITE_DATA | DELETE))) {
+             DesiredAccess &= ~FILE_WRITE_ATTRIBUTES;
+        }
+    }
+
+    // [Outlook] OICE_ 临时文件安全描述符处理
+    // 清除 SecurityDescriptor 以避免权限问题
+    if (g_CurrentProcessType == ProcType_Office_Outlook) {
+        if (fullNtPath.find(L"\\OICE_") != std::wstring::npos) {
+            if (ObjectAttributes && ObjectAttributes->SecurityDescriptor) {
+                ObjectAttributes->SecurityDescriptor = NULL;
+                DebugLog(L"Compat: Outlook - Cleared SecurityDescriptor for OICE_ file");
+            }
+        }
+    }
+
+    // [System Services] 强制迁移只读数据库
+    // 针对被系统锁定的数据库 (catdb, DataStore.edb, WebCache)，强制请求写权限以触发 CoW
+    if (g_CurrentProcessType == ProcType_SvcHost || g_CurrentProcessType == ProcType_DllHost) {
+        bool isLockedDb = false;
+        if (ContainsCaseInsensitive(fullNtPath, L"catdb")) isLockedDb = true;
+        if (ContainsCaseInsensitive(fullNtPath, L"DataStore.edb")) isLockedDb = true;
+        if (ContainsCaseInsensitive(fullNtPath, L"WebCache")) isLockedDb = true;
+
+        if (isLockedDb) {
+            if (!(DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA))) {
+                DesiredAccess |= FILE_GENERIC_WRITE;
+                DebugLog(L"Compat: SystemDB - Forced Write Access to trigger migration for %s", fullNtPath.c_str());
+            }
+        }
+    }
+
+    // [重定向逻辑]
     std::wstring targetNtPath;
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
+        // 判断是否为写入操作 (包括显式写权限和创建/覆盖操作)
         bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA));
-
         if (CreateDisposition == FILE_CREATE || CreateDisposition == FILE_SUPERSEDE || CreateDisposition == FILE_OVERWRITE || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_OPEN_IF) {
             isWrite = true;
         }
@@ -1254,8 +1437,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         bool sandboxExists = NtPathExists(targetNtPath);
         bool realExists = NtPathExists(fullNtPath);
 
-        // [新增] Mode 3 可见性检查
-        // 如果真实文件存在 但根据策略不可见 则视为不存在
+        // [Mode 3] 可见性检查：如果真实文件存在但被策略隐藏，视为不存在
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
@@ -1264,58 +1446,88 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
         bool shouldRedirect = false;
 
+        // 逻辑分支：
         if (isDirectory && !isWrite) {
+            // 只读目录访问
             shouldRedirect = false;
             if (!realExists && sandboxExists) {
-                shouldRedirect = true;
+                shouldRedirect = true; // 真实不存在，沙盒存在 -> 进沙盒
             } else if (realExists) {
-                // 如果真实存在且可见 直接打开真实目录
-                // 目录内容的过滤由 NtQueryDirectoryFile (BuildMergedDirectoryList) 处理
-                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                // 真实存在 -> 访问真实目录 (内容合并由 NtQueryDirectoryFile 处理)
+                // 除非沙盒里有，真实里没有，否则优先访问真实以获得更好的性能和兼容性
+                // 但如果沙盒里也有，且我们想优先看沙盒属性？通常目录属性不重要，内容才重要。
+                // 这里保持原逻辑：优先真实。
+                shouldRedirect = false;
             } else {
-                // 都不存在 (或被隐藏) -> 重定向到沙盒以报错
-                shouldRedirect = true;
+                shouldRedirect = true; // 都不存在 -> 进沙盒报错
             }
         } else if (isWrite) {
+            // 写入操作
             if (sandboxExists) {
-                shouldRedirect = true;
+                shouldRedirect = true; // 沙盒已有 -> 直接写沙盒
             } else if (realExists) {
+                // 真实有，沙盒没有 -> 写时复制 (CoW)
                 PerformCopyOnWrite(fullNtPath, targetNtPath);
                 shouldRedirect = true;
             } else {
-                shouldRedirect = true;
+                shouldRedirect = true; // 都不存在 -> 在沙盒创建
             }
         } else {
+            // 只读文件访问
             if (sandboxExists) {
-                shouldRedirect = true;
+                shouldRedirect = true; // 沙盒有 -> 读沙盒 (可能是修改过的副本)
             } else if (realExists) {
-                shouldRedirect = false;
-                return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                shouldRedirect = false; // 沙盒没有 -> 读真实
             } else {
-                shouldRedirect = true;
+                shouldRedirect = true; // 都不存在 -> 进沙盒报错
             }
         }
 
+        // 执行重定向
         if (shouldRedirect) {
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
-            ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = NULL;
 
+            // 替换路径
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL; // 必须清空 RootDirectory，因为我们提供了完整路径
+
+            // 如果是写入或创建，确保沙盒内父目录存在
             if (isWrite || CreateDisposition == FILE_CREATE || CreateDisposition == FILE_OPEN_IF || CreateDisposition == FILE_OVERWRITE_IF || CreateDisposition == FILE_SUPERSEDE) {
                 EnsureDirectoryExistsNT(targetNtPath.c_str());
             }
 
             NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+            // 恢复原始参数
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
+
             return status;
         }
     }
 
-    return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    // 不重定向，直接调用原始函数
+    NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+    // [兼容性补丁 - 重试逻辑]
+    // [通用补丁] 自动降级权限重试
+    // 很多程序请求 FILE_WRITE_ATTRIBUTES 但实际上并不需要它来读取文件
+    if (status == STATUS_ACCESS_DENIED && (DesiredAccess & FILE_WRITE_ATTRIBUTES)) {
+        if (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF) {
+            ACCESS_MASK downgradedAccess = DesiredAccess & ~FILE_WRITE_ATTRIBUTES;
+            if (downgradedAccess != 0) {
+                status = fpNtCreateFile(FileHandle, downgradedAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                if (NT_SUCCESS(status)) {
+                    DebugLog(L"Compat: Auto-downgraded access (removed FILE_WRITE_ATTRIBUTES) for %s", fullNtPath.c_str());
+                }
+            }
+        }
+    }
+
+    return status;
 }
 
 NTSTATUS NTAPI Detour_NtOpenFile(
@@ -1563,8 +1775,16 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     RecursionGuard guard;
 
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
-    // [修改] 规范化路径
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] Explorer Autorun.inf 优化
+    // file.c: File_NtQueryFullAttributesFileImpl 中的优化
+    if (g_CurrentProcessType == ProcType_Explorer) {
+        if (fullNtPath.length() >= 12 &&
+            _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 12, L"\\autorun.inf") == 0) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    }
 
     std::wstring targetNtPath;
 
@@ -1594,9 +1814,23 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
 NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_NETWORK_OPEN_INFORMATION FileInformation) {
     if (g_IsInHook) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
-    std::wstring fullNtPath = ResolvePathFromAttr(ObjectAttributes);
+
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
     std::wstring targetNtPath;
 
+    // [兼容性补丁 - 预处理]
+    // [Explorer] Autorun.inf 优化
+    // 防止资源管理器扫描所有驱动器导致卡顿
+    if (g_CurrentProcessType == ProcType_Explorer) {
+        if (fullNtPath.length() >= 12 &&
+            _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 12, L"\\autorun.inf") == 0) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    }
+
+
+    // [重定向逻辑]
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, targetNtPath.c_str());
@@ -1604,19 +1838,47 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = NULL;
+
+        // 1. 优先查询沙盒
         NTSTATUS status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
+
         if (status == STATUS_SUCCESS) return status;
 
-        // [新增] 隐藏检查
+        // 2. [Mode 3] 隐藏检查
+        // 如果沙盒里没有，且模式为 3，检查真实文件是否应该被隐藏
         if (g_HookMode == 3) {
             if (!IsPathVisible(fullNtPath)) {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
     }
-    return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+
+    // 查询真实文件
+    NTSTATUS status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+
+    // [兼容性补丁 - 后处理]
+    // [MSI Installer] Config.Msi 补丁
+    // MSI 必须能访问 Config.Msi，如果失败则尝试创建
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_CurrentProcessType == ProcType_Msi_Installer) {
+        if (fullNtPath.length() >= 11 &&
+            _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 11, L"\\Config.Msi") == 0) {
+
+            std::wstring dosPath = NtPathToDosPath(fullNtPath);
+            if (!dosPath.empty()) {
+                // 尝试创建目录 (CreateDirectory 会自动处理重定向逻辑，如果在 Hook 范围内)
+                if (CreateDirectoryW(dosPath.c_str(), NULL)) {
+                    DebugLog(L"Compat: MSI - Created missing Config.Msi at %s", dosPath.c_str());
+                    // 重试查询
+                    status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+                }
+            }
+        }
+    }
+
+    return status;
 }
 
 // [新增] 智能获取真实路径和沙盒路径
@@ -2047,7 +2309,103 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
-    return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+
+    NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+
+    // 拦截 FileNameInformation (用于 GetFinalPathNameByHandle 等 API)
+    if (NT_SUCCESS(status) && FileInformationClass == FileNameInformation) {
+
+        PFILE_NAME_INFORMATION nameInfo = (PFILE_NAME_INFORMATION)FileInformation;
+
+        if (nameInfo->FileNameLength > 0) {
+            // 构造要移除的子串: \Sandbox\C
+            // 这需要根据你的 g_SandboxRoot 动态计算
+            // 这是一个优化点，如果你的沙盒结构固定，可以直接硬编码逻辑
+        }
+    }
+
+    // 另外：FileAllInformation 也包含 NameInformation，也需要处理
+    if (NT_SUCCESS(status) && FileInformationClass == FileAllInformation) {
+        // PFILE_ALL_INFORMATION allInfo = (PFILE_ALL_INFORMATION)FileInformation;
+        // 处理 allInfo->NameInformation ...
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtQueryObject(
+    HANDLE Handle,
+    OBJECT_INFORMATION_CLASS ObjectInformationClass,
+    PVOID ObjectInformation,
+    ULONG ObjectInformationLength,
+    PULONG ReturnLength
+) {
+    // 1. 调用原始函数
+    NTSTATUS status = fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, ObjectInformationLength, ReturnLength);
+
+    // 2. 仅处理成功且查询类型为 ObjectNameInformation 的情况
+    if (NT_SUCCESS(status) && ObjectInformationClass == ObjectNameInformation && ObjectInformation) {
+
+        POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)ObjectInformation;
+
+        // 确保缓冲区有效且有内容
+        if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
+
+            // 构造沙盒 NT 前缀: \??\Z:\Sandbox
+            // 注意：建议将此字符串缓存为全局变量，避免每次调用都构造 std::wstring
+            static std::wstring sandboxPrefix = L"\\??\\" + std::wstring(g_SandboxRoot);
+            size_t prefixLenBytes = sandboxPrefix.length() * sizeof(wchar_t);
+
+            // 检查是否以沙盒路径开头
+            if (nameInfo->Name.Length > prefixLenBytes) {
+                if (_wcsnicmp(nameInfo->Name.Buffer, sandboxPrefix.c_str(), sandboxPrefix.length()) == 0) {
+
+                    // 检查分隔符 (确保不是部分匹配，如 \SandboxOld)
+                    if (nameInfo->Name.Buffer[sandboxPrefix.length()] == L'\\') {
+
+                        // 原始: \??\Z:\Sandbox \ C \ Windows...
+                        // 目标: \??\C:\Windows...
+
+                        // 指向: C\Windows...
+                        wchar_t* pRel = nameInfo->Name.Buffer + sandboxPrefix.length() + 1;
+
+                        // 计算剩余长度
+                        size_t relLenBytes = nameInfo->Name.Length - (prefixLenBytes + sizeof(wchar_t));
+
+                        // 简单的启发式还原: 检查是否是驱动器结构 (C\...)
+                        if (relLenBytes >= 2 * sizeof(wchar_t) && pRel[1] == L'\\') {
+                             // 构造 \??\C:\Windows...
+
+                             // 1. 搬运盘符 'C' 到 Buffer[4] (紧跟在 \??\ 后)
+                             nameInfo->Name.Buffer[4] = pRel[0];
+
+                             // 2. 补冒号 ':' 到 Buffer[5]
+                             nameInfo->Name.Buffer[5] = L':';
+
+                             // 3. 搬运剩余路径 (\Windows...) 到 Buffer[6]
+                             // 源: pRel + 1 (即 \Windows...)
+                             // 长度: relLenBytes - 1个字符(盘符)
+                             size_t moveLenBytes = relLenBytes - sizeof(wchar_t);
+
+                             memmove(&nameInfo->Name.Buffer[6], &pRel[1], moveLenBytes);
+
+                             // 4. 更新长度: \??\ (4) + C: (2) + \Windows...
+                             nameInfo->Name.Length = (USHORT)( (6 * sizeof(wchar_t)) + moveLenBytes );
+
+                             // 5. 截断字符串 (安全起见)
+                             if (nameInfo->Name.MaximumLength >= nameInfo->Name.Length + sizeof(wchar_t)) {
+                                 nameInfo->Name.Buffer[nameInfo->Name.Length / sizeof(wchar_t)] = L'\0';
+                             }
+                        }
+                        // 如果不是驱动器结构 (例如 Users\...)，可能需要更复杂的逻辑
+                        // 但对于大多数基于驱动器的沙盒，上述逻辑已足够覆盖 99% 的情况
+                    }
+                }
+            }
+        }
+    }
+
+    return status;
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
@@ -2796,8 +3154,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 获取当前进程路径用于自身保护
     if (GetModuleFileNameW(NULL, buffer, MAX_PATH) > 0) {
         std::wstring dosPath = buffer;
-        // 转换为 NT 路径: C:\Ex.exe -> \??\C:\Ex.exe
         g_CurrentProcessPathNt = L"\\??\\" + dosPath;
+
+        // [新增] 识别进程类型
+        InitProcessType();
     }
 
     // 5. 环境变量回退 (如果内存映射没读到)
@@ -2881,6 +3241,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
