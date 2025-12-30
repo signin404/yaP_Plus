@@ -134,6 +134,13 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef struct _FILE_RENAME_INFORMATION {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
+
 #ifndef FileLinkInformation
 #define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
 #endif
@@ -725,22 +732,6 @@ void InitSpoofing() {
     }
 
     DebugLog(L"Spoof Init: Device='%s', Rel='%s'", g_SandboxDevicePath.c_str(), g_SandboxRelativePath.c_str());
-}
-
-// [新增] 辅助：根据盘符获取设备路径 (C: -> \Device\HarddiskVolume1)
-std::wstring GetDevicePathByDrive(wchar_t driveLetter) {
-    // 遍历 g_DeviceMap (格式: \Device\HarddiskVolume1 -> C:)
-    // 注意：g_DeviceMap 在 InitHookThread 中已初始化
-    std::wstring driveStr;
-    driveStr += driveLetter;
-    driveStr += L":";
-
-    for (const auto& pair : g_DeviceMap) {
-        if (_wcsicmp(pair.second.c_str(), driveStr.c_str()) == 0) {
-            return pair.first;
-        }
-    }
-    return L"";
 }
 
 // 辅助：获取文件句柄对应的路径
@@ -2520,10 +2511,10 @@ NTSTATUS NTAPI Detour_NtQueryObject(
 }
 
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle, 
-    PIO_STATUS_BLOCK IoStatusBlock, 
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation,
-    ULONG Length, 
+    ULONG Length,
     FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
@@ -2533,7 +2524,7 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (NT_SUCCESS(status)) {
-        
+
         // =========================================================
         // [保留] File ID 混淆逻辑 (这对数据库兼容性很重要)
         // =========================================================
@@ -3388,11 +3379,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [修改] 挂钩 NtQueryObject 以支持路径欺骗
-            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-            if (pNtQueryObject) {
-                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
-            }
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
