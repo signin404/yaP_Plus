@@ -83,6 +83,14 @@
 #define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
 #endif
 
+#ifndef STATUS_INVALID_DEVICE_REQUEST
+#define STATUS_INVALID_DEVICE_REQUEST ((NTSTATUS)0xC0000010L)
+#endif
+
+#ifndef STATUS_NOT_SUPPORTED
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BBL)
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
@@ -587,6 +595,26 @@ void DebugLog(const wchar_t* format, ...) {
 
 // --- 辅助工具 ---
 
+// 辅助：将 ANSI 转换为 Wide
+std::wstring AnsiToWide(LPCSTR text) {
+    if (!text) return L"";
+    int size = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+    if (size <= 0) return L"";
+    std::wstring res(size - 1, 0);
+    MultiByteToWideChar(CP_ACP, 0, text, -1, &res[0], size);
+    return res;
+}
+
+// 辅助：将 Wide 转换为 ANSI
+std::string WideToAnsi(LPCWSTR text) {
+    if (!text) return "";
+    int size = WideCharToMultiByte(CP_ACP, 0, text, -1, NULL, 0, NULL, NULL);
+    if (size <= 0) return "";
+    std::string res(size - 1, 0);
+    WideCharToMultiByte(CP_ACP, 0, text, -1, &res[0], size, NULL, NULL);
+    return res;
+}
+
 // [新增] 移除 NTFS 交换数据流 (ADS) 后缀
 // 逻辑参考 file.c: File_MatchPath2
 std::wstring StripAds(const std::wstring& path) {
@@ -715,6 +743,52 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.find(L"\\Device\\") == 0) {
         return L"";
     }
+    return ntPath;
+}
+
+// [新增] 路径规范化：解析短文件名、符号链接、Junction
+// 必须放在 NtPathToDosPath 之后，Detour_NtCreateFile 之前
+std::wstring NormalizeNtPath(const std::wstring& ntPath) {
+    if (ntPath.empty()) return ntPath;
+
+    // 1. 转换为 DOS 路径以便使用 Win32 API
+    std::wstring dosPath = NtPathToDosPath(ntPath);
+    if (dosPath.empty()) return ntPath; // 无法转换，保持原样
+
+    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
+    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
+    HANDLE hFile = CreateFileW(dosPath.c_str(), 
+        0, 
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
+        NULL, 
+        OPEN_EXISTING, 
+        FILE_FLAG_BACKUP_SEMANTICS, 
+        NULL);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        wchar_t finalPath[MAX_PATH];
+        // VOLUME_NAME_DOS 返回 \\?\C:\Path 格式
+        DWORD len = GetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, VOLUME_NAME_DOS);
+        CloseHandle(hFile);
+
+        if (len > 0 && len < MAX_PATH) {
+            std::wstring res = finalPath;
+            // 将 \\?\ 转换为 NT 格式 \??\ (注意注释末尾不要加反斜杠)
+            if (res.rfind(L"\\\\?\\", 0) == 0) {
+                return L"\\??\\" + res.substr(4);
+            }
+            return res; 
+        }
+    } 
+    else {
+        // 3. 文件不存在 (可能是创建新文件)，尝试展开短文件名
+        // GetLongPathNameW 即使文件不存在，只要路径组件存在也能工作
+        wchar_t longPath[MAX_PATH];
+        if (GetLongPathNameW(dosPath.c_str(), longPath, MAX_PATH) > 0) {
+            return L"\\??\\" + std::wstring(longPath);
+        }
+    }
+
     return ntPath;
 }
 
@@ -1992,70 +2066,6 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 }
 
 // --- 路径处理辅助函数 ---
-
-// [新增] 路径规范化：解析短文件名、符号链接、Junction
-// 对应 Sandboxie 的 File_GetName_ExpandShortNames 和 File_GetName_TranslateSymlinks
-std::wstring NormalizeNtPath(const std::wstring& ntPath) {
-    if (ntPath.empty()) return ntPath;
-
-    // 1. 转换为 DOS 路径以便使用 Win32 API
-    std::wstring dosPath = NtPathToDosPath(ntPath);
-    if (dosPath.empty()) return ntPath; // 无法转换，保持原样
-
-    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
-    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
-    HANDLE hFile = CreateFileW(dosPath.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        NULL);
-
-    if (hFile != INVALID_HANDLE_VALUE) {
-        wchar_t finalPath[MAX_PATH];
-        // VOLUME_NAME_DOS 返回 \\?\C:\Path 格式
-        DWORD len = GetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, VOLUME_NAME_DOS);
-        CloseHandle(hFile);
-
-        if (len > 0 && len < MAX_PATH) {
-            std::wstring res = finalPath;
-            // 将 \\?\ 转换为 NT 格式 \??\
-            if (res.rfind(L"\\\\?\\", 0) == 0) {
-                return L"\\??\\" + res.substr(4);
-            }
-            return res; // 理论上不应到此，除非是 UNC
-        }
-    }
-    else {
-        // 3. 文件不存在 (可能是创建新文件)，尝试展开短文件名
-        // GetLongPathNameW 即使文件不存在，只要路径组件存在也能工作
-        wchar_t longPath[MAX_PATH];
-        if (GetLongPathNameW(dosPath.c_str(), longPath, MAX_PATH) > 0) {
-            return L"\\??\\" + std::wstring(longPath);
-        }
-    }
-
-    return ntPath;
-}
-
-// 辅助：将 ANSI 转换为 Wide
-std::wstring AnsiToWide(LPCSTR text) {
-    if (!text) return L"";
-    int size = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
-    std::wstring res(size - 1, 0);
-    MultiByteToWideChar(CP_ACP, 0, text, -1, &res[0], size);
-    return res;
-}
-
-// 辅助：将 Wide 转换为 ANSI
-std::string WideToAnsi(LPCWSTR text) {
-    if (!text) return "";
-    int size = WideCharToMultiByte(CP_ACP, 0, text, -1, NULL, 0, NULL, NULL);
-    std::string res(size - 1, 0);
-    WideCharToMultiByte(CP_ACP, 0, text, -1, &res[0], size, NULL, NULL);
-    return res;
-}
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
 // 如果不需要重定向或重定向后文件/目录不存在 返回空字符串
