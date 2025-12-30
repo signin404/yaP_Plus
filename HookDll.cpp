@@ -126,6 +126,10 @@
 #define FileIdBothDirectoryInformation ((FILE_INFORMATION_CLASS)37)
 #endif
 
+#ifndef FileInternalInformation
+#define FileInternalInformation ((FILE_INFORMATION_CLASS)6)
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -737,6 +741,21 @@ std::wstring GetDevicePathByDrive(wchar_t driveLetter) {
         }
     }
     return L"";
+}
+
+// 辅助：获取文件句柄对应的路径
+std::wstring GetPathFromHandle(HANDLE hFile) {
+    ULONG len = 0;
+    fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
+    if (len == 0) return L"";
+
+    std::vector<BYTE> buffer(len);
+    if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
+
+    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+    if (!nameInfo->Name.Buffer) return L"";
+
+    return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
 
 // [新增] 判断句柄是否指向沙盒内对象
@@ -1501,27 +1520,27 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     if (CreateOptions & FILE_OPEN_BY_FILE_ID) {
         // 这种模式下，RootDirectory 必须存在，且 ObjectName 是一个 8 字节的 File ID
         if (ObjectAttributes && ObjectAttributes->RootDirectory && ObjectAttributes->ObjectName) {
-            
+
             // 检查父目录句柄是否在沙盒内
             if (IsHandleInSandbox(ObjectAttributes->RootDirectory)) {
-                
+
                 // 如果父目录在沙盒内，说明传入的 ID 很可能是我们之前混淆过的
                 // 我们需要将其还原 (Unscramble) 才能让系统找到真实文件
-                
+
                 if (ObjectAttributes->ObjectName->Length == sizeof(LARGE_INTEGER)) {
                     // 1. 复制 ObjectAttributes (避免修改调用者的只读内存)
                     OBJECT_ATTRIBUTES oa = *ObjectAttributes;
                     UNICODE_STRING objName = *ObjectAttributes->ObjectName;
                     LARGE_INTEGER fileId;
-                    
+
                     // 2. 复制并还原 ID
                     memcpy(&fileId, objName.Buffer, sizeof(LARGE_INTEGER));
                     ToggleFileIdScramble(&fileId);
-                    
+
                     // 3. 指向还原后的 ID
                     objName.Buffer = (PWSTR)&fileId;
                     oa.ObjectName = &objName;
-                    
+
                     // 4. 调用原始函数
                     return fpNtCreateFile(FileHandle, DesiredAccess, &oa, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
                 }
@@ -1718,21 +1737,6 @@ NTSTATUS NTAPI Detour_NtOpenFile(
     ULONG OpenOptions
 ) {
     return Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, NULL, 0, ShareAccess, FILE_OPEN, OpenOptions, NULL, 0);
-}
-
-// 辅助：获取文件句柄对应的路径
-std::wstring GetPathFromHandle(HANDLE hFile) {
-    ULONG len = 0;
-    fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
-    if (len == 0) return L"";
-
-    std::vector<BYTE> buffer(len);
-    if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
-
-    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-    if (!nameInfo->Name.Buffer) return L"";
-
-    return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
 
 // [新增] 创建一个空的占位文件
@@ -2531,10 +2535,10 @@ NTSTATUS NTAPI Detour_NtQueryObject(
 }
 
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle, 
-    PIO_STATUS_BLOCK IoStatusBlock, 
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation,
-    ULONG Length, 
+    ULONG Length,
     FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
@@ -2544,7 +2548,7 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (NT_SUCCESS(status)) {
-        
+
         // =========================================================
         // [新增] File ID 混淆逻辑
         // =========================================================
@@ -2579,10 +2583,10 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
         if (pNameInfo && pNameInfo->FileNameLength > 0) {
             std::wstring currentPath(pNameInfo->FileName, pNameInfo->FileNameLength / sizeof(wchar_t));
-            if (!g_SandboxRelativePath.empty() && 
+            if (!g_SandboxRelativePath.empty() &&
                 currentPath.size() > g_SandboxRelativePath.size() &&
                 _wcsnicmp(currentPath.c_str(), g_SandboxRelativePath.c_str(), g_SandboxRelativePath.size()) == 0) {
-                
+
                 size_t relLen = g_SandboxRelativePath.size();
                 if (currentPath[relLen] == L'\\' && currentPath[relLen + 2] == L'\\') {
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
