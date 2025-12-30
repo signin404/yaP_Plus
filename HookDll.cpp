@@ -126,14 +126,6 @@
 #define FileIdBothDirectoryInformation ((FILE_INFORMATION_CLASS)37)
 #endif
 
-// 3. 补充 IsTombstone 辅助函数 (必须在 BuildMergedDirectoryList 之前定义)
-// 辅助：判断是否为墓碑文件 (隐藏 + 系统)
-bool IsTombstone(DWORD attrs) {
-    return (attrs != INVALID_FILE_ATTRIBUTES) &&
-           (attrs & FILE_ATTRIBUTE_HIDDEN) &&
-           (attrs & FILE_ATTRIBUTE_SYSTEM);
-}
-
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -1163,46 +1155,70 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     return true;
 }
 
-void PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath) {
+// [重写] 执行写时复制 (Migration)
+// 移植自 file.c: File_MigrateFile 和 File_CreatePath
+bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath) {
     std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
     std::wstring targetDos = NtPathToDosPath(targetNtPath);
 
+    if (sourceDos.empty() || targetDos.empty()) return false;
+
     DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
-    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return;
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
 
-    // 如果目标已存在 不需要复制
-    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    // 1. 检查目标是否已存在 (避免重复迁移)
+    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
 
-    // 1. 确保父目录存在
+    // 2. 确保父目录存在 (递归创建)
     wchar_t dirBuf[MAX_PATH];
-    wcscpy_s(dirBuf, targetDos.c_str());
+    wcscpy_s(dirBuf, MAX_PATH, targetDos.c_str());
     PathRemoveFileSpecW(dirBuf);
     RecursiveCreateDirectory(dirBuf);
 
-    // 2. 根据类型处理
+    bool success = false;
+
+    // 3. 分类处理
     if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
-        CreateDirectoryW(targetDos.c_str(), NULL);
-    } else {
-        // [新增] Windows Media Player 补丁
-        // file.c: Dll_ImageType == DLL_IMAGE_WINDOWS_MEDIA_PLAYER
-        // 不复制 .wmdb 文件的内容 因为它们太大且会被重建
-        if (g_CurrentProcessType == ProcType_WMP) {
-            if (sourceDos.length() > 5 &&
-                _wcsicmp(sourceDos.c_str() + sourceDos.length() - 5, L".wmdb") == 0) {
-
-                // 仅创建空文件 不复制内容
-                HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, srcAttrs, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-
-                DebugLog(L"Compat: WMP - Skipped content copy for %s", sourceDos.c_str());
-                return;
-            }
+        // --- 目录迁移 ---
+        // 创建目录并同步属性
+        if (CreateDirectoryW(targetDos.c_str(), NULL)) {
+            CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+            CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+            success = true;
+            DebugLog(L"CoW: Migrated Directory %s", targetDos.c_str());
         }
-
-        // 如果是文件 执行复制
-        DebugLog(L"Migrating: %s -> %s", sourceDos.c_str(), targetDos.c_str());
-        CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE);
     }
+    else {
+        // --- 文件迁移 ---
+        // file.c: File_MigrateFile 逻辑
+
+        // A. 尝试复制文件内容
+        // CopyFileW 内部处理了大部分锁定情况 (使用共享读)
+        // 如果失败 (例如文件被独占锁定) 用户模式 Hook 很难处理 (Sandboxie 驱动可以绕过)
+        if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
+
+            // B. 同步属性并剥离只读
+            CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+
+            // C. 同步时间戳
+            // 注意：CopyFileW 默认会保留时间戳 但为了保险起见(特别是对于某些文件系统) 手动同步一次
+            CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+
+            success = true;
+            DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
+        }
+        else {
+            DWORD err = GetLastError();
+            DebugLog(L"CoW: Failed to copy %s (Error: %d)", sourceDos.c_str(), err);
+
+            // [容错] 如果是因为文件被锁 (ERROR_SHARING_VIOLATION)
+            // 且目标是系统数据库 (catdb, edb) Sandboxie 有特殊处理
+            // 但在纯用户模式下 我们无法强制读取被锁定的文件
+            // 此时只能让操作失败 或者创建一个空文件占位 (但这通常会导致程序崩溃)
+        }
+    }
+
+    return success;
 }
 
 struct RecursionGuard {
@@ -1523,8 +1539,17 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 shouldRedirect = true;
             } else if (realExists) {
                 // 真实存在但沙盒没有 -> 执行写时复制 (CoW)
-                PerformCopyOnWrite(fullNtPath, targetNtPath);
-                shouldRedirect = true;
+                // [修改] 检查返回值 如果迁移失败 则不重定向 让原始函数去处理(通常会报错 Access Denied 或 Sharing Violation)
+                if (PerformCopyOnWrite(fullNtPath, targetNtPath)) {
+                    shouldRedirect = true;
+                } else {
+                    // 迁移失败 (可能是文件被锁) 不重定向 让程序直接访问原文件(只读)或报错
+                    // 但因为我们判定是 isWrite 访问原文件通常会失败 这符合预期
+                    shouldRedirect = false;
+                    // 或者：强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
+                    // Sandboxie 的行为通常是报错
+                    shouldRedirect = true;
+                }
             } else {
                 // 都不存在 (新建文件)
                 shouldRedirect = true;
@@ -2487,6 +2512,42 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
 }
 
 // --- 路径处理辅助函数 ---
+
+// [新增] 复制文件时间戳 (Creation, Access, Write)
+bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
+    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hSrc == INVALID_HANDLE_VALUE) return false;
+
+    FILETIME ftCreate, ftAccess, ftWrite;
+    bool result = false;
+    if (GetFileTime(hSrc, &ftCreate, &ftAccess, &ftWrite)) {
+        HANDLE hDest = CreateFileW(destPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (hDest != INVALID_HANDLE_VALUE) {
+            if (SetFileTime(hDest, &ftCreate, &ftAccess, &ftWrite)) {
+                result = true;
+            }
+            CloseHandle(hDest);
+        }
+    }
+    CloseHandle(hSrc);
+    return result;
+}
+
+// [新增] 复制文件属性 (Hidden, System 等) 并剥离 ReadOnly
+// 对应 file.c: File_SetAttributes / File_CheckCreateParameters 中的逻辑
+bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
+    DWORD srcAttrs = GetFileAttributesW(srcPath);
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
+
+    // 核心逻辑：剥离只读属性
+    // 如果源文件是只读的 复制到沙盒后必须变为可写 否则 CoW 失去意义
+    DWORD destAttrs = srcAttrs & ~FILE_ATTRIBUTE_READONLY;
+
+    // 确保至少有一个属性 (防止为 0)
+    if (destAttrs == 0) destAttrs = FILE_ATTRIBUTE_NORMAL;
+
+    return SetFileAttributesW(destPath, destAttrs) != FALSE;
+}
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
 // 如果不需要重定向或重定向后文件/目录不存在 返回空字符串
