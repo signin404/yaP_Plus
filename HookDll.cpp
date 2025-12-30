@@ -134,9 +134,33 @@
 #define FileNormalizedNameInformation ((FILE_INFORMATION_CLASS)48)
 #endif
 
+#ifndef FileFsVolumeInformation
+#define FileFsVolumeInformation ((FS_INFORMATION_CLASS)1)
+#endif
+
+#ifndef FileFsAttributeInformation
+#define FileFsAttributeInformation ((FS_INFORMATION_CLASS)5)
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// 卷信息结构体
+typedef struct _FILE_FS_VOLUME_INFORMATION {
+    LARGE_INTEGER VolumeCreationTime;
+    ULONG VolumeSerialNumber;
+    ULONG VolumeLabelLength;
+    BOOLEAN SupportsObjects;
+    WCHAR VolumeLabel[1];
+} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
+
+typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
+    ULONG FileSystemAttributes;
+    LONG MaximumComponentNameLength;
+    ULONG FileSystemNameLength;
+    WCHAR FileSystemName[1];
+} FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
 
 typedef struct _FILE_RENAME_INFORMATION {
     BOOLEAN ReplaceIfExists;
@@ -388,6 +412,8 @@ typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTIN
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
+typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
+P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -549,6 +575,30 @@ void InitProcessType() {
         g_CurrentProcessType = ProcType_DllHost;
         DebugLog(L"Compat: Detected DllHost");
     }
+}
+
+// [新增] 缓存真实驱动器的卷信息
+// Key: Drive Letter (e.g., 'C'), Value: Volume Serial Number
+std::map<wchar_t, ULONG> g_VolumeSerialCache;
+std::mutex g_VolumeCacheMutex;
+
+ULONG GetRealVolumeSerial(wchar_t driveLetter) {
+    {
+        std::lock_guard<std::mutex> lock(g_VolumeCacheMutex);
+        if (g_VolumeSerialCache.count(driveLetter)) {
+            return g_VolumeSerialCache[driveLetter];
+        }
+    }
+
+    wchar_t rootPath[] = { driveLetter, L':', L'\\', L'\0' };
+    DWORD serial = 0;
+    // 获取卷序列号
+    if (GetVolumeInformationW(rootPath, NULL, 0, &serial, NULL, NULL, NULL, 0)) {
+        std::lock_guard<std::mutex> lock(g_VolumeCacheMutex);
+        g_VolumeSerialCache[driveLetter] = serial;
+        return serial;
+    }
+    return 0;
 }
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
@@ -2649,6 +2699,62 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     return status;
 }
 
+NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation,
+    ULONG Length,
+    FS_INFORMATION_CLASS FsInformationClass
+) {
+    if (g_IsInHook) return fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
+    RecursionGuard guard;
+
+    // 1. 调用原始函数获取沙盒卷的真实信息
+    NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
+
+    if (NT_SUCCESS(status)) {
+        
+        // 2. 检查句柄是否指向沙盒内
+        // 只有沙盒内的文件才需要欺骗卷信息
+        if (IsHandleInSandbox(FileHandle)) {
+            
+            // 3. 解析出它应该属于哪个盘
+            // 路径格式: \Device\HarddiskVolumeZ\Sandbox\C\New
+            // 我们需要提取 'C'
+            std::wstring rawPath = GetPathFromHandle(FileHandle);
+            if (!rawPath.empty() && !g_SandboxDevicePath.empty()) {
+                
+                // 检查前缀匹配
+                if (rawPath.size() > g_SandboxDevicePath.size() &&
+                    _wcsnicmp(rawPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+                    
+                    // g_SandboxDevicePath 结尾没有斜杠，rawPath 紧接着应该是 \C\
+                    size_t devLen = g_SandboxDevicePath.size();
+                    if (rawPath[devLen] == L'\\' && rawPath[devLen + 2] == L'\\') {
+                        wchar_t targetDrive = rawPath[devLen + 1]; // 'C'
+                        
+                        // 4. 根据查询类型进行欺骗
+                        if (FsInformationClass == FileFsVolumeInformation) {
+                            PFILE_FS_VOLUME_INFORMATION pVolInfo = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
+                            
+                            // 获取真实 C 盘的序列号
+                            ULONG realSerial = GetRealVolumeSerial(targetDrive);
+                            if (realSerial != 0) {
+                                pVolInfo->VolumeSerialNumber = realSerial;
+                                // 可选：如果需要，也可以欺骗 VolumeLabel
+                                // 但通常序列号是 Explorer 检查的关键
+                            }
+                        }
+                        // FileFsAttributeInformation 通常不需要欺骗，除非文件系统类型不同(如 FAT32 vs NTFS)
+                    }
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -3536,6 +3642,11 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+
+            // [新增] 挂钩 NtQueryVolumeInformationFile
+            void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
+            if (pNtQueryVolumeInformationFile) {
+                MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
 
             // [修改] 挂钩 NtQueryObject 以支持路径欺骗
             void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
