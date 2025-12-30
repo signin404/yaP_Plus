@@ -3783,6 +3783,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     return 0;
 }
+}
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
