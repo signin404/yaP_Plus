@@ -2498,56 +2498,14 @@ NTSTATUS NTAPI Detour_NtQueryDirectoryFileEx(
     return status;
 }
 
-NTSTATUS NTAPI Detour_NtQueryObject(
-    HANDLE Handle,
-    OBJECT_INFORMATION_CLASS ObjectInformationClass,
-    PVOID ObjectInformation,
-    ULONG Length,
-    PULONG ReturnLength
-) {
-    // [修改] 移除路径欺骗逻辑，直接调用原始函数
-    // 避免 Explorer 因卷信息不匹配而报错
-    return fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
-}
-
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    PVOID FileInformation,
-    ULONG Length,
-    FILE_INFORMATION_CLASS FileInformationClass
+    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // 1. 调用原始函数
-    NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-
-    if (NT_SUCCESS(status)) {
-
-        // =========================================================
-        // [保留] File ID 混淆逻辑 (这对数据库兼容性很重要)
-        // =========================================================
-        PLARGE_INTEGER pFileId = NULL;
-
-        if (FileInformationClass == FileInternalInformation) {
-            if (Length >= sizeof(FILE_INTERNAL_INFORMATION)) {
-                pFileId = &((PFILE_INTERNAL_INFORMATION)FileInformation)->IndexNumber;
-            }
-        }
-        else if (FileInformationClass == FileAllInformation) {
-            if (Length >= sizeof(FILE_ALL_INFORMATION)) {
-                pFileId = &((PFILE_ALL_INFORMATION)FileInformation)->InternalInformation.IndexNumber;
-            }
-        }
-
-        // 如果获取到了 ID 指针，且文件位于沙盒内，则进行混淆
-        if (pFileId && IsHandleInSandbox(FileHandle)) {
-            ToggleFileIdScramble(pFileId);
-        }
-    }
-
-    return status;
+    return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
