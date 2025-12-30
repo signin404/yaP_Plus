@@ -2049,6 +2049,19 @@ BOOL CreateProcessInternal(
     else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+
+    // --- [新增] 自动解析无路径、无扩展名的命令 (修复 ping 找不到的问题) ---
+    // 如果 targetExe 只是一个文件名 (不包含 \ 或 /)
+    if (targetExe.find(L'\\') == std::wstring::npos && targetExe.find(L'/') == std::wstring::npos) {
+        wchar_t foundPath[MAX_PATH];
+        // SearchPathW 会在 PATH 中搜索。
+        // 第三个参数 L".exe" 表示如果文件没扩展名，默认尝试 .exe
+        // 如果 targetExe 本身有扩展名 (如 script.bat)，SearchPathW 会忽略这个参数，直接搜 script.bat
+        if (SearchPathW(NULL, targetExe.c_str(), L".exe", MAX_PATH, foundPath, NULL) > 0) {
+            targetExe = foundPath; // 更新为全路径，例如 C:\Windows\System32\PING.EXE
+        }
+    }
+
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
     // 2. 处理 CurrentDirectory (工作目录)
