@@ -130,44 +130,9 @@
 #define FileInternalInformation ((FILE_INFORMATION_CLASS)6)
 #endif
 
-#ifndef FileNormalizedNameInformation
-#define FileNormalizedNameInformation ((FILE_INFORMATION_CLASS)48)
-#endif
-
-#ifndef FileFsVolumeInformation
-#define FileFsVolumeInformation ((FS_INFORMATION_CLASS)1)
-#endif
-
-#ifndef FileFsAttributeInformation
-#define FileFsAttributeInformation ((FS_INFORMATION_CLASS)5)
-#endif
-
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
-
-// 卷信息结构体
-typedef struct _FILE_FS_VOLUME_INFORMATION {
-    LARGE_INTEGER VolumeCreationTime;
-    ULONG VolumeSerialNumber;
-    ULONG VolumeLabelLength;
-    BOOLEAN SupportsObjects;
-    WCHAR VolumeLabel[1];
-} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
-
-typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
-    ULONG FileSystemAttributes;
-    LONG MaximumComponentNameLength;
-    ULONG FileSystemNameLength;
-    WCHAR FileSystemName[1];
-} FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
-
-typedef struct _FILE_RENAME_INFORMATION {
-    BOOLEAN ReplaceIfExists;
-    HANDLE RootDirectory;
-    ULONG FileNameLength;
-    WCHAR FileName[1];
-} FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
 #ifndef FileLinkInformation
 #define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
@@ -397,32 +362,6 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 #define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
 #endif
 
-// [新增] 定义 FS_INFORMATION_CLASS 枚举 (必须在函数指针定义之前)
-#ifdef FileFsVolumeInformation
-#undef FileFsVolumeInformation
-#endif
-#ifdef FileFsAttributeInformation
-#undef FileFsAttributeInformation
-#endif
-
-typedef enum _FS_INFORMATION_CLASS {
-    FileFsVolumeInformation = 1,
-    FileFsLabelInformation,
-    FileFsSizeInformation,
-    FileFsDeviceInformation,
-    FileFsAttributeInformation,
-    FileFsControlInformation,
-    FileFsFullSizeInformation,
-    FileFsObjectIdInformation,
-    FileFsDriverPathInformation,
-    FileFsVolumeFlagsInformation,
-    FileFsSectorSizeInformation,
-    FileFsDataCopyInformation,
-    FileFsMetadataSizeInformation,
-    FileFsFullSizeInformationEx,
-    FileFsMaximumInformation
-} FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
-
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
@@ -438,8 +377,6 @@ typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTIN
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
-typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
-P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -601,30 +538,6 @@ void InitProcessType() {
         g_CurrentProcessType = ProcType_DllHost;
         DebugLog(L"Compat: Detected DllHost");
     }
-}
-
-// [新增] 缓存真实驱动器的卷信息
-// Key: Drive Letter (e.g., 'C'), Value: Volume Serial Number
-std::map<wchar_t, ULONG> g_VolumeSerialCache;
-std::mutex g_VolumeCacheMutex;
-
-ULONG GetRealVolumeSerial(wchar_t driveLetter) {
-    {
-        std::lock_guard<std::mutex> lock(g_VolumeCacheMutex);
-        if (g_VolumeSerialCache.count(driveLetter)) {
-            return g_VolumeSerialCache[driveLetter];
-        }
-    }
-
-    wchar_t rootPath[] = { driveLetter, L':', L'\\', L'\0' };
-    DWORD serial = 0;
-    // 获取卷序列号
-    if (GetVolumeInformationW(rootPath, NULL, 0, &serial, NULL, NULL, NULL, 0)) {
-        std::lock_guard<std::mutex> lock(g_VolumeCacheMutex);
-        g_VolumeSerialCache[driveLetter] = serial;
-        return serial;
-    }
-    return 0;
 }
 
 // 初始化系统盘白名单 (在 InitHookThread 中调用)
@@ -2601,174 +2514,45 @@ NTSTATUS NTAPI Detour_NtQueryObject(
     ULONG Length,
     PULONG ReturnLength
 ) {
-    // 调用原始函数
-    NTSTATUS status = fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
-
-    if (NT_SUCCESS(status) && ObjectInformationClass == ObjectNameInformation && ObjectInformation) {
-
-        POBJECT_NAME_INFORMATION pNameInfo = (POBJECT_NAME_INFORMATION)ObjectInformation;
-        if (pNameInfo->Name.Buffer && pNameInfo->Name.Length > 0) {
-
-            std::wstring currentPath(pNameInfo->Name.Buffer, pNameInfo->Name.Length / sizeof(wchar_t));
-
-            if (!g_SandboxDevicePath.empty() &&
-                currentPath.size() > g_SandboxDevicePath.size() &&
-                _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
-
-                size_t devLen = g_SandboxDevicePath.size();
-                if (currentPath[devLen] == L'\\' && currentPath[devLen + 2] == L'\\') {
-
-                    wchar_t driveLetter = currentPath[devLen + 1];
-                    std::wstring realDevicePrefix = GetDevicePathByDrive(driveLetter);
-
-                    if (!realDevicePrefix.empty()) {
-                        std::wstring spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
-
-                        if (spoofedPath.length() * sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
-
-                            // [关键修复] 计算长度差值
-                            ULONG oldLenBytes = pNameInfo->Name.Length;
-                            ULONG newLenBytes = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
-
-                            // 修改缓冲区
-                            memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), newLenBytes);
-                            pNameInfo->Name.Length = (USHORT)newLenBytes;
-                            pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0'; // 安全截断
-
-                            // [关键修复] 更新 ReturnLength
-                            // 告诉调用者：实际返回的数据变短了，不要读多了
-                            if (ReturnLength) {
-                                *ReturnLength -= (oldLenBytes - newLenBytes);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return status;
+    // [修改] 移除路径欺骗逻辑，直接调用原始函数
+    // 避免 Explorer 因卷信息不匹配而报错
+    return fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
 }
 
-// [新增] 补充枚举值
-#ifndef FileNormalizedNameInformation
-#define FileNormalizedNameInformation ((FILE_INFORMATION_CLASS)48)
-#endif
-
 NTSTATUS NTAPI Detour_NtQueryInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
+    HANDLE FileHandle, 
+    PIO_STATUS_BLOCK IoStatusBlock, 
     PVOID FileInformation,
-    ULONG Length,
+    ULONG Length, 
     FILE_INFORMATION_CLASS FileInformationClass
 ) {
     if (g_IsInHook) return fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
+    // 1. 调用原始函数
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (NT_SUCCESS(status)) {
-
-        // --- File ID 混淆逻辑 (保持不变) ---
+        
+        // =========================================================
+        // [保留] File ID 混淆逻辑 (这对数据库兼容性很重要)
+        // =========================================================
         PLARGE_INTEGER pFileId = NULL;
+
         if (FileInformationClass == FileInternalInformation) {
-            if (Length >= sizeof(FILE_INTERNAL_INFORMATION))
+            if (Length >= sizeof(FILE_INTERNAL_INFORMATION)) {
                 pFileId = &((PFILE_INTERNAL_INFORMATION)FileInformation)->IndexNumber;
+            }
         }
         else if (FileInformationClass == FileAllInformation) {
-            if (Length >= sizeof(FILE_ALL_INFORMATION))
+            if (Length >= sizeof(FILE_ALL_INFORMATION)) {
                 pFileId = &((PFILE_ALL_INFORMATION)FileInformation)->InternalInformation.IndexNumber;
+            }
         }
+
+        // 如果获取到了 ID 指针，且文件位于沙盒内，则进行混淆
         if (pFileId && IsHandleInSandbox(FileHandle)) {
             ToggleFileIdScramble(pFileId);
-        }
-
-        // --- 路径欺骗逻辑 ---
-        PFILE_NAME_INFORMATION pNameInfo = NULL;
-        if (FileInformationClass == (FILE_INFORMATION_CLASS)9 /*FileNameInformation*/) {
-            pNameInfo = (PFILE_NAME_INFORMATION)FileInformation;
-        }
-        else if (FileInformationClass == (FILE_INFORMATION_CLASS)18 /*FileAllInformation*/) {
-            pNameInfo = &((PFILE_ALL_INFORMATION)FileInformation)->NameInformation;
-        }
-
-        if (pNameInfo && pNameInfo->FileNameLength > 0) {
-            std::wstring currentPath(pNameInfo->FileName, pNameInfo->FileNameLength / sizeof(wchar_t));
-
-            if (!g_SandboxRelativePath.empty() &&
-                currentPath.size() > g_SandboxRelativePath.size() &&
-                _wcsnicmp(currentPath.c_str(), g_SandboxRelativePath.c_str(), g_SandboxRelativePath.size()) == 0) {
-
-                size_t relLen = g_SandboxRelativePath.size();
-                if (currentPath[relLen] == L'\\' && currentPath[relLen + 2] == L'\\') {
-
-                    std::wstring spoofedPath = currentPath.substr(relLen + 2);
-
-                    // [关键修复] 计算长度差值
-                    ULONG oldLenBytes = pNameInfo->FileNameLength;
-                    ULONG newLenBytes = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
-
-                    // 修改缓冲区
-                    memcpy(pNameInfo->FileName, spoofedPath.c_str(), newLenBytes);
-                    pNameInfo->FileNameLength = newLenBytes;
-
-                    // [关键修复] 更新 IoStatusBlock->Information
-                    // 这告诉 Explorer：缓冲区里只有这么多字节是有效的，后面的别读！
-                    if (IoStatusBlock->Information >= (oldLenBytes - newLenBytes)) {
-                        IoStatusBlock->Information -= (oldLenBytes - newLenBytes);
-                    }
-                }
-            }
-        }
-    }
-
-    return status;
-}
-
-NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    PVOID FsInformation,
-    ULONG Length,
-    FS_INFORMATION_CLASS FsInformationClass
-) {
-    if (g_IsInHook) return fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
-    RecursionGuard guard;
-
-    // 1. 调用原始函数获取沙盒卷的真实信息
-    NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
-
-    if (NT_SUCCESS(status)) {
-        
-        // 2. 检查句柄是否指向沙盒内
-        if (IsHandleInSandbox(FileHandle)) {
-            
-            std::wstring rawPath = GetPathFromHandle(FileHandle);
-            if (!rawPath.empty() && !g_SandboxDevicePath.empty()) {
-                
-                if (rawPath.size() > g_SandboxDevicePath.size() &&
-                    _wcsnicmp(rawPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
-                    
-                    // [修复] 移除了注释末尾的反斜杠，防止吃掉下一行代码
-                    // g_SandboxDevicePath 结尾没有斜杠，rawPath 紧接着应该是 \C\ 
-                    size_t devLen = g_SandboxDevicePath.size();
-                    
-                    if (rawPath[devLen] == L'\\' && rawPath[devLen + 2] == L'\\') {
-                        wchar_t targetDrive = rawPath[devLen + 1]; // 'C'
-                        
-                        // 4. 根据查询类型进行欺骗
-                        if (FsInformationClass == FileFsVolumeInformation) {
-                            PFILE_FS_VOLUME_INFORMATION pVolInfo = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
-                            
-                            // 获取真实 C 盘的序列号
-                            ULONG realSerial = GetRealVolumeSerial(targetDrive);
-                            if (realSerial != 0) {
-                                pVolInfo->VolumeSerialNumber = realSerial;
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -3134,66 +2918,7 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     if (g_IsInHook) return fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
     RecursionGuard guard;
 
-    DWORD lastErr = GetLastError();
-
-    // 1. 调用原始函数
-    DWORD result = fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
-
-    if (result > 0 && result < cchFilePath) {
-        std::wstring finalPath = lpszFilePath;
-        DWORD type = dwFlags & 0x7; // 提取类型标志
-
-        // --- 情况 A: DOS 路径 (\\?\Z:\Sandbox\C\New) ---
-        if (type == VOLUME_NAME_DOS || type == VOLUME_NAME_GUID) { // GUID 路径通常也以 \\?\ 开头
-            std::wstring sandboxPrefix = L"\\\\?\\" + std::wstring(g_SandboxRoot);
-
-            if (finalPath.size() >= sandboxPrefix.size() &&
-                _wcsnicmp(finalPath.c_str(), sandboxPrefix.c_str(), sandboxPrefix.size()) == 0) {
-
-                // \C\New
-                std::wstring relPath = finalPath.substr(sandboxPrefix.size());
-                if (relPath.length() >= 2 && relPath[0] == L'\\') {
-                    std::wstring driveLetter(1, relPath[1]);
-                    std::wstring remaining = relPath.substr(2);
-                    std::wstring spoofedPath = L"\\\\?\\" + driveLetter + L":" + remaining;
-
-                    if (spoofedPath.length() < cchFilePath) {
-                        wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
-                        result = (DWORD)spoofedPath.length();
-                    }
-                }
-            }
-        }
-        // --- [新增] 情况 B: NT 设备路径 (\Device\HarddiskVolumeZ\Sandbox\C\New) ---
-        else if (type == VOLUME_NAME_NT) {
-            // g_SandboxDevicePath 在 InitSpoofing 中初始化 (如 \Device\HarddiskVolume2\Sandbox)
-            if (!g_SandboxDevicePath.empty() &&
-                finalPath.size() >= g_SandboxDevicePath.size() &&
-                _wcsnicmp(finalPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
-
-                // \C\New
-                std::wstring relPath = finalPath.substr(g_SandboxDevicePath.size());
-                if (relPath.length() >= 2 && relPath[0] == L'\\') {
-                    wchar_t driveLetter = relPath[1];
-                    // 获取真实 C 盘的设备路径 (\Device\HarddiskVolume1)
-                    std::wstring realDevPrefix = GetDevicePathByDrive(driveLetter);
-
-                    if (!realDevPrefix.empty()) {
-                        std::wstring remaining = relPath.substr(2);
-                        std::wstring spoofedPath = realDevPrefix + remaining;
-
-                        if (spoofedPath.length() < cchFilePath) {
-                            wcscpy_s(lpszFilePath, cchFilePath, spoofedPath.c_str());
-                            result = (DWORD)spoofedPath.length();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    SetLastError(lastErr);
-    return result;
+    return fpGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
 }
 
 // --- Winsock Hooks ---
@@ -3663,11 +3388,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [新增] 挂钩 NtQueryVolumeInformationFile
-            void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
-            if (pNtQueryVolumeInformationFile) {
-                MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
-
             // [修改] 挂钩 NtQueryObject 以支持路径欺骗
             void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
             if (pNtQueryObject) {
@@ -3782,7 +3502,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     return 0;
-}
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
