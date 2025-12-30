@@ -2023,6 +2023,44 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
 
 // --- CreateProcess Hooks ---
 
+// 辅助：模拟系统逻辑，结合 PATHEXT 搜索命令的全路径
+bool ResolveCmdPath(const std::wstring& cmd, std::wstring& outPath) {
+    // 1. 获取 PATHEXT，如果获取失败则使用默认值
+    wchar_t pathExtBuffer[MAX_PATH];
+    if (GetEnvironmentVariableW(L"PATHEXT", pathExtBuffer, MAX_PATH) == 0) {
+        wcscpy_s(pathExtBuffer, L".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC");
+    }
+
+    // 2. 分割 PATHEXT
+    std::vector<std::wstring> extensions;
+    wchar_t* next_token = NULL;
+    wchar_t* token = wcstok_s(pathExtBuffer, L";", &next_token);
+    while (token) {
+        extensions.push_back(token);
+        token = wcstok_s(NULL, L";", &next_token);
+    }
+    // 确保 .exe 存在且在前面 (优化常见情况)
+    extensions.insert(extensions.begin(), L".EXE");
+
+    wchar_t foundPath[MAX_PATH];
+
+    // 3. 尝试直接搜索 (如果 cmd 已经包含扩展名)
+    if (SearchPathW(NULL, cmd.c_str(), NULL, MAX_PATH, foundPath, NULL) > 0) {
+        outPath = foundPath;
+        return true;
+    }
+
+    // 4. 遍历扩展名搜索
+    for (const auto& ext : extensions) {
+        if (SearchPathW(NULL, cmd.c_str(), ext.c_str(), MAX_PATH, foundPath, NULL) > 0) {
+            outPath = foundPath;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -2056,12 +2094,12 @@ BOOL CreateProcessInternal(
 
     // --- 自动解析无路径的命令 ---
     if (isBareFilename) {
-        wchar_t foundPath[MAX_PATH];
-        // 在 PATH 中搜索文件。显式指定 .exe 以模拟 CreateProcess 的默认行为
-        if (SearchPathW(NULL, targetExe.c_str(), L".exe", MAX_PATH, foundPath, NULL) > 0) {
-            targetExe = foundPath; // 更新为全路径 (如 C:\Windows\System32\PING.EXE)
-            isBareFilename = false; // 现在它是一个全路径了
-            wasResolved = true;
+        std::wstring resolvedPath;
+        // 使用增强的 ResolveCmdPath (支持 PATHEXT)
+        if (ResolveCmdPath(targetExe, resolvedPath)) {
+            targetExe = resolvedPath; // 更新为全路径 (如 C:\Windows\System32\PING.EXE)
+            isBareFilename = false;   // 现在它是一个全路径了
+            wasResolved = true;       // 标记为已解析
         }
     }
     // -------------------------------------------------------------------
@@ -2069,7 +2107,7 @@ BOOL CreateProcessInternal(
     std::wstring redirectedExe;
 
     // [关键修复] 只有当路径包含目录分隔符（或者是已解析的全路径）时，才尝试重定向。
-    // 如果仍然是 bare filename (说明 SearchPath 没找到)，则绝对不要调用 TryRedirectDosPath！
+    // 如果仍然是 bare filename (说明 ResolveCmdPath 没找到)，则绝对不要调用 TryRedirectDosPath！
     // 否则 GetFullPathName 会把它变成 "当前目录\ping"，导致错误的重定向和“文件未找到”。
     if (!isBareFilename) {
         redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
