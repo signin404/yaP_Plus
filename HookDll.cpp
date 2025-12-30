@@ -2050,15 +2050,17 @@ BOOL CreateProcessInternal(
 
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
 
-    // --- [新增] 自动解析无路径、无扩展名的命令 (修复 ping 找不到的问题) ---
+    // [新增] 标记是否由 Hook 主动解析了路径
+    bool wasResolved = false;
+
+    // --- 自动解析无路径的命令 (修复 ping 找不到的问题) ---
     // 如果 targetExe 只是一个文件名 (不包含 \ 或 /)
     if (targetExe.find(L'\\') == std::wstring::npos && targetExe.find(L'/') == std::wstring::npos) {
         wchar_t foundPath[MAX_PATH];
         // SearchPathW 会在 PATH 中搜索。
-        // 第三个参数 L".exe" 表示如果文件没扩展名，默认尝试 .exe
-        // 如果 targetExe 本身有扩展名 (如 script.bat)，SearchPathW 会忽略这个参数，直接搜 script.bat
         if (SearchPathW(NULL, targetExe.c_str(), L".exe", MAX_PATH, foundPath, NULL) > 0) {
             targetExe = foundPath; // 更新为全路径，例如 C:\Windows\System32\PING.EXE
+            wasResolved = true;    // [新增] 标记为已解析
         }
     }
 
@@ -2077,13 +2079,25 @@ BOOL CreateProcessInternal(
 
     std::string ansiExe, ansiDir; // 保持生命周期
 
+    // [修改] 路径选择优先级逻辑
     if (!redirectedExe.empty()) {
+        // 优先级 1: 如果有重定向，必须使用重定向路径
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
         if (isAnsi) {
             ansiExe = WideToAnsi(redirectedExe.c_str());
             finalAppName = ansiExe.c_str();
         } else {
             finalAppName = redirectedExe.c_str();
+        }
+    }
+    else if (wasResolved && lpApplicationName == NULL) {
+        // [新增] 优先级 2: 如果没有重定向，但我们解析出了全路径，且原路径为空
+        // 直接使用我们解析出的全路径，避免系统再次搜索失败
+        if (isAnsi) {
+            ansiExe = WideToAnsi(targetExe.c_str());
+            finalAppName = ansiExe.c_str();
+        } else {
+            finalAppName = targetExe.c_str();
         }
     }
 
