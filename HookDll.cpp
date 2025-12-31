@@ -1990,58 +1990,6 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     return fpNtDeleteFile(ObjectAttributes);
 }
 
-// [新增] 辅助：将文件转换为墓碑 (截断 + 隐藏 + 系统)
-NTSTATUS ConvertToTombstone(const std::wstring& filePath) {
-    IO_STATUS_BLOCK iosb;
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-
-    // 1. 尝试打开文件以修改属性和内容
-    // 必须使用宽松的共享模式 因为应用程序此时正持有该文件的句柄
-    hFile = CreateFileW(filePath.c_str(),
-        GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
-
-    if (hFile == INVALID_HANDLE_VALUE) {
-        DebugLog(L"Tombstone Failed: Open Error %d for %s", GetLastError(), filePath.c_str());
-        return STATUS_ACCESS_DENIED;
-    }
-
-    NTSTATUS status = STATUS_SUCCESS;
-
-    // 2. 截断为 0 字节
-    FILE_END_OF_FILE_INFORMATION eofInfo;
-    eofInfo.EndOfFile.QuadPart = 0;
-    status = fpNtSetInformationFile(hFile, &iosb, &eofInfo, sizeof(eofInfo), FileEndOfFileInformation);
-
-    if (!NT_SUCCESS(status)) {
-        DebugLog(L"Tombstone Failed: Truncate Error 0x%X", status);
-        CloseHandle(hFile);
-        return status;
-    }
-
-    // 3. 设置属性为 Hidden + System
-    FILE_BASIC_INFORMATION basicInfo = { 0 };
-    // 为了安全 先查询现有时间 避免时间戳被清零
-    status = fpNtQueryInformationFile(hFile, &iosb, &basicInfo, sizeof(basicInfo), FileBasicInformation);
-    if (NT_SUCCESS(status)) {
-        basicInfo.FileAttributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
-        status = fpNtSetInformationFile(hFile, &iosb, &basicInfo, sizeof(basicInfo), FileBasicInformation);
-    }
-
-    if (!NT_SUCCESS(status)) {
-        DebugLog(L"Tombstone Failed: SetAttr Error 0x%X", status);
-    } else {
-        DebugLog(L"Tombstone Created: %s", filePath.c_str());
-    }
-
-    CloseHandle(hFile);
-    return status;
-}
-
 NTSTATUS NTAPI Detour_NtSetInformationFile(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -2112,7 +2060,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
                                 // 4. 真实存在但沙盒不存在 -> 迁移目录结构
                                 DebugLog(L"Rename: Creating missing destination directory %s", sandboxDir);
-                                RecursiveCreateDirectory(sandboxDir);
+                                RecursiveCreatePathWithSync(sandboxDir);
 
                                 // 5. 同步目录属性 (可选 但推荐)
                                 CopyFileAttributesAndStripReadOnly(realDir, sandboxDir);
