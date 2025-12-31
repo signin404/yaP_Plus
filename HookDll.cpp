@@ -1298,7 +1298,7 @@ bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
 
 // [重写] 执行写时复制 (Migration)
 // 移植自 file.c: File_MigrateFile 和 File_CreatePath
-bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath) {
+bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
     std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
     std::wstring targetDos = NtPathToDosPath(targetNtPath);
 
@@ -1333,29 +1333,34 @@ bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
         // --- 文件迁移 ---
         // file.c: File_MigrateFile 逻辑
 
-        // A. 尝试复制文件内容
-        // CopyFileW 内部处理了大部分锁定情况 (使用共享读)
-        // 如果失败 (例如文件被独占锁定) 用户模式 Hook 很难处理 (Sandboxie 驱动可以绕过)
-        if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
-
-            // B. 同步属性并剥离只读
-            CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
-
-            // C. 同步时间戳
-            // 注意：CopyFileW 默认会保留时间戳 但为了保险起见(特别是对于某些文件系统) 手动同步一次
-            CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
-
-            success = true;
-            DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
+        if (copyContents) {
+            // A. 尝试复制文件内容 (标准 CoW)
+            // CopyFileW 内部处理了大部分锁定情况 (使用共享读)
+            if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
+                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+                success = true;
+                DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
+            }
+            else {
+                DWORD err = GetLastError();
+                DebugLog(L"CoW: Failed to copy %s (Error: %d)", sourceDos.c_str(), err);
+            }
         }
         else {
-            DWORD err = GetLastError();
-            DebugLog(L"CoW: Failed to copy %s (Error: %d)", sourceDos.c_str(), err);
+            // [新增] B. 仅创建占位文件 (针对 FILE_DELETE_ON_CLOSE 优化)
+            // 不需要复制内容，只需创建一个空文件供后续删除
+            HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
 
-            // [容错] 如果是因为文件被锁 (ERROR_SHARING_VIOLATION)
-            // 且目标是系统数据库 (catdb, edb) Sandboxie 有特殊处理
-            // 但在纯用户模式下 我们无法强制读取被锁定的文件
-            // 此时只能让操作失败 或者创建一个空文件占位 (但这通常会导致程序崩溃)
+                // 同步属性和时间戳 (虽然马上要删了，但保持一致性较好)
+                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+
+                success = true;
+                DebugLog(L"CoW: Migrated File Stub (No Content) %s", targetDos.c_str());
+            }
         }
     }
 
@@ -1743,14 +1748,18 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 shouldRedirect = true;
             } else if (realExists) {
                 // 真实存在但沙盒没有 -> 执行写时复制 (CoW)
-                // [修改] 检查返回值 如果迁移失败 则不重定向 让原始函数去处理(通常会报错 Access Denied 或 Sharing Violation)
-                if (PerformCopyOnWrite(fullNtPath, targetNtPath)) {
+
+                // [新增] 检查是否为删除操作 (FILE_DELETE_ON_CLOSE)
+                // 如果是为了删除，则不需要复制内容，极大提升性能
+                bool isDeleteOnClose = (CreateOptions & FILE_DELETE_ON_CLOSE) != 0;
+
+                // [修改] 传入 !isDeleteOnClose 作为 copyContents 参数
+                // 如果是删除操作，copyContents 为 false，仅创建占位文件
+                if (PerformCopyOnWrite(fullNtPath, targetNtPath, !isDeleteOnClose)) {
                     shouldRedirect = true;
                 } else {
-                    // 迁移失败 (可能是文件被锁) 不重定向 让程序直接访问原文件(只读)或报错
-                    // 但因为我们判定是 isWrite 访问原文件通常会失败 这符合预期
-                    shouldRedirect = false;
-                    // 或者：强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
+                    // 迁移失败 (可能是文件被锁)
+                    // 强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
                     // Sandboxie 的行为通常是报错
                     shouldRedirect = true;
                 }
