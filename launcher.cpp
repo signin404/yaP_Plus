@@ -4034,6 +4034,34 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         }
     }
 
+    // [新增] 解析 hookchildname 配置
+    std::wstring childHookNamesVar;
+    {
+        std::wstringstream stream(data->iniContent);
+        std::wstring line;
+        bool inGeneral = false;
+        while (std::getline(stream, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+            if (line[0] == L'[' && line.back() == L']') {
+                inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
+                continue;
+            }
+            if (inGeneral) {
+                size_t delimiterPos = line.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, delimiterPos));
+                    if (_wcsicmp(key.c_str(), L"hookchildname") == 0) {
+                        std::wstring val = trim(line.substr(delimiterPos + 1));
+                        if (!val.empty()) {
+                            childHookNamesVar += val + L";";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --- 3. 准备 IPC 与 DLL (如果启用 Hook) ---
     std::atomic<bool> stopIpc(false);
     HANDLE hIpcThread = NULL;
@@ -4082,6 +4110,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             hookChildVal = L"1"; // 默认开启
         }
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
+        SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);

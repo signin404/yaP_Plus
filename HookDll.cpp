@@ -473,6 +473,7 @@ wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 int g_HookMode = 1; // [新增] 默认模式 1
+std::vector<std::wstring> g_ChildHookWhitelist;
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_SystemDriveLetter; // [新增] 系统盘符 DOS 路径 (如 C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
@@ -515,6 +516,42 @@ void DebugLog(const wchar_t* format, ...) {
 
     OutputDebugStringW(buffer);
     SetLastError(lastErr);
+}
+
+// [新增] 初始化子进程白名单 (在 InitHookThread 中调用)
+void InitChildHookWhitelist() {
+    wchar_t buffer[2048]; // 假设白名单列表不会特别长
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", buffer, 2048) > 0) {
+        wchar_t* next_token = NULL;
+        wchar_t* token = wcstok_s(buffer, L";", &next_token);
+        while (token) {
+            g_ChildHookWhitelist.push_back(token);
+            token = wcstok_s(NULL, L";", &next_token);
+        }
+    }
+}
+
+// [新增] 检查是否应该挂钩该子进程
+bool ShouldHookChildProcess(const std::wstring& exePath) {
+    // 1. 如果总开关关闭 直接返回 false
+    if (!g_HookChild) return false;
+
+    // 2. 如果白名单为空 默认挂钩所有子进程
+    if (g_ChildHookWhitelist.empty()) return true;
+
+    // 3. 获取文件名 (例如 C:\Path\To\1.exe -> 1.exe)
+    const wchar_t* fileName = PathFindFileNameW(exePath.c_str());
+    if (!fileName || *fileName == L'\0') return false; // 无法获取文件名 保守起见不挂钩
+
+    // 4. 检查文件名是否在白名单中 (不区分大小写)
+    for (const auto& allowedName : g_ChildHookWhitelist) {
+        if (_wcsicmp(fileName, allowedName.c_str()) == 0) {
+            return true;
+        }
+    }
+
+    // 5. 有白名单但未匹配 不挂钩
+    return false;
 }
 
 // [新增] 进程类型枚举
@@ -3203,7 +3240,14 @@ BOOL CreateProcessInternal(
 
     // 5. 注入与恢复
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        // [修改] 增加白名单检查逻辑
+        // 只有当 ShouldHookChildProcess 返回 true 时才请求注入
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3791,6 +3835,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             g_HookChild = false;
         }
     }
+
+    // [新增] 初始化子进程白名单
+    InitChildHookWhitelist();
 
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];
