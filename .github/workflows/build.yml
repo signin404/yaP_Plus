@@ -1,0 +1,183 @@
+name: Build Full & Lite Version
+
+on:
+  #push:
+    #branches: [ "main", "master" ]
+  #pull_request:
+    #branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  # ==================================================================
+  # 第一步：构建 Hook DLLs (x86 和 x64) - 保持不变
+  # ==================================================================
+  build-hooks:
+    name: Build Hook DLL (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            name: YapHook32.dll
+            lib_minhook: libMinHook.x86.lib
+          - arch: x64
+            name: YapHook64.dll
+            lib_minhook: libMinHook.x64.lib
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Checkout MinHook
+      uses: actions/checkout@v4
+      with:
+        repository: TsudaKageyu/minhook
+        path: MinHook
+
+    - name: Setup MSVC (${{ matrix.arch }})
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.arch }}
+
+    - name: Compile MinHook Library
+      shell: cmd
+      run: |
+        echo Compiling MinHook for ${{ matrix.arch }}...
+        mkdir minhook_build
+        cd minhook_build
+        cl /nologo /c /O2 /MT /MP /DNDEBUG /I ..\MinHook\include ..\MinHook\src\*.c ..\MinHook\src\hde\*.c || exit 1
+        lib /nologo /OUT:..\${{ matrix.lib_minhook }} *.obj || exit 1
+        cd ..
+        echo MinHook library built: ${{ matrix.lib_minhook }}
+
+    - name: Compile Hook DLL
+      shell: cmd
+      run: |
+        echo Compiling ${{ matrix.name }}...
+        cl /nologo /LD /O2 /MT /EHsc /DUNICODE /D_UNICODE /I MinHook\include HookDll.cpp ${{ matrix.lib_minhook }} Shlwapi.lib Shell32.lib /Fe:${{ matrix.name }} || exit 1
+        if not exist "${{ matrix.name }}" (
+            echo Error: ${{ matrix.name }} was not created!
+            exit 1
+        )
+        del *.obj *.exp *.lib
+
+    - name: Upload Hook DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.name }}
+        path: ${{ matrix.name }}
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第二步：构建 32位 注入器 (YapInjector32.exe) - 保持不变
+  # ==================================================================
+  build-injector:
+    name: Build Injector32 (x86)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC (x86)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+
+    - name: Compile Injector32
+      shell: cmd
+      run: |
+        echo Compiling YapInjector32.exe...
+        cl /nologo /O2 /MT /EHsc /DUNICODE /D_UNICODE Injector32.cpp /Fe:YapInjector32.exe /link /SUBSYSTEM:CONSOLE || exit 1
+        if not exist "YapInjector32.exe" (
+            echo Error: YapInjector32.exe was not created!
+            exit 1
+        )
+        del *.obj
+
+    - name: Upload Injector EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: YapInjector32.exe
+        path: YapInjector32.exe
+        if-no-files-found: error
+
+  # ==================================================================
+  # 第三步：构建主程序 EXE (Full 和 Lite 版本)
+  # ==================================================================
+  build-launcher:
+    name: Build Launcher EXE
+    needs: [build-hooks, build-injector]
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+
+    - name: Verify Dependencies Existence
+      shell: cmd
+      run: |
+        if exist YapHook32.dll ( echo YapHook32.dll found. ) else ( echo Error: YapHook32.dll missing! & exit 1 )
+        if exist YapHook64.dll ( echo YapHook64.dll found. ) else ( echo Error: YapHook64.dll missing! & exit 1 )
+        if exist YapInjector32.exe ( echo YapInjector32.exe found. ) else ( echo Error: YapInjector32.exe missing! & exit 1 )
+
+    - name: Setup MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Prepare Common Files
+      shell: cmd
+      run: |
+        REM 准备空 INI (如果不存在)
+        if not exist "launcher.ini" echo ;Empty INI > launcher.ini
+
+    # ------------------------------------------------------------
+    # 构建完整版 (Full Version)
+    # 包含: EMBED_HOOK_DLLS
+    # ------------------------------------------------------------
+    - name: Build Full Version (yaP_Plus.exe)
+      shell: cmd
+      run: |
+        echo Building Full Version...
+
+        REM 1. 编译资源文件 (Full)
+        REM 定义 EMBED_HOOK_DLLS 以嵌入 DLL 和 Injector
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /d "EMBED_HOOK_DLLS" /fo launcher_full.res launcher.rc || exit 1
+
+        REM 2. 编译 C++ 代码并链接 Full 资源
+        cl.exe /std:c++17 /EHsc /O2 /MT /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher_full.res /Fe:yaP_Plus.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
+
+        REM 清理中间文件，防止干扰 Lite 构建
+        del *.obj
+
+    # ------------------------------------------------------------
+    # 构建轻量版 (Lite Version)
+    # 不包含: EMBED_HOOK_DLLS
+    # ------------------------------------------------------------
+    - name: Build Lite Version (yaP_Plus_Lite.exe)
+      shell: cmd
+      run: |
+        echo Building Lite Version...
+
+        REM 1. 编译资源文件 (Lite)
+        REM 注意：这里移除了 /d "EMBED_HOOK_DLLS"
+        rc.exe /d "EMBED_INI_FILE=\"launcher.ini\"" /fo launcher_lite.res launcher.rc || exit 1
+
+        REM 2. 编译 C++ 代码并链接 Lite 资源
+        cl.exe /std:c++17 /EHsc /O2 /MT /D "UNICODE" /D "_UNICODE" /utf-8 launcher.cpp launcher_lite.res /Fe:yaP_Plus_Lite.exe /link Shlwapi.lib User32.lib ntdll.lib Shell32.lib Ole32.lib Advapi32.lib OleAut32.lib Userenv.lib || exit 1
+
+        REM 清理
+        del *.obj
+
+    - name: Upload Final EXEs
+      uses: actions/upload-artifact@v4
+      with:
+        name: yaP_Plus_Builds
+        path: |
+          yaP_Plus.exe
+          yaP_Plus_Lite.exe
