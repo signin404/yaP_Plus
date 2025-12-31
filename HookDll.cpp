@@ -131,9 +131,47 @@
 #define FileInternalInformation ((FILE_INFORMATION_CLASS)6)
 #endif
 
+#ifndef FSCTL_GET_REPARSE_POINT
+#define FSCTL_GET_REPARSE_POINT 0x000900A8
+#endif
+
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003
+#endif
+
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000C
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+typedef struct _REPARSE_DATA_BUFFER {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG Flags;
+            WCHAR PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR PathBuffer[1];
+        } MountPointReparseBuffer;
+        struct {
+            UCHAR  DataBuffer[1];
+        } GenericReparseBuffer;
+    } DUMMYUNIONNAME;
+} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
 
 typedef struct _FILE_RENAME_INFORMATION {
     BOOLEAN ReplaceIfExists;
@@ -885,6 +923,111 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     return ntPath;
 }
 
+// [新增] 获取重解析点目标 (Junction/Symlink)
+std::wstring GetReparseTarget(const std::wstring& path) {
+    // 打开重解析点本身而不是其目标
+    HANDLE hFile = CreateFileW(path.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    // 16KB 缓冲区 (足够容纳最大路径)
+    std::vector<BYTE> buffer(16 * 1024);
+    DWORD bytesReturned = 0;
+    std::wstring target = L"";
+
+    if (DeviceIoControl(hFile, FSCTL_GET_REPARSE_POINT, NULL, 0, buffer.data(), (DWORD)buffer.size(), &bytesReturned, NULL)) {
+        PREPARSE_DATA_BUFFER pData = (PREPARSE_DATA_BUFFER)buffer.data();
+
+        WCHAR* pPathBuffer = NULL;
+        USHORT offset = 0;
+        USHORT length = 0;
+
+        if (pData->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+            pPathBuffer = pData->MountPointReparseBuffer.PathBuffer;
+            offset = pData->MountPointReparseBuffer.SubstituteNameOffset;
+            length = pData->MountPointReparseBuffer.SubstituteNameLength;
+        }
+        else if (pData->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+            pPathBuffer = pData->SymbolicLinkReparseBuffer.PathBuffer;
+            offset = pData->SymbolicLinkReparseBuffer.SubstituteNameOffset;
+            length = pData->SymbolicLinkReparseBuffer.SubstituteNameLength;
+        }
+
+        if (pPathBuffer) {
+            target.assign(pPathBuffer + offset / sizeof(WCHAR), length / sizeof(WCHAR));
+
+            // 处理 NT 前缀 \??\ (例如 \??\C:\Windows -> C:\Windows)
+            if (target.rfind(L"\\??\\", 0) == 0) {
+                target = target.substr(4);
+            }
+        }
+    }
+
+    CloseHandle(hFile);
+    return target;
+}
+
+// [新增] 深度解析路径 (处理不存在文件父目录中的 Junction)
+// 移植自 file.c: File_TranslateTempLinks 逻辑
+// 解决场景: 在沙盒内的 Junction (指向真实系统) 下创建新文件时，防止直接写入真实系统
+std::wstring ResolvePathDeep(const std::wstring& ntPath) {
+    std::wstring currentPath = NtPathToDosPath(ntPath);
+    if (currentPath.empty()) return ntPath;
+
+    std::wstring pathToCheck = currentPath;
+    std::wstring suffix = L"";
+
+    // 防止无限循环 (Junction Loop)
+    int maxDepth = 32;
+
+    while (maxDepth-- > 0) {
+        DWORD attrs = GetFileAttributesW(pathToCheck.c_str());
+
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            // 找到存在的路径组件
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+                // 是重解析点，获取目标
+                std::wstring target = GetReparseTarget(pathToCheck.c_str());
+                if (!target.empty()) {
+                    // 拼接后缀
+                    if (!suffix.empty()) {
+                        if (target.back() != L'\\') target += L"\\";
+                        target += suffix;
+                    }
+
+                    // 重置循环，从新路径开始重新检查 (因为目标里可能还有 Junction)
+                    currentPath = target;
+                    pathToCheck = currentPath;
+                    suffix = L"";
+                    continue;
+                }
+            }
+            // 找到存在的路径且不是重解析点，或者解析失败 -> 停止解析，返回当前结果
+            break;
+        }
+        else {
+            // 当前层级不存在，剥离最后一层，继续向上查找
+            size_t lastSlash = pathToCheck.find_last_of(L'\\');
+            if (lastSlash == std::wstring::npos) break;
+
+            std::wstring component = pathToCheck.substr(lastSlash + 1);
+            pathToCheck = pathToCheck.substr(0, lastSlash);
+
+            if (suffix.empty()) suffix = component;
+            else suffix = component + L"\\" + suffix;
+        }
+    }
+
+    // 转回 NT 路径
+    return L"\\??\\" + currentPath;
+}
+
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
 // 必须放在 NtPathToDosPath 之后 Detour_NtCreateFile 之前
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
@@ -912,7 +1055,7 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
 
         if (len > 0 && len < MAX_PATH) {
             std::wstring res = finalPath;
-            // 将 \\?\ 转换为 NT 格式 \??\ (注意注释末尾不要加反斜杠)
+            // 将 \\?\ 转换为 NT 格式 \??\
             if (res.rfind(L"\\\\?\\", 0) == 0) {
                 return L"\\??\\" + res.substr(4);
             }
@@ -920,12 +1063,7 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         }
     }
     else {
-        // 3. 文件不存在 (可能是创建新文件) 尝试展开短文件名
-        // GetLongPathNameW 即使文件不存在 只要路径组件存在也能工作
-        wchar_t longPath[MAX_PATH];
-        if (GetLongPathNameW(dosPath.c_str(), longPath, MAX_PATH) > 0) {
-            return L"\\??\\" + std::wstring(longPath);
-        }
+        return ResolvePathDeep(ntPath);
     }
 
     return ntPath;
