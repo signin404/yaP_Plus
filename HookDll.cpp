@@ -1497,6 +1497,16 @@ bool IsDriveRoot(const std::wstring& path) {
     return false;
 }
 
+// [新增] 生成简单的 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    std::hash<std::wstring> hasher;
+    // 简单的哈希 确保非零
+    size_t h = hasher(name);
+    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
+    return id;
+}
+
 // 核心：构建合并后的文件列表
 void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
@@ -2217,16 +2227,6 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
     }
 
     return status;
-}
-
-// [新增] 生成简单的 FileId (基于文件名哈希)
-LARGE_INTEGER GenerateFileId(const std::wstring& name) {
-    LARGE_INTEGER id;
-    std::hash<std::wstring> hasher;
-    // 简单的哈希 确保非零
-    size_t h = hasher(name);
-    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
-    return id;
 }
 
 // [新增] 内部公共查询逻辑
