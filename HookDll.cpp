@@ -925,25 +925,26 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
 
 // [新增] 获取重解析点目标 (Junction/Symlink)
 std::wstring GetReparseTarget(const std::wstring& path) {
-    // 打开重解析点本身而不是其目标
-    HANDLE hFile = CreateFileW(path.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    // 打开重解析点本身
+    // [修改] 增加 FILE_READ_ATTRIBUTES 权限，这是读取 Reparse Tag 的标准要求
+    HANDLE hFile = CreateFileW(path.c_str(), 
+        FILE_READ_ATTRIBUTES, 
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
+        NULL, 
+        OPEN_EXISTING, 
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 
         NULL);
 
     if (hFile == INVALID_HANDLE_VALUE) return L"";
 
-    // 16KB 缓冲区 (足够容纳最大路径)
+    // 16KB 缓冲区
     std::vector<BYTE> buffer(16 * 1024);
     DWORD bytesReturned = 0;
     std::wstring target = L"";
 
     if (DeviceIoControl(hFile, FSCTL_GET_REPARSE_POINT, NULL, 0, buffer.data(), (DWORD)buffer.size(), &bytesReturned, NULL)) {
         PREPARSE_DATA_BUFFER pData = (PREPARSE_DATA_BUFFER)buffer.data();
-
+        
         WCHAR* pPathBuffer = NULL;
         USHORT offset = 0;
         USHORT length = 0;
@@ -961,7 +962,7 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 
         if (pPathBuffer) {
             target.assign(pPathBuffer + offset / sizeof(WCHAR), length / sizeof(WCHAR));
-
+            
             // 处理 NT 前缀 \??\ (例如 \??\C:\Windows -> C:\Windows)
             if (target.rfind(L"\\??\\", 0) == 0) {
                 target = target.substr(4);
@@ -1028,42 +1029,53 @@ std::wstring ResolvePathDeep(const std::wstring& ntPath) {
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     if (ntPath.empty()) return ntPath;
 
-    // 1. 转换为 DOS 路径以便使用 Win32 API
-    std::wstring dosPath = NtPathToDosPath(ntPath);
-    if (dosPath.empty()) return ntPath; // 无法转换 保持原样
+    // 1. 转换为 DOS 路径
+    std::wstring currentPath = NtPathToDosPath(ntPath);
+    if (currentPath.empty()) return ntPath;
 
-    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
-    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
-    HANDLE hFile = CreateFileW(dosPath.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        NULL);
+    std::wstring pathToCheck = currentPath;
+    std::wstring suffix = L"";
+    
+    // 防止无限循环
+    int maxDepth = 32; 
 
-    if (hFile != INVALID_HANDLE_VALUE) {
-        wchar_t finalPath[MAX_PATH];
-        // VOLUME_NAME_DOS 返回 \\?\C:\Path 格式
-        DWORD len = GetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, VOLUME_NAME_DOS);
-        CloseHandle(hFile);
-
-        if (len > 0 && len < MAX_PATH) {
-            std::wstring res = finalPath;
-            // 将 \\?\ 转换为 NT 格式 \??\ (注意此处已移除末尾反斜杠)
-            if (res.rfind(L"\\\\?\\", 0) == 0) {
-                return L"\\??\\" + res.substr(4);
+    // 2. 逐层向上检查是否存在重解析点
+    while (maxDepth-- > 0) {
+        // 尝试获取当前路径组件的重解析目标
+        // 如果是普通文件/目录或不存在，返回空字符串
+        // 如果是 Junction/Symlink，返回目标路径 (例如 Z:\aaa)
+        std::wstring target = GetReparseTarget(pathToCheck.c_str());
+        
+        if (!target.empty()) {
+            // 发现重解析点
+            // 拼接后缀 (例如 Z:\aaa + \ + 1.txt)
+            if (!suffix.empty()) {
+                if (target.back() != L'\\') target += L"\\";
+                target += suffix;
             }
-            return res;
+            
+            // 更新当前路径，并重置循环以检查新路径中是否还包含 Junction
+            currentPath = target;
+            pathToCheck = currentPath;
+            suffix = L"";
+            continue;
         }
-    }
-    else {
-        // 3. 文件不存在 (可能是创建新文件)
-        // 使用深度解析逻辑，处理路径中包含的 Junction
-        return ResolvePathDeep(ntPath);
+
+        // 当前层级不是重解析点
+        // 剥离最后一层，继续向上查找父目录
+        size_t lastSlash = pathToCheck.find_last_of(L'\\');
+        if (lastSlash == std::wstring::npos) break; // 已到达根目录
+
+        std::wstring component = pathToCheck.substr(lastSlash + 1);
+        pathToCheck = pathToCheck.substr(0, lastSlash);
+        
+        if (suffix.empty()) suffix = component;
+        else suffix = component + L"\\" + suffix;
     }
 
-    return ntPath;
+    // 3. 转回 NT 路径
+    // 如果解析出了 Z:\aaa\1.txt，这里返回 \??\Z:\aaa\1.txt
+    return L"\\??\\" + currentPath;
 }
 
 // [新增] 智能获取真实路径和沙盒路径
