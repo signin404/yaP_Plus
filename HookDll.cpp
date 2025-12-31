@@ -1189,6 +1189,78 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     return true;
 }
 
+// [新增] 智能获取真实路径和沙盒路径
+bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
+    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Portable\Data\C)
+    std::wstring rawPath = GetPathFromHandle(hFile);
+    if (rawPath.empty()) return false;
+
+    // 2. [关键修复] 转换为 NT DOS 路径 (例如 \??\D:\Portable\Data\C)
+    std::wstring handleNtPath = DevicePathToNtPath(rawPath);
+
+    // 构造沙盒的 NT 路径前缀用于比较
+    std::wstring sandboxRootNt = L"\\??\\";
+    sandboxRootNt += g_SandboxRoot;
+    // 移除末尾斜杠以防万一 确保匹配准确
+    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
+
+    // 3. 检查句柄是否已经指向沙盒 (反向解析)
+    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
+    if (handleNtPath.size() >= sandboxRootNt.size() &&
+        _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
+
+        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
+        size_t rootLen = sandboxRootNt.length();
+
+        // 提取相对部分: \C
+        std::wstring relPath = handleNtPath.substr(rootLen);
+
+        std::wstring realNtPath;
+
+        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
+        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
+            // \C\Windows -> \??\C:\Windows
+            wchar_t driveLetter = relPath[1];
+            realNtPath = L"\\??\\";
+            realNtPath += driveLetter;
+            realNtPath += L":";
+            realNtPath += relPath.substr(2);
+        }
+        // 针对根目录 \C
+        else if (relPath.length() == 2 && relPath[0] == L'\\') {
+             wchar_t driveLetter = relPath[1];
+             realNtPath = L"\\??\\";
+             realNtPath += driveLetter;
+             realNtPath += L":";
+             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
+             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
+        }
+        else {
+            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
+            // 比如检测 \Users 映射回 C:\Users
+            // 目前暂不支持 返回 false
+            return false;
+        }
+
+        outSandboxDos = NtPathToDosPath(handleNtPath);
+        outRealDos = NtPathToDosPath(realNtPath);
+        return true;
+    }
+
+    // 4. 句柄指向真实路径 (正向解析)
+    else {
+        std::wstring targetNtPath;
+        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
+        if (ShouldRedirect(handleNtPath, targetNtPath)) {
+            outRealDos = NtPathToDosPath(handleNtPath);
+            outSandboxDos = NtPathToDosPath(targetNtPath);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // [新增] 复制文件时间戳 (Creation, Access, Write)
 bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
     HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -1290,107 +1362,45 @@ bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
     return success;
 }
 
-// [新增] 递归迁移整个目录 (用于目录重命名/移动)
-// 遍历真实目录，将所有缺失的文件 CoW 到沙盒
-void MigrateEntireDirectory(const std::wstring& realPath, const std::wstring& sandboxPath) {
-    // 1. 确保沙盒当前层级目录存在
-    // 使用 PerformCopyOnWrite 处理属性同步和只读剥离
-    PerformCopyOnWrite(L"\\??\\" + realPath, L"\\??\\" + sandboxPath);
-
-    std::wstring searchPath = realPath + L"\\*";
+// [新增] 递归合并目录树 (将真实目录内容合并到沙盒目录)
+// 用于在重命名目录前，确保沙盒目录包含真实目录的所有内容
+void CopyDirectoryTree(const std::wstring& srcDir, const std::wstring& destDir) {
+    std::wstring searchPath = srcDir + L"\\*";
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
 
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+    if (hFind == INVALID_HANDLE_VALUE) return;
 
-            std::wstring childReal = realPath + L"\\" + fd.cFileName;
-            std::wstring childSandbox = sandboxPath + L"\\" + fd.cFileName;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                // 递归处理子目录
-                MigrateEntireDirectory(childReal, childSandbox);
-            } else {
-                // 迁移文件 (PerformCopyOnWrite 内部会检查是否存在，若存在则跳过)
-                PerformCopyOnWrite(L"\\??\\" + childReal, L"\\??\\" + childSandbox);
+        std::wstring srcPath = srcDir + L"\\" + fd.cFileName;
+        std::wstring destPath = destDir + L"\\" + fd.cFileName;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // 如果是目录
+            // 1. 确保目标目录存在
+            if (GetFileAttributesW(destPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                CreateDirectoryW(destPath.c_str(), NULL);
+                // 同步目录属性
+                CopyFileAttributesAndStripReadOnly(srcPath.c_str(), destPath.c_str());
             }
-
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-}
-
-// [新增] 智能获取真实路径和沙盒路径
-bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
-    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Portable\Data\C)
-    std::wstring rawPath = GetPathFromHandle(hFile);
-    if (rawPath.empty()) return false;
-
-    // 2. [关键修复] 转换为 NT DOS 路径 (例如 \??\D:\Portable\Data\C)
-    std::wstring handleNtPath = DevicePathToNtPath(rawPath);
-
-    // 构造沙盒的 NT 路径前缀用于比较
-    std::wstring sandboxRootNt = L"\\??\\";
-    sandboxRootNt += g_SandboxRoot;
-    // 移除末尾斜杠以防万一 确保匹配准确
-    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
-
-    // 3. 检查句柄是否已经指向沙盒 (反向解析)
-    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
-    if (handleNtPath.size() >= sandboxRootNt.size() &&
-        _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
-
-        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
-        size_t rootLen = sandboxRootNt.length();
-
-        // 提取相对部分: \C
-        std::wstring relPath = handleNtPath.substr(rootLen);
-
-        std::wstring realNtPath;
-
-        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
-        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
-            // \C\Windows -> \??\C:\Windows
-            wchar_t driveLetter = relPath[1];
-            realNtPath = L"\\??\\";
-            realNtPath += driveLetter;
-            realNtPath += L":";
-            realNtPath += relPath.substr(2);
-        }
-        // 针对根目录 \C
-        else if (relPath.length() == 2 && relPath[0] == L'\\') {
-             wchar_t driveLetter = relPath[1];
-             realNtPath = L"\\??\\";
-             realNtPath += driveLetter;
-             realNtPath += L":";
-             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
-             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
+            // 2. 递归处理
+            CopyDirectoryTree(srcPath, destPath);
         }
         else {
-            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
-            // 比如检测 \Users 映射回 C:\Users
-            // 目前暂不支持 返回 false
-            return false;
+            // 如果是文件，且目标不存在，则复制
+            if (GetFileAttributesW(destPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                if (CopyFileW(srcPath.c_str(), destPath.c_str(), TRUE)) {
+                    CopyFileAttributesAndStripReadOnly(srcPath.c_str(), destPath.c_str());
+                    CopyFileTimestamps(srcPath.c_str(), destPath.c_str());
+                    DebugLog(L"Merge: Copied %s to %s", srcPath.c_str(), destPath.c_str());
+                }
+            }
         }
+    } while (FindNextFileW(hFind, &fd));
 
-        outSandboxDos = NtPathToDosPath(handleNtPath);
-        outRealDos = NtPathToDosPath(realNtPath);
-        return true;
-    }
-
-    // 4. 句柄指向真实路径 (正向解析)
-    else {
-        std::wstring targetNtPath;
-        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
-        if (ShouldRedirect(handleNtPath, targetNtPath)) {
-            outRealDos = NtPathToDosPath(handleNtPath);
-            outSandboxDos = NtPathToDosPath(targetNtPath);
-            return true;
-        }
-    }
-
-    return false;
+    FindClose(hFind);
 }
 
 struct RecursionGuard {
@@ -1954,57 +1964,39 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // 1. [新增] 拦截硬链接创建 (FileLinkInformation)
-    if (FileInformationClass == FileLinkInformation) {
-        // 检查句柄是否指向受控路径
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
-            std::wstring targetPath;
-            // 如果源文件在重定向范围内，禁止创建硬链接
-            // 这迫使应用程序（如 MSI）回退到 CopyFile，从而触发我们的 CoW 逻辑
-            if (ShouldRedirect(ntPath, targetPath)) {
-                DebugLog(L"Blocked HardLink creation for: %s", ntPath.c_str());
-                return STATUS_INVALID_DEVICE_REQUEST;
-            }
-        }
-    }
-
-    // 2. [新增] 重命名处理 (全量迁移 + 目标路径修正)
+    // [修改] 处理重命名逻辑
     if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
 
-        PFILE_RENAME_INFORMATION pRename = (PFILE_RENAME_INFORMATION)FileInformation;
-        std::wstring targetName(pRename->FileName, pRename->FileNameLength / sizeof(wchar_t));
-
-        // --- A. 目录全量迁移 (防止重命名目录后文件丢失) ---
-        // 检查源句柄是否为目录
+        // 新增逻辑：目录全量迁移 (Merge before Rename)
+        // 检查当前句柄是否为目录
+        IO_STATUS_BLOCK queryIosb;
         FILE_STANDARD_INFORMATION stdInfo;
-        IO_STATUS_BLOCK stdIosb;
-        if (NT_SUCCESS(fpNtQueryInformationFile(FileHandle, &stdIosb, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
+        if (NT_SUCCESS(fpNtQueryInformationFile(FileHandle, &queryIosb, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
             if (stdInfo.Directory) {
-                std::wstring rawPath = GetPathFromHandle(FileHandle);
-                if (!rawPath.empty()) {
-                    std::wstring ntPath = DevicePathToNtPath(rawPath);
-                    std::wstring targetPath; // 这里的 targetPath 是指重定向后的沙盒路径
+                // 获取当前句柄的真实路径和沙盒路径
+                std::wstring realDosPath, sandboxDosPath;
+                if (GetRealAndSandboxPaths(FileHandle, realDosPath, sandboxDosPath)) {
+                    // 如果句柄指向沙盒路径 (GetRealAndSandboxPaths 内部逻辑已确认)
+                    // 且真实路径也存在，说明这是一个“分层”的目录
+                    if (GetFileAttributesW(realDosPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        DebugLog(L"Rename: Merging directory content before rename...");
+                        DebugLog(L"  Src: %s", realDosPath.c_str());
+                        DebugLog(L"  Dst: %s", sandboxDosPath.c_str());
 
-                    if (ShouldRedirect(ntPath, targetPath)) {
-                        std::wstring realDos, sandboxDos;
-                        // 获取源目录的真实路径和沙盒路径
-                        if (GetRealAndSandboxPaths(FileHandle, realDos, sandboxDos)) {
-                            // 执行全量迁移：将真实目录下的所有内容复制到沙盒
-                            DebugLog(L"Rename: Migrating entire directory %s", realDos.c_str());
-                            MigrateEntireDirectory(realDos, sandboxDos);
-                        }
+                        // 执行递归合并：将 Real 中的遗留文件复制到 Sandbox
+                        CopyDirectoryTree(realDosPath, sandboxDosPath);
                     }
                 }
             }
         }
 
-        // --- B. 目标路径修正 (防止跨卷移动错误) ---
+        PFILE_RENAME_INFORMATION pRename = (PFILE_RENAME_INFORMATION)FileInformation;
+        std::wstring targetName(pRename->FileName, pRename->FileNameLength / sizeof(wchar_t));
+
         // 检查目标路径是否是绝对路径 (以 \ 开头)
         if (targetName.length() > 0 && targetName[0] == L'\\') {
 
-            // 1. 规范化目标路径 (处理短文件名等)
+            // 1. 规范化目标路径
             std::wstring fullTargetNt = NormalizeNtPath(targetName);
             std::wstring redirectedTargetNt;
 
@@ -2030,7 +2022,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                     pNewRename->FileNameLength = (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t));
                     memcpy(pNewRename->FileName, redirectedTargetNt.c_str(), pNewRename->FileNameLength);
 
-                    // 4. 调用原始函数 (使用修正后的目标路径)
+                    // 4. 调用原始函数
                     NTSTATUS status = fpNtSetInformationFile(FileHandle, IoStatusBlock, pNewRename, newSize, FileInformationClass);
 
                     delete[] (char*)pNewRename;
@@ -2040,8 +2032,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         }
     }
 
-    // 3. [原有] 删除拦截 (虚拟删除)
-    // 检查是否为删除操作
+    // 1. 检查是否为删除操作
     bool isDelete = false;
     if (FileInformationClass == FileDispositionInformation) {
         isDelete = ((PFILE_DISPOSITION_INFORMATION)FileInformation)->DeleteFile;
@@ -2050,28 +2041,55 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         isDelete = (((PFILE_DISPOSITION_INFORMATION_EX)FileInformation)->Flags & FILE_DISPOSITION_DELETE) != 0;
     }
 
-    if (isDelete) {
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
-            std::wstring targetPath;
+    // 如果不是删除操作 或者请求取消删除 (Delete=FALSE) 直接放行
+    if (!isDelete) {
+        return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
 
-            if (ShouldRedirect(ntPath, targetPath)) {
-                // 检查句柄是否已经指向沙盒内的文件
-                if (IsHandleInSandbox(FileHandle)) {
-                    // 情况 A: 句柄指向沙盒文件 -> 允许物理删除
-                    return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
-                }
-                else {
-                    IoStatusBlock->Status = STATUS_SUCCESS;
-                    IoStatusBlock->Information = 0;
-                    return STATUS_SUCCESS;
-                }
-            }
+    // 2. 获取路径
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) {
+        return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+
+    // 3. 路径标准化
+    std::wstring ntPath = DevicePathToNtPath(rawPath);
+    std::wstring targetPath;
+
+    // 4. 检查是否需要重定向
+    if (!ShouldRedirect(ntPath, targetPath)) {
+        return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+
+    // 5. 判断目标位置
+    std::wstring sandboxRootNt = L"\\??\\";
+    sandboxRootNt += g_SandboxRoot;
+
+    // 检查句柄是否已经指向沙盒内的文件
+    bool isHandleInSandbox = ContainsCaseInsensitive(ntPath, sandboxRootNt);
+
+    // --- 分支 A: 句柄指向沙盒内的文件 ---
+    if (isHandleInSandbox) {
+        // [修改] 之前是转换为墓碑 现在直接调用原始函数进行物理删除
+        // 因为句柄已经指向沙盒文件 直接放行即可
+        return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+
+    // --- 分支 B: 句柄指向真实文件 (尚未 CoW) ---
+    else {
+        std::wstring realDosPath = NtPathToDosPath(ntPath);
+        DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
+
+        if (realAttrs != INVALID_FILE_ATTRIBUTES) {
+            // [修改] 真实文件存在 但我们不想删除它 也不想创建墓碑
+            // 直接伪造成功
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 0;
+            return STATUS_SUCCESS;
         }
     }
 
-    // 默认：调用原始函数
+    // 异常情况 交给系统处理
     return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
