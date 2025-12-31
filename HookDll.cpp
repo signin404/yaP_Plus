@@ -423,6 +423,8 @@ typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTIN
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
+typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
+P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -476,6 +478,7 @@ bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
 std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
+std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -926,13 +929,13 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
 // [新增] 获取重解析点目标 (Junction/Symlink)
 std::wstring GetReparseTarget(const std::wstring& path) {
     // 打开重解析点本身
-    // [修改] 增加 FILE_READ_ATTRIBUTES 权限，这是读取 Reparse Tag 的标准要求
-    HANDLE hFile = CreateFileW(path.c_str(), 
-        FILE_READ_ATTRIBUTES, 
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
-        NULL, 
-        OPEN_EXISTING, 
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 
+    // [修改] 增加 FILE_READ_ATTRIBUTES 权限 这是读取 Reparse Tag 的标准要求
+    HANDLE hFile = CreateFileW(path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         NULL);
 
     if (hFile == INVALID_HANDLE_VALUE) return L"";
@@ -944,7 +947,7 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 
     if (DeviceIoControl(hFile, FSCTL_GET_REPARSE_POINT, NULL, 0, buffer.data(), (DWORD)buffer.size(), &bytesReturned, NULL)) {
         PREPARSE_DATA_BUFFER pData = (PREPARSE_DATA_BUFFER)buffer.data();
-        
+
         WCHAR* pPathBuffer = NULL;
         USHORT offset = 0;
         USHORT length = 0;
@@ -962,7 +965,7 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 
         if (pPathBuffer) {
             target.assign(pPathBuffer + offset / sizeof(WCHAR), length / sizeof(WCHAR));
-            
+
             // 处理 NT 前缀 \??\ (例如 \??\C:\Windows -> C:\Windows)
             if (target.rfind(L"\\??\\", 0) == 0) {
                 target = target.substr(4);
@@ -972,56 +975,6 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 
     CloseHandle(hFile);
     return target;
-}
-
-// [新增] 深度解析路径 (处理不存在文件父目录中的 Junction)
-// 移植自 file.c: File_TranslateTempLinks 逻辑
-// 解决场景: 在沙盒内的 Junction (指向真实系统) 下创建新文件时，防止直接写入真实系统
-std::wstring ResolvePathDeep(const std::wstring& ntPath) {
-    std::wstring currentPath = NtPathToDosPath(ntPath);
-    if (currentPath.empty()) return ntPath;
-
-    std::wstring pathToCheck = currentPath;
-    std::wstring suffix = L"";
-
-    // 防止无限循环 (Junction Loop)
-    int maxDepth = 32;
-
-    while (maxDepth-- > 0) {
-        // 尝试获取当前路径组件的重解析目标
-        // GetReparseTarget 内部使用 CreateFile(OPEN_REPARSE_POINT) + DeviceIoControl
-        // 如果是普通文件/目录或不存在，返回空字符串
-        // 如果是 Junction/Symlink，返回目标路径
-        std::wstring target = GetReparseTarget(pathToCheck.c_str());
-
-        if (!target.empty()) {
-            // 发现重解析点，拼接后缀
-            if (!suffix.empty()) {
-                if (target.back() != L'\\') target += L"\\";
-                target += suffix;
-            }
-
-            // 重置循环，从新路径开始重新检查 (因为目标里可能还有 Junction)
-            currentPath = target;
-            pathToCheck = currentPath;
-            suffix = L"";
-            continue;
-        }
-
-        // 当前层级不是重解析点 (可能是普通文件、目录或不存在)
-        // 剥离最后一层，继续向上查找父目录
-        size_t lastSlash = pathToCheck.find_last_of(L'\\');
-        if (lastSlash == std::wstring::npos) break; // 已到达根目录
-
-        std::wstring component = pathToCheck.substr(lastSlash + 1);
-        pathToCheck = pathToCheck.substr(0, lastSlash);
-
-        if (suffix.empty()) suffix = component;
-        else suffix = component + L"\\" + suffix;
-    }
-
-    // 转回 NT 路径
-    return L"\\??\\" + currentPath;
 }
 
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
@@ -1035,17 +988,17 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
 
     std::wstring pathToCheck = currentPath;
     std::wstring suffix = L"";
-    
+
     // 防止无限循环
-    int maxDepth = 32; 
+    int maxDepth = 32;
 
     // 2. 逐层向上检查是否存在重解析点
     while (maxDepth-- > 0) {
         // 尝试获取当前路径组件的重解析目标
-        // 如果是普通文件/目录或不存在，返回空字符串
-        // 如果是 Junction/Symlink，返回目标路径 (例如 Z:\aaa)
+        // 如果是普通文件/目录或不存在 返回空字符串
+        // 如果是 Junction/Symlink 返回目标路径 (例如 Z:\aaa)
         std::wstring target = GetReparseTarget(pathToCheck.c_str());
-        
+
         if (!target.empty()) {
             // 发现重解析点
             // 拼接后缀 (例如 Z:\aaa + \ + 1.txt)
@@ -1053,8 +1006,8 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
                 if (target.back() != L'\\') target += L"\\";
                 target += suffix;
             }
-            
-            // 更新当前路径，并重置循环以检查新路径中是否还包含 Junction
+
+            // 更新当前路径 并重置循环以检查新路径中是否还包含 Junction
             currentPath = target;
             pathToCheck = currentPath;
             suffix = L"";
@@ -1062,19 +1015,19 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         }
 
         // 当前层级不是重解析点
-        // 剥离最后一层，继续向上查找父目录
+        // 剥离最后一层 继续向上查找父目录
         size_t lastSlash = pathToCheck.find_last_of(L'\\');
         if (lastSlash == std::wstring::npos) break; // 已到达根目录
 
         std::wstring component = pathToCheck.substr(lastSlash + 1);
         pathToCheck = pathToCheck.substr(0, lastSlash);
-        
+
         if (suffix.empty()) suffix = component;
         else suffix = component + L"\\" + suffix;
     }
 
     // 3. 转回 NT 路径
-    // 如果解析出了 Z:\aaa\1.txt，这里返回 \??\Z:\aaa\1.txt
+    // 如果解析出了 Z:\aaa\1.txt 这里返回 \??\Z:\aaa\1.txt
     return L"\\??\\" + currentPath;
 }
 
@@ -1833,6 +1786,40 @@ bool NtPathExists(const std::wstring& ntPath) {
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
+// [新增] 初始化管道前缀 (在 InitHookThread 中调用)
+void InitPipeVirtualization() {
+    DWORD sessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+
+    // 生成唯一前缀 格式: YapBox_<SessionId>_
+    // 这样不同 Session 的沙盒不会冲突 且与真实管道区分开
+    wchar_t buf[64];
+    swprintf_s(buf, L"YapBox_%08x_", sessionId);
+    g_PipePrefix = buf;
+}
+
+// [新增] 计算虚拟化管道路径
+// 输入: \Device\NamedPipe\MyPipe
+// 输出: \Device\NamedPipe\YapBox_00000001_MyPipe
+bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
+    const std::wstring pipeDevice = L"\\Device\\NamedPipe\\";
+
+    // 检查是否为命名管道路径
+    if (fullNtPath.size() > pipeDevice.size() &&
+        _wcsnicmp(fullNtPath.c_str(), pipeDevice.c_str(), pipeDevice.size()) == 0) {
+
+        std::wstring pipeName = fullNtPath.substr(pipeDevice.size());
+
+        // 检查是否已经被虚拟化 (防止重复添加前缀)
+        if (pipeName.find(g_PipePrefix) == 0) return false;
+
+        // 构造虚拟化路径
+        outBoxedPath = pipeDevice + g_PipePrefix + pipeName;
+        return true;
+    }
+    return false;
+}
+
 NTSTATUS NTAPI Detour_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -1887,6 +1874,45 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 1. 路径解析与规范化 (后续原有逻辑)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 命名管道客户端虚拟化
+    std::wstring boxedPipePath;
+    if (GetBoxedPipePath(fullNtPath, boxedPipePath)) {
+        // 这是一个管道路径 我们需要决定是连接到沙盒内的虚拟管道 还是直通系统管道
+
+        // 1. 检查沙盒内是否存在该虚拟管道
+        // 使用 NtQueryAttributesFile 探测 避免产生连接副作用
+        OBJECT_ATTRIBUTES oaPipe;
+        UNICODE_STRING usPipe;
+        FILE_BASIC_INFORMATION basicInfo;
+
+        RtlInitUnicodeString(&usPipe, boxedPipePath.c_str());
+        InitializeObjectAttributes(&oaPipe, &usPipe, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        // 注意：对于管道 NtQueryAttributesFile 可能返回 STATUS_SUCCESS 或其他状态
+        // 只要不是 Object Name Not Found 就说明管道存在
+        NTSTATUS probeStatus = fpNtQueryAttributesFile(&oaPipe, &basicInfo);
+
+        if (probeStatus != STATUS_OBJECT_NAME_NOT_FOUND && probeStatus != STATUS_OBJECT_PATH_NOT_FOUND) {
+            // 沙盒内存在同名管道 (由本沙盒内的进程创建) 优先连接它
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, boxedPipePath.c_str());
+
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            DebugLog(L"Pipe: Connected to Virtualized Pipe %s", boxedPipePath.c_str());
+            return status;
+        }
+        // 如果沙盒内不存在 则放行 允许连接到真实的系统管道 (如 RPC, SCM 等)
+    }
 
     // 兼容性补丁区域 (Pre-Call)
 
@@ -2951,6 +2977,45 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     return status;
 }
 
+// [新增] Hook NtCreateNamedPipeFile (用于创建管道服务端)
+NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, ULONG NamedPipeType, ULONG ReadMode,
+    ULONG CompletionMode, ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout)
+{
+    if (g_IsInHook) return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+    RecursionGuard guard;
+
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring boxedPath;
+
+    // 如果是创建管道 强制重定向到虚拟化名称
+    // 这样沙盒内创建的管道对外部不可见 且不会与系统服务冲突
+    if (GetBoxedPipePath(rawNtPath, boxedPath)) {
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, boxedPath.c_str());
+
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+        // 替换为绝对路径 忽略 RootDirectory
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        NTSTATUS status = fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+
+        if (NT_SUCCESS(status)) {
+            DebugLog(L"Pipe: Virtualized Server %s -> %s", rawNtPath.c_str(), boxedPath.c_str());
+        }
+        return status;
+    }
+
+    return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -3682,6 +3747,8 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
+    // [新增] 初始化管道前缀
+    InitPipeVirtualization();
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
@@ -3833,6 +3900,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
             if (pNtQueryObject) {
                 MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+            }
+
+            // [新增] 挂钩 NtCreateNamedPipeFile
+            void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
+            if (pNtCreateNamedPipeFile) {
+                MH_CreateHook(pNtCreateNamedPipeFile, &Detour_NtCreateNamedPipeFile, reinterpret_cast<LPVOID*>(&fpNtCreateNamedPipeFile));
             }
 
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
