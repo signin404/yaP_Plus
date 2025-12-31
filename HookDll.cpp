@@ -1055,7 +1055,7 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
 
         if (len > 0 && len < MAX_PATH) {
             std::wstring res = finalPath;
-            // 将 \\?\ 转换为 NT 格式 \??\
+            // 将 \\?\ 转换为 NT 格式 \??\ (注意此处已移除末尾反斜杠)
             if (res.rfind(L"\\\\?\\", 0) == 0) {
                 return L"\\??\\" + res.substr(4);
             }
@@ -1063,6 +1063,8 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         }
     }
     else {
+        // 3. 文件不存在 (可能是创建新文件)
+        // 使用深度解析逻辑，处理路径中包含的 Junction
         return ResolvePathDeep(ntPath);
     }
 
