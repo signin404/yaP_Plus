@@ -868,19 +868,44 @@ bool IsPipeOrDevice(LPCWSTR path) {
     return false;
 }
 
-void RecursiveCreateDirectory(wchar_t* path) {
-    if (!path || !*path) return;
-    DWORD attr = GetFileAttributesW(path);
-    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
-    wchar_t* p = wcsrchr(path, L'\\');
-    if (!p) p = wcsrchr(path, L'/');
-    if (p) {
-        wchar_t saved = *p;
-        *p = L'\0';
-        RecursiveCreateDirectory(path);
-        *p = saved;
+// [新增] 智能递归创建目录 (同步属性和短文件名)
+void RecursiveCreatePathWithSync(const std::wstring& sandboxDosPath) {
+    if (sandboxDosPath.empty()) return;
+
+    // 如果目录已存在 直接返回
+    DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+    // 递归处理父目录
+    size_t lastSlash = sandboxDosPath.find_last_of(L'\\');
+    if (lastSlash != std::wstring::npos) {
+        RecursiveCreatePathWithSync(sandboxDosPath.substr(0, lastSlash));
     }
-    CreateDirectoryW(path, NULL);
+
+    // 创建当前目录
+    if (CreateDirectoryW(sandboxDosPath.c_str(), NULL)) {
+
+        std::wstring sandboxRoot = NtPathToDosPath(L"\\??\\" + std::wstring(g_SandboxRoot));
+
+        if (sandboxDosPath.size() > sandboxRoot.size() &&
+            _wcsnicmp(sandboxDosPath.c_str(), sandboxRoot.c_str(), sandboxRoot.size()) == 0) {
+
+            std::wstring relPath = sandboxDosPath.substr(sandboxRoot.size());
+            // relPath 如 "\C\Windows"
+
+            if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
+                wchar_t drive = relPath[1];
+                std::wstring realPath = std::wstring(1, drive) + L":" + relPath.substr(2);
+
+                // 同步属性、时间戳和短文件名
+                if (GetFileAttributesW(realPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    CopyFileAttributesAndStripReadOnly(realPath.c_str(), sandboxDosPath.c_str());
+                    CopyFileTimestamps(realPath.c_str(), sandboxDosPath.c_str());
+                    CopyShortName(realPath.c_str(), sandboxDosPath.c_str());
+                }
+            }
+        }
+    }
 }
 
 void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
@@ -889,7 +914,7 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
         wchar_t path[MAX_PATH];
         wcscpy_s(path, MAX_PATH, dosPath);
         PathRemoveFileSpecW(path);
-        RecursiveCreateDirectory(path);
+        RecursiveCreatePathWithSync(path);
     }
 }
 
@@ -1297,6 +1322,61 @@ bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
     return SetFileAttributesW(destPath, destAttrs) != FALSE;
 }
 
+// [新增] 启用 SE_RESTORE_NAME 特权 (用于设置短文件名)
+void EnableRestorePrivilege() {
+    HANDLE hToken;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        LookupPrivilegeValueW(NULL, SE_RESTORE_NAME, &tp.Privileges[0].Luid);
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
+        CloseHandle(hToken);
+    }
+}
+
+// [新增] 复制短文件名 (8.3 Filename)
+// 移植自 file.c: File_CopyShortName
+void CopyShortName(LPCWSTR realPath, LPCWSTR sandboxPath) {
+    // 1. 获取真实文件的短文件名
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(realPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    FindClose(hFind);
+
+    // 如果没有短文件名 或短文件名与长文件名相同 则无需设置
+    if (fd.cAlternateFileName[0] == L'\0' || wcscmp(fd.cFileName, fd.cAlternateFileName) == 0) {
+        return;
+    }
+
+    // 2. 打开沙盒文件以设置短文件名
+    // 注意：设置 ShortName 需要 DELETE 权限 (Windows 内部机制要求) 和 SE_RESTORE_NAME 特权
+    HANDLE hFile = CreateFileW(sandboxPath,
+        GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, // 支持目录
+        NULL);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        // 构造 FILE_NAME_INFORMATION 结构
+        size_t len = wcslen(fd.cAlternateFileName);
+        size_t bufSize = sizeof(FILE_NAME_INFORMATION) + len * sizeof(WCHAR);
+        std::vector<BYTE> buffer(bufSize);
+
+        PFILE_NAME_INFORMATION info = (PFILE_NAME_INFORMATION)buffer.data();
+        info->FileNameLength = (ULONG)(len * sizeof(WCHAR));
+        memcpy(info->FileName, fd.cAlternateFileName, info->FileNameLength);
+
+        IO_STATUS_BLOCK iosb;
+        // FileShortNameInformation = 40
+        fpNtSetInformationFile(hFile, &iosb, info, (ULONG)bufSize, (FILE_INFORMATION_CLASS)40);
+
+        CloseHandle(hFile);
+    }
+}
+
 // [重写] 执行写时复制 (Migration)
 // 移植自 file.c: File_MigrateFile 和 File_CreatePath
 bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
@@ -1311,35 +1391,39 @@ bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
     // 1. 检查目标是否已存在 (避免重复迁移)
     if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
 
-    // 2. 确保父目录存在 (递归创建)
+    // 2. 确保父目录存在 (递归创建并同步属性/短文件名)
     wchar_t dirBuf[MAX_PATH];
     wcscpy_s(dirBuf, MAX_PATH, targetDos.c_str());
     PathRemoveFileSpecW(dirBuf);
-    RecursiveCreateDirectory(dirBuf);
+
+    // [修改] 使用带同步功能的递归创建
+    RecursiveCreatePathWithSync(dirBuf);
 
     bool success = false;
 
     // 3. 分类处理
     if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
         // --- 目录迁移 ---
-        // 创建目录并同步属性
         if (CreateDirectoryW(targetDos.c_str(), NULL)) {
             CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
             CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+            // [新增] 复制短文件名
+            CopyShortName(sourceDos.c_str(), targetDos.c_str());
+
             success = true;
             DebugLog(L"CoW: Migrated Directory %s", targetDos.c_str());
         }
     }
     else {
         // --- 文件迁移 ---
-        // file.c: File_MigrateFile 逻辑
-
         if (copyContents) {
-            // A. 尝试复制文件内容 (标准 CoW)
-            // CopyFileW 内部处理了大部分锁定情况 (使用共享读)
+            // A. 尝试复制文件内容
             if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
                 CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
                 CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+                // [新增] 复制短文件名
+                CopyShortName(sourceDos.c_str(), targetDos.c_str());
+
                 success = true;
                 DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
             }
@@ -1349,18 +1433,17 @@ bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
             }
         }
         else {
-            // [新增] B. 仅创建占位文件 (针对 FILE_DELETE_ON_CLOSE 优化)
-            // 不需要复制内容 只需创建一个空文件供后续删除
+            // B. 仅创建占位文件 (针对 FILE_DELETE_ON_CLOSE 优化)
             HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {
                 CloseHandle(hFile);
-
-                // 同步属性和时间戳 (虽然马上要删了 但保持一致性较好)
                 CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
                 CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+                // [新增] 复制短文件名
+                CopyShortName(sourceDos.c_str(), targetDos.c_str());
 
                 success = true;
-                DebugLog(L"CoW: Migrated File Stub (No Content) %s", targetDos.c_str());
+                DebugLog(L"CoW: Migrated File Stub %s", targetDos.c_str());
             }
         }
     }
@@ -3429,6 +3512,9 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
+    // [新增] 启用特权以支持短文件名设置
+    EnableRestorePrivilege();
+
     // 1. 刷新设备映射
     RefreshDeviceMap();
 
