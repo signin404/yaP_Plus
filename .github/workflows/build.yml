@@ -177,7 +177,7 @@ jobs:
     - name: Upload Final EXEs
       uses: actions/upload-artifact@v4
       with:
-        name: yaP_Plus_Builds
+        name: yaP_Plus
         path: |
           yaP_Plus.exe
           yaP_Plus_Lite.exe
