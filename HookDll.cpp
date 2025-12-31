@@ -2005,25 +2005,21 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
     if (g_IsInHook) return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     RecursionGuard guard;
 
-    // [修改] 处理重命名逻辑
+    // 1. 处理重命名 (Rename)
     if (FileInformationClass == FileRenameInformation || FileInformationClass == FileRenameInformationEx) {
 
-        // 新增逻辑：目录全量迁移 (Merge before Rename)
-        // 检查当前句柄是否为目录
+        // ---------------------------------------------------------
+        // A. 目录全量迁移 (Merge before Rename)
+        // ---------------------------------------------------------
         IO_STATUS_BLOCK queryIosb;
         FILE_STANDARD_INFORMATION stdInfo;
         if (NT_SUCCESS(fpNtQueryInformationFile(FileHandle, &queryIosb, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
             if (stdInfo.Directory) {
-                // 获取当前句柄的真实路径和沙盒路径
                 std::wstring realDosPath, sandboxDosPath;
                 if (GetRealAndSandboxPaths(FileHandle, realDosPath, sandboxDosPath)) {
-                    // 如果句柄指向沙盒路径 (GetRealAndSandboxPaths 内部逻辑已确认)
-                    // 且真实路径也存在 说明这是一个“分层”的目录
+                    // 如果句柄指向沙盒路径且真实路径也存在 说明这是一个“分层”的目录
                     if (GetFileAttributesW(realDosPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                         DebugLog(L"Rename: Merging directory content before rename...");
-                        DebugLog(L"  Src: %s", realDosPath.c_str());
-                        DebugLog(L"  Dst: %s", sandboxDosPath.c_str());
-
                         // 执行递归合并：将 Real 中的遗留文件复制到 Sandbox
                         CopyDirectoryTree(realDosPath, sandboxDosPath);
                     }
@@ -2037,18 +2033,19 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         // 检查目标路径是否是绝对路径 (以 \ 开头)
         if (targetName.length() > 0 && targetName[0] == L'\\') {
 
-            // 1. 规范化目标路径
             std::wstring fullTargetNt = NormalizeNtPath(targetName);
             std::wstring redirectedTargetNt;
 
-            // 2. 检查目标路径是否需要重定向
+            // 检查目标路径是否需要重定向
             if (ShouldRedirect(fullTargetNt, redirectedTargetNt)) {
 
-                // [新增] 修复移动到仅真实存在目录时的报错 (Auto-Create Destination Directory)
+                // ---------------------------------------------------------
+                // B. 修复移动到仅真实存在目录时的报错 (Auto-Create Destination Directory)
+                // ---------------------------------------------------------
                 std::wstring sandboxTargetDos = NtPathToDosPath(redirectedTargetNt);
                 wchar_t sandboxDir[MAX_PATH];
                 if (wcscpy_s(sandboxDir, MAX_PATH, sandboxTargetDos.c_str()) == 0) {
-                    PathRemoveFileSpecW(sandboxDir); // 获取沙盒目标父目录 (例如 Z:\Sandbox\C\123)
+                    PathRemoveFileSpecW(sandboxDir); // 获取沙盒目标父目录
 
                     // 1. 检查沙盒父目录是否存在
                     if (GetFileAttributesW(sandboxDir) == INVALID_FILE_ATTRIBUTES) {
@@ -2057,7 +2054,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                         std::wstring realTargetDos = NtPathToDosPath(fullTargetNt);
                         wchar_t realDir[MAX_PATH];
                         if (wcscpy_s(realDir, MAX_PATH, realTargetDos.c_str()) == 0) {
-                            PathRemoveFileSpecW(realDir); // 获取真实目标父目录 (例如 C:\123)
+                            PathRemoveFileSpecW(realDir); // 获取真实目标父目录
 
                             // 3. 检查真实父目录是否存在
                             DWORD realAttr = GetFileAttributesW(realDir);
@@ -2065,9 +2062,10 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
                                 // 4. 真实存在但沙盒不存在 -> 迁移目录结构
                                 DebugLog(L"Rename: Creating missing destination directory %s", sandboxDir);
+                                // 使用带同步功能的递归创建 (如果已移植) 或普通递归创建
                                 RecursiveCreatePathWithSync(sandboxDir);
 
-                                // 5. 同步目录属性 (可选 但推荐)
+                                // 5. 同步目录属性 (双重保险)
                                 CopyFileAttributesAndStripReadOnly(realDir, sandboxDir);
                                 CopyFileTimestamps(realDir, sandboxDir);
                             }
@@ -2075,7 +2073,9 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                     }
                 }
 
-                // 3. 构造新的重命名结构体 (原有逻辑)
+                // ---------------------------------------------------------
+                // C. 构造新的重命名结构体
+                // ---------------------------------------------------------
                 ULONG newSize = Length + (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t)) + 128;
                 PFILE_RENAME_INFORMATION pNewRename = (PFILE_RENAME_INFORMATION)new(char[newSize]);
 
@@ -2094,7 +2094,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                     pNewRename->FileNameLength = (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t));
                     memcpy(pNewRename->FileName, redirectedTargetNt.c_str(), pNewRename->FileNameLength);
 
-                    // 4. 调用原始函数
+                    // 调用原始函数
                     NTSTATUS status = fpNtSetInformationFile(FileHandle, IoStatusBlock, pNewRename, newSize, FileInformationClass);
 
                     delete[] (char*)pNewRename;
@@ -2104,7 +2104,77 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         }
     }
 
-    // 1. 检查是否为删除操作
+    // 2. 处理硬链接 (Hard Link)
+    if (FileInformationClass == FileLinkInformation || FileInformationClass == (FILE_INFORMATION_CLASS)65 /*FileLinkInformationEx*/) {
+
+        PFILE_LINK_INFORMATION pLink = (PFILE_LINK_INFORMATION)FileInformation;
+        std::wstring targetName(pLink->FileName, pLink->FileNameLength / sizeof(wchar_t));
+
+        if (targetName.length() > 0 && targetName[0] == L'\\') {
+
+            std::wstring fullTargetNt = NormalizeNtPath(targetName);
+            std::wstring redirectedTargetNt;
+
+            if (ShouldRedirect(fullTargetNt, redirectedTargetNt)) {
+
+                // 1. 构造新的 Link 结构体
+                ULONG newSize = Length + (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t)) + 128;
+                PFILE_LINK_INFORMATION pNewLink = (PFILE_LINK_INFORMATION)new(char[newSize]);
+
+                if (pNewLink) {
+                    memset(pNewLink, 0, newSize);
+
+                    // 复制头部信息 (兼容 Ex 结构)
+                    *(ULONG*)pNewLink = *(ULONG*)pLink;
+
+                    pNewLink->RootDirectory = pLink->RootDirectory;
+                    pNewLink->FileNameLength = (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t));
+                    memcpy(pNewLink->FileName, redirectedTargetNt.c_str(), pNewLink->FileNameLength);
+
+                    // 2. 检查源文件是否需要迁移 (CoW)
+                    HANDLE hOpHandle = FileHandle;
+                    bool closeHandle = false;
+
+                    if (!IsHandleInSandbox(FileHandle)) {
+                        std::wstring rawPath = GetPathFromHandle(FileHandle);
+                        std::wstring sourceNtPath = DevicePathToNtPath(rawPath);
+                        std::wstring sourceSandboxNt;
+
+                        if (ShouldRedirect(sourceNtPath, sourceSandboxNt)) {
+                            // 执行写时复制 (CoW)
+                            if (PerformCopyOnWrite(sourceNtPath, sourceSandboxNt)) {
+                                std::wstring sourceSandboxDos = NtPathToDosPath(sourceSandboxNt);
+                                HANDLE hSandboxed = CreateFileW(sourceSandboxDos.c_str(),
+                                    FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+                                if (hSandboxed != INVALID_HANDLE_VALUE) {
+                                    hOpHandle = hSandboxed;
+                                    closeHandle = true;
+                                    DebugLog(L"HardLink: Source migrated to %s", sourceSandboxDos.c_str());
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. 调用原始函数
+                    NTSTATUS status = fpNtSetInformationFile(hOpHandle, IoStatusBlock, pNewLink, newSize, FileInformationClass);
+
+                    if (closeHandle) CloseHandle(hOpHandle);
+                    delete[] (char*)pNewLink;
+                    return status;
+                }
+            }
+        }
+    }
+
+    // [拦截] FileHardLinkInformation (强制程序使用 CopyFile)
+    if (FileInformationClass == (FILE_INFORMATION_CLASS)46 /*FileHardLinkInformation*/) {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    // 3. 处理删除 (Delete)
     bool isDelete = false;
     if (FileInformationClass == FileDispositionInformation) {
         isDelete = ((PFILE_DISPOSITION_INFORMATION)FileInformation)->DeleteFile;
@@ -2118,22 +2188,22 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 2. 获取路径
+    // 获取路径
     std::wstring rawPath = GetPathFromHandle(FileHandle);
     if (rawPath.empty()) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 3. 路径标准化
+    // 路径标准化
     std::wstring ntPath = DevicePathToNtPath(rawPath);
     std::wstring targetPath;
 
-    // 4. 检查是否需要重定向
+    // 检查是否需要重定向
     if (!ShouldRedirect(ntPath, targetPath)) {
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
-    // 5. 判断目标位置
+    // 判断目标位置
     std::wstring sandboxRootNt = L"\\??\\";
     sandboxRootNt += g_SandboxRoot;
 
@@ -2142,8 +2212,7 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
 
     // --- 分支 A: 句柄指向沙盒内的文件 ---
     if (isHandleInSandbox) {
-        // [修改] 之前是转换为墓碑 现在直接调用原始函数进行物理删除
-        // 因为句柄已经指向沙盒文件 直接放行即可
+        // 直接调用原始函数进行物理删除
         return fpNtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     }
 
@@ -2153,8 +2222,9 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
         DWORD realAttrs = GetFileAttributesW(realDosPath.c_str());
 
         if (realAttrs != INVALID_FILE_ATTRIBUTES) {
-            // [修改] 真实文件存在 但我们不想删除它 也不想创建墓碑
-            // 直接伪造成功
+            // 真实文件存在 但我们不能删除它
+            // 在纯用户模式下 我们无法完美隐藏它（除非使用墓碑机制）
+            // 这里返回伪造的成功 欺骗程序文件已删除
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = 0;
             return STATUS_SUCCESS;
