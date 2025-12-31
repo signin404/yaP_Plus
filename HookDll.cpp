@@ -987,31 +987,30 @@ std::wstring ResolvePathDeep(const std::wstring& ntPath) {
     int maxDepth = 32;
 
     while (maxDepth-- > 0) {
-        DWORD attrs = GetFileAttributesW(pathToCheck.c_str());
+        // 尝试获取当前路径组件的重解析目标
+        // GetReparseTarget 内部使用 CreateFile(OPEN_REPARSE_POINT) + DeviceIoControl
+        // 如果是普通文件/目录或不存在，返回空字符串
+        // 如果是 Junction/Symlink，返回目标路径
+        std::wstring target = GetReparseTarget(pathToCheck.c_str());
 
-        // 检查是否为重解析点 (Junction / Symlink)
-        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
-            // 是重解析点，获取目标
-            std::wstring target = GetReparseTarget(pathToCheck.c_str());
-            if (!target.empty()) {
-                // 拼接后缀
-                if (!suffix.empty()) {
-                    if (target.back() != L'\\') target += L"\\";
-                    target += suffix;
-                }
-
-                // 重置循环，从新路径开始重新检查 (因为目标里可能还有 Junction)
-                currentPath = target;
-                pathToCheck = currentPath;
-                suffix = L"";
-                continue;
+        if (!target.empty()) {
+            // 发现重解析点，拼接后缀
+            if (!suffix.empty()) {
+                if (target.back() != L'\\') target += L"\\";
+                target += suffix;
             }
+
+            // 重置循环，从新路径开始重新检查 (因为目标里可能还有 Junction)
+            currentPath = target;
+            pathToCheck = currentPath;
+            suffix = L"";
+            continue;
         }
 
-        // [关键修改] 无论文件是否存在，或者是否为普通文件，都继续向上剥离
-        // 以便检查父目录是否为 Junction
+        // 当前层级不是重解析点 (可能是普通文件、目录或不存在)
+        // 剥离最后一层，继续向上查找父目录
         size_t lastSlash = pathToCheck.find_last_of(L'\\');
-        if (lastSlash == std::wstring::npos) break; // 已到达根目录 (如 C:)
+        if (lastSlash == std::wstring::npos) break; // 已到达根目录
 
         std::wstring component = pathToCheck.substr(lastSlash + 1);
         pathToCheck = pathToCheck.substr(0, lastSlash);
