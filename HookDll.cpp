@@ -868,56 +868,6 @@ bool IsPipeOrDevice(LPCWSTR path) {
     return false;
 }
 
-// [新增] 智能递归创建目录 (同步属性和短文件名)
-void RecursiveCreatePathWithSync(const std::wstring& sandboxDosPath) {
-    if (sandboxDosPath.empty()) return;
-
-    // 如果目录已存在 直接返回
-    DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
-
-    // 递归处理父目录
-    size_t lastSlash = sandboxDosPath.find_last_of(L'\\');
-    if (lastSlash != std::wstring::npos) {
-        RecursiveCreatePathWithSync(sandboxDosPath.substr(0, lastSlash));
-    }
-
-    // 创建当前目录
-    if (CreateDirectoryW(sandboxDosPath.c_str(), NULL)) {
-
-        std::wstring sandboxRoot = NtPathToDosPath(L"\\??\\" + std::wstring(g_SandboxRoot));
-
-        if (sandboxDosPath.size() > sandboxRoot.size() &&
-            _wcsnicmp(sandboxDosPath.c_str(), sandboxRoot.c_str(), sandboxRoot.size()) == 0) {
-
-            std::wstring relPath = sandboxDosPath.substr(sandboxRoot.size());
-            // relPath 如 "\C\Windows"
-
-            if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
-                wchar_t drive = relPath[1];
-                std::wstring realPath = std::wstring(1, drive) + L":" + relPath.substr(2);
-
-                // 同步属性、时间戳和短文件名
-                if (GetFileAttributesW(realPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    CopyFileAttributesAndStripReadOnly(realPath.c_str(), sandboxDosPath.c_str());
-                    CopyFileTimestamps(realPath.c_str(), sandboxDosPath.c_str());
-                    CopyShortName(realPath.c_str(), sandboxDosPath.c_str());
-                }
-            }
-        }
-    }
-}
-
-void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
-    if (wcsncmp(ntPath, L"\\??\\", 4) == 0) {
-        LPCWSTR dosPath = ntPath + 4;
-        wchar_t path[MAX_PATH];
-        wcscpy_s(path, MAX_PATH, dosPath);
-        PathRemoveFileSpecW(path);
-        RecursiveCreatePathWithSync(path);
-    }
-}
-
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
@@ -974,6 +924,292 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     }
 
     return ntPath;
+}
+
+// [新增] 智能获取真实路径和沙盒路径
+bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
+    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Portable\Data\C)
+    std::wstring rawPath = GetPathFromHandle(hFile);
+    if (rawPath.empty()) return false;
+
+    // 2. [关键修复] 转换为 NT DOS 路径 (例如 \??\D:\Portable\Data\C)
+    std::wstring handleNtPath = DevicePathToNtPath(rawPath);
+
+    // 构造沙盒的 NT 路径前缀用于比较
+    std::wstring sandboxRootNt = L"\\??\\";
+    sandboxRootNt += g_SandboxRoot;
+    // 移除末尾斜杠以防万一 确保匹配准确
+    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
+
+    // 3. 检查句柄是否已经指向沙盒 (反向解析)
+    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
+    if (handleNtPath.size() >= sandboxRootNt.size() &&
+        _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
+
+        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
+        size_t rootLen = sandboxRootNt.length();
+
+        // 提取相对部分: \C
+        std::wstring relPath = handleNtPath.substr(rootLen);
+
+        std::wstring realNtPath;
+
+        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
+        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
+            // \C\Windows -> \??\C:\Windows
+            wchar_t driveLetter = relPath[1];
+            realNtPath = L"\\??\\";
+            realNtPath += driveLetter;
+            realNtPath += L":";
+            realNtPath += relPath.substr(2);
+        }
+        // 针对根目录 \C
+        else if (relPath.length() == 2 && relPath[0] == L'\\') {
+             wchar_t driveLetter = relPath[1];
+             realNtPath = L"\\??\\";
+             realNtPath += driveLetter;
+             realNtPath += L":";
+             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
+             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
+        }
+        else {
+            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
+            // 比如检测 \Users 映射回 C:\Users
+            // 目前暂不支持 返回 false
+            return false;
+        }
+
+        outSandboxDos = NtPathToDosPath(handleNtPath);
+        outRealDos = NtPathToDosPath(realNtPath);
+        return true;
+    }
+
+    // 4. 句柄指向真实路径 (正向解析)
+    else {
+        std::wstring targetNtPath;
+        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
+        if (ShouldRedirect(handleNtPath, targetNtPath)) {
+            outRealDos = NtPathToDosPath(handleNtPath);
+            outSandboxDos = NtPathToDosPath(targetNtPath);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// [新增] 复制文件时间戳 (Creation, Access, Write)
+bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
+    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hSrc == INVALID_HANDLE_VALUE) return false;
+
+    FILETIME ftCreate, ftAccess, ftWrite;
+    bool result = false;
+    if (GetFileTime(hSrc, &ftCreate, &ftAccess, &ftWrite)) {
+        HANDLE hDest = CreateFileW(destPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (hDest != INVALID_HANDLE_VALUE) {
+            if (SetFileTime(hDest, &ftCreate, &ftAccess, &ftWrite)) {
+                result = true;
+            }
+            CloseHandle(hDest);
+        }
+    }
+    CloseHandle(hSrc);
+    return result;
+}
+
+// [新增] 复制文件属性 (Hidden, System 等) 并剥离 ReadOnly
+bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
+    DWORD srcAttrs = GetFileAttributesW(srcPath);
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
+
+    // 核心逻辑：剥离只读属性
+    // 如果源文件是只读的 复制到沙盒后必须变为可写 否则 CoW 失去意义
+    DWORD destAttrs = srcAttrs & ~FILE_ATTRIBUTE_READONLY;
+
+    // 确保至少有一个属性 (防止为 0)
+    if (destAttrs == 0) destAttrs = FILE_ATTRIBUTE_NORMAL;
+
+    return SetFileAttributesW(destPath, destAttrs) != FALSE;
+}
+
+// [新增] 启用 SE_RESTORE_NAME 特权 (用于设置短文件名)
+void EnableRestorePrivilege() {
+    HANDLE hToken;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        LookupPrivilegeValueW(NULL, SE_RESTORE_NAME, &tp.Privileges[0].Luid);
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
+        CloseHandle(hToken);
+    }
+}
+
+// [新增] 复制短文件名 (8.3 Filename)
+// 移植自 file.c: File_CopyShortName
+void CopyShortName(LPCWSTR realPath, LPCWSTR sandboxPath) {
+    // 1. 获取真实文件的短文件名
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(realPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    FindClose(hFind);
+
+    // 如果没有短文件名 或短文件名与长文件名相同 则无需设置
+    if (fd.cAlternateFileName[0] == L'\0' || wcscmp(fd.cFileName, fd.cAlternateFileName) == 0) {
+        return;
+    }
+
+    // 2. 打开沙盒文件以设置短文件名
+    // 注意：设置 ShortName 需要 DELETE 权限 (Windows 内部机制要求) 和 SE_RESTORE_NAME 特权
+    HANDLE hFile = CreateFileW(sandboxPath,
+        GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, // 支持目录
+        NULL);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        // 构造 FILE_NAME_INFORMATION 结构
+        size_t len = wcslen(fd.cAlternateFileName);
+        size_t bufSize = sizeof(FILE_NAME_INFORMATION) + len * sizeof(WCHAR);
+        std::vector<BYTE> buffer(bufSize);
+
+        PFILE_NAME_INFORMATION info = (PFILE_NAME_INFORMATION)buffer.data();
+        info->FileNameLength = (ULONG)(len * sizeof(WCHAR));
+        memcpy(info->FileName, fd.cAlternateFileName, info->FileNameLength);
+
+        IO_STATUS_BLOCK iosb;
+        // FileShortNameInformation = 40
+        fpNtSetInformationFile(hFile, &iosb, info, (ULONG)bufSize, (FILE_INFORMATION_CLASS)40);
+
+        CloseHandle(hFile);
+    }
+}
+
+// [重写] 执行写时复制 (Migration)
+// 移植自 file.c: File_MigrateFile 和 File_CreatePath
+bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
+    std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
+    std::wstring targetDos = NtPathToDosPath(targetNtPath);
+
+    if (sourceDos.empty() || targetDos.empty()) return false;
+
+    DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
+
+    // 1. 检查目标是否已存在 (避免重复迁移)
+    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+
+    // 2. 确保父目录存在 (递归创建并同步属性/短文件名)
+    wchar_t dirBuf[MAX_PATH];
+    wcscpy_s(dirBuf, MAX_PATH, targetDos.c_str());
+    PathRemoveFileSpecW(dirBuf);
+
+    // [修改] 使用带同步功能的递归创建
+    RecursiveCreatePathWithSync(dirBuf);
+
+    bool success = false;
+
+    // 3. 分类处理
+    if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+        // --- 目录迁移 ---
+        if (CreateDirectoryW(targetDos.c_str(), NULL)) {
+            CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+            CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+            // [新增] 复制短文件名
+            CopyShortName(sourceDos.c_str(), targetDos.c_str());
+
+            success = true;
+            DebugLog(L"CoW: Migrated Directory %s", targetDos.c_str());
+        }
+    }
+    else {
+        // --- 文件迁移 ---
+        if (copyContents) {
+            // A. 尝试复制文件内容
+            if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
+                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+                // [新增] 复制短文件名
+                CopyShortName(sourceDos.c_str(), targetDos.c_str());
+
+                success = true;
+                DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
+            }
+            else {
+                DWORD err = GetLastError();
+                DebugLog(L"CoW: Failed to copy %s (Error: %d)", sourceDos.c_str(), err);
+            }
+        }
+        else {
+            // B. 仅创建占位文件 (针对 FILE_DELETE_ON_CLOSE 优化)
+            HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
+                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
+                // [新增] 复制短文件名
+                CopyShortName(sourceDos.c_str(), targetDos.c_str());
+
+                success = true;
+                DebugLog(L"CoW: Migrated File Stub %s", targetDos.c_str());
+            }
+        }
+    }
+
+    return success;
+}
+
+// [新增] 智能递归创建目录 (同步属性和短文件名)
+void RecursiveCreatePathWithSync(const std::wstring& sandboxDosPath) {
+    if (sandboxDosPath.empty()) return;
+
+    // 如果目录已存在 直接返回
+    DWORD attrs = GetFileAttributesW(sandboxDosPath.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+    // 递归处理父目录
+    size_t lastSlash = sandboxDosPath.find_last_of(L'\\');
+    if (lastSlash != std::wstring::npos) {
+        RecursiveCreatePathWithSync(sandboxDosPath.substr(0, lastSlash));
+    }
+
+    // 创建当前目录
+    if (CreateDirectoryW(sandboxDosPath.c_str(), NULL)) {
+
+        std::wstring sandboxRoot = NtPathToDosPath(L"\\??\\" + std::wstring(g_SandboxRoot));
+
+        if (sandboxDosPath.size() > sandboxRoot.size() &&
+            _wcsnicmp(sandboxDosPath.c_str(), sandboxRoot.c_str(), sandboxRoot.size()) == 0) {
+
+            std::wstring relPath = sandboxDosPath.substr(sandboxRoot.size());
+            // relPath 如 "\C\Windows"
+
+            if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
+                wchar_t drive = relPath[1];
+                std::wstring realPath = std::wstring(1, drive) + L":" + relPath.substr(2);
+
+                // 同步属性、时间戳和短文件名
+                if (GetFileAttributesW(realPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    CopyFileAttributesAndStripReadOnly(realPath.c_str(), sandboxDosPath.c_str());
+                    CopyFileTimestamps(realPath.c_str(), sandboxDosPath.c_str());
+                    CopyShortName(realPath.c_str(), sandboxDosPath.c_str());
+                }
+            }
+        }
+    }
+}
+
+void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
+    if (wcsncmp(ntPath, L"\\??\\", 4) == 0) {
+        LPCWSTR dosPath = ntPath + 4;
+        wchar_t path[MAX_PATH];
+        wcscpy_s(path, MAX_PATH, dosPath);
+        PathRemoveFileSpecW(path);
+        RecursiveCreatePathWithSync(path);
+    }
 }
 
 std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
@@ -1213,242 +1449,6 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     targetPath += L"\\";
     targetPath += relPath;
     return true;
-}
-
-// [新增] 智能获取真实路径和沙盒路径
-bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring& outSandboxDos) {
-    // 1. 获取原始设备路径 (例如 \Device\HarddiskVolume2\Portable\Data\C)
-    std::wstring rawPath = GetPathFromHandle(hFile);
-    if (rawPath.empty()) return false;
-
-    // 2. [关键修复] 转换为 NT DOS 路径 (例如 \??\D:\Portable\Data\C)
-    std::wstring handleNtPath = DevicePathToNtPath(rawPath);
-
-    // 构造沙盒的 NT 路径前缀用于比较
-    std::wstring sandboxRootNt = L"\\??\\";
-    sandboxRootNt += g_SandboxRoot;
-    // 移除末尾斜杠以防万一 确保匹配准确
-    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
-
-    // 3. 检查句柄是否已经指向沙盒 (反向解析)
-    // 使用不区分大小写的比较更安全 或者确保路径都已规范化
-    if (handleNtPath.size() >= sandboxRootNt.size() &&
-        _wcsnicmp(handleNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
-
-        // 句柄在沙盒内 例如: \??\D:\Portable\Data\C
-        size_t rootLen = sandboxRootNt.length();
-
-        // 提取相对部分: \C
-        std::wstring relPath = handleNtPath.substr(rootLen);
-
-        std::wstring realNtPath;
-
-        // 简单启发式反向映射 (针对 \C\ 这种驱动器结构)
-        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
-            // \C\Windows -> \??\C:\Windows
-            wchar_t driveLetter = relPath[1];
-            realNtPath = L"\\??\\";
-            realNtPath += driveLetter;
-            realNtPath += L":";
-            realNtPath += relPath.substr(2);
-        }
-        // 针对根目录 \C
-        else if (relPath.length() == 2 && relPath[0] == L'\\') {
-             wchar_t driveLetter = relPath[1];
-             realNtPath = L"\\??\\";
-             realNtPath += driveLetter;
-             realNtPath += L":";
-             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
-             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
-        }
-        else {
-            // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
-            // 比如检测 \Users 映射回 C:\Users
-            // 目前暂不支持 返回 false
-            return false;
-        }
-
-        outSandboxDos = NtPathToDosPath(handleNtPath);
-        outRealDos = NtPathToDosPath(realNtPath);
-        return true;
-    }
-
-    // 4. 句柄指向真实路径 (正向解析)
-    else {
-        std::wstring targetNtPath;
-        // ShouldRedirect 内部已经处理了 \??\ 前缀检查 现在传入转换后的路径就能正常工作了
-        if (ShouldRedirect(handleNtPath, targetNtPath)) {
-            outRealDos = NtPathToDosPath(handleNtPath);
-            outSandboxDos = NtPathToDosPath(targetNtPath);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// [新增] 复制文件时间戳 (Creation, Access, Write)
-bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath) {
-    HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (hSrc == INVALID_HANDLE_VALUE) return false;
-
-    FILETIME ftCreate, ftAccess, ftWrite;
-    bool result = false;
-    if (GetFileTime(hSrc, &ftCreate, &ftAccess, &ftWrite)) {
-        HANDLE hDest = CreateFileW(destPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (hDest != INVALID_HANDLE_VALUE) {
-            if (SetFileTime(hDest, &ftCreate, &ftAccess, &ftWrite)) {
-                result = true;
-            }
-            CloseHandle(hDest);
-        }
-    }
-    CloseHandle(hSrc);
-    return result;
-}
-
-// [新增] 复制文件属性 (Hidden, System 等) 并剥离 ReadOnly
-bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath) {
-    DWORD srcAttrs = GetFileAttributesW(srcPath);
-    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
-
-    // 核心逻辑：剥离只读属性
-    // 如果源文件是只读的 复制到沙盒后必须变为可写 否则 CoW 失去意义
-    DWORD destAttrs = srcAttrs & ~FILE_ATTRIBUTE_READONLY;
-
-    // 确保至少有一个属性 (防止为 0)
-    if (destAttrs == 0) destAttrs = FILE_ATTRIBUTE_NORMAL;
-
-    return SetFileAttributesW(destPath, destAttrs) != FALSE;
-}
-
-// [新增] 启用 SE_RESTORE_NAME 特权 (用于设置短文件名)
-void EnableRestorePrivilege() {
-    HANDLE hToken;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
-        TOKEN_PRIVILEGES tp;
-        tp.PrivilegeCount = 1;
-        LookupPrivilegeValueW(NULL, SE_RESTORE_NAME, &tp.Privileges[0].Luid);
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
-        CloseHandle(hToken);
-    }
-}
-
-// [新增] 复制短文件名 (8.3 Filename)
-// 移植自 file.c: File_CopyShortName
-void CopyShortName(LPCWSTR realPath, LPCWSTR sandboxPath) {
-    // 1. 获取真实文件的短文件名
-    WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW(realPath, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-    FindClose(hFind);
-
-    // 如果没有短文件名 或短文件名与长文件名相同 则无需设置
-    if (fd.cAlternateFileName[0] == L'\0' || wcscmp(fd.cFileName, fd.cAlternateFileName) == 0) {
-        return;
-    }
-
-    // 2. 打开沙盒文件以设置短文件名
-    // 注意：设置 ShortName 需要 DELETE 权限 (Windows 内部机制要求) 和 SE_RESTORE_NAME 特权
-    HANDLE hFile = CreateFileW(sandboxPath,
-        GENERIC_WRITE | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS, // 支持目录
-        NULL);
-
-    if (hFile != INVALID_HANDLE_VALUE) {
-        // 构造 FILE_NAME_INFORMATION 结构
-        size_t len = wcslen(fd.cAlternateFileName);
-        size_t bufSize = sizeof(FILE_NAME_INFORMATION) + len * sizeof(WCHAR);
-        std::vector<BYTE> buffer(bufSize);
-
-        PFILE_NAME_INFORMATION info = (PFILE_NAME_INFORMATION)buffer.data();
-        info->FileNameLength = (ULONG)(len * sizeof(WCHAR));
-        memcpy(info->FileName, fd.cAlternateFileName, info->FileNameLength);
-
-        IO_STATUS_BLOCK iosb;
-        // FileShortNameInformation = 40
-        fpNtSetInformationFile(hFile, &iosb, info, (ULONG)bufSize, (FILE_INFORMATION_CLASS)40);
-
-        CloseHandle(hFile);
-    }
-}
-
-// [重写] 执行写时复制 (Migration)
-// 移植自 file.c: File_MigrateFile 和 File_CreatePath
-bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
-    std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
-    std::wstring targetDos = NtPathToDosPath(targetNtPath);
-
-    if (sourceDos.empty() || targetDos.empty()) return false;
-
-    DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
-    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
-
-    // 1. 检查目标是否已存在 (避免重复迁移)
-    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
-
-    // 2. 确保父目录存在 (递归创建并同步属性/短文件名)
-    wchar_t dirBuf[MAX_PATH];
-    wcscpy_s(dirBuf, MAX_PATH, targetDos.c_str());
-    PathRemoveFileSpecW(dirBuf);
-
-    // [修改] 使用带同步功能的递归创建
-    RecursiveCreatePathWithSync(dirBuf);
-
-    bool success = false;
-
-    // 3. 分类处理
-    if (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) {
-        // --- 目录迁移 ---
-        if (CreateDirectoryW(targetDos.c_str(), NULL)) {
-            CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
-            CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
-            // [新增] 复制短文件名
-            CopyShortName(sourceDos.c_str(), targetDos.c_str());
-
-            success = true;
-            DebugLog(L"CoW: Migrated Directory %s", targetDos.c_str());
-        }
-    }
-    else {
-        // --- 文件迁移 ---
-        if (copyContents) {
-            // A. 尝试复制文件内容
-            if (CopyFileW(sourceDos.c_str(), targetDos.c_str(), TRUE)) {
-                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
-                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
-                // [新增] 复制短文件名
-                CopyShortName(sourceDos.c_str(), targetDos.c_str());
-
-                success = true;
-                DebugLog(L"CoW: Migrated File %s", targetDos.c_str());
-            }
-            else {
-                DWORD err = GetLastError();
-                DebugLog(L"CoW: Failed to copy %s (Error: %d)", sourceDos.c_str(), err);
-            }
-        }
-        else {
-            // B. 仅创建占位文件 (针对 FILE_DELETE_ON_CLOSE 优化)
-            HANDLE hFile = CreateFileW(targetDos.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                CloseHandle(hFile);
-                CopyFileAttributesAndStripReadOnly(sourceDos.c_str(), targetDos.c_str());
-                CopyFileTimestamps(sourceDos.c_str(), targetDos.c_str());
-                // [新增] 复制短文件名
-                CopyShortName(sourceDos.c_str(), targetDos.c_str());
-
-                success = true;
-                DebugLog(L"CoW: Migrated File Stub %s", targetDos.c_str());
-            }
-        }
-    }
-
-    return success;
 }
 
 // [新增] 递归合并目录树 (将真实目录内容合并到沙盒目录)
