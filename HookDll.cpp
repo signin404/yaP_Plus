@@ -474,6 +474,7 @@ wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
 wchar_t g_LauncherDir[MAX_PATH] = { 0 };
 int g_HookMode = 1; // [新增] 默认模式 1
 std::vector<std::wstring> g_ChildHookWhitelist;
+long long g_HookCopySizeLimit = -1; // [新增] CoW 文件大小限制 (-1 表示不限制)
 std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_SystemDriveLetter; // [新增] 系统盘符 DOS 路径 (如 C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
@@ -1235,25 +1236,35 @@ void CopyShortName(LPCWSTR realPath, LPCWSTR sandboxPath) {
 }
 
 // [重写] 执行写时复制 (Migration)
-// 移植自 file.c: File_MigrateFile 和 File_CreatePath
-bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
+// 返回值: 0=Success, 1=Failed, 2=AccessDenied(SizeLimit)
+int PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& targetNtPath, bool copyContents = true) {
     std::wstring sourceDos = NtPathToDosPath(sourceNtPath);
     std::wstring targetDos = NtPathToDosPath(targetNtPath);
 
-    if (sourceDos.empty() || targetDos.empty()) return false;
+    if (sourceDos.empty() || targetDos.empty()) return 1;
 
     DWORD srcAttrs = GetFileAttributesW(sourceDos.c_str());
-    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return false;
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return 1;
 
     // 1. 检查目标是否已存在 (避免重复迁移)
-    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesW(targetDos.c_str()) != INVALID_FILE_ATTRIBUTES) return 0;
 
-    // 2. 确保父目录存在 (递归创建并同步属性/短文件名)
+    // [新增] 检查文件大小限制 (仅针对文件且需要复制内容时)
+    if (copyContents && g_HookCopySizeLimit > 0 && !(srcAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        WIN32_FILE_ATTRIBUTE_DATA attrs;
+        if (GetFileAttributesExW(sourceDos.c_str(), GetFileExInfoStandard, &attrs)) {
+            long long fileSize = ((long long)attrs.nFileSizeHigh << 32) | attrs.nFileSizeLow;
+            if (fileSize > g_HookCopySizeLimit) {
+                DebugLog(L"CoW: Blocked large file %s (%lld bytes)", sourceDos.c_str(), fileSize);
+                return 2; // 返回特定错误码：大小超限
+            }
+        }
+    }
+
+    // 2. 确保父目录存在
     wchar_t dirBuf[MAX_PATH];
     wcscpy_s(dirBuf, MAX_PATH, targetDos.c_str());
     PathRemoveFileSpecW(dirBuf);
-
-    // [修改] 使用带同步功能的递归创建
     RecursiveCreatePathWithSync(dirBuf);
 
     bool success = false;
@@ -1305,7 +1316,7 @@ bool PerformCopyOnWrite(const std::wstring& sourceNtPath, const std::wstring& ta
         }
     }
 
-    return success;
+    return success ? 0 : 1;
 }
 
 // [新增] 智能递归创建目录 (同步属性和短文件名)
@@ -2046,19 +2057,20 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 shouldRedirect = true;
             } else if (realExists) {
                 // 真实存在但沙盒没有 -> 执行写时复制 (CoW)
-
-                // [新增] 检查是否为删除操作 (FILE_DELETE_ON_CLOSE)
-                // 如果是为了删除 则不需要复制内容 极大提升性能
                 bool isDeleteOnClose = (CreateOptions & FILE_DELETE_ON_CLOSE) != 0;
 
-                // [修改] 传入 !isDeleteOnClose 作为 copyContents 参数
-                // 如果是删除操作 copyContents 为 false 仅创建占位文件
-                if (PerformCopyOnWrite(fullNtPath, targetNtPath, !isDeleteOnClose)) {
+                // [修改] 处理 CoW 返回值
+                int cowResult = PerformCopyOnWrite(fullNtPath, targetNtPath, !isDeleteOnClose);
+
+                if (cowResult == 0) {
+                    // 成功
                     shouldRedirect = true;
+                } else if (cowResult == 2) {
+                    // [新增] 大小超限 直接拒绝访问
+                    return STATUS_ACCESS_DENIED;
                 } else {
                     // 迁移失败 (可能是文件被锁)
                     // 强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
-                    // Sandboxie 的行为通常是报错
                     shouldRedirect = true;
                 }
             } else {
@@ -2355,8 +2367,16 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
                         std::wstring sourceSandboxNt;
 
                         if (ShouldRedirect(sourceNtPath, sourceSandboxNt)) {
-                            // 执行写时复制 (CoW)
-                            if (PerformCopyOnWrite(sourceNtPath, sourceSandboxNt)) {
+                            // [修改] 处理 CoW 返回值
+                            int cowResult = PerformCopyOnWrite(sourceNtPath, sourceSandboxNt);
+
+                            if (cowResult == 2) {
+                                // [新增] 大小超限
+                                delete[] (char*)pNewLink;
+                                return STATUS_ACCESS_DENIED;
+                            }
+
+                            if (cowResult == 0) {
                                 std::wstring sourceSandboxDos = NtPathToDosPath(sourceSandboxNt);
                                 HANDLE hSandboxed = CreateFileW(sourceSandboxDos.c_str(),
                                     FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
@@ -3838,6 +3858,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // [新增] 初始化子进程白名单
     InitChildHookWhitelist();
+
+    // [新增] 读取 hookcopysize 配置
+    wchar_t copySizeBuf[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", copySizeBuf, 64) > 0) {
+        long long mb = _wtoi64(copySizeBuf);
+        if (mb > 0) {
+            g_HookCopySizeLimit = mb * 1024 * 1024; // 转换为字节
+        }
+    }
 
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];

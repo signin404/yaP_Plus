@@ -3999,6 +3999,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
     bool blockNetwork = (netBlockVal == L"1");
 
+    // [新增] 解析 hookcopysize 配置 (单位: MB)
+    std::wstring hookCopySizeVal = GetValueFromIniContent(data->iniContent, L"General", L"hookcopysize");
+    if (!hookCopySizeVal.empty()) {
+        SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
+    } else {
+        SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
     bool enableHook = (hookMode > 0 || blockNetwork);
 
