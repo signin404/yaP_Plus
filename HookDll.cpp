@@ -867,98 +867,28 @@ bool IsPipeOrDevice(LPCWSTR path) {
     return false;
 }
 
-// [新增] 目录迁移与创建增强逻辑
-// 前向声明 (这两个函数在文件后面定义, 需要先声明才能使用)
-bool CopyFileTimestamps(LPCWSTR srcPath, LPCWSTR destPath);
-bool CopyFileAttributesAndStripReadOnly(LPCWSTR srcPath, LPCWSTR destPath);
-
-// [新增] 辅助：从沙盒 DOS 路径反推真实 DOS 路径
-// 例如: Z:\Sandbox\C\Windows -> C:\Windows
-std::wstring GetRealPathFromSandboxPath(const std::wstring& sandboxDosPath) {
-    std::wstring prefix = g_SandboxRoot; // 例如 Z:\Sandbox
-    if (sandboxDosPath.size() <= prefix.size()) return L"";
-
-    // 检查前缀匹配
-    if (_wcsnicmp(sandboxDosPath.c_str(), prefix.c_str(), prefix.size()) != 0) return L"";
-
-    // 提取相对部分: \C\Windows 或 \C
-    std::wstring rel = sandboxDosPath.substr(prefix.size());
-
-    // 格式检查: 至少包含 \DriveLetter
-    if (rel.size() < 2 || rel[0] != L'\\') return L"";
-
-    wchar_t drive = rel[1];
-    // 简单检查盘符是否为字母
-    if (!((drive >= L'a' && drive <= L'z') || (drive >= L'A' && drive <= L'Z'))) return L"";
-
-    std::wstring realPath;
-    realPath += drive;
-    realPath += L":"; // C:
-
-    if (rel.size() > 2) {
-        realPath += rel.substr(2); // \Windows -> C:\Windows
-    } else {
-        realPath += L"\\"; // C:\ 根目录
-    }
-    return realPath;
-}
-
-// [重写] 递归创建目录 (带迁移功能)
-// 如果真实系统中存在对应目录，则在创建沙盒目录时同步属性和时间戳
 void RecursiveCreateDirectory(wchar_t* path) {
     if (!path || !*path) return;
-
-    // 1. 如果目录已存在，直接返回
-    DWORD attrs = GetFileAttributesW(path);
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
-
-    // 2. 确保父目录存在 (递归)
-    wchar_t parent[MAX_PATH];
-    wcscpy_s(parent, MAX_PATH, path);
-    PathRemoveFileSpecW(parent); // 移除最后一级，得到父目录
-
-    // 防止根目录死循环 (例如 Z: 的父目录还是 Z:)
-    if (wcscmp(parent, path) != 0) {
-        RecursiveCreateDirectory(parent);
+    DWORD attr = GetFileAttributesW(path);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    wchar_t* p = wcsrchr(path, L'\\');
+    if (!p) p = wcsrchr(path, L'/');
+    if (p) {
+        wchar_t saved = *p;
+        *p = L'\0';
+        RecursiveCreateDirectory(path);
+        *p = saved;
     }
-
-    // 3. 创建当前目录
-    // 检查真实系统中是否存在对应的目录
-    std::wstring realPath = GetRealPathFromSandboxPath(path);
-    bool migrated = false;
-
-    if (!realPath.empty()) {
-        DWORD realAttrs = GetFileAttributesW(realPath.c_str());
-        // 如果真实路径存在且是目录 -> 执行迁移 (Create + Copy Attrs)
-        if (realAttrs != INVALID_FILE_ATTRIBUTES && (realAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
-             if (CreateDirectoryW(path, NULL)) {
-                 CopyFileAttributesAndStripReadOnly(realPath.c_str(), path);
-                 CopyFileTimestamps(realPath.c_str(), path);
-                 migrated = true;
-                 DebugLog(L"MigrateDir: Created %s from %s", path, realPath.c_str());
-             }
-        }
-    }
-
-    // 如果没有迁移 (真实目录不存在或迁移失败)，则执行普通创建
-    if (!migrated) {
-        CreateDirectoryW(path, NULL);
-    }
+    CreateDirectoryW(path, NULL);
 }
 
-// [重写] 确保 NT 路径对应的目录存在
 void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
     if (wcsncmp(ntPath, L"\\??\\", 4) == 0) {
-        std::wstring dosPath = ntPath + 4;
-
-        // 移除文件名，只保留目录部分
-        // 例如: Z:\Sandbox\C\123\999 -> Z:\Sandbox\C\123
-        wchar_t dirPath[MAX_PATH];
-        wcscpy_s(dirPath, MAX_PATH, dosPath.c_str());
-        PathRemoveFileSpecW(dirPath);
-
-        // 使用带迁移功能的递归创建
-        RecursiveCreateDirectory(dirPath);
+        LPCWSTR dosPath = ntPath + 4;
+        wchar_t path[MAX_PATH];
+        wcscpy_s(path, MAX_PATH, dosPath);
+        PathRemoveFileSpecW(path);
+        RecursiveCreateDirectory(path);
     }
 }
 
@@ -2082,7 +2012,38 @@ NTSTATUS NTAPI Detour_NtSetInformationFile(
             // 2. 检查目标路径是否需要重定向
             if (ShouldRedirect(fullTargetNt, redirectedTargetNt)) {
 
-                // 3. 构造新的重命名结构体
+                // [新增] 修复移动到仅真实存在目录时的报错 (Auto-Create Destination Directory)
+                std::wstring sandboxTargetDos = NtPathToDosPath(redirectedTargetNt);
+                wchar_t sandboxDir[MAX_PATH];
+                if (wcscpy_s(sandboxDir, MAX_PATH, sandboxTargetDos.c_str()) == 0) {
+                    PathRemoveFileSpecW(sandboxDir); // 获取沙盒目标父目录 (例如 Z:\Sandbox\C\123)
+
+                    // 1. 检查沙盒父目录是否存在
+                    if (GetFileAttributesW(sandboxDir) == INVALID_FILE_ATTRIBUTES) {
+
+                        // 2. 获取真实目标父目录
+                        std::wstring realTargetDos = NtPathToDosPath(fullTargetNt);
+                        wchar_t realDir[MAX_PATH];
+                        if (wcscpy_s(realDir, MAX_PATH, realTargetDos.c_str()) == 0) {
+                            PathRemoveFileSpecW(realDir); // 获取真实目标父目录 (例如 C:\123)
+
+                            // 3. 检查真实父目录是否存在
+                            DWORD realAttr = GetFileAttributesW(realDir);
+                            if (realAttr != INVALID_FILE_ATTRIBUTES && (realAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+
+                                // 4. 真实存在但沙盒不存在 -> 迁移目录结构
+                                DebugLog(L"Rename: Creating missing destination directory %s", sandboxDir);
+                                RecursiveCreateDirectory(sandboxDir);
+
+                                // 5. 同步目录属性 (可选，但推荐)
+                                CopyFileAttributesAndStripReadOnly(realDir, sandboxDir);
+                                CopyFileTimestamps(realDir, sandboxDir);
+                            }
+                        }
+                    }
+                }
+
+                // 3. 构造新的重命名结构体 (原有逻辑)
                 ULONG newSize = Length + (ULONG)(redirectedTargetNt.length() * sizeof(wchar_t)) + 128;
                 PFILE_RENAME_INFORMATION pNewRename = (PFILE_RENAME_INFORMATION)new(char[newSize]);
 
