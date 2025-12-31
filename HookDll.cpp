@@ -454,6 +454,10 @@ P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 
+// 函数前向声明 (Forward Declarations)
+bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
+void RecursiveCreatePathWithSync(const std::wstring& sandboxDosPath);
+
 // --- 调试日志 ---
 void DebugLog(const wchar_t* format, ...) {
     DWORD lastErr = GetLastError();
