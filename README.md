@@ -47,6 +47,10 @@ Just copy and paste to create portable software.
 - [x] Full directory traversal with hard links
 - [x] Hard/Symbolic Link Single-Level Directory Traversal
 - [x] Check the parent process or path and terminate the process
+- [x] Traverse subdirectories and delete files/directories
+- [x] (Experimental) Hooking Redirect File Operations
+- [x] (Experimental) Hook to prevent network connection
+- [x] (Experimental) Injecting a third-party DLL
 
 ## Unported Features
 * !admin
