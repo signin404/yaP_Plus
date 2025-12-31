@@ -467,6 +467,25 @@ void DebugLog(const wchar_t* format, ...) {
     SetLastError(lastErr);
 }
 
+// [新增] 线程局部存储 (TLS) 结构体 对应 Sandboxie 的 THREAD_DATA
+struct HookTlsData {
+    int NtCreateFile_LockCount;      // 对应 file_NtCreateFile_lock
+    int DontStripWriteAccess;        // 对应 file_dont_strip_write_access
+    int InRenameOperation;           // 标记当前是否处于重命名逻辑中
+
+    // 构造函数初始化
+    HookTlsData() : NtCreateFile_LockCount(0), DontStripWriteAccess(0), InRenameOperation(0) {}
+};
+
+// 使用 C++11 thread_local 替代复杂的 TlsAlloc/TlsGetValue
+thread_local HookTlsData g_Tls;
+
+// [新增] 专用的 RAII 锁辅助类
+struct NtCreateFileGuard {
+    NtCreateFileGuard() { g_Tls.NtCreateFile_LockCount++; }
+    ~NtCreateFileGuard() { g_Tls.NtCreateFile_LockCount--; }
+};
+
 // [新增] 进程类型枚举
 enum ProcessType {
     ProcType_Generic = 0,
@@ -618,20 +637,26 @@ void RefreshDeviceMap() {
 
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
-    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
     if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
-        const std::wstring& devPrefix = pair.first;
-        const std::wstring& driveLetter = pair.second;
+        const std::wstring& devPrefix = pair.first; // \Device\HarddiskVolume1
+        const std::wstring& driveLetter = pair.second; // C:
 
         if (devicePath.find(devPrefix) == 0) {
-            if (devicePath.length() == devPrefix.length() || devicePath[devPrefix.length()] == L'\\') {
+            // 匹配成功
+            if (devicePath.length() == devPrefix.length()) {
+                return L"\\??\\" + driveLetter;
+            }
+            if (devicePath[devPrefix.length()] == L'\\') {
                 std::wstring suffix = devicePath.substr(devPrefix.length());
                 return L"\\??\\" + driveLetter + suffix;
             }
         }
+    }
+    // 如果没匹配到 (可能是网络路径或其他)，尝试直接添加 \??\ 如果它看起来像 DOS 路径
+    if (devicePath.length() > 2 && devicePath[1] == L':') {
+         return L"\\??\\" + devicePath;
     }
     return devicePath;
 }
@@ -905,48 +930,90 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
 }
 
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
-// 必须放在 NtPathToDosPath 之后 Detour_NtCreateFile 之前
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     if (ntPath.empty()) return ntPath;
 
-    // 1. 转换为 DOS 路径以便使用 Win32 API
-    std::wstring dosPath = NtPathToDosPath(ntPath);
-    if (dosPath.empty()) return ntPath; // 无法转换 保持原样
+    // 准备 ObjectAttributes
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    OBJECT_ATTRIBUTES oa = { sizeof(OBJECT_ATTRIBUTES), NULL, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL };
+    IO_STATUS_BLOCK iosb;
+    HANDLE hFile = NULL;
 
-    // 2. 尝试打开文件获取最终路径 (解析 Symlink/Junction/短文件名)
-    // FILE_FLAG_BACKUP_SEMANTICS 用于打开目录
-    HANDLE hFile = CreateFileW(dosPath.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        NULL);
+    // 1. 尝试打开原始路径 (使用原始函数 fpNtCreateFile，不经过 Hook)
+    // FILE_READ_ATTRIBUTES 足够用于获取路径，FILE_FLAG_BACKUP_SEMANTICS 用于目录
+    NTSTATUS status = fpNtCreateFile(&hFile, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &oa, &iosb, NULL,
+                                     0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
 
-    if (hFile != INVALID_HANDLE_VALUE) {
+    // 2. 如果原始路径不存在，尝试手动拼接沙盒路径并打开
+    // 这是为了解决 "C:\New" 只在沙盒存在时，Normalize 失败的问题
+    if (!NT_SUCCESS(status) && !g_SandboxDevicePath.empty()) {
+        // 检查是否已经是沙盒路径
+        if (ntPath.find(g_SandboxDevicePath) == std::wstring::npos) {
+            // 构造沙盒路径: \Device\HarddiskVolumeZ\Sandbox + \C\New
+            // 需要将 \??\C:\New 转换为 \C\New 格式
+            std::wstring relPath;
+            if (ntPath.rfind(L"\\??\\", 0) == 0) {
+                relPath = ntPath.substr(4); // C:\New
+                // 处理驱动器号冒号: C:\New -> \C\New
+                size_t colon = relPath.find(L':');
+                if (colon != std::wstring::npos) relPath.erase(colon, 1);
+                if (relPath.empty() || relPath[0] != L'\\') relPath = L"\\" + relPath;
+            } else {
+                // 可能是 \Device\HarddiskVolume1\New 格式，处理较复杂，暂略
+                // 对于绝大多数 Win32 API 调用，都是 \??\ 开头
+            }
+
+            if (!relPath.empty()) {
+                std::wstring sandboxPath = g_SandboxDevicePath + relPath;
+                RtlInitUnicodeString(&uStr, sandboxPath.c_str());
+                // 尝试打开沙盒路径
+                status = fpNtCreateFile(&hFile, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &oa, &iosb, NULL,
+                                        0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+            }
+        }
+    }
+
+    // 3. 如果打开成功，获取最终路径 (解析短文件名/符号链接)
+    if (NT_SUCCESS(status) && hFile) {
         wchar_t finalPath[MAX_PATH];
-        // VOLUME_NAME_DOS 返回 \\?\C:\Path 格式
-        DWORD len = GetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, VOLUME_NAME_DOS);
-        CloseHandle(hFile);
+        // 使用原始函数 fpGetFinalPathNameByHandleW
+        // VOLUME_NAME_NT 返回 \Device\HarddiskVolume...\Path
+        DWORD len = fpGetFinalPathNameByHandleW(hFile, finalPath, MAX_PATH, 0 /* VOLUME_NAME_NT */);
+
+        // 记得关闭句柄 (使用原始 NtClose)
+        fpNtClose(hFile);
 
         if (len > 0 && len < MAX_PATH) {
             std::wstring res = finalPath;
-            // 将 \\?\ 转换为 NT 格式 \??\ (注意注释末尾不要加反斜杠)
-            if (res.rfind(L"\\\\?\\", 0) == 0) {
-                return L"\\??\\" + res.substr(4);
+
+            // 4. 如果结果指向沙盒，需要反向伪装回真实路径
+            // 否则 NormalizeNtPath 返回了沙盒路径，会导致后续 ShouldRedirect 判断失效或重复重定向
+            if (!g_SandboxDevicePath.empty() &&
+                res.size() >= g_SandboxDevicePath.size() &&
+                _wcsnicmp(res.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+
+                // 提取相对路径: \Device\...\Sandbox\C\New -> \C\New
+                std::wstring rel = res.substr(g_SandboxDevicePath.size());
+
+                // 还原为 NT 路径: \C\New -> \??\C:\New
+                if (rel.length() >= 2 && rel[0] == L'\\') {
+                    wchar_t driveLetter = rel[1];
+                    std::wstring remaining = rel.substr(2);
+                    return L"\\??\\" + std::wstring(1, driveLetter) + L":" + remaining;
+                }
             }
-            return res;
-        }
-    }
-    else {
-        // 3. 文件不存在 (可能是创建新文件) 尝试展开短文件名
-        // GetLongPathNameW 即使文件不存在 只要路径组件存在也能工作
-        wchar_t longPath[MAX_PATH];
-        if (GetLongPathNameW(dosPath.c_str(), longPath, MAX_PATH) > 0) {
-            return L"\\??\\" + std::wstring(longPath);
+
+            // 如果是普通真实路径 (\Device\HarddiskVolume1\New)，转换为 \??\C:\New
+            // 使用 DevicePathToNtPath (需要确保它能处理 \Device 前缀)
+            return DevicePathToNtPath(res);
         }
     }
 
+    // 如果文件完全不存在，或者打开失败，返回原路径
+    // 此时无法解析短文件名，但这通常发生在创建新文件时，影响较小
     return ntPath;
 }
 
@@ -1497,8 +1564,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength
 ) {
-    if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-    RecursionGuard guard;
+    // 锁检查 (使用之前移植的 TLS 锁)
+    if (g_Tls.NtCreateFile_LockCount > 0) {
+        return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+    NtCreateFileGuard tlsGuard;
 
     // [新增] 处理按 ID 打开 (FILE_OPEN_BY_FILE_ID)
     // 移植自 file.c: File_GetName_FromFileId
@@ -1564,8 +1634,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     // [Explorer] 移除只读文件的写属性请求
     if (g_CurrentProcessType == ProcType_Explorer && CreateDisposition == FILE_OPEN) {
-        if ((DesiredAccess & FILE_WRITE_ATTRIBUTES) && !(DesiredAccess & (FILE_WRITE_DATA | DELETE))) {
-             DesiredAccess &= ~FILE_WRITE_ATTRIBUTES;
+        // 只有当 TLS 标志未设置时 才剥离权限
+        if (g_Tls.DontStripWriteAccess == 0) {
+            if ((DesiredAccess & FILE_WRITE_ATTRIBUTES) && !(DesiredAccess & (FILE_WRITE_DATA | DELETE))) {
+                 DesiredAccess &= ~FILE_WRITE_ATTRIBUTES;
+            }
         }
     }
 
