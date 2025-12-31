@@ -3999,6 +3999,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
     bool blockNetwork = (netBlockVal == L"1");
 
+    // [新增] 解析 hookcopysize 配置 (单位: MB)
+    std::wstring hookCopySizeVal = GetValueFromIniContent(data->iniContent, L"General", L"hookcopysize");
+    if (!hookCopySizeVal.empty()) {
+        SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
+    } else {
+        SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
     bool enableHook = (hookMode > 0 || blockNetwork);
 
@@ -4027,6 +4035,34 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                         std::wstring expanded = ResolveToAbsolutePath(ExpandVariables(val, data->variables), data->variables);
                         if (!expanded.empty()) {
                             thirdPartyDlls.push_back(expanded);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // [新增] 解析 hookchildname 配置
+    std::wstring childHookNamesVar;
+    {
+        std::wstringstream stream(data->iniContent);
+        std::wstring line;
+        bool inGeneral = false;
+        while (std::getline(stream, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+            if (line[0] == L'[' && line.back() == L']') {
+                inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
+                continue;
+            }
+            if (inGeneral) {
+                size_t delimiterPos = line.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, delimiterPos));
+                    if (_wcsicmp(key.c_str(), L"hookchildname") == 0) {
+                        std::wstring val = trim(line.substr(delimiterPos + 1));
+                        if (!val.empty()) {
+                            childHookNamesVar += val + L";";
                         }
                     }
                 }
@@ -4076,12 +4112,13 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
 
         // [新增] 读取 hookchild 配置
-        // 1 = 挂钩 (默认), 2 = 不挂钩
+        // 1 = 挂钩 (默认) 0 = 不挂钩
         std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"General", L"hookchild");
         if (hookChildVal.empty()) {
             hookChildVal = L"1"; // 默认开启
         }
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
+        SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
