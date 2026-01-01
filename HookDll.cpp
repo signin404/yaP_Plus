@@ -105,6 +105,18 @@
 #define FileAllInformation ((FILE_INFORMATION_CLASS)18)
 #endif
 
+#ifndef IOCTL_STORAGE_QUERY_PROPERTY
+#define IOCTL_STORAGE_QUERY_PROPERTY CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#ifndef PropertyStandardQuery
+#define PropertyStandardQuery 0
+#endif
+
+#ifndef StorageDeviceProperty
+#define StorageDeviceProperty 0
+#endif
+
 // 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
