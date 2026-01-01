@@ -151,6 +151,34 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// [新增] 文件系统信息类枚举
+typedef enum _FSINFOCLASS {
+    FileFsVolumeInformation = 1,
+    FileFsLabelInformation,      // 2
+    FileFsSizeInformation,       // 3
+    FileFsDeviceInformation,     // 4
+    FileFsAttributeInformation,  // 5
+    FileFsControlInformation,    // 6
+    FileFsFullSizeInformation,   // 7
+    FileFsObjectIdInformation,   // 8
+    FileFsDriverPathInformation, // 9
+    FileFsVolumeFlagsInformation,// 10
+    FileFsSectorSizeInformation, // 11
+    FileFsDataCopyInformation,   // 12
+    FileFsMetadataSizeInformation, // 13
+    FileFsFullSizeInformationEx, // 14
+    FileFsMaximumInformation
+} FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
+
+// [新增] 卷信息结构体
+typedef struct _FILE_FS_VOLUME_INFORMATION {
+    LARGE_INTEGER VolumeCreationTime;
+    ULONG         VolumeSerialNumber;
+    ULONG         VolumeLabelLength;
+    BOOLEAN       SupportsObjects;
+    WCHAR         VolumeLabel[1];
+} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
+
 typedef struct _REPARSE_DATA_BUFFER {
     ULONG  ReparseTag;
     USHORT ReparseDataLength;
@@ -429,6 +457,8 @@ typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
 P_NtDeleteFile fpNtDeleteFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
 P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
+typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
+P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -485,6 +515,8 @@ std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于�
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
 std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
+DWORD g_FakeVolumeSerial = 0;
+bool g_HookVolumeId = false;
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3084,6 +3116,52 @@ NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
     return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
+NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation,
+    ULONG Length,
+    FS_INFORMATION_CLASS FsInformationClass
+) {
+    // 1. 调用原始函数
+    NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
+
+    // 2. 如果成功且查询的是卷信息 (FileFsVolumeInformation = 1)
+    if (NT_SUCCESS(status) && FsInformationClass == FileFsVolumeInformation && g_HookVolumeId) {
+
+        // 3. 检查是否为目标驱动器 (系统盘 或 启动器盘)
+        // 获取句柄对应的路径
+        std::wstring rawPath = GetPathFromHandle(FileHandle);
+        if (!rawPath.empty()) {
+            // 转换为 NT 路径 (例如 \Device\HarddiskVolume1 -> \??\C:)
+            std::wstring ntPath = DevicePathToNtPath(rawPath);
+
+            bool shouldFake = false;
+
+            // 检查系统盘
+            if (!g_SystemDriveNt.empty() &&
+                (ntPath.size() >= g_SystemDriveNt.size() &&
+                 _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
+                shouldFake = true;
+            }
+            // 检查启动器盘
+            else if (!g_LauncherDriveNt.empty() &&
+                     (ntPath.size() >= g_LauncherDriveNt.size() &&
+                      _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
+                shouldFake = true;
+            }
+
+            // 4. 修改序列号
+            if (shouldFake) {
+                PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
+                info->VolumeSerialNumber = g_FakeVolumeSerial;
+            }
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -3881,6 +3959,26 @@ DWORD WINAPI InitHookThread(LPVOID) {
         g_BlockNetwork = (_wtoi(netBuffer) == 1);
     }
 
+    // [新增] 读取 hookvolumeid 配置
+    wchar_t volIdBuf[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", volIdBuf, 64) > 0) {
+        std::wstring volIdStr = volIdBuf;
+        // 移除 '-' (例如 1234-5678 -> 12345678)
+        size_t dashPos = volIdStr.find(L'-');
+        if (dashPos != std::wstring::npos) {
+            volIdStr.erase(dashPos, 1);
+        }
+
+        // 解析十六进制
+        wchar_t* endPtr;
+        g_FakeVolumeSerial = wcstoul(volIdStr.c_str(), &endPtr, 16);
+
+        if (g_FakeVolumeSerial != 0) {
+            g_HookVolumeId = true;
+            DebugLog(L"VolumeID: Configured to %08X", g_FakeVolumeSerial);
+        }
+    }
+
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -3969,8 +4067,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 分组挂钩逻辑
     // =======================================================
 
-    // --- 组 A: 文件系统 Hook (仅当 hookfile > 0 时挂钩) ---
-    if (g_HookMode > 0) {
+    // --- 组 A: 文件系统 Hook ---
+    if (g_HookMode > 0 || g_HookVolumeId) {
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
         if (hNtdll) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
@@ -3998,6 +4096,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
                 MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            }
+
+            // [新增] 挂钩 NtQueryVolumeInformationFile
+            if (g_HookVolumeId) {
+                void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
+                if (pNtQueryVolumeInformationFile) {
+                    MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
+                }
             }
         }
 
