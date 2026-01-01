@@ -170,6 +170,7 @@ typedef DWORD DEVINST;
 #define CR_SUCCESS          0x00000000
 #define CM_DRP_CAPABILITIES 0x0000000F
 #define CM_DEVCAP_REMOVABLE 0x00000004
+#define SPDRP_CAPABILITIES 0x0000000F
 
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
@@ -499,6 +500,22 @@ typedef CONFIGRET (WINAPI* P_CM_Get_DevNode_Registry_PropertyW)(
     ULONG ulFlags
 );
 P_CM_Get_DevNode_Registry_PropertyW fpCM_Get_DevNode_Registry_PropertyW = NULL;
+
+// [新增] GetDriveTypeW
+typedef UINT (WINAPI* P_GetDriveTypeW)(LPCWSTR lpRootPathName);
+P_GetDriveTypeW fpGetDriveTypeW = NULL;
+
+// [新增] SetupDiGetDeviceRegistryPropertyW
+typedef BOOL (WINAPI* P_SetupDiGetDeviceRegistryPropertyW)(
+    PVOID DeviceInfoSet,
+    PVOID DeviceInfoData,
+    DWORD Property,
+    PDWORD PropertyRegDataType,
+    PBYTE PropertyBuffer,
+    DWORD PropertyBufferSize,
+    PDWORD RequiredSize
+);
+P_SetupDiGetDeviceRegistryPropertyW fpSetupDiGetDeviceRegistryPropertyW = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -3327,6 +3344,79 @@ CONFIGRET WINAPI Detour_CM_Get_DevNode_Registry_PropertyW(
     return status;
 }
 
+UINT WINAPI Detour_GetDriveTypeW(LPCWSTR lpRootPathName) {
+    // 1. 如果未开启伪造，直接返回原始值
+    if (!g_HookRemovable) {
+        return fpGetDriveTypeW(lpRootPathName);
+    }
+
+    // 2. 解析目标路径
+    std::wstring pathToCheck;
+    if (lpRootPathName && *lpRootPathName) {
+        pathToCheck = lpRootPathName;
+    } else {
+        // 如果为 NULL，表示当前目录
+        wchar_t currentDir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, currentDir);
+        pathToCheck = currentDir;
+    }
+
+    // 3. 检查是否为目标盘
+    // GetDriveType 通常传入 "C:\" 或 "C:"
+    bool shouldFake = false;
+
+    // 简单提取盘符 (例如 "C:")
+    std::wstring driveLetter;
+    if (pathToCheck.length() >= 2 && pathToCheck[1] == L':') {
+        driveLetter = pathToCheck.substr(0, 2);
+    }
+
+    if (!driveLetter.empty()) {
+        // 检查系统盘 (g_SystemDriveLetter 格式为 "C:")
+        if (!g_SystemDriveLetter.empty() && _wcsicmp(driveLetter.c_str(), g_SystemDriveLetter.c_str()) == 0) {
+            shouldFake = true;
+        }
+        // 检查启动器盘 (从 g_LauncherDriveNt 转换，例如 "\??\Z:" -> "Z:")
+        else if (!g_LauncherDriveNt.empty() && g_LauncherDriveNt.length() >= 6) {
+            std::wstring launcherLetter = g_LauncherDriveNt.substr(4, 2); // 提取 "Z:"
+            if (_wcsicmp(driveLetter.c_str(), launcherLetter.c_str()) == 0) {
+                shouldFake = true;
+            }
+        }
+    }
+
+    // 4. 如果是目标盘，直接返回 DRIVE_REMOVABLE (2)
+    if (shouldFake) {
+        return DRIVE_REMOVABLE;
+    }
+
+    return fpGetDriveTypeW(lpRootPathName);
+}
+
+BOOL WINAPI Detour_SetupDiGetDeviceRegistryPropertyW(
+    PVOID DeviceInfoSet,
+    PVOID DeviceInfoData,
+    DWORD Property,
+    PDWORD PropertyRegDataType,
+    PBYTE PropertyBuffer,
+    DWORD PropertyBufferSize,
+    PDWORD RequiredSize
+) {
+    // 1. 调用原始函数
+    BOOL result = fpSetupDiGetDeviceRegistryPropertyW(DeviceInfoSet, DeviceInfoData, Property, PropertyRegDataType, PropertyBuffer, PropertyBufferSize, RequiredSize);
+
+    // 2. 拦截 Capabilities 查询
+    if (result && g_HookRemovable && Property == SPDRP_CAPABILITIES) {
+        if (PropertyBuffer && PropertyBufferSize >= sizeof(DWORD)) {
+            DWORD* pCaps = (DWORD*)PropertyBuffer;
+            // 强制添加可移动标志
+            *pCaps |= CM_DEVCAP_REMOVABLE;
+        }
+    }
+
+    return result;
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -4289,6 +4379,27 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     MH_CreateHook(pDeviceIoControl, &Detour_DeviceIoControl, reinterpret_cast<LPVOID*>(&fpDeviceIoControl));
                 }
             }
+
+    // [新增] 挂钩 GetDriveTypeW (Kernel32)
+    // 这是最上层的 API，对 UI 识别最有效
+    if (g_HookRemovable && hKernel32) {
+        void* pGetDriveTypeW = (void*)GetProcAddress(hKernel32, "GetDriveTypeW");
+        if (pGetDriveTypeW) {
+            MH_CreateHook(pGetDriveTypeW, &Detour_GetDriveTypeW, reinterpret_cast<LPVOID*>(&fpGetDriveTypeW));
+        }
+    }
+
+    // [新增] 挂钩 SetupAPI (setupapi.dll)
+    // 替代/补充 cfgmgr32，很多程序使用此 API 查询硬件属性
+    if (g_HookRemovable) {
+        HMODULE hSetupApi = LoadLibraryW(L"setupapi.dll");
+        if (hSetupApi) {
+            void* pSetupDiGet = (void*)GetProcAddress(hSetupApi, "SetupDiGetDeviceRegistryPropertyW");
+            if (pSetupDiGet) {
+                MH_CreateHook(pSetupDiGet, &Detour_SetupDiGetDeviceRegistryPropertyW, reinterpret_cast<LPVOID*>(&fpSetupDiGetDeviceRegistryPropertyW));
+            }
+        }
+    }
 
             // [新增] 挂钩 PnP 管理器 (cfgmgr32.dll)
             // 许多高级文件管理器通过此 API 判断设备是否可移动
