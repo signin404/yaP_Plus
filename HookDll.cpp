@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <winioctl.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -162,56 +163,6 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
-
-// 总线类型枚举
-typedef enum _STORAGE_BUS_TYPE {
-    BusTypeUnknown = 0x00,
-    BusTypeScsi = 0x01,
-    BusTypeAtapi = 0x02,
-    BusTypeAta = 0x03,
-    BusType1394 = 0x04,
-    BusTypeSsa = 0x05,
-    BusTypeFibre = 0x06,
-    BusTypeUsb = 0x07, // <--- 目标类型
-    BusTypeRAID = 0x08,
-    BusTypeiScsi = 0x09,
-    BusTypeSas = 0x0A,
-    BusTypeSata = 0x0B,
-    BusTypeSd = 0x0C,
-    BusTypeMmc = 0x0D,
-    BusTypeVirtual = 0x0E,
-    BusTypeFileBackedVirtual = 0x0F,
-    BusTypeSpaces = 0x10,
-    BusTypeNvme = 0x11,
-    BusTypeScm = 0x12,
-    BusTypeUfs = 0x13,
-    BusTypeMax = 0x14,
-    BusTypeMaxReserved = 0x7F
-} STORAGE_BUS_TYPE, *PSTORAGE_BUS_TYPE;
-
-// 存储设备描述符
-typedef struct _STORAGE_DEVICE_DESCRIPTOR {
-    DWORD Version;
-    DWORD Size;
-    BYTE  DeviceType;
-    BYTE  DeviceTypeModifier;
-    BOOLEAN RemovableMedia;
-    BOOLEAN CommandQueueing;
-    DWORD VendorIdOffset;
-    DWORD ProductIdOffset;
-    DWORD ProductRevisionOffset;
-    DWORD SerialNumberOffset;
-    STORAGE_BUS_TYPE BusType;
-    DWORD RawPropertiesLength;
-    BYTE  RawDeviceProperties[1];
-} STORAGE_DEVICE_DESCRIPTOR, *PSTORAGE_DEVICE_DESCRIPTOR;
-
-// 查询结构
-typedef struct _STORAGE_PROPERTY_QUERY {
-    DWORD PropertyId;
-    DWORD QueryType;
-    BYTE  AdditionalParameters[1];
-} STORAGE_PROPERTY_QUERY, *PSTORAGE_PROPERTY_QUERY;
 
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
