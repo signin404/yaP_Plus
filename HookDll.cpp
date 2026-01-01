@@ -4011,7 +4011,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
-    if (g_HookChild && (g_HookMode > 0 || g_BlockNetwork)) {
+    if (g_HookChild) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
