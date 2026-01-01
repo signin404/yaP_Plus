@@ -168,15 +168,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-// [新增] 热插拔信息结构体
-typedef struct _STORAGE_HOTPLUG_INFO {
-    DWORD   Size;
-    BOOLEAN MediaRemovable; // 介质是否可移动
-    BOOLEAN MediaHotplug;   // 介质是否可热插拔
-    BOOLEAN DeviceHotplug;  // 设备是否可热插拔
-    BOOLEAN WriteCacheEnableOverride;
-} STORAGE_HOTPLUG_INFO, *PSTORAGE_HOTPLUG_INFO;
-
 // [新增] PnP 配置管理器相关定义
 typedef DWORD CONFIGRET;
 typedef DWORD DEVINST;
