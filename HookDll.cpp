@@ -151,11 +151,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-typedef enum _EVENT_TYPE {
-    NotificationEvent,
-    SynchronizationEvent
-} EVENT_TYPE;
-
 typedef struct _REPARSE_DATA_BUFFER {
     ULONG  ReparseTag;
     USHORT ReparseDataLength;
@@ -439,18 +434,6 @@ P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
 
-// IPC / Object Hooks
-typedef NTSTATUS(NTAPI* P_NtCreateMutant)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, BOOLEAN);
-typedef NTSTATUS(NTAPI* P_NtOpenMutant)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI* P_NtCreateEvent)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, EVENT_TYPE, BOOLEAN);
-typedef NTSTATUS(NTAPI* P_NtOpenEvent)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI* P_NtCreateSemaphore)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, ULONG);
-typedef NTSTATUS(NTAPI* P_NtOpenSemaphore)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI* P_NtCreateSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
-typedef NTSTATUS(NTAPI* P_NtOpenSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI* P_NtOpenDirectoryObject)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-P_NtOpenDirectoryObject fpNtOpenDirectoryObject = NULL;
-
 // ICMP (Ping)
 typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
 typedef DWORD (WINAPI* P_IcmpSendEcho2)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
@@ -502,8 +485,6 @@ std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于�
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
 std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
-bool g_MultiInstance = false; // [新增] 多实例绕过开关
-std::wstring g_BoxId;         // [新增] 沙盒唯一 ID
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -520,14 +501,6 @@ P_InternetConnectA fpInternetConnectA = NULL;
 P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
-P_NtCreateMutant fpNtCreateMutant = NULL;
-P_NtOpenMutant fpNtOpenMutant = NULL;
-P_NtCreateEvent fpNtCreateEvent = NULL;
-P_NtOpenEvent fpNtOpenEvent = NULL;
-P_NtCreateSemaphore fpNtCreateSemaphore = NULL;
-P_NtOpenSemaphore fpNtOpenSemaphore = NULL;
-P_NtCreateSection fpNtCreateSection = NULL;
-P_NtOpenSection fpNtOpenSection = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -1878,59 +1851,14 @@ bool NtPathExists(const std::wstring& ntPath) {
 
 // [新增] 初始化管道前缀 (在 InitHookThread 中调用)
 void InitPipeVirtualization() {
-    // 优先使用 Launcher 传递的唯一 ID
-    wchar_t boxIdBuf[64];
-    if (GetEnvironmentVariableW(L"YAP_BOX_ID", boxIdBuf, 64) > 0) {
-        g_BoxId = boxIdBuf;
-    } else {
-        // 回退到 SessionID
-        DWORD sessionId = 0;
-        ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
-        swprintf_s(boxIdBuf, L"%08x", sessionId);
-        g_BoxId = boxIdBuf;
-    }
+    DWORD sessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
 
-    // 生成前缀: YapBox_<ID>_
-    g_PipePrefix = L"YapBox_" + g_BoxId + L"_";
-}
-
-// [新增] 计算虚拟化 IPC 对象路径 (Mutex, Event, Section 等)
-// 输入: \BaseNamedObjects\MyMutex
-// 输出: \BaseNamedObjects\YapBox_<ID>_MyMutex
-bool GetBoxedIpcPath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
-    if (fullNtPath.empty()) return false;
-
-    // [修改] 移除 \RPC Control\ 以避免破坏系统服务连接 (修复无窗口/僵死问题)
-    // 仅拦截 BaseNamedObjects (全局/会话) 即可覆盖绝大多数单实例互斥体
-    const wchar_t* prefixes[] = {
-        L"\\BaseNamedObjects\\",
-        // L"\\RPC Control\\", // <--- 删除此行
-        L"\\Sessions\\"
-    };
-
-    for (const auto& prefix : prefixes) {
-        size_t pLen = wcslen(prefix);
-        size_t findPos = fullNtPath.find(prefix);
-
-        // 如果包含该前缀 (通常在开头，但 Sessions 路径可能较长)
-        if (findPos != std::wstring::npos) {
-            // 找到最后一个反斜杠，分离目录和对象名
-            size_t lastSlash = fullNtPath.find_last_of(L'\\');
-            if (lastSlash != std::wstring::npos && lastSlash < fullNtPath.length() - 1) {
-
-                std::wstring dirPart = fullNtPath.substr(0, lastSlash + 1);
-                std::wstring namePart = fullNtPath.substr(lastSlash + 1);
-
-                // 检查是否已经被虚拟化
-                if (namePart.find(g_PipePrefix) == 0) return false;
-
-                // 构造虚拟化路径
-                outBoxedPath = dirPart + g_PipePrefix + namePart;
-                return true;
-            }
-        }
-    }
-    return false;
+    // 生成唯一前缀 格式: YapBox_<SessionId>_
+    // 这样不同 Session 的沙盒不会冲突 且与真实管道区分开
+    wchar_t buf[64];
+    swprintf_s(buf, L"YapBox_%08x_", sessionId);
+    g_PipePrefix = buf;
 }
 
 // [新增] 计算虚拟化管道路径
@@ -3156,68 +3084,6 @@ NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
     return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
-// [新增] 通用 IPC 虚拟化宏
-#define VIRTUALIZE_IPC_OBJECT(OriginalFunc, ...) \
-    if (g_IsInHook) return OriginalFunc(__VA_ARGS__); \
-    RecursionGuard guard; \
-    if (g_MultiInstance && ObjectAttributes && ObjectAttributes->ObjectName) { \
-        std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes); \
-        std::wstring boxedPath; \
-        if (GetBoxedIpcPath(rawNtPath, boxedPath)) { \
-            UNICODE_STRING uStr; \
-            RtlInitUnicodeString(&uStr, boxedPath.c_str()); \
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName; \
-            HANDLE oldRoot = ObjectAttributes->RootDirectory; \
-            ObjectAttributes->ObjectName = &uStr; \
-            ObjectAttributes->RootDirectory = NULL; \
-            NTSTATUS status = OriginalFunc(__VA_ARGS__); \
-            ObjectAttributes->ObjectName = oldName; \
-            ObjectAttributes->RootDirectory = oldRoot; \
-            if (NT_SUCCESS(status)) { \
-                /* DebugLog(L"IPC: Virtualized %s -> %s", rawNtPath.c_str(), boxedPath.c_str()); */ \
-            } \
-            return status; \
-        } \
-    } \
-    return OriginalFunc(__VA_ARGS__);
-
-NTSTATUS NTAPI Detour_NtCreateMutant(PHANDLE MutantHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner) {
-    VIRTUALIZE_IPC_OBJECT(fpNtCreateMutant, MutantHandle, DesiredAccess, ObjectAttributes, InitialOwner);
-}
-
-NTSTATUS NTAPI Detour_NtOpenMutant(PHANDLE MutantHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    VIRTUALIZE_IPC_OBJECT(fpNtOpenMutant, MutantHandle, DesiredAccess, ObjectAttributes);
-}
-
-NTSTATUS NTAPI Detour_NtCreateEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, EVENT_TYPE EventType, BOOLEAN InitialState) {
-    VIRTUALIZE_IPC_OBJECT(fpNtCreateEvent, EventHandle, DesiredAccess, ObjectAttributes, EventType, InitialState);
-}
-
-NTSTATUS NTAPI Detour_NtOpenEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    VIRTUALIZE_IPC_OBJECT(fpNtOpenEvent, EventHandle, DesiredAccess, ObjectAttributes);
-}
-
-NTSTATUS NTAPI Detour_NtCreateSemaphore(PHANDLE SemaphoreHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG InitialCount, ULONG MaximumCount) {
-    VIRTUALIZE_IPC_OBJECT(fpNtCreateSemaphore, SemaphoreHandle, DesiredAccess, ObjectAttributes, InitialCount, MaximumCount);
-}
-
-NTSTATUS NTAPI Detour_NtOpenSemaphore(PHANDLE SemaphoreHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    VIRTUALIZE_IPC_OBJECT(fpNtOpenSemaphore, SemaphoreHandle, DesiredAccess, ObjectAttributes);
-}
-
-NTSTATUS NTAPI Detour_NtCreateSection(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize, ULONG PageAttributes, ULONG SectionAttributes, HANDLE FileHandle) {
-    // Section 比较特殊，如果是文件映射(FileHandle != NULL)，通常不需要虚拟化名称，除非是为了隔离
-    // 这里仅处理命名内存映射 (FileHandle == NULL)
-    if (FileHandle == NULL) {
-        VIRTUALIZE_IPC_OBJECT(fpNtCreateSection, SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize, PageAttributes, SectionAttributes, FileHandle);
-    }
-    return fpNtCreateSection(SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize, PageAttributes, SectionAttributes, FileHandle);
-}
-
-NTSTATUS NTAPI Detour_NtOpenSection(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    VIRTUALIZE_IPC_OBJECT(fpNtOpenSection, SectionHandle, DesiredAccess, ObjectAttributes);
-}
-
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -4000,12 +3866,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 初始化子进程白名单
     InitChildHookWhitelist();
 
-    // [新增] 读取多实例配置
-    wchar_t multiBuf[64];
-    if (GetEnvironmentVariableW(L"YAP_MULTI_INSTANCE", multiBuf, 64) > 0) {
-        g_MultiInstance = (_wtoi(multiBuf) == 1);
-    }
-
     // [新增] 读取 hookcopysize 配置
     wchar_t copySizeBuf[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", copySizeBuf, 64) > 0) {
@@ -4105,15 +3965,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
-    // [新增] 预先初始化核心 API 指针 (修复 hookfile=0 时的崩溃)
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        // 无论是否挂钩，ResolvePathFromAttr 等辅助函数都需要这些指针
-        if (!fpNtQueryObject) fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
-        if (!fpNtOpenDirectoryObject) fpNtOpenDirectoryObject = (P_NtOpenDirectoryObject)GetProcAddress(hNtdll, "NtOpenDirectoryObject");
-        // 如果有其他在 Hook 逻辑外使用的 NT 函数，也应在此初始化
-    }
-
     // =======================================================
     // 分组挂钩逻辑
     // =======================================================
@@ -4132,12 +3983,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [修改] 使用已获取的指针或重新获取
-            if (fpNtQueryObject) {
-                MH_CreateHook(fpNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+            // [修改] 挂钩 NtQueryObject 以支持路径欺骗
+            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
+            if (pNtQueryObject) {
+                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
             }
 
-             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
+            // [新增] 挂钩 NtCreateNamedPipeFile
+            void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
             if (pNtCreateNamedPipeFile) {
                 MH_CreateHook(pNtCreateNamedPipeFile, &Detour_NtCreateNamedPipeFile, reinterpret_cast<LPVOID*>(&fpNtCreateNamedPipeFile));
             }
@@ -4234,32 +4087,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hWinHttp) {
             void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
             if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
-        }
-    }
-
-    // --- [新增] 组 D: 多实例隔离 Hook (仅当 multiple=2 时挂钩) ---
-    if (g_MultiInstance) {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-        if (hNtdll) {
-            void* pNtCreateMutant = (void*)GetProcAddress(hNtdll, "NtCreateMutant");
-            void* pNtOpenMutant = (void*)GetProcAddress(hNtdll, "NtOpenMutant");
-            void* pNtCreateEvent = (void*)GetProcAddress(hNtdll, "NtCreateEvent");
-            void* pNtOpenEvent = (void*)GetProcAddress(hNtdll, "NtOpenEvent");
-            void* pNtCreateSemaphore = (void*)GetProcAddress(hNtdll, "NtCreateSemaphore");
-            void* pNtOpenSemaphore = (void*)GetProcAddress(hNtdll, "NtOpenSemaphore");
-            void* pNtCreateSection = (void*)GetProcAddress(hNtdll, "NtCreateSection");
-            void* pNtOpenSection = (void*)GetProcAddress(hNtdll, "NtOpenSection");
-
-            if (pNtCreateMutant) MH_CreateHook(pNtCreateMutant, &Detour_NtCreateMutant, reinterpret_cast<LPVOID*>(&fpNtCreateMutant));
-            if (pNtOpenMutant) MH_CreateHook(pNtOpenMutant, &Detour_NtOpenMutant, reinterpret_cast<LPVOID*>(&fpNtOpenMutant));
-            if (pNtCreateEvent) MH_CreateHook(pNtCreateEvent, &Detour_NtCreateEvent, reinterpret_cast<LPVOID*>(&fpNtCreateEvent));
-            if (pNtOpenEvent) MH_CreateHook(pNtOpenEvent, &Detour_NtOpenEvent, reinterpret_cast<LPVOID*>(&fpNtOpenEvent));
-            if (pNtCreateSemaphore) MH_CreateHook(pNtCreateSemaphore, &Detour_NtCreateSemaphore, reinterpret_cast<LPVOID*>(&fpNtCreateSemaphore));
-            if (pNtOpenSemaphore) MH_CreateHook(pNtOpenSemaphore, &Detour_NtOpenSemaphore, reinterpret_cast<LPVOID*>(&fpNtOpenSemaphore));
-            if (pNtCreateSection) MH_CreateHook(pNtCreateSection, &Detour_NtCreateSection, reinterpret_cast<LPVOID*>(&fpNtCreateSection));
-            if (pNtOpenSection) MH_CreateHook(pNtOpenSection, &Detour_NtOpenSection, reinterpret_cast<LPVOID*>(&fpNtOpenSection));
-
-            DebugLog(L"MultiInstance: IPC Hooks Installed. BoxID: %s", g_BoxId.c_str());
         }
     }
 

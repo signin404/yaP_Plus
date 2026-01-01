@@ -3992,80 +3992,54 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
     // --- 2. 解析 Hook 配置 ---
-    std::wstring hookFileVal = GetValueFromIniContent(data->iniContent, L"General", L"hookfile");
+    std::wstring hookFileVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfile");
     int hookMode = _wtoi(hookFileVal.c_str());
 
-    // [新增] 解析 multiple 配置
-    std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
-    int multipleMode = _wtoi(multipleVal.c_str());
-    bool multiInstanceBypass = (multipleMode == 2);
-
     // [新增] 解析网络拦截配置
-    std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
+    std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooknet");
     bool blockNetwork = (netBlockVal == L"1");
 
     // [新增] 解析 hookcopysize 配置 (单位: MB)
-    std::wstring hookCopySizeVal = GetValueFromIniContent(data->iniContent, L"General", L"hookcopysize");
+    std::wstring hookCopySizeVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookcopysize");
     if (!hookCopySizeVal.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
     } else {
         SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
     }
 
-    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启 或 多实例绕过开启
-    bool enableHook = (hookMode > 0 || blockNetwork || multiInstanceBypass);
+    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
+    bool enableHook = (hookMode > 0 || blockNetwork);
 
-    std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
+    std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
-    // --- [新增] 解析 Injector 配置 (第三方 DLL) ---
+    // --- [修改] 解析 Injector 和 hookchildname 配置 (从 [Hook] 章节) ---
     std::vector<std::wstring> thirdPartyDlls;
+    std::wstring childHookNamesVar; // 用于存储 hookchildname 列表
     {
         std::wstringstream stream(data->iniContent);
         std::wstring line;
-        bool inGeneral = false;
+        bool inHookSection = false; // [修改] 标志位改为 inHookSection
         while (std::getline(stream, line)) {
             line = trim(line);
             if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
             if (line[0] == L'[' && line.back() == L']') {
-                inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
+                // [修改] 检查是否进入 [Hook] 章节
+                inHookSection = (_wcsicmp(line.c_str(), L"[Hook]") == 0);
                 continue;
             }
-            if (inGeneral) {
+            if (inHookSection) {
                 size_t delimiterPos = line.find(L'=');
                 if (delimiterPos != std::wstring::npos) {
                     std::wstring key = trim(line.substr(0, delimiterPos));
+                    std::wstring val = trim(line.substr(delimiterPos + 1));
+
                     if (_wcsicmp(key.c_str(), L"Injector") == 0) {
-                        std::wstring val = trim(line.substr(delimiterPos + 1));
                         std::wstring expanded = ResolveToAbsolutePath(ExpandVariables(val, data->variables), data->variables);
                         if (!expanded.empty()) {
                             thirdPartyDlls.push_back(expanded);
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    // [新增] 解析 hookchildname 配置
-    std::wstring childHookNamesVar;
-    {
-        std::wstringstream stream(data->iniContent);
-        std::wstring line;
-        bool inGeneral = false;
-        while (std::getline(stream, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
-            if (line[0] == L'[' && line.back() == L']') {
-                inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
-                continue;
-            }
-            if (inGeneral) {
-                size_t delimiterPos = line.find(L'=');
-                if (delimiterPos != std::wstring::npos) {
-                    std::wstring key = trim(line.substr(0, delimiterPos));
-                    if (_wcsicmp(key.c_str(), L"hookchildname") == 0) {
-                        std::wstring val = trim(line.substr(delimiterPos + 1));
+                    } else if (_wcsicmp(key.c_str(), L"hookchildname") == 0) {
                         if (!val.empty()) {
                             childHookNamesVar += val + L";";
                         }
@@ -4116,20 +4090,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
 
-        // [新增] 设置多实例绕过环境变量
-        if (multiInstanceBypass) {
-            SetEnvironmentVariableW(L"YAP_MULTI_INSTANCE", L"1");
-            // 生成本次运行的唯一 ID (基于时间戳和线程ID) 以确保不同启动器实例下的程序互不干扰
-            wchar_t uniqueId[64];
-            swprintf_s(uniqueId, L"%08x%08x", GetTickCount(), GetCurrentThreadId());
-            SetEnvironmentVariableW(L"YAP_BOX_ID", uniqueId);
-        } else {
-            SetEnvironmentVariableW(L"YAP_MULTI_INSTANCE", L"0");
-        }
-
         // [新增] 读取 hookchild 配置
         // 1 = 挂钩 (默认) 0 = 不挂钩
-        std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"General", L"hookchild");
+        std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookchild");
         if (hookChildVal.empty()) {
             hookChildVal = L"1"; // 默认开启
         }
@@ -4223,7 +4186,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
         }
 
-        bool multiInstanceEnabled = (multipleMode >= 1);
+        bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
 
         if (multiInstanceEnabled) {
             // --- 多实例模式等待 ---
@@ -4703,8 +4666,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     } else {
         CloseHandle(hMutex);
-        std::wstring multipleVal = GetValueFromIniContent(iniContent, L"General", L"multiple");
-        if (_wtoi(multipleVal.c_str()) >= 1) {
+        if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
             LaunchApplication(iniContent, variables);
         }
     }
