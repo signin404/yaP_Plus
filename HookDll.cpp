@@ -4298,6 +4298,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     void* pCM_Get_DevNode_Registry_PropertyW = (void*)GetProcAddress(hCfgMgr, "CM_Get_DevNode_Registry_PropertyW");
                     if (pCM_Get_DevNode_Registry_PropertyW) {
 						MH_CreateHook(pCM_Get_DevNode_Registry_PropertyW, &Detour_CM_Get_DevNode_Registry_PropertyW, reinterpret_cast<LPVOID*>(&fpCM_Get_DevNode_Registry_PropertyW));
+                    }
                 }
             }
         }
