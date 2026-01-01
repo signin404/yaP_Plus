@@ -160,9 +160,22 @@
 #define IO_REPARSE_TAG_SYMLINK 0xA000000C
 #endif
 
+#ifndef IOCTL_STORAGE_GET_HOTPLUG_INFO
+#define IOCTL_STORAGE_GET_HOTPLUG_INFO CTL_CODE(IOCTL_STORAGE_BASE, 0x0305, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// [新增] 热插拔信息结构体
+typedef struct _STORAGE_HOTPLUG_INFO {
+    DWORD   Size;
+    BOOLEAN MediaRemovable; // 介质是否可移动
+    BOOLEAN MediaHotplug;   // 介质是否可热插拔
+    BOOLEAN DeviceHotplug;  // 设备是否可热插拔
+    BOOLEAN WriteCacheEnableOverride;
+} STORAGE_HOTPLUG_INFO, *PSTORAGE_HOTPLUG_INFO;
 
 // [新增] PnP 配置管理器相关定义
 typedef DWORD CONFIGRET;
@@ -500,6 +513,10 @@ typedef CONFIGRET (WINAPI* P_CM_Get_DevNode_Registry_PropertyW)(
     ULONG ulFlags
 );
 P_CM_Get_DevNode_Registry_PropertyW fpCM_Get_DevNode_Registry_PropertyW = NULL;
+
+// [新增] GetDriveTypeA
+typedef UINT (WINAPI* P_GetDriveTypeA)(LPCSTR lpRootPathName);
+P_GetDriveTypeA fpGetDriveTypeA = NULL;
 
 // [新增] GetDriveTypeW
 typedef UINT (WINAPI* P_GetDriveTypeW)(LPCWSTR lpRootPathName);
@@ -3248,39 +3265,37 @@ BOOL WINAPI Detour_DeviceIoControl(
 
     // 2. 仅在成功且开启了 Removable 伪造时处理
     if (result && g_HookRemovable) {
-
-        // 3. 检查是否为目标驱动器
-        // 注意：这里需要对所有相关 IOCTL 进行路径检查 避免影响非目标盘
-        // 为了性能 先检查 IOCTL 代码 如果是相关的再检查路径
-        bool isTargetIoctl = (dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY ||
-                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY ||
-                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX);
+        
+        // 3. 检查 IOCTL 类型 (增加 IOCTL_STORAGE_GET_HOTPLUG_INFO)
+        bool isTargetIoctl = (dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY || 
+                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY || 
+                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX ||
+                              dwIoControlCode == IOCTL_STORAGE_GET_HOTPLUG_INFO); // <--- 新增
 
         if (!isTargetIoctl) return result;
 
+        // 4. 路径检查 (保持不变)
         std::wstring rawPath = GetPathFromHandle(hDevice);
         if (rawPath.empty()) return result;
 
         std::wstring ntPath = DevicePathToNtPath(rawPath);
         bool shouldFake = false;
 
-        // 检查系统盘
-        if (!g_SystemDriveNt.empty() &&
-            (ntPath.size() >= g_SystemDriveNt.size() &&
+        if (!g_SystemDriveNt.empty() && 
+            (ntPath.size() >= g_SystemDriveNt.size() && 
                 _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
             shouldFake = true;
         }
-        // 检查启动器盘
-        else if (!g_LauncherDriveNt.empty() &&
-                    (ntPath.size() >= g_LauncherDriveNt.size() &&
+        else if (!g_LauncherDriveNt.empty() && 
+                    (ntPath.size() >= g_LauncherDriveNt.size() && 
                     _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
             shouldFake = true;
         }
 
         if (!shouldFake) return result;
 
-        // 4. 根据 IOCTL 类型进行伪造
-
+        // 5. 根据 IOCTL 类型进行伪造
+        
         // A. 存储属性查询 (BusType, RemovableMedia)
         if (dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY) {
             if (lpInBuffer && nInBufferSize >= sizeof(STORAGE_PROPERTY_QUERY)) {
@@ -3308,13 +3323,58 @@ BOOL WINAPI Detour_DeviceIoControl(
         else if (dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX) {
             if (lpOutBuffer && nOutBufferSize >= sizeof(DISK_GEOMETRY_EX)) {
                 PDISK_GEOMETRY_EX pGeoEx = (PDISK_GEOMETRY_EX)lpOutBuffer;
-                // 修改介质类型为 RemovableMedia (11)
                 pGeoEx->Geometry.MediaType = RemovableMedia;
+            }
+        }
+
+        // D. [新增] 热插拔信息查询 (Hotplug Info)
+        // 这是骗过 XYplorer 的关键
+        else if (dwIoControlCode == IOCTL_STORAGE_GET_HOTPLUG_INFO) {
+            if (lpOutBuffer && nOutBufferSize >= sizeof(STORAGE_HOTPLUG_INFO)) {
+                PSTORAGE_HOTPLUG_INFO pHotplug = (PSTORAGE_HOTPLUG_INFO)lpOutBuffer;
+                pHotplug->MediaRemovable = TRUE; // 介质可移动
+                pHotplug->DeviceHotplug = TRUE;  // 设备可热插拔
+                pHotplug->MediaHotplug = TRUE;   // 介质可热插拔
             }
         }
     }
 
     return result;
+}
+
+UINT WINAPI Detour_GetDriveTypeA(LPCSTR lpRootPathName) {
+    if (!g_HookRemovable) return fpGetDriveTypeA(lpRootPathName);
+
+    // 转换为 WideChar 并复用 Detour_GetDriveTypeW 的逻辑
+    // 或者简单地重复逻辑
+    std::wstring pathToCheck;
+    if (lpRootPathName && *lpRootPathName) {
+        pathToCheck = AnsiToWide(lpRootPathName);
+    } else {
+        wchar_t currentDir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, currentDir);
+        pathToCheck = currentDir;
+    }
+
+    // 提取盘符
+    std::wstring driveLetter;
+    if (pathToCheck.length() >= 2 && pathToCheck[1] == L':') {
+        driveLetter = pathToCheck.substr(0, 2);
+    }
+
+    if (!driveLetter.empty()) {
+        if (!g_SystemDriveLetter.empty() && _wcsicmp(driveLetter.c_str(), g_SystemDriveLetter.c_str()) == 0) {
+            return DRIVE_REMOVABLE;
+        }
+        else if (!g_LauncherDriveNt.empty() && g_LauncherDriveNt.length() >= 6) {
+            std::wstring launcherLetter = g_LauncherDriveNt.substr(4, 2);
+            if (_wcsicmp(driveLetter.c_str(), launcherLetter.c_str()) == 0) {
+                return DRIVE_REMOVABLE;
+            }
+        }
+    }
+
+    return fpGetDriveTypeA(lpRootPathName);
 }
 
 CONFIGRET WINAPI Detour_CM_Get_DevNode_Registry_PropertyW(
@@ -4379,6 +4439,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     MH_CreateHook(pDeviceIoControl, &Detour_DeviceIoControl, reinterpret_cast<LPVOID*>(&fpDeviceIoControl));
                 }
             }
+
+    // [新增] 挂钩 GetDriveTypeA (Kernel32)
+    if (g_HookRemovable && hKernel32) {
+        void* pGetDriveTypeA = (void*)GetProcAddress(hKernel32, "GetDriveTypeA");
+        if (pGetDriveTypeA) {
+            MH_CreateHook(pGetDriveTypeA, &Detour_GetDriveTypeA, reinterpret_cast<LPVOID*>(&fpGetDriveTypeA));
+        }
+    }
 
     // [新增] 挂钩 GetDriveTypeW (Kernel32)
     // 这是最上层的 API，对 UI 识别最有效
