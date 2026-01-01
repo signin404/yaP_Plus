@@ -2337,6 +2337,10 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
+            if (pe32.th32ProcessID == GetCurrentProcessId()) {
+                continue;
+            }
+
             // --- [最终核心修正：实现按规则区分的PPID检查] ---
             bool parentIsTrusted = trustedPids.count(pe32.th32ParentProcessID) > 0;
 
@@ -2416,6 +2420,10 @@ std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<WaitProcessInfo>
 
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
+            if (pe32.th32ProcessID == GetCurrentProcessId()) {
+                continue;
+            }
+
             for (const auto& info : processInfos) {
                 if (WildcardMatch(pe32.szExeFile, info.processName.c_str())) {
                     bool match = false;
