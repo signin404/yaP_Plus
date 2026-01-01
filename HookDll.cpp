@@ -3214,45 +3214,69 @@ BOOL WINAPI Detour_DeviceIoControl(
     BOOL result = fpDeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
 
     // 2. 仅在成功且开启了 Removable 伪造时处理
-    if (result && g_HookRemovable && dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY) {
+    if (result && g_HookRemovable) {
 
-        if (lpInBuffer && nInBufferSize >= sizeof(STORAGE_PROPERTY_QUERY)) {
-            PSTORAGE_PROPERTY_QUERY query = (PSTORAGE_PROPERTY_QUERY)lpInBuffer;
+        // 3. 检查是否为目标驱动器
+        // 注意：这里需要对所有相关 IOCTL 进行路径检查 避免影响非目标盘
+        // 为了性能 先检查 IOCTL 代码 如果是相关的再检查路径
+        bool isTargetIoctl = (dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY ||
+                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY ||
+                              dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX);
 
-            // 仅处理对 "设备属性" (StorageDeviceProperty) 的 "标准查询" (PropertyStandardQuery)
-            if (query->PropertyId == StorageDeviceProperty && query->QueryType == PropertyStandardQuery) {
+        if (!isTargetIoctl) return result;
 
-                // 3. 检查是否为目标驱动器
-                std::wstring rawPath = GetPathFromHandle(hDevice);
-                if (!rawPath.empty()) {
-                    std::wstring ntPath = DevicePathToNtPath(rawPath);
-                    bool shouldFake = false;
+        std::wstring rawPath = GetPathFromHandle(hDevice);
+        if (rawPath.empty()) return result;
 
-                    // 检查系统盘
-                    if (!g_SystemDriveNt.empty() &&
-                        (ntPath.size() >= g_SystemDriveNt.size() &&
-                         _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
-                        shouldFake = true;
-                    }
-                    // 检查启动器盘
-                    else if (!g_LauncherDriveNt.empty() &&
-                             (ntPath.size() >= g_LauncherDriveNt.size() &&
-                              _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
-                        shouldFake = true;
-                    }
+        std::wstring ntPath = DevicePathToNtPath(rawPath);
+        bool shouldFake = false;
 
-                    // 4. 修改返回数据
-                    if (shouldFake && lpOutBuffer && nOutBufferSize >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        // 检查系统盘
+        if (!g_SystemDriveNt.empty() &&
+            (ntPath.size() >= g_SystemDriveNt.size() &&
+                _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
+            shouldFake = true;
+        }
+        // 检查启动器盘
+        else if (!g_LauncherDriveNt.empty() &&
+                    (ntPath.size() >= g_LauncherDriveNt.size() &&
+                    _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
+            shouldFake = true;
+        }
+
+        if (!shouldFake) return result;
+
+        // 4. 根据 IOCTL 类型进行伪造
+
+        // A. 存储属性查询 (BusType, RemovableMedia)
+        if (dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY) {
+            if (lpInBuffer && nInBufferSize >= sizeof(STORAGE_PROPERTY_QUERY)) {
+                PSTORAGE_PROPERTY_QUERY query = (PSTORAGE_PROPERTY_QUERY)lpInBuffer;
+                if (query->PropertyId == StorageDeviceProperty && query->QueryType == PropertyStandardQuery) {
+                    if (lpOutBuffer && nOutBufferSize >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
                         PSTORAGE_DEVICE_DESCRIPTOR desc = (PSTORAGE_DEVICE_DESCRIPTOR)lpOutBuffer;
-
-                        // 关键修改：将总线类型改为 USB
-                        desc->BusType = BusTypeUsb;
-
-                        // 关键修改：标记为可移动介质
-                        desc->RemovableMedia = TRUE;
-
+                        desc->BusType = BusTypeUsb;       // 伪装为 USB 总线
+                        desc->RemovableMedia = TRUE;      // 标记为可移动
                     }
                 }
+            }
+        }
+
+        // B. [新增] 磁盘几何结构查询 (MediaType)
+        else if (dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
+            if (lpOutBuffer && nOutBufferSize >= sizeof(DISK_GEOMETRY)) {
+                PDISK_GEOMETRY pGeo = (PDISK_GEOMETRY)lpOutBuffer;
+                // 修改介质类型为 RemovableMedia (11)
+                pGeo->MediaType = RemovableMedia;
+            }
+        }
+
+        // C. [新增] 扩展磁盘几何结构查询 (MediaType)
+        else if (dwIoControlCode == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX) {
+            if (lpOutBuffer && nOutBufferSize >= sizeof(DISK_GEOMETRY_EX)) {
+                PDISK_GEOMETRY_EX pGeoEx = (PDISK_GEOMETRY_EX)lpOutBuffer;
+                // 修改介质类型为 RemovableMedia (11)
+                pGeoEx->Geometry.MediaType = RemovableMedia;
             }
         }
     }
