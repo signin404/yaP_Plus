@@ -1898,23 +1898,24 @@ void InitPipeVirtualization() {
 bool GetBoxedIpcPath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
     if (fullNtPath.empty()) return false;
 
-    // 定义需要拦截的根目录
+    // [修改] 移除 \RPC Control\ 以避免破坏系统服务连接 (修复无窗口/僵死问题)
+    // 仅拦截 BaseNamedObjects (全局/会话) 即可覆盖绝大多数单实例互斥体
     const wchar_t* prefixes[] = {
         L"\\BaseNamedObjects\\",
-        L"\\RPC Control\\",
-        L"\\Sessions\\" // 处理 \Sessions\1\BaseNamedObjects\...
+        // L"\\RPC Control\\", // <--- 删除此行
+        L"\\Sessions\\"
     };
 
     for (const auto& prefix : prefixes) {
         size_t pLen = wcslen(prefix);
         size_t findPos = fullNtPath.find(prefix);
-        
+
         // 如果包含该前缀 (通常在开头，但 Sessions 路径可能较长)
         if (findPos != std::wstring::npos) {
             // 找到最后一个反斜杠，分离目录和对象名
             size_t lastSlash = fullNtPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos && lastSlash < fullNtPath.length() - 1) {
-                
+
                 std::wstring dirPart = fullNtPath.substr(0, lastSlash + 1);
                 std::wstring namePart = fullNtPath.substr(lastSlash + 1);
 
@@ -4102,6 +4103,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
+    // [新增] 预先初始化核心 API 指针 (修复 hookfile=0 时的崩溃)
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        // 无论是否挂钩，ResolvePathFromAttr 等辅助函数都需要这些指针
+        if (!fpNtQueryObject) fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+        if (!fpNtOpenDirectoryObject) fpNtOpenDirectoryObject = (P_NtOpenDirectoryObject)GetProcAddress(hNtdll, "NtOpenDirectoryObject");
+        // 如果有其他在 Hook 逻辑外使用的 NT 函数，也应在此初始化
+    }
+
     // =======================================================
     // 分组挂钩逻辑
     // =======================================================
@@ -4120,14 +4130,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [修改] 挂钩 NtQueryObject 以支持路径欺骗
-            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-            if (pNtQueryObject) {
-                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+            // [修改] 使用已获取的指针或重新获取
+            if (fpNtQueryObject) {
+                MH_CreateHook(fpNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
             }
 
-            // [新增] 挂钩 NtCreateNamedPipeFile
-            void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
+             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
             if (pNtCreateNamedPipeFile) {
                 MH_CreateHook(pNtCreateNamedPipeFile, &Detour_NtCreateNamedPipeFile, reinterpret_cast<LPVOID*>(&fpNtCreateNamedPipeFile));
             }
@@ -4248,7 +4256,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pNtOpenSemaphore) MH_CreateHook(pNtOpenSemaphore, &Detour_NtOpenSemaphore, reinterpret_cast<LPVOID*>(&fpNtOpenSemaphore));
             if (pNtCreateSection) MH_CreateHook(pNtCreateSection, &Detour_NtCreateSection, reinterpret_cast<LPVOID*>(&fpNtCreateSection));
             if (pNtOpenSection) MH_CreateHook(pNtOpenSection, &Detour_NtOpenSection, reinterpret_cast<LPVOID*>(&fpNtOpenSection));
-            
+
             DebugLog(L"MultiInstance: IPC Hooks Installed. BoxID: %s", g_BoxId.c_str());
         }
     }
