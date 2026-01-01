@@ -1666,20 +1666,22 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
     RtlInitUnicodeString(&uStr, ntPath.c_str());
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // 打开目录 (请求列出目录权限)
+    // 打开目录
     NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
 
     if (!NT_SUCCESS(status)) return;
 
-    // 缓冲区大小 (4KB)
     const size_t bufSize = 4096;
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
 
+    // [新增] 预先计算路径前缀，用于子项可见性检查
+    std::wstring pathPrefix = ntPath;
+    if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
+
     while (true) {
-        // 使用 FileIdBothDirectoryInformation 获取包含 FileId 的信息
         status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
                                         FileIdBothDirectoryInformation, FALSE, NULL, firstQuery);
         firstQuery = false;
@@ -1693,30 +1695,39 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                 std::wstring fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
 
                 if (fileName != L"." && fileName != L"..") {
-                    CachedDirEntry entry;
-                    entry.FileName = fileName;
-                    // ShortName 可能为空
-                    if (info->ShortNameLength > 0) {
-                        entry.ShortName = std::wstring(info->ShortName, info->ShortNameLength / sizeof(wchar_t));
-                    }
-                    entry.FileAttributes = info->FileAttributes;
-                    entry.CreationTime = info->CreationTime;
-                    entry.LastAccessTime = info->LastAccessTime;
-                    entry.LastWriteTime = info->LastWriteTime;
-                    entry.ChangeTime = info->ChangeTime;
-                    entry.EndOfFile = info->EndOfFile;
-                    entry.AllocationSize = info->AllocationSize;
-                    entry.FileId = info->FileId;
-
-                    // [关键] 如果是沙盒文件 混淆 ID (Scramble)
-                    // 这样当程序用这个 ID 打开文件时 我们可以识别出它属于沙盒
-                    if (isSandbox) {
-                        ToggleFileIdScramble(&entry.FileId);
+                    
+                    // [新增] 核心修复：Mode 3 下对真实目录的子项进行二次过滤
+                    bool isVisible = true;
+                    if (g_HookMode == 3 && !isSandbox) {
+                        std::wstring fullChildPath = pathPrefix + fileName;
+                        if (!IsPathVisible(fullChildPath)) {
+                            isVisible = false;
+                        }
                     }
 
-                    std::wstring key = fileName;
-                    std::transform(key.begin(), key.end(), key.begin(), towlower);
-                    outMap[key] = entry;
+                    if (isVisible) {
+                        CachedDirEntry entry;
+                        entry.FileName = fileName;
+                        if (info->ShortNameLength > 0) {
+                            entry.ShortName = std::wstring(info->ShortName, info->ShortNameLength / sizeof(wchar_t));
+                        }
+                        entry.FileAttributes = info->FileAttributes;
+                        entry.CreationTime = info->CreationTime;
+                        entry.LastAccessTime = info->LastAccessTime;
+                        entry.LastWriteTime = info->LastWriteTime;
+                        entry.ChangeTime = info->ChangeTime;
+                        entry.EndOfFile = info->EndOfFile;
+                        entry.AllocationSize = info->AllocationSize;
+                        entry.FileId = info->FileId;
+
+                        if (isSandbox) {
+                            ToggleFileIdScramble(&entry.FileId);
+                        }
+
+                        std::wstring key = fileName;
+                        std::transform(key.begin(), key.end(), key.begin(), towlower);
+                        outMap[key] = entry;
+                    }
                 }
             }
 
@@ -2987,9 +2998,7 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
     if (NT_SUCCESS(status)) {
 
-        // =========================================================
         // [新增] File ID 混淆逻辑
-        // =========================================================
         PLARGE_INTEGER pFileId = NULL;
 
         if (FileInformationClass == FileInternalInformation) {
@@ -3008,9 +3017,7 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
             ToggleFileIdScramble(pFileId);
         }
 
-        // =========================================================
-        // [原有] 文件名欺骗逻辑 (保持不变)
-        // =========================================================
+        // [原有] 文件名欺骗逻辑
         PFILE_NAME_INFORMATION pNameInfo = NULL;
         if (FileInformationClass == (FILE_INFORMATION_CLASS)9 /*FileNameInformation*/) {
             pNameInfo = (PFILE_NAME_INFORMATION)FileInformation;
