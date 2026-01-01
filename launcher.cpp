@@ -4051,6 +4051,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
     }
 
+    // [新增] 解析 hookremovable 配置 (1=开启)
+    std::wstring hookRemovableVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookremovable");
+    if (hookRemovableVal == L"1") {
+        SetEnvironmentVariableW(L"YAP_HOOK_REMOVABLE", L"1");
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
     bool enableHook = (hookMode > 0 || blockNetwork || (hookChild && !thirdPartyDlls.empty()));
 

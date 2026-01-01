@@ -179,6 +179,15 @@ typedef struct _FILE_FS_VOLUME_INFORMATION {
     WCHAR         VolumeLabel[1];
 } FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
 
+// [新增] 设备信息结构体
+typedef struct _FILE_FS_DEVICE_INFORMATION {
+    ULONG DeviceType;
+    ULONG Characteristics;
+} FILE_FS_DEVICE_INFORMATION, *PFILE_FS_DEVICE_INFORMATION;
+
+// 特征标志位
+#define FILE_REMOVABLE_MEDIA 0x00000001
+
 typedef struct _REPARSE_DATA_BUFFER {
     ULONG  ReparseTag;
     USHORT ReparseDataLength;
@@ -517,6 +526,7 @@ std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
 DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
+bool g_HookRemovable = false; // [新增] 是否伪装为可移动磁盘
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3126,37 +3136,50 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     // 1. 调用原始函数
     NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
 
-    // 2. 如果成功且查询的是卷信息 (FileFsVolumeInformation = 1)
-    if (NT_SUCCESS(status) && FsInformationClass == FileFsVolumeInformation && g_HookVolumeId) {
+    if (!NT_SUCCESS(status)) return status;
 
-        // 3. 检查是否为目标驱动器 (系统盘 或 启动器盘)
-        // 获取句柄对应的路径
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            // 转换为 NT 路径 (例如 \Device\HarddiskVolume1 -> \??\C:)
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
+    // 2. 判断是否需要处理 (开启了 VolumeID 伪造 或 Removable 伪造)
+    if (!g_HookVolumeId && !g_HookRemovable) return status;
 
-            bool shouldFake = false;
+    // 3. 仅处理感兴趣的信息类
+    if (FsInformationClass != FileFsVolumeInformation && FsInformationClass != FileFsDeviceInformation) {
+        return status;
+    }
 
-            // 检查系统盘
-            if (!g_SystemDriveNt.empty() &&
-                (ntPath.size() >= g_SystemDriveNt.size() &&
-                 _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
-                shouldFake = true;
-            }
-            // 检查启动器盘
-            else if (!g_LauncherDriveNt.empty() &&
-                     (ntPath.size() >= g_LauncherDriveNt.size() &&
-                      _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
-                shouldFake = true;
-            }
+    // 4. 检查是否为目标驱动器 (系统盘 或 启动器盘)
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) return status;
 
-            // 4. 修改序列号
-            if (shouldFake) {
-                PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
-                info->VolumeSerialNumber = g_FakeVolumeSerial;
-            }
-        }
+    std::wstring ntPath = DevicePathToNtPath(rawPath);
+    bool shouldFake = false;
+
+    // 检查系统盘
+    if (!g_SystemDriveNt.empty() &&
+        (ntPath.size() >= g_SystemDriveNt.size() &&
+            _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
+        shouldFake = true;
+    }
+    // 检查启动器盘
+    else if (!g_LauncherDriveNt.empty() &&
+                (ntPath.size() >= g_LauncherDriveNt.size() &&
+                _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
+        shouldFake = true;
+    }
+
+    if (!shouldFake) return status;
+
+    // 5. 执行伪造
+    if (FsInformationClass == FileFsVolumeInformation && g_HookVolumeId) {
+        // --- 伪造卷序列号 ---
+        PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
+        info->VolumeSerialNumber = g_FakeVolumeSerial;
+    }
+    else if (FsInformationClass == FileFsDeviceInformation && g_HookRemovable) {
+        // --- [新增] 伪造为可移动磁盘 ---
+        PFILE_FS_DEVICE_INFORMATION info = (PFILE_FS_DEVICE_INFORMATION)FsInformation;
+
+        // 添加 FILE_REMOVABLE_MEDIA 标志
+        info->Characteristics |= FILE_REMOVABLE_MEDIA;
     }
 
     return status;
@@ -3979,6 +4002,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
+    // [新增] 读取 hookremovable 配置
+    wchar_t removableBuf[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_REMOVABLE", removableBuf, 64) > 0) {
+        if (_wtoi(removableBuf) == 1) {
+            g_HookRemovable = true;
+        }
+    }
+
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -4068,7 +4099,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // =======================================================
 
     // --- 组 A: 文件系统 Hook ---
-    if (g_HookMode > 0 || g_HookVolumeId) {
+    if (g_HookMode > 0 || g_HookVolumeId || g_HookRemovable) {
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
         if (hNtdll) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
@@ -4099,7 +4130,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
 
             // [新增] 挂钩 NtQueryVolumeInformationFile
-            if (g_HookVolumeId) {
+            if (g_HookVolumeId || g_HookRemovable) {
                 void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
                 if (pNtQueryVolumeInformationFile) {
                     MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
