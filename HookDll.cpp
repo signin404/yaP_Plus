@@ -164,6 +164,13 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// [新增] PnP 配置管理器相关定义
+typedef DWORD CONFIGRET;
+typedef DWORD DEVINST;
+#define CR_SUCCESS          0x00000000
+#define CM_DRP_CAPABILITIES 0x0000000F
+#define CM_DEVCAP_REMOVABLE 0x00000004
+
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
     FileFsVolumeInformation = 1,
@@ -483,6 +490,15 @@ typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 typedef BOOL (WINAPI* P_DeviceIoControl)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 P_DeviceIoControl fpDeviceIoControl = NULL;
+typedef CONFIGRET (WINAPI* P_CM_Get_DevNode_Registry_PropertyW)(
+    DEVINST dnDevInst,
+    ULONG ulProperty,
+    PULONG pulRegDataType,
+    PVOID Buffer,
+    PULONG pulLength,
+    ULONG ulFlags
+);
+P_CM_Get_DevNode_Registry_PropertyW fpCM_Get_DevNode_Registry_PropertyW = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -3284,6 +3300,33 @@ BOOL WINAPI Detour_DeviceIoControl(
     return result;
 }
 
+CONFIGRET WINAPI Detour_CM_Get_DevNode_Registry_PropertyW(
+    DEVINST dnDevInst,
+    ULONG ulProperty,
+    PULONG pulRegDataType,
+    PVOID Buffer,
+    PULONG pulLength,
+    ULONG ulFlags
+) {
+    // 1. 调用原始函数
+    CONFIGRET status = fpCM_Get_DevNode_Registry_PropertyW(dnDevInst, ulProperty, pulRegDataType, Buffer, pulLength, ulFlags);
+
+    // 2. 仅在成功、开启了 Removable 伪造、且查询的是设备能力时处理
+    if (status == CR_SUCCESS && g_HookRemovable && ulProperty == CM_DRP_CAPABILITIES) {
+
+        // 3. 确保缓冲区足够大
+        if (Buffer && pulLength && *pulLength >= sizeof(DWORD)) {
+            DWORD* pCapabilities = (DWORD*)Buffer;
+
+            // 4. 强制添加 CM_DEVCAP_REMOVABLE 标志
+            *pCapabilities |= CM_DEVCAP_REMOVABLE;
+
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -4231,6 +4274,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
             }
 
+            // [新增] 挂钩 NtQueryVolumeInformationFile
+            if (g_HookVolumeId || g_HookRemovable) {
+                void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
+                if (pNtQueryVolumeInformationFile) {
+                    MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
+                }
+            }
+
             // [新增] 挂钩 DeviceIoControl (仅当开启 Removable 伪造时)
             if (g_HookRemovable && hKernel32) {
                 void* pDeviceIoControl = (void*)GetProcAddress(hKernel32, "DeviceIoControl");
@@ -4239,11 +4290,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 }
             }
 
-            // [新增] 挂钩 NtQueryVolumeInformationFile
-            if (g_HookVolumeId || g_HookRemovable) {
-                void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
-                if (pNtQueryVolumeInformationFile) {
-                    MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
+            // [新增] 挂钩 PnP 管理器 (cfgmgr32.dll)
+            // 许多高级文件管理器通过此 API 判断设备是否可移动
+            if (g_HookRemovable) {
+                HMODULE hCfgMgr = LoadLibraryW(L"cfgmgr32.dll");
+                if (hCfgMgr) {
+                    void* pCM_Get_DevNode_Registry_PropertyW = (void*)GetProcAddress(hCfgMgr, "CM_Get_DevNode_Registry_PropertyW");
+                    if (pCM_Get_DevNode_Registry_PropertyW) {
+						MH_CreateHook(pCM_Get_DevNode_Registry_PropertyW, &Detour_CM_Get_DevNode_Registry_PropertyW, reinterpret_cast<LPVOID*>(&fpCM_Get_DevNode_Registry_PropertyW));
                 }
             }
         }
