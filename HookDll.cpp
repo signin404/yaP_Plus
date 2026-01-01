@@ -16,7 +16,6 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
-#include <winioctl.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -4223,6 +4222,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 分组挂钩逻辑
     // =======================================================
 
+    // 获取 Kernel32 句柄 (提升作用域)
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+
     // --- 组 A: 文件系统 Hook ---
     if (g_HookMode > 0 || g_HookVolumeId || g_HookRemovable) {
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
@@ -4255,7 +4257,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
 
             // [新增] 挂钩 DeviceIoControl (仅当开启 Removable 伪造时)
-            if (g_HookRemovable) {
+            if (g_HookRemovable && hKernel32) {
                 void* pDeviceIoControl = (void*)GetProcAddress(hKernel32, "DeviceIoControl");
                 if (pDeviceIoControl) {
                     MH_CreateHook(pDeviceIoControl, &Detour_DeviceIoControl, reinterpret_cast<LPVOID*>(&fpDeviceIoControl));
@@ -4271,7 +4273,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         if (hKernel32) {
             void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
             if (pGetFinalPathNameByHandleW) {
