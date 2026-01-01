@@ -521,8 +521,8 @@ void DebugLog(const wchar_t* format, ...) {
 
 // [新增] 初始化子进程白名单 (在 InitHookThread 中调用)
 void InitChildHookWhitelist() {
-    wchar_t buffer[2048]; // 假设白名单列表不会特别长
-    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", buffer, 2048) > 0) {
+    wchar_t buffer[4096];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", buffer, 4096) > 0) {
         wchar_t* next_token = NULL;
         wchar_t* token = wcstok_s(buffer, L";", &next_token);
         while (token) {

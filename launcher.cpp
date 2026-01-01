@@ -3733,7 +3733,7 @@ LPVOID GetLoadLibraryAddress(HANDLE hProcess, bool targetIs32Bit) {
 }
 
 // --- [修改] 核心注入函数 ---
-bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
+bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath, const std::wstring& injectorPath) {
     if (dllPath.empty()) return false;
 
     BOOL isWow64 = FALSE;
@@ -3747,11 +3747,7 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
     LPVOID pLoadLibrary = GetLoadLibraryAddress(hProcess, targetIs32Bit);
     LPVOID pEntryPoint = GetEntryPoint(hProcess);
 
-    // 只有当能获取到入口点时才尝试自旋锁 这有助于让挂起的进程初始化 Kernel32
     if (pEntryPoint) {
-        // 如果第一次没获取到地址 或者为了保险起见 执行自旋等待
-        // 注意：对于 x64->x86 GetLoadLibraryAddress 经常失败 所以这个循环通常会跑满 3 秒
-        // 这是为了确保目标进程有足够时间初始化 Ldr
         if (!pLoadLibrary) {
             BYTE originalBytes[2];
             BYTE loopBytes[2] = { 0xEB, 0xFE }; // JMP $
@@ -3763,11 +3759,8 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
                     if (g_NtResumeProcess) g_NtResumeProcess(hProcess);
                     else ResumeThread(hThread);
 
-                    // 等待 Kernel32 加载
-                    // [优化] 对于 32 位目标 我们不需要疯狂查询 因为 Launcher 查不到是正常的
-                    // 直接睡一会 让子进程跑一会初始化逻辑即可
                     if (targetIs32Bit) {
-                        Sleep(1000); // 给 32 位进程 1 秒钟时间初始化
+                        Sleep(1000);
                     } else {
                         for (int i = 0; i < 300; ++i) {
                             Sleep(10);
@@ -3786,20 +3779,16 @@ bool InjectDll(HANDLE hProcess, HANDLE hThread, const std::wstring& dllPath) {
         }
     }
 
-    // [核心修复]：如果是 32 位目标 即使 Launcher 没找到 LoadLibrary 地址
-    // 也不能返回 false！因为我们要依赖 YapInjector32 去做这件事
-    // 只有当目标是 64 位且没找到地址时 才认为是真正的失败
     if (!pLoadLibrary && !targetIs32Bit) return false;
 
     // 2. 分支处理
     if (targetIs32Bit) {
         // --- 方案：调用外部 32位 Injector ---
 
-        // [路径修复] 从 dllPath 推导 YapInjector32 路径 (假设它们在同一目录)
-        wchar_t drive[_MAX_DRIVE];
-        wchar_t dir[_MAX_DIR];
-        _wsplitpath_s(dllPath.c_str(), drive, _MAX_DRIVE, dir, _MAX_DIR, NULL, 0, NULL, 0);
-        std::wstring injectorPath = std::wstring(drive) + std::wstring(dir) + L"YapInjector32.exe";
+        // [修改] 使用传入的 injectorPath 不再自行推导
+        if (injectorPath.empty() || !PathFileExistsW(injectorPath.c_str())) {
+            return false;
+        }
 
         // C. 构造命令行: YapInjector32 <PID> <DLLPath>
         DWORD pid = GetProcessId(hProcess);
@@ -3876,7 +3865,7 @@ bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstrin
     }
 
     // 传递 hThread
-    if (!InjectDll(hProcess, hThread, dllPath)) {
+    if (!InjectDll(hProcess, hThread, dllPath, injectorPath)) {
         if (hMap) CloseHandle(hMap);
         CloseHandle(hEvent);
         return false;
@@ -3901,7 +3890,8 @@ struct IpcThreadParam {
     std::wstring dll64Path;
     std::wstring hookPath;
     std::atomic<bool>* shouldStop;
-    std::vector<std::wstring> extraDlls; // [新增] 第三方 DLL 列表
+    std::vector<std::wstring> extraDlls;
+    std::wstring injectorPath;
 };
 
 // --- [修改] IPC 服务端线程 ---
@@ -3945,13 +3935,12 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
                     std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
 
                     // 1. 注入主 Hook DLL
-                    success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName);
+                    success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
 
                     // 2. [新增] 注入第三方 DLL (如果主 Hook 注入成功)
                     if (success) {
                         for (const auto& dllPath : param->extraDlls) {
-                            // 简单的注入 不等待事件
-                            InjectDll(hTarget, NULL, dllPath);
+                            InjectDll(hTarget, NULL, dllPath, param->injectorPath);
                         }
                     }
 
@@ -4054,16 +4043,20 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
+    // [新增] 是否需要释放辅助文件 (Hook开启 或 有第三方DLL注入)
+    bool needHelpers = enableHook || !thirdPartyDlls.empty();
+
     // 将 DLL 路径变量移到函数作用域顶部 以便最后删除
     std::wstring dll32Path;
     std::wstring dll64Path;
     std::wstring injectorPath;
 
-    if (enableHook) {
+    // [修改] 提取资源逻辑移出 enableHook 判断 改用 needHelpers
+    if (needHelpers) {
         // A. 确定 DLL 释放路径 (改为 tempfile 路径)
         wchar_t dllDir[MAX_PATH];
         wcscpy_s(dllDir, MAX_PATH, data->tempFilePath.c_str());
-        PathRemoveFileSpecW(dllDir); // 从 temp INI 路径获取目录
+        PathRemoveFileSpecW(dllDir);
 
         dll32Path = std::wstring(dllDir) + L"\\YapHook32.dll";
         dll64Path = std::wstring(dllDir) + L"\\YapHook64.dll";
@@ -4073,14 +4066,17 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ExtractResourceToFile(IDR_HOOK_DLL_32, dll32Path);
         ExtractResourceToFile(IDR_HOOK_DLL_64, dll64Path);
         ExtractResourceToFile(IDR_INJECTOR32, injectorPath);
+    }
 
+    if (enableHook) {
         // C. 配置 IPC 参数
         ipcParam.dll32Path = dll32Path;
         ipcParam.dll64Path = dll64Path;
         ipcParam.hookPath = finalHookPath;
         ipcParam.shouldStop = &stopIpc;
         ipcParam.pipeName = kPipeNamePrefix + std::to_wstring(GetCurrentProcessId());
-        ipcParam.extraDlls = thirdPartyDlls; // [新增] 传递第三方 DLL 列表给 IPC 线程
+        ipcParam.extraDlls = thirdPartyDlls;
+        ipcParam.injectorPath = injectorPath; // [新增] 传递 injectorPath
 
         // D. 设置环境变量 (供 Hook DLL 读取)
         SetEnvironmentVariableW(L"YAP_IPC_PIPE", ipcParam.pipeName.c_str());
@@ -4123,19 +4119,19 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
             // 1. 注入主 Hook DLL (带等待)
             if (!targetDll.empty()) {
-                InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName);
+                InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName, injectorPath);
             }
 
             // 2. [新增] 注入第三方 DLL (不带等待)
             for (const auto& dllPath : thirdPartyDlls) {
-                InjectDll(pi.hProcess, pi.hThread, dllPath);
+                InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
         // 情况 B: 禁用 Hook (hookfile=0)
         else {
             // [新增] 仅注入第三方 DLL
             for (const auto& dllPath : thirdPartyDlls) {
-                InjectDll(pi.hProcess, pi.hThread, dllPath);
+                InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
 
@@ -4327,7 +4323,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     DeleteFileW(data->tempFilePath.c_str());
 
     // [修改] 删除已释放的 DLL 文件
-    if (enableHook) {
+    if (needHelpers) {
         DeleteFileW(dll32Path.c_str());
         DeleteFileW(dll64Path.c_str());
         DeleteFileW(injectorPath.c_str());
