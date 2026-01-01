@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <winioctl.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -150,6 +151,56 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// 总线类型枚举
+typedef enum _STORAGE_BUS_TYPE {
+    BusTypeUnknown = 0x00,
+    BusTypeScsi = 0x01,
+    BusTypeAtapi = 0x02,
+    BusTypeAta = 0x03,
+    BusType1394 = 0x04,
+    BusTypeSsa = 0x05,
+    BusTypeFibre = 0x06,
+    BusTypeUsb = 0x07, // <--- 目标类型
+    BusTypeRAID = 0x08,
+    BusTypeiScsi = 0x09,
+    BusTypeSas = 0x0A,
+    BusTypeSata = 0x0B,
+    BusTypeSd = 0x0C,
+    BusTypeMmc = 0x0D,
+    BusTypeVirtual = 0x0E,
+    BusTypeFileBackedVirtual = 0x0F,
+    BusTypeSpaces = 0x10,
+    BusTypeNvme = 0x11,
+    BusTypeScm = 0x12,
+    BusTypeUfs = 0x13,
+    BusTypeMax = 0x14,
+    BusTypeMaxReserved = 0x7F
+} STORAGE_BUS_TYPE, *PSTORAGE_BUS_TYPE;
+
+// 存储设备描述符
+typedef struct _STORAGE_DEVICE_DESCRIPTOR {
+    DWORD Version;
+    DWORD Size;
+    BYTE  DeviceType;
+    BYTE  DeviceTypeModifier;
+    BOOLEAN RemovableMedia;
+    BOOLEAN CommandQueueing;
+    DWORD VendorIdOffset;
+    DWORD ProductIdOffset;
+    DWORD ProductRevisionOffset;
+    DWORD SerialNumberOffset;
+    STORAGE_BUS_TYPE BusType;
+    DWORD RawPropertiesLength;
+    BYTE  RawDeviceProperties[1];
+} STORAGE_DEVICE_DESCRIPTOR, *PSTORAGE_DEVICE_DESCRIPTOR;
+
+// 查询结构
+typedef struct _STORAGE_PROPERTY_QUERY {
+    DWORD PropertyId;
+    DWORD QueryType;
+    BYTE  AdditionalParameters[1];
+} STORAGE_PROPERTY_QUERY, *PSTORAGE_PROPERTY_QUERY;
 
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
@@ -468,6 +519,8 @@ typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_A
 P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
+typedef BOOL (WINAPI* P_DeviceIoControl)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+P_DeviceIoControl fpDeviceIoControl = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -3185,6 +3238,66 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     return status;
 }
 
+BOOL WINAPI Detour_DeviceIoControl(
+    HANDLE hDevice,
+    DWORD dwIoControlCode,
+    LPVOID lpInBuffer,
+    DWORD nInBufferSize,
+    LPVOID lpOutBuffer,
+    DWORD nOutBufferSize,
+    LPDWORD lpBytesReturned,
+    LPOVERLAPPED lpOverlapped
+) {
+    // 1. 调用原始函数
+    BOOL result = fpDeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
+
+    // 2. 仅在成功且开启了 Removable 伪造时处理
+    if (result && g_HookRemovable && dwIoControlCode == IOCTL_STORAGE_QUERY_PROPERTY) {
+
+        if (lpInBuffer && nInBufferSize >= sizeof(STORAGE_PROPERTY_QUERY)) {
+            PSTORAGE_PROPERTY_QUERY query = (PSTORAGE_PROPERTY_QUERY)lpInBuffer;
+
+            // 仅处理对 "设备属性" (StorageDeviceProperty) 的 "标准查询" (PropertyStandardQuery)
+            if (query->PropertyId == StorageDeviceProperty && query->QueryType == PropertyStandardQuery) {
+
+                // 3. 检查是否为目标驱动器
+                std::wstring rawPath = GetPathFromHandle(hDevice);
+                if (!rawPath.empty()) {
+                    std::wstring ntPath = DevicePathToNtPath(rawPath);
+                    bool shouldFake = false;
+
+                    // 检查系统盘
+                    if (!g_SystemDriveNt.empty() &&
+                        (ntPath.size() >= g_SystemDriveNt.size() &&
+                         _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
+                        shouldFake = true;
+                    }
+                    // 检查启动器盘
+                    else if (!g_LauncherDriveNt.empty() &&
+                             (ntPath.size() >= g_LauncherDriveNt.size() &&
+                              _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
+                        shouldFake = true;
+                    }
+
+                    // 4. 修改返回数据
+                    if (shouldFake && lpOutBuffer && nOutBufferSize >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+                        PSTORAGE_DEVICE_DESCRIPTOR desc = (PSTORAGE_DEVICE_DESCRIPTOR)lpOutBuffer;
+
+                        // 关键修改：将总线类型改为 USB
+                        desc->BusType = BusTypeUsb;
+
+                        // 关键修改：标记为可移动介质
+                        desc->RemovableMedia = TRUE;
+
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 清理 Context
     {
@@ -4127,6 +4240,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
                 MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
+            }
+
+            // [新增] 挂钩 DeviceIoControl (仅当开启 Removable 伪造时)
+            if (g_HookRemovable) {
+                void* pDeviceIoControl = (void*)GetProcAddress(hKernel32, "DeviceIoControl");
+                if (pDeviceIoControl) {
+                    MH_CreateHook(pDeviceIoControl, &Detour_DeviceIoControl, reinterpret_cast<LPVOID*>(&fpDeviceIoControl));
+                }
             }
 
             // [新增] 挂钩 NtQueryVolumeInformationFile
