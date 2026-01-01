@@ -3995,6 +3995,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring hookFileVal = GetValueFromIniContent(data->iniContent, L"General", L"hookfile");
     int hookMode = _wtoi(hookFileVal.c_str());
 
+    // [新增] 解析 multiple 配置
+    std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
+    int multipleMode = _wtoi(multipleVal.c_str());
+    bool multiInstanceBypass = (multipleMode == 2);
+
     // [新增] 解析网络拦截配置
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"General", L"hooknet");
     bool blockNetwork = (netBlockVal == L"1");
@@ -4007,8 +4012,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
     }
 
-    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork);
+    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启 或 多实例绕过开启
+    bool enableHook = (hookMode > 0 || blockNetwork || multiInstanceBypass);
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"General", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -4111,6 +4116,17 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
 
+        // [新增] 设置多实例绕过环境变量
+        if (multiInstanceBypass) {
+            SetEnvironmentVariableW(L"YAP_MULTI_INSTANCE", L"1");
+            // 生成本次运行的唯一 ID (基于时间戳和线程ID) 以确保不同启动器实例下的程序互不干扰
+            wchar_t uniqueId[64];
+            swprintf_s(uniqueId, L"%08x%08x", GetTickCount(), GetCurrentThreadId());
+            SetEnvironmentVariableW(L"YAP_BOX_ID", uniqueId);
+        } else {
+            SetEnvironmentVariableW(L"YAP_MULTI_INSTANCE", L"0");
+        }
+
         // [新增] 读取 hookchild 配置
         // 1 = 挂钩 (默认) 0 = 不挂钩
         std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"General", L"hookchild");
@@ -4207,7 +4223,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
         }
 
-        bool multiInstanceEnabled = (GetValueFromIniContent(data->iniContent, L"General", L"multiple") == L"1");
+        bool multiInstanceEnabled = (multipleMode >= 1);
 
         if (multiInstanceEnabled) {
             // --- 多实例模式等待 ---
@@ -4687,7 +4703,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     } else {
         CloseHandle(hMutex);
-        if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
+        std::wstring multipleVal = GetValueFromIniContent(iniContent, L"General", L"multiple");
+        if (_wtoi(multipleVal.c_str()) >= 1) {
             LaunchApplication(iniContent, variables);
         }
     }
