@@ -521,8 +521,8 @@ void DebugLog(const wchar_t* format, ...) {
 
 // [新增] 初始化子进程白名单 (在 InitHookThread 中调用)
 void InitChildHookWhitelist() {
-    wchar_t buffer[2048]; // 假设白名单列表不会特别长
-    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", buffer, 2048) > 0) {
+    wchar_t buffer[4096];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", buffer, 4096) > 0) {
         wchar_t* next_token = NULL;
         wchar_t* token = wcstok_s(buffer, L";", &next_token);
         while (token) {
@@ -1677,7 +1677,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
 
-    // [新增] 预先计算路径前缀，用于子项可见性检查
+    // [新增] 预先计算路径前缀 用于子项可见性检查
     std::wstring pathPrefix = ntPath;
     if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
 
@@ -1695,7 +1695,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                 std::wstring fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
 
                 if (fileName != L"." && fileName != L"..") {
-                    
+
                     // [新增] 核心修复：Mode 3 下对真实目录的子项进行二次过滤
                     bool isVisible = true;
                     if (g_HookMode == 3 && !isSandbox) {
@@ -4011,7 +4011,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
-    if (g_HookChild && (g_HookMode > 0 || g_BlockNetwork)) {
+    if (g_HookChild) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
