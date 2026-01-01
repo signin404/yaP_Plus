@@ -3847,7 +3847,7 @@ void LauncherLog(const std::wstring& msg) {
 }
 
 // --- [修改] 注入并智能等待 ---
-bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstring& dllPath, const std::wstring& hookPath, const std::wstring& pipeName) {
+bool InjectAndWait(HANDLE hProcess, HANDLE hThread, DWORD pid, const std::wstring& dllPath, const std::wstring& hookPath, const std::wstring& pipeName, const std::wstring& injectorPath) {
     std::wstring eventName = GetReadyEventName(pid);
     HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
 
