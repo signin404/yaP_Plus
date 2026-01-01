@@ -2353,7 +2353,7 @@ std::vector<HANDLE> FindNewDescendantsAndWaitTargets(
             // 步骤3: 遍历所有等待规则 为当前进程寻找匹配项
             for (const auto& info : processInfos) {
                 // 首先 名字必须匹配
-                if (_wcsicmp(pe32.szExeFile, info.processName.c_str()) != 0) {
+                if (!WildcardMatch(pe32.szExeFile, info.processName.c_str())) {
                     continue; // 名字不符 看下一条规则
                 }
 
@@ -2417,7 +2417,7 @@ std::vector<HANDLE> ScanForWaitProcessHandles(const std::vector<WaitProcessInfo>
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
             for (const auto& info : processInfos) {
-                if (_wcsicmp(pe32.szExeFile, info.processName.c_str()) == 0) {
+                if (WildcardMatch(pe32.szExeFile, info.processName.c_str())) {
                     bool match = false;
                     if (!info.checkPath) {
                         // 模式1：仅按名称匹配
