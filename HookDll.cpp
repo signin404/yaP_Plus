@@ -17,7 +17,9 @@
 #include <mutex>
 #include <shared_mutex>
 #include <mswsock.h>
+#include <shellapi.h>
 
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -470,6 +472,9 @@ typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSO
 P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
 P_WSAConnectByList fpWSAConnectByList = NULL;
+// [新增] ShellExecuteExW 函数指针
+typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
+P_ShellExecuteExW fpShellExecuteExW = NULL;
 
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
@@ -3589,6 +3594,51 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     return result;
 }
 
+// [新增] 拦截 ShellExecuteExW
+BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
+    if (g_IsInHook) return fpShellExecuteExW(pExecInfo);
+    RecursionGuard guard;
+
+    // 1. 保存原始 Mask
+    ULONG originalMask = pExecInfo->fMask;
+
+    // 2. 强制要求返回进程句柄 (否则 hProcess 可能为空)
+    pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
+
+    // 3. 调用原始函数
+    BOOL result = fpShellExecuteExW(pExecInfo);
+
+    // 4. 如果成功且获取到了进程句柄
+    if (result && pExecInfo->hProcess) {
+        // 获取 PID
+        DWORD pid = GetProcessId(pExecInfo->hProcess);
+
+        // 获取目标文件路径 (用于白名单检查)
+        std::wstring targetExe = L"";
+        if (pExecInfo->lpFile) {
+            targetExe = pExecInfo->lpFile;
+        }
+
+        // 检查白名单并请求注入
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pid);
+            DebugLog(L"ShellExecute: Injected PID %d (%s)", pid, targetExe.c_str());
+        }
+
+        // 5. 清理句柄 (关键!)
+        // 如果原始调用者没有请求 NOCLOSEPROCESS 说明它不打算管理这个句柄
+        // 我们强行请求了它 就有责任关闭它 否则会造成句柄泄漏
+        // 同时要将 hProcess 置空 以免调用者意外使用它
+        if (!(originalMask & SEE_MASK_NOCLOSEPROCESS)) {
+            CloseHandle(pExecInfo->hProcess);
+            pExecInfo->hProcess = NULL;
+            pExecInfo->fMask = originalMask; // 恢复 Mask
+        }
+    }
+
+    return result;
+}
+
 // --- Winsock Hooks ---
 
 // 辅助：判断是否为内网/私有 IP 地址
@@ -3817,7 +3867,7 @@ struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
             return fpGethostbyname(name);
         }
 
-        // 如果是 IP 字符串，放行
+        // 如果是 IP 字符串 放行
         if (IsIpAddressString(nameW.c_str())) {
              return fpGethostbyname(name);
         }
@@ -3829,7 +3879,7 @@ struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
         }
 
         // Mode 1: 默认拦截非 IP 字符串 (因为无法预知解析结果)
-        // 如果需要支持内网旧版域名解析，这里需要放行，但为了安全默认拦截
+        // 如果需要支持内网旧版域名解析 这里需要放行 但为了安全默认拦截
         WSASetLastError(WSAHOST_NOT_FOUND);
         return NULL;
     }
@@ -3890,12 +3940,12 @@ int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDR
 
     // Mode 2: 拦截所有 DNS 解析
     if (g_BlockNetwork == 2) {
-        // 1. 如果是 IP 字符串，放行 (GetAddrInfoW 会将其转换为 sockaddr，不涉及网络查询)
+        // 1. 如果是 IP 字符串 放行 (GetAddrInfoW 会将其转换为 sockaddr 不涉及网络查询)
         if (IsIpAddressString(pNodeName)) {
             return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
         }
 
-        // 2. 允许 localhost (本地回环通常不走 DNS，但为了保险起见放行)
+        // 2. 允许 localhost (本地回环通常不走 DNS 但为了保险起见放行)
         if (pNodeName && _wcsicmp(pNodeName, L"localhost") == 0) {
              return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
         }
@@ -3922,11 +3972,11 @@ BOOL PASCAL Detour_ConnectEx(
 ) {
     // 检查是否为内网 IP
     if (IsIntranetAddress(name)) {
-        // 如果是内网，调用真实的 ConnectEx
+        // 如果是内网 调用真实的 ConnectEx
         return fpConnectEx_Real(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
     }
 
-    // 如果是外网，拦截
+    // 如果是外网 拦截
     WSASetLastError(WSAEACCES);
     return FALSE;
 }
@@ -3946,7 +3996,7 @@ int WSAAPI Detour_WSAIoctl(
     // 1. 调用原始函数
     int result = fpWSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
 
-    // 2. 检查是否成功，且是否在请求扩展函数指针
+    // 2. 检查是否成功 且是否在请求扩展函数指针
     if (result == 0 && dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER) {
         if (cbInBuffer >= sizeof(GUID) && lpvInBuffer != NULL && lpvOutBuffer != NULL && cbOutBuffer >= sizeof(PVOID)) {
 
@@ -3971,8 +4021,8 @@ int WSAAPI Detour_WSAIoctl(
 }
 
 BOOL WSAAPI Detour_WSAConnectByNameW(SOCKET s, LPWSTR nodename, LPWSTR servicename, LPDWORD LocalAddressLength, LPSOCKADDR LocalAddress, LPDWORD RemoteAddressLength, LPSOCKADDR RemoteAddress, LPDWORD Timeout, const struct timeval* Reserved, LPWSAOVERLAPPED Overlapped) {
-    // 这里的逻辑比较复杂，因为 RemoteAddress 是输出参数。
-    // 简单策略：如果启用了阻断，直接检查 nodename 是否为内网主机
+    // 这里的逻辑比较复杂 因为 RemoteAddress 是输出参数
+    // 简单策略：如果启用了阻断 直接检查 nodename 是否为内网主机
     if (g_BlockNetwork) {
         if (!IsIntranetHost(nodename)) {
             WSASetLastError(WSAEACCES);
@@ -3999,8 +4049,8 @@ BOOL WSAAPI Detour_WSAConnectByList(
         for (int i = 0; i < SocketAddressList->iAddressCount; i++) {
             LPSOCKADDR pAddr = SocketAddressList->Address[i].lpSockaddr;
 
-            // 只要发现有一个地址不是内网地址，就拒绝整个连接请求
-            // 这是最安全的策略，防止程序尝试连接列表中的公网 IP
+            // 只要发现有一个地址不是内网地址 就拒绝整个连接请求
+            // 这是最安全的策略 防止程序尝试连接列表中的公网 IP
             if (!IsIntranetAddress(pAddr)) {
                 WSASetLastError(WSAEACCES);
                 return FALSE;
@@ -4008,7 +4058,7 @@ BOOL WSAAPI Detour_WSAConnectByList(
         }
     }
 
-    // 如果所有地址都是内网地址（或未开启拦截），则放行
+    // 如果所有地址都是内网地址（或未开启拦截） 则放行
     return fpWSAConnectByList(s, SocketAddressList, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, timeout, Reserved);
 }
 
@@ -4253,6 +4303,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (g_HookChild) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+
+        // [新增] 挂钩 ShellExecuteExW (解决 v2rayN 等 .NET 程序无法挂钩子进程的问题)
+        HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
+        if (hShell32) {
+            void* pShellExecuteExW = (void*)GetProcAddress(hShell32, "ShellExecuteExW");
+            if (pShellExecuteExW) {
+                MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
+            }
+        }
 
         HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
         if (hAdvapi32) {
