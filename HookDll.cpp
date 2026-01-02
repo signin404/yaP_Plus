@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <mswsock.h>
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -463,6 +464,15 @@ P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
+typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID, DWORD, LPDWORD, LPOVERLAPPED);
+typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
+P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
+typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
+P_WSAConnectByList fpWSAConnectByList = NULL;
+
+// ConnectEx 的 GUID
+const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
 // ICMP (Ping)
 typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
@@ -533,6 +543,8 @@ P_InternetConnectA fpInternetConnectA = NULL;
 P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
+LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
+P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -3879,6 +3891,108 @@ int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDR
     return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
 }
 
+// 拦截 ConnectEx
+BOOL PASCAL Detour_ConnectEx(
+    SOCKET s,
+    const struct sockaddr* name,
+    int namelen,
+    PVOID lpSendBuffer,
+    DWORD dwSendDataLength,
+    LPDWORD lpdwBytesSent,
+    LPOVERLAPPED lpOverlapped
+) {
+    // 检查是否为内网 IP
+    if (IsIntranetAddress(name)) {
+        // 如果是内网，调用真实的 ConnectEx
+        return fpConnectEx_Real(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
+    }
+
+    // 如果是外网，拦截
+    WSASetLastError(WSAEACCES);
+    return FALSE;
+}
+
+// 拦截 WSAIoctl 以劫持 ConnectEx 的获取
+int WSAAPI Detour_WSAIoctl(
+    SOCKET s,
+    DWORD dwIoControlCode,
+    LPVOID lpvInBuffer,
+    DWORD cbInBuffer,
+    LPVOID lpvOutBuffer,
+    DWORD cbOutBuffer,
+    LPDWORD lpcbBytesReturned,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+) {
+    // 1. 调用原始函数
+    int result = fpWSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
+
+    // 2. 检查是否成功，且是否在请求扩展函数指针
+    if (result == 0 && dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER) {
+        if (cbInBuffer >= sizeof(GUID) && lpvInBuffer != NULL && lpvOutBuffer != NULL && cbOutBuffer >= sizeof(PVOID)) {
+
+            GUID* pGuid = (GUID*)lpvInBuffer;
+
+            // 3. 检查请求的是否为 ConnectEx
+            if (IsEqualGUID(*pGuid, g_GuidConnectEx)) {
+                // 保存真实的 ConnectEx 地址 (仅保存一次)
+                if (fpConnectEx_Real == NULL) {
+                    fpConnectEx_Real = *(LPFN_CONNECTEX*)lpvOutBuffer;
+                }
+
+                // 4. 将返回缓冲区中的地址替换为我们的 Detour 函数
+                *(void**)lpvOutBuffer = (void*)Detour_ConnectEx;
+
+                // DebugLog(L"Network: Hijacked ConnectEx pointer via WSAIoctl");
+            }
+        }
+    }
+
+    return result;
+}
+
+BOOL WSAAPI Detour_WSAConnectByNameW(SOCKET s, LPWSTR nodename, LPWSTR servicename, LPDWORD LocalAddressLength, LPSOCKADDR LocalAddress, LPDWORD RemoteAddressLength, LPSOCKADDR RemoteAddress, LPDWORD Timeout, const struct timeval* Reserved, LPWSAOVERLAPPED Overlapped) {
+    // 这里的逻辑比较复杂，因为 RemoteAddress 是输出参数。
+    // 简单策略：如果启用了阻断，直接检查 nodename 是否为内网主机
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(nodename)) {
+            WSASetLastError(WSAEACCES);
+            return FALSE;
+        }
+    }
+    return fpWSAConnectByNameW(s, nodename, servicename, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, Timeout, Reserved, Overlapped);
+}
+
+// [新增] 拦截 WSAConnectByList
+BOOL WSAAPI Detour_WSAConnectByList(
+    SOCKET s,
+    PSOCKET_ADDRESS_LIST SocketAddressList,
+    LPDWORD LocalAddressLength,
+    LPSOCKADDR LocalAddress,
+    LPDWORD RemoteAddressLength,
+    LPSOCKADDR RemoteAddress,
+    const struct timeval* timeout,
+    LPWSAOVERLAPPED Reserved
+) {
+    // 如果开启了网络拦截
+    if (g_BlockNetwork && SocketAddressList) {
+        // 遍历所有候选地址
+        for (int i = 0; i < SocketAddressList->iAddressCount; i++) {
+            LPSOCKADDR pAddr = SocketAddressList->Address[i].lpSockaddr;
+
+            // 只要发现有一个地址不是内网地址，就拒绝整个连接请求
+            // 这是最安全的策略，防止程序尝试连接列表中的公网 IP
+            if (!IsIntranetAddress(pAddr)) {
+                WSASetLastError(WSAEACCES);
+                return FALSE;
+            }
+        }
+    }
+
+    // 如果所有地址都是内网地址（或未开启拦截），则放行
+    return fpWSAConnectByList(s, SocketAddressList, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, timeout, Reserved);
+}
+
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -4145,7 +4259,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
             void* pWSASendTo = (void*)GetProcAddress(hWinsock, "WSASendTo");
             void* pGethostbyname = (void*)GetProcAddress(hWinsock, "gethostbyname");
+            void* pWSAIoctl = (void*)GetProcAddress(hWinsock, "WSAIoctl");
+            void* pWSAConnectByNameW = (void*)GetProcAddress(hWinsock, "WSAConnectByNameW");
+            void* pWSAConnectByList = (void*)GetProcAddress(hWinsock, "WSAConnectByList");
 
+            if (pWSAConnectByList) {
+                MH_CreateHook(pWSAConnectByList, &Detour_WSAConnectByList, reinterpret_cast<LPVOID*>(&fpWSAConnectByList));
+            }
+            if (pWSAConnectByNameW) MH_CreateHook(pWSAConnectByNameW, &Detour_WSAConnectByNameW, reinterpret_cast<LPVOID*>(&fpWSAConnectByNameW));
+            if (pWSAIoctl) MH_CreateHook(pWSAIoctl, &Detour_WSAIoctl, reinterpret_cast<LPVOID*>(&fpWSAIoctl));
             if (pGethostbyname) MH_CreateHook(pGethostbyname, &Detour_gethostbyname, reinterpret_cast<LPVOID*>(&fpGethostbyname));
             if (pWSASendTo) MH_CreateHook(pWSASendTo, &Detour_WSASendTo, reinterpret_cast<LPVOID*>(&fpWSASendTo));
             if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
