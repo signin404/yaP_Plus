@@ -3231,6 +3231,13 @@ std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
     if (!lpCmd || !*lpCmd) return L"";
 
     std::wstring cmd = lpCmd;
+
+    // [新增] 去除前导空格 防止解析错误
+    size_t firstNonSpace = cmd.find_first_not_of(L' ');
+    if (firstNonSpace != std::wstring::npos && firstNonSpace > 0) {
+        cmd = cmd.substr(firstNonSpace);
+    }
+
     std::wstring exePath;
     if (cmd.front() == L'"') {
         size_t end = cmd.find(L'"', 1);
@@ -3406,10 +3413,7 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    // AsUser 系列稍微特殊 需要单独处理或适配 Internal 这里为了简洁直接展开逻辑 或者使用 lambda 封装
-    // 为了代码复用 我们可以稍微修改 Internal 让它接受 Token 但这里直接复制逻辑可能更清晰
 
-    // 简化的逻辑复用：
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
@@ -3432,7 +3436,13 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     BOOL result = fpCreateProcessAsUserW(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        // [修复] 增加白名单检查 确保 Firefox 子进程被正确识别
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3474,7 +3484,13 @@ BOOL WINAPI Detour_CreateProcessAsUserA(HANDLE hToken, LPCSTR lpApplicationName,
     BOOL result = fpCreateProcessAsUserA(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        // [修复] 增加白名单检查
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3504,7 +3520,13 @@ BOOL WINAPI Detour_CreateProcessWithTokenW(HANDLE hToken, DWORD dwLogonFlags, LP
     BOOL result = fpCreateProcessWithTokenW(hToken, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        // [修复] 增加白名单检查
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3534,7 +3556,13 @@ BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain,
     BOOL result = fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        // [修复] 增加白名单检查
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
