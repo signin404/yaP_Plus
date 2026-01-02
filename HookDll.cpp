@@ -3227,27 +3227,22 @@ std::wstring TryRedirectDosPath(LPCWSTR dosPath, bool isDirectory) {
 
 // 辅助：从命令行提取 EXE 路径
 std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
+    // 1. 如果显式提供了 ApplicationName，直接使用
     if (lpApp && *lpApp) return lpApp;
+
+    // 2. 如果只有 CommandLine，使用系统标准方式解析
     if (!lpCmd || !*lpCmd) return L"";
 
-    std::wstring cmd = lpCmd;
-
-    // [新增] 去除前导空格 防止解析错误
-    size_t firstNonSpace = cmd.find_first_not_of(L' ');
-    if (firstNonSpace != std::wstring::npos && firstNonSpace > 0) {
-        cmd = cmd.substr(firstNonSpace);
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(lpCmd, &argc);
+    std::wstring result = L"";
+    
+    if (argv && argc > 0) {
+        result = argv[0];
     }
-
-    std::wstring exePath;
-    if (cmd.front() == L'"') {
-        size_t end = cmd.find(L'"', 1);
-        if (end != std::wstring::npos) exePath = cmd.substr(1, end - 1);
-    } else {
-        size_t end = cmd.find(L' ');
-        if (end != std::wstring::npos) exePath = cmd.substr(0, end);
-        else exePath = cmd;
-    }
-    return exePath;
+    
+    if (argv) LocalFree(argv);
+    return result;
 }
 
 // --- IPC & Process Hooks ---
@@ -3318,6 +3313,7 @@ BOOL CreateProcessInternal(
     if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
     else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
+    // 使用修复后的解析函数
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
@@ -3354,12 +3350,32 @@ BOOL CreateProcessInternal(
         }
     }
 
-    // 4. 调用原始函数
+    // 4. [关键修复] 针对 Firefox/Chrome 等浏览器的安全策略剥离
+    // 浏览器通常使用 EXTENDED_STARTUPINFO_PRESENT 来设置 "BlockNonMicrosoftBinaries" 策略
+    // 这会导致我们的 HookDll 无法加载。如果目标在白名单中，我们强制移除此标志。
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+
+    // 检查是否应该挂钩该子进程
+    bool shouldHook = ShouldHookChildProcess(targetExe);
+
+    if (shouldHook) {
+        if (newCreationFlags & EXTENDED_STARTUPINFO_PRESENT) {
+            // 移除扩展启动信息标志
+            // 注意：这会丢失所有扩展属性（如特定的句柄继承列表），但这是注入浏览器的必要妥协
+            newCreationFlags &= ~EXTENDED_STARTUPINFO_PRESENT;
+            
+            // 如果是 Unicode 版本，我们需要将 lpStartupInfo 强制转换为普通的 STARTUPINFOW
+            // 因为原始调用者传递的可能是 STARTUPINFOEXW
+            // 但 CreateProcessW 会根据标志位决定读取多少数据，去掉标志位后它只读取基础部分，是安全的
+            DebugLog(L"Compat: Stripped EXTENDED_STARTUPINFO_PRESENT for %s to bypass mitigation policy", targetExe.c_str());
+        }
+    }
+
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
+    // 5. 调用原始函数
     BOOL result;
     if (isAnsi) {
         result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
@@ -3367,11 +3383,9 @@ BOOL CreateProcessInternal(
         result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
     }
 
-    // 5. 注入与恢复
+    // 6. 注入与恢复
     if (result) {
-        // [修改] 增加白名单检查逻辑
-        // 只有当 ShouldHookChildProcess 返回 true 时才请求注入
-        if (ShouldHookChildProcess(targetExe)) {
+        if (shouldHook) {
             RequestInjectionFromLauncher(pPI->dwProcessId);
         } else {
             DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
@@ -3630,7 +3644,7 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     // 1. 保存原始 Mask
     ULONG originalMask = pExecInfo->fMask;
 
-    // 2. 强制要求返回进程句柄 (否则 hProcess 可能为空)
+    // 2. 强制要求返回进程句柄 (否则 hProcess 可能为空，导致无法注入)
     pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
 
     // 3. 调用原始函数
@@ -3638,10 +3652,9 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
 
     // 4. 如果成功且获取到了进程句柄
     if (result && pExecInfo->hProcess) {
-        // 获取 PID
         DWORD pid = GetProcessId(pExecInfo->hProcess);
 
-        // 获取目标文件路径 (用于白名单检查)
+        // 获取目标文件路径
         std::wstring targetExe = L"";
         if (pExecInfo->lpFile) {
             targetExe = pExecInfo->lpFile;
@@ -3653,10 +3666,8 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
             DebugLog(L"ShellExecute: Injected PID %d (%s)", pid, targetExe.c_str());
         }
 
-        // 5. 清理句柄 (关键!)
-        // 如果原始调用者没有请求 NOCLOSEPROCESS 说明它不打算管理这个句柄
-        // 我们强行请求了它 就有责任关闭它 否则会造成句柄泄漏
-        // 同时要将 hProcess 置空 以免调用者意外使用它
+        // 5. 清理句柄
+        // 如果原始调用者没有请求 NOCLOSEPROCESS，我们必须关闭它以防泄漏
         if (!(originalMask & SEE_MASK_NOCLOSEPROCESS)) {
             CloseHandle(pExecInfo->hProcess);
             pExecInfo->hProcess = NULL;
