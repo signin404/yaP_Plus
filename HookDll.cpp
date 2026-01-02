@@ -519,7 +519,7 @@ std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_SystemDriveLetter; // [新增] 系统盘符 DOS 路径 (如 C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
-bool g_BlockNetwork = false; // 网络拦截开关
+int g_BlockNetwork = 0; // 0=Off, 1=Block Public, 2=Block All DNS
 bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
@@ -3809,26 +3809,27 @@ HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LP
 
 // --- 旧版 DNS (gethostbyname) 拦截 ---
 struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
-    if (g_BlockNetwork) {
+    if (g_BlockNetwork > 0) { // Mode 1 or 2
         std::wstring nameW = AnsiToWide(name);
+
         // 允许 localhost
         if (_wcsicmp(nameW.c_str(), L"localhost") == 0) {
             return fpGethostbyname(name);
         }
 
-        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表
-        // 我们无法预知它解析出的是内网还是外网 IP
-        // 策略：
-        // 1. 如果输入的是纯 IP 字符串 放行（让 connect 去拦截）
-        // 2. 如果是域名 直接拦截因为内网域名解析通常走 DNS 而 gethostbyname 是非常老的 API
-        //    现代内网环境（mDNS/LLMNR）它支持不好 且容易泄露隐私
-        //    如果确实需要支持内网旧版域名解析 可以放行 依靠 connect 拦截 IP
-        //    但为了安全 这里默认拦截非 IP 字符串
-
+        // 如果是 IP 字符串，放行
         if (IsIpAddressString(nameW.c_str())) {
              return fpGethostbyname(name);
         }
 
+        // Mode 2: 拦截所有域名
+        if (g_BlockNetwork == 2) {
+            WSASetLastError(WSAHOST_NOT_FOUND);
+            return NULL;
+        }
+
+        // Mode 1: 默认拦截非 IP 字符串 (因为无法预知解析结果)
+        // 如果需要支持内网旧版域名解析，这里需要放行，但为了安全默认拦截
         WSASetLastError(WSAHOST_NOT_FOUND);
         return NULL;
     }
@@ -3886,8 +3887,26 @@ DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUT
 
 // --- DNS Hook (拦截域名解析) ---
 int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
-    // 始终放行 DNS 解析 以便支持内网主机名解析
-    // 真正的拦截由 connect/sendto/IcmpSendEcho 负责（它们会检查解析出来的 IP）
+
+    // Mode 2: 拦截所有 DNS 解析
+    if (g_BlockNetwork == 2) {
+        // 1. 如果是 IP 字符串，放行 (GetAddrInfoW 会将其转换为 sockaddr，不涉及网络查询)
+        if (IsIpAddressString(pNodeName)) {
+            return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        }
+
+        // 2. 允许 localhost (本地回环通常不走 DNS，但为了保险起见放行)
+        if (pNodeName && _wcsicmp(pNodeName, L"localhost") == 0) {
+             return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        }
+
+        // 3. 拦截其他所有域名 (包括内网域名)
+        // 返回 EAI_FAIL (不可恢复的错误) 或 EAI_NONAME
+        return EAI_FAIL;
+    }
+
+    // Mode 1 (或 0): 始终放行 DNS 解析
+    // Mode 1 依赖 connect/sendto 拦截解析后的 IP
     return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
 }
 
@@ -4070,7 +4089,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 64) > 0) {
-        g_BlockNetwork = (_wtoi(netBuffer) == 1);
+        g_BlockNetwork = _wtoi(netBuffer);
     }
 
     // [新增] 读取 hookvolumeid 配置
