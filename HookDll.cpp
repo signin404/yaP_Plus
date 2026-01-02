@@ -462,6 +462,8 @@ typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_A
 P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
+typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
+P_NtResumeProcess fpNtResumeProcess = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -3623,40 +3625,36 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     if (g_IsInHook) return fpShellExecuteExW(pExecInfo);
     RecursionGuard guard;
 
-    // 1. 保存原始 Mask
     ULONG originalMask = pExecInfo->fMask;
-
-    // 2. 强制要求返回进程句柄 (否则 hProcess 可能为空)
     pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
 
-    // 3. 调用原始函数
     BOOL result = fpShellExecuteExW(pExecInfo);
 
-    // 4. 如果成功且获取到了进程句柄
     if (result && pExecInfo->hProcess) {
-        // 获取 PID
         DWORD pid = GetProcessId(pExecInfo->hProcess);
 
-        // 获取目标文件路径 (用于白名单检查)
         std::wstring targetExe = L"";
         if (pExecInfo->lpFile) {
             targetExe = pExecInfo->lpFile;
         }
 
-        // 检查白名单并请求注入
         if (ShouldHookChildProcess(targetExe)) {
+            // 1. 请求注入 (这会导致进程被挂起)
             RequestInjectionFromLauncher(pid);
             DebugLog(L"ShellExecute: Injected PID %d (%s)", pid, targetExe.c_str());
+
+            // 2. [新增] 注入完成后 强制恢复进程
+            // 注入器为了安全注入 会将进程挂起 (SuspendCount + 1)
+            // 我们必须将其恢复 否则进程将一直挂起
+            if (fpNtResumeProcess) {
+                fpNtResumeProcess(pExecInfo->hProcess);
+            }
         }
 
-        // 5. 清理句柄 (关键!)
-        // 如果原始调用者没有请求 NOCLOSEPROCESS 说明它不打算管理这个句柄
-        // 我们强行请求了它 就有责任关闭它 否则会造成句柄泄漏
-        // 同时要将 hProcess 置空 以免调用者意外使用它
         if (!(originalMask & SEE_MASK_NOCLOSEPROCESS)) {
             CloseHandle(pExecInfo->hProcess);
             pExecInfo->hProcess = NULL;
-            pExecInfo->fMask = originalMask; // 恢复 Mask
+            pExecInfo->fMask = originalMask;
         }
     }
 
@@ -4114,6 +4112,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // 1. 刷新设备映射
     RefreshDeviceMap();
+
+    // [新增] 提前获取 ntdll 句柄和 NtResumeProcess
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
 
     wchar_t buffer[MAX_PATH] = { 0 };
 
