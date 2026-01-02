@@ -3994,7 +3994,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     // [新增] 解析网络拦截配置
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooknet");
-    bool blockNetwork = (netBlockVal == L"1");
+    int netBlockMode = _wtoi(netBlockVal.c_str());
+    bool blockNetwork = (netBlockMode > 0); // 只要大于0就启用网络挂钩
 
     // 2. 解析 hookchild (提前)
     std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookchild");
@@ -4103,7 +4104,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
-        SetEnvironmentVariableW(L"YAP_HOOK_NET", blockNetwork ? L"1" : L"0");
+        SetEnvironmentVariableW(L"YAP_HOOK_NET", std::to_wstring(netBlockMode).c_str());
 
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());

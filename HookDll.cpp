@@ -16,7 +16,10 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <mswsock.h>
+#include <shellapi.h>
 
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -459,10 +462,24 @@ typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_A
 P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
+typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
+P_NtResumeProcess fpNtResumeProcess = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
+typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID, DWORD, LPDWORD, LPOVERLAPPED);
+typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
+P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
+typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
+P_WSAConnectByList fpWSAConnectByList = NULL;
+// [新增] ShellExecuteExW 函数指针
+typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
+P_ShellExecuteExW fpShellExecuteExW = NULL;
+
+// ConnectEx 的 GUID
+const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
 // ICMP (Ping)
 typedef DWORD (WINAPI* P_IcmpSendEcho)(HANDLE, IPAddr, LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID, DWORD, DWORD);
@@ -509,7 +526,7 @@ std::wstring g_SystemDriveNt; // [新增] 系统盘符 NT 路径 (如 \??\C:)
 std::wstring g_SystemDriveLetter; // [新增] 系统盘符 DOS 路径 (如 C:)
 std::wstring g_LauncherDriveNt; // 启动器所在盘符 NT 路径 (如 \??\Z:)
 std::vector<std::wstring> g_SystemWhitelist; // 系统盘白名单
-bool g_BlockNetwork = false; // 网络拦截开关
+int g_BlockNetwork = 0; // 0=Off, 1=Block Public, 2=Block All DNS
 bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
@@ -533,6 +550,8 @@ P_InternetConnectA fpInternetConnectA = NULL;
 P_InternetOpenUrlW fpInternetOpenUrlW = NULL;
 P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
+LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
+P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -3214,6 +3233,13 @@ std::wstring GetTargetExePath(LPCWSTR lpApp, LPWSTR lpCmd) {
     if (!lpCmd || !*lpCmd) return L"";
 
     std::wstring cmd = lpCmd;
+
+    // [新增] 去除前导空格 防止解析错误
+    size_t firstNonSpace = cmd.find_first_not_of(L' ');
+    if (firstNonSpace != std::wstring::npos && firstNonSpace > 0) {
+        cmd = cmd.substr(firstNonSpace);
+    }
+
     std::wstring exePath;
     if (cmd.front() == L'"') {
         size_t end = cmd.find(L'"', 1);
@@ -3389,10 +3415,7 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
     if (g_IsInHook) return fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     RecursionGuard guard;
-    // AsUser 系列稍微特殊 需要单独处理或适配 Internal 这里为了简洁直接展开逻辑 或者使用 lambda 封装
-    // 为了代码复用 我们可以稍微修改 Internal 让它接受 Token 但这里直接复制逻辑可能更清晰
 
-    // 简化的逻辑复用：
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
@@ -3415,7 +3438,12 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     BOOL result = fpCreateProcessAsUserW(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3457,7 +3485,12 @@ BOOL WINAPI Detour_CreateProcessAsUserA(HANDLE hToken, LPCSTR lpApplicationName,
     BOOL result = fpCreateProcessAsUserA(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3487,7 +3520,12 @@ BOOL WINAPI Detour_CreateProcessWithTokenW(HANDLE hToken, DWORD dwLogonFlags, LP
     BOOL result = fpCreateProcessWithTokenW(hToken, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3517,7 +3555,12 @@ BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain,
     BOOL result = fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
 
     if (result) {
-        RequestInjectionFromLauncher(pPI->dwProcessId);
+        if (ShouldHookChildProcess(targetExe)) {
+            RequestInjectionFromLauncher(pPI->dwProcessId);
+        } else {
+            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        }
+
         if (!callerWantedSuspended) ResumeThread(pPI->hThread);
         if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
@@ -3574,6 +3617,47 @@ DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath,
     }
 
     SetLastError(lastErr);
+    return result;
+}
+
+// [新增] 拦截 ShellExecuteExW
+BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
+    if (g_IsInHook) return fpShellExecuteExW(pExecInfo);
+    RecursionGuard guard;
+
+    ULONG originalMask = pExecInfo->fMask;
+    pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
+
+    BOOL result = fpShellExecuteExW(pExecInfo);
+
+    if (result && pExecInfo->hProcess) {
+        DWORD pid = GetProcessId(pExecInfo->hProcess);
+
+        std::wstring targetExe = L"";
+        if (pExecInfo->lpFile) {
+            targetExe = pExecInfo->lpFile;
+        }
+
+        if (ShouldHookChildProcess(targetExe)) {
+            // 1. 请求注入 (这会导致进程被挂起)
+            RequestInjectionFromLauncher(pid);
+            DebugLog(L"ShellExecute: Injected PID %d (%s)", pid, targetExe.c_str());
+
+            // 2. [新增] 注入完成后 强制恢复进程
+            // 注入器为了安全注入 会将进程挂起 (SuspendCount + 1)
+            // 我们必须将其恢复 否则进程将一直挂起
+            if (fpNtResumeProcess) {
+                fpNtResumeProcess(pExecInfo->hProcess);
+            }
+        }
+
+        if (!(originalMask & SEE_MASK_NOCLOSEPROCESS)) {
+            CloseHandle(pExecInfo->hProcess);
+            pExecInfo->hProcess = NULL;
+            pExecInfo->fMask = originalMask;
+        }
+    }
+
     return result;
 }
 
@@ -3797,26 +3881,27 @@ HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LP
 
 // --- 旧版 DNS (gethostbyname) 拦截 ---
 struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
-    if (g_BlockNetwork) {
+    if (g_BlockNetwork > 0) { // Mode 1 or 2
         std::wstring nameW = AnsiToWide(name);
+
         // 允许 localhost
         if (_wcsicmp(nameW.c_str(), L"localhost") == 0) {
             return fpGethostbyname(name);
         }
 
-        // 这里的逻辑比较特殊：gethostbyname 返回的是 IP 列表
-        // 我们无法预知它解析出的是内网还是外网 IP
-        // 策略：
-        // 1. 如果输入的是纯 IP 字符串 放行（让 connect 去拦截）
-        // 2. 如果是域名 直接拦截因为内网域名解析通常走 DNS 而 gethostbyname 是非常老的 API
-        //    现代内网环境（mDNS/LLMNR）它支持不好 且容易泄露隐私
-        //    如果确实需要支持内网旧版域名解析 可以放行 依靠 connect 拦截 IP
-        //    但为了安全 这里默认拦截非 IP 字符串
-
+        // 如果是 IP 字符串 放行
         if (IsIpAddressString(nameW.c_str())) {
              return fpGethostbyname(name);
         }
 
+        // Mode 2: 拦截所有域名
+        if (g_BlockNetwork == 2) {
+            WSASetLastError(WSAHOST_NOT_FOUND);
+            return NULL;
+        }
+
+        // Mode 1: 默认拦截非 IP 字符串 (因为无法预知解析结果)
+        // 如果需要支持内网旧版域名解析 这里需要放行 但为了安全默认拦截
         WSASetLastError(WSAHOST_NOT_FOUND);
         return NULL;
     }
@@ -3874,9 +3959,129 @@ DWORD WINAPI Detour_Icmp6SendEcho2(HANDLE IcmpHandle, HANDLE Event, PIO_APC_ROUT
 
 // --- DNS Hook (拦截域名解析) ---
 int WSAAPI Detour_GetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName, const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
-    // 始终放行 DNS 解析 以便支持内网主机名解析
-    // 真正的拦截由 connect/sendto/IcmpSendEcho 负责（它们会检查解析出来的 IP）
+
+    // Mode 2: 拦截所有 DNS 解析
+    if (g_BlockNetwork == 2) {
+        // 1. 如果是 IP 字符串 放行 (GetAddrInfoW 会将其转换为 sockaddr 不涉及网络查询)
+        if (IsIpAddressString(pNodeName)) {
+            return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        }
+
+        // 2. 允许 localhost (本地回环通常不走 DNS 但为了保险起见放行)
+        if (pNodeName && _wcsicmp(pNodeName, L"localhost") == 0) {
+             return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+        }
+
+        // 3. 拦截其他所有域名 (包括内网域名)
+        // 返回 EAI_FAIL (不可恢复的错误) 或 EAI_NONAME
+        return EAI_FAIL;
+    }
+
+    // Mode 1 (或 0): 始终放行 DNS 解析
+    // Mode 1 依赖 connect/sendto 拦截解析后的 IP
     return fpGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
+}
+
+// 拦截 ConnectEx
+BOOL PASCAL Detour_ConnectEx(
+    SOCKET s,
+    const struct sockaddr* name,
+    int namelen,
+    PVOID lpSendBuffer,
+    DWORD dwSendDataLength,
+    LPDWORD lpdwBytesSent,
+    LPOVERLAPPED lpOverlapped
+) {
+    // 检查是否为内网 IP
+    if (IsIntranetAddress(name)) {
+        // 如果是内网 调用真实的 ConnectEx
+        return fpConnectEx_Real(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
+    }
+
+    // 如果是外网 拦截
+    WSASetLastError(WSAEACCES);
+    return FALSE;
+}
+
+// 拦截 WSAIoctl 以劫持 ConnectEx 的获取
+int WSAAPI Detour_WSAIoctl(
+    SOCKET s,
+    DWORD dwIoControlCode,
+    LPVOID lpvInBuffer,
+    DWORD cbInBuffer,
+    LPVOID lpvOutBuffer,
+    DWORD cbOutBuffer,
+    LPDWORD lpcbBytesReturned,
+    LPWSAOVERLAPPED lpOverlapped,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+) {
+    // 1. 调用原始函数
+    int result = fpWSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
+
+    // 2. 检查是否成功 且是否在请求扩展函数指针
+    if (result == 0 && dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER) {
+        if (cbInBuffer >= sizeof(GUID) && lpvInBuffer != NULL && lpvOutBuffer != NULL && cbOutBuffer >= sizeof(PVOID)) {
+
+            GUID* pGuid = (GUID*)lpvInBuffer;
+
+            // 3. 检查请求的是否为 ConnectEx
+            if (IsEqualGUID(*pGuid, g_GuidConnectEx)) {
+                // 保存真实的 ConnectEx 地址 (仅保存一次)
+                if (fpConnectEx_Real == NULL) {
+                    fpConnectEx_Real = *(LPFN_CONNECTEX*)lpvOutBuffer;
+                }
+
+                // 4. 将返回缓冲区中的地址替换为我们的 Detour 函数
+                *(void**)lpvOutBuffer = (void*)Detour_ConnectEx;
+
+                // DebugLog(L"Network: Hijacked ConnectEx pointer via WSAIoctl");
+            }
+        }
+    }
+
+    return result;
+}
+
+BOOL WSAAPI Detour_WSAConnectByNameW(SOCKET s, LPWSTR nodename, LPWSTR servicename, LPDWORD LocalAddressLength, LPSOCKADDR LocalAddress, LPDWORD RemoteAddressLength, LPSOCKADDR RemoteAddress, LPDWORD Timeout, const struct timeval* Reserved, LPWSAOVERLAPPED Overlapped) {
+    // 这里的逻辑比较复杂 因为 RemoteAddress 是输出参数
+    // 简单策略：如果启用了阻断 直接检查 nodename 是否为内网主机
+    if (g_BlockNetwork) {
+        if (!IsIntranetHost(nodename)) {
+            WSASetLastError(WSAEACCES);
+            return FALSE;
+        }
+    }
+    return fpWSAConnectByNameW(s, nodename, servicename, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, Timeout, Reserved, Overlapped);
+}
+
+// [新增] 拦截 WSAConnectByList
+BOOL WSAAPI Detour_WSAConnectByList(
+    SOCKET s,
+    PSOCKET_ADDRESS_LIST SocketAddressList,
+    LPDWORD LocalAddressLength,
+    LPSOCKADDR LocalAddress,
+    LPDWORD RemoteAddressLength,
+    LPSOCKADDR RemoteAddress,
+    const struct timeval* timeout,
+    LPWSAOVERLAPPED Reserved
+) {
+    // 如果开启了网络拦截
+    if (g_BlockNetwork && SocketAddressList) {
+        // 遍历所有候选地址
+        for (int i = 0; i < SocketAddressList->iAddressCount; i++) {
+            LPSOCKADDR pAddr = SocketAddressList->Address[i].lpSockaddr;
+
+            // 只要发现有一个地址不是内网地址 就拒绝整个连接请求
+            // 这是最安全的策略 防止程序尝试连接列表中的公网 IP
+            if (!IsIntranetAddress(pAddr)) {
+                WSASetLastError(WSAEACCES);
+                return FALSE;
+            }
+        }
+    }
+
+    // 如果所有地址都是内网地址（或未开启拦截） 则放行
+    return fpWSAConnectByList(s, SocketAddressList, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, timeout, Reserved);
 }
 
 // --- 初始化 ---
@@ -3907,6 +4112,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // 1. 刷新设备映射
     RefreshDeviceMap();
+
+    // [新增] 提前获取 ntdll 句柄和 NtResumeProcess
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+    }
 
     wchar_t buffer[MAX_PATH] = { 0 };
 
@@ -3956,7 +4167,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 读取网络拦截开关
     wchar_t netBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 64) > 0) {
-        g_BlockNetwork = (_wtoi(netBuffer) == 1);
+        g_BlockNetwork = _wtoi(netBuffer);
     }
 
     // [新增] 读取 hookvolumeid 配置
@@ -4121,6 +4332,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
+        // [新增] 挂钩 ShellExecuteExW
+        HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
+        if (hShell32) {
+            void* pShellExecuteExW = (void*)GetProcAddress(hShell32, "ShellExecuteExW");
+            if (pShellExecuteExW) {
+                MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
+            }
+        }
+
         HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
         if (hAdvapi32) {
             void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
@@ -4145,7 +4365,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pSendTo = (void*)GetProcAddress(hWinsock, "sendto");
             void* pWSASendTo = (void*)GetProcAddress(hWinsock, "WSASendTo");
             void* pGethostbyname = (void*)GetProcAddress(hWinsock, "gethostbyname");
+            void* pWSAIoctl = (void*)GetProcAddress(hWinsock, "WSAIoctl");
+            void* pWSAConnectByNameW = (void*)GetProcAddress(hWinsock, "WSAConnectByNameW");
+            void* pWSAConnectByList = (void*)GetProcAddress(hWinsock, "WSAConnectByList");
 
+            if (pWSAConnectByList) {
+                MH_CreateHook(pWSAConnectByList, &Detour_WSAConnectByList, reinterpret_cast<LPVOID*>(&fpWSAConnectByList));
+            }
+            if (pWSAConnectByNameW) MH_CreateHook(pWSAConnectByNameW, &Detour_WSAConnectByNameW, reinterpret_cast<LPVOID*>(&fpWSAConnectByNameW));
+            if (pWSAIoctl) MH_CreateHook(pWSAIoctl, &Detour_WSAIoctl, reinterpret_cast<LPVOID*>(&fpWSAIoctl));
             if (pGethostbyname) MH_CreateHook(pGethostbyname, &Detour_gethostbyname, reinterpret_cast<LPVOID*>(&fpGethostbyname));
             if (pWSASendTo) MH_CreateHook(pWSASendTo, &Detour_WSASendTo, reinterpret_cast<LPVOID*>(&fpWSASendTo));
             if (pConnect) MH_CreateHook(pConnect, &Detour_connect, reinterpret_cast<LPVOID*>(&fpConnect));
