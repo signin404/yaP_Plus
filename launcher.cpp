@@ -24,6 +24,7 @@
 #include <locale>
 #include <codecvt>
 #include <regex>
+#include <functional>
 #include "IpcCommon.h"
 
 #pragma comment(lib, "Shlwapi.lib")
