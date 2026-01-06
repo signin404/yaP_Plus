@@ -4695,14 +4695,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         // 检查是否允许运行多实例
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
 
-            // 检查是否启用了 Hook
+            // 1. 解析 Hook 和 Net 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
             int hookMode = _wtoi(hookFileVal.c_str());
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
             int netBlockMode = _wtoi(netBlockVal.c_str());
 
-            // 如果不需要 Hook 直接使用简单启动
-            if (hookMode == 0 && netBlockMode == 0) {
+            // 2. [新增] 解析 Injector 配置 (检查是否有第三方DLL)
+            bool hasThirdPartyDlls = false;
+            {
+                std::wstringstream stream(iniContent);
+                std::wstring line;
+                bool inHookSection = false;
+                while (std::getline(stream, line)) {
+                    line = trim(line);
+                    if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+                    if (line[0] == L'[' && line.back() == L']') {
+                        inHookSection = (_wcsicmp(line.c_str(), L"[Hook]") == 0);
+                        continue;
+                    }
+                    if (inHookSection) {
+                        size_t delimiterPos = line.find(L'=');
+                        if (delimiterPos != std::wstring::npos) {
+                            std::wstring key = trim(line.substr(0, delimiterPos));
+                            if (_wcsicmp(key.c_str(), L"Injector") == 0) {
+                                hasThirdPartyDlls = true;
+                                break; // 只要发现一个 就知道需要注入流程了
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
+            if (hookMode == 0 && netBlockMode == 0 && !hasThirdPartyDlls) {
                 LaunchApplication(iniContent, variables);
             }
             else {
