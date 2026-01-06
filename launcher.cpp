@@ -4094,7 +4094,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ipcParam.dll64Path = dll64Path;
         ipcParam.hookPath = finalHookPath;
         ipcParam.shouldStop = &stopIpc;
-        ipcParam.pipeName = kPipeNamePrefix + std::to_wstring(GetCurrentProcessId());
+        ipcParam.pipeName = sharedPipeName;
         ipcParam.extraDlls = thirdPartyDlls;
         ipcParam.injectorPath = injectorPath; // [新增] 传递 injectorPath
 
@@ -4347,6 +4347,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
+// --- [新增] 获取确定性的管道名称 (基于唯一标识符的哈希) ---
+std::wstring GetDeterministicPipeName(const std::wstring& uniqueId) {
+    std::hash<std::wstring> hasher;
+    size_t hash = hasher(uniqueId);
+    // kPipeNamePrefix 定义在 IpcCommon.h 中 通常为 L"\\\\.\\pipe\\YapLauncherPipe_"
+    return kPipeNamePrefix + std::to_wstring(hash);
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
 	DWORD launcherPid = GetCurrentProcessId();
@@ -4421,6 +4429,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         PathRemoveExtensionW(appBaseName);
     }
     std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
+
+    // [新增] 计算确定性的管道名称 供所有实例使用
+    std::wstring sharedPipeName = GetDeterministicPipeName(mutexName);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -4675,9 +4686,81 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CoUninitialize();
 
     } else {
-        CloseHandle(hMutex);
+        // --- [修改] 第二个实例的处理逻辑 ---
+        CloseHandle(hMutex); // 释放互斥体句柄 因为我们不是所有者
+
+        // 检查是否允许运行多实例
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
-            LaunchApplication(iniContent, variables);
+
+            // 检查是否启用了 Hook
+            std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
+            int hookMode = _wtoi(hookFileVal.c_str());
+            std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
+            int netBlockMode = _wtoi(netBlockVal.c_str());
+
+            // 如果不需要 Hook 直接使用简单启动
+            if (hookMode == 0 && netBlockMode == 0) {
+                LaunchApplication(iniContent, variables);
+            }
+            else {
+                // --- 需要 Hook：通过 IPC 请求第一个实例进行注入 ---
+
+                // 1. 准备启动参数
+                std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
+                std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
+                std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
+                std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
+
+                if (finalWorkDir.empty()) {
+                    wchar_t appDir[MAX_PATH];
+                    wcscpy_s(appDir, absoluteAppPath.c_str());
+                    PathRemoveFileSpecW(appDir);
+                    finalWorkDir = appDir;
+                }
+
+                std::wstring fullCommandLine = L"\"" + absoluteAppPath + L"\" " + commandLine;
+                wchar_t commandLineBuffer[4096];
+                wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
+
+                STARTUPINFOW si = { 0 };
+                si.cb = sizeof(si);
+                PROCESS_INFORMATION pi = { 0 };
+
+                // 2. 设置环境变量 让新进程知道 IPC 管道名称 (以便子进程 Hook 能连接)
+                SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
+
+                // 3. 挂起启动
+                if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, finalWorkDir.c_str(), &si, &pi)) {
+
+                    // 4. 连接到第一个实例的 IPC 管道
+                    bool injected = false;
+
+                    // 等待管道可用 (最多等待 1 秒)
+                    if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
+                        IpcMessage msg;
+                        msg.targetPid = pi.dwProcessId;
+
+                        IpcResponse resp;
+                        DWORD bytesRead;
+
+                        // 发送注入请求
+                        if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
+                            if (resp.success) {
+                                injected = true;
+                            }
+                        }
+                    }
+
+                    // 5. 恢复进程
+                    ResumeThread(pi.hThread);
+
+                    if (!injected) {
+                    }
+
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                }
+            }
         }
     }
     return 0;
