@@ -307,6 +307,7 @@ struct LauncherThreadData {
     std::atomic<bool>* stopMonitor = nullptr;
     std::atomic<bool>* isBackupWorking = nullptr;
 	DWORD launcherPid;
+    std::wstring pipeName;
 };
 
 // --- 提取嵌入资源的辅助函数 ---
@@ -4095,7 +4096,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ipcParam.dll64Path = dll64Path;
         ipcParam.hookPath = finalHookPath;
         ipcParam.shouldStop = &stopIpc;
-        ipcParam.pipeName = sharedPipeName;
+        ipcParam.pipeName = data->pipeName;
         ipcParam.extraDlls = thirdPartyDlls;
         ipcParam.injectorPath = injectorPath; // [新增] 传递 injectorPath
 
@@ -4616,6 +4617,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         threadData.stopMonitor = &stopMonitor;
         threadData.isBackupWorking = &isBackupWorking;
 		threadData.launcherPid = launcherPid;
+        threadData.pipeName = sharedPipeName;
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
