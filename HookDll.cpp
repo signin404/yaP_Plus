@@ -19,6 +19,15 @@
 #include <mswsock.h>
 #include <shellapi.h>
 
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "advapi32.lib")
+
 // 导出函数转发
 #pragma comment(linker, "/export:GetFileVersionInfoA=C:\\Windows\\System32\\version.GetFileVersionInfoA")
 #pragma comment(linker, "/export:GetFileVersionInfoByHandle=C:\\Windows\\System32\\version.GetFileVersionInfoByHandle")
@@ -37,15 +46,6 @@
 #pragma comment(linker, "/export:VerLanguageNameW=C:\\Windows\\System32\\version.VerLanguageNameW")
 #pragma comment(linker, "/export:VerQueryValueA=C:\\Windows\\System32\\version.VerQueryValueA")
 #pragma comment(linker, "/export:VerQueryValueW=C:\\Windows\\System32\\version.VerQueryValueW")
-
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ntdll.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "wininet.lib")
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "advapi32.lib")
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
