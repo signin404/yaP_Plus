@@ -2246,7 +2246,6 @@ namespace ActionHelpers {
                 lb_pos_replace += normalizedNewline.length();
             }
         }
-        // --- [修改结束] ---
 
         std::wstring new_content;
 
@@ -2278,6 +2277,11 @@ namespace ActionHelpers {
             }
         }
 
+        // --- [新增] 如果内容没有变化 则不写入文件 ---
+        if (new_content == content) {
+            return;
+        }
+
         // 将新内容写回文件
         std::vector<std::wstring> new_lines;
         std::wstringstream ss(new_content);
@@ -2304,12 +2308,27 @@ namespace ActionHelpers {
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
         std::vector<std::wstring> new_lines;
+        bool contentChanged = false; // [新增] 变更标记
+
         for (const auto& l : lines) {
+            // 检查行是否以 lineStart 开头
             if (l.rfind(op.lineStart, 0) == 0) {
-                new_lines.push_back(finalReplaceLine);
+                // 只有当新行内容与旧行不同时 才标记为已变更
+                if (l != finalReplaceLine) {
+                    new_lines.push_back(finalReplaceLine);
+                    contentChanged = true;
+                } else {
+                    // 如果内容完全一致 则保留原样
+                    new_lines.push_back(l);
+                }
             } else {
                 new_lines.push_back(l);
             }
+        }
+
+        // [新增] 如果内容没有发生任何实质性变化 直接返回 不写入文件
+        if (!contentChanged) {
+            return;
         }
 
         WriteFileWithFormat(op.path, new_lines, formatInfo);
