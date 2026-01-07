@@ -2120,6 +2120,7 @@ namespace ActionHelpers {
         if (!ReadFileWithFormatDetection(op.path, formatInfo)) return;
 
         std::vector<std::wstring> lines = GetLinesFromFile(formatInfo);
+        bool contentChanged = false; // [新增] 变更标记
 
         if (op.deleteSection) {
             std::vector<std::wstring> new_lines;
@@ -2138,8 +2139,15 @@ namespace ActionHelpers {
 
                 if (!in_section_to_delete) {
                     new_lines.push_back(l);
+                } else {
+                    // 如果我们在删除部分 说明内容发生了变化（有行被跳过）
+                    contentChanged = true;
                 }
             }
+
+            // 如果内容没有变化（例如要删除的节根本不存在） 则直接返回
+            if (!contentChanged) return;
+
             WriteFileWithFormat(op.path, new_lines, formatInfo);
             return;
         }
@@ -2167,16 +2175,25 @@ namespace ActionHelpers {
                     std::wstring current_key = trim(trimmed_line.substr(0, eq_pos));
                     if (_wcsicmp(current_key.c_str(), op.key.c_str()) == 0) {
                         if (_wcsicmp(op.value.c_str(), L"null") != 0) { // Modify
+                            // 构建新的行内容
+                            std::wstring new_line_content;
                             size_t original_eq_pos = l.find(L'=');
                             size_t value_start_pos = l.find_first_not_of(L" \t", original_eq_pos + 1);
                             if (value_start_pos == std::wstring::npos) { // key=
-                                l = l.substr(0, original_eq_pos + 1) + op.value;
+                                new_line_content = l.substr(0, original_eq_pos + 1) + op.value;
                             } else {
-                                l = l.substr(0, value_start_pos) + op.value;
+                                new_line_content = l.substr(0, value_start_pos) + op.value;
+                            }
+
+                            // 只有当新内容与旧内容不同时 才进行修改并标记变更
+                            if (l != new_line_content) {
+                                l = new_line_content;
+                                contentChanged = true;
                             }
                         } else { // Delete
                             lines.erase(lines.begin() + i);
                             --i;
+                            contentChanged = true;
                         }
                         key_found_and_handled = true;
                         if (is_null_section) break;
@@ -2186,6 +2203,8 @@ namespace ActionHelpers {
         }
 
         if (!key_found_and_handled && _wcsicmp(op.value.c_str(), L"null") != 0) {
+            // 需要插入新键值对
+            contentChanged = true;
             if (is_null_section) {
                 lines.insert(lines.begin(), op.key + L"=" + op.value);
             } else {
@@ -2206,6 +2225,11 @@ namespace ActionHelpers {
                     lines.push_back(op.key + L"=" + op.value);
                 }
             }
+        }
+
+        // 如果内容没有变化 则不写入文件
+        if (!contentChanged) {
+            return;
         }
 
         WriteFileWithFormat(op.path, lines, formatInfo);
