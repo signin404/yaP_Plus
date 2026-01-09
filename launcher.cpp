@@ -4463,6 +4463,42 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     PathRemoveFileSpecW(launcherDir);
     variables[L"YAPROOT"] = launcherDir;
 
+    // --- 预解析 ---
+    // 预解析 [Before] 中的 uservar 以便在 application 路径中使用
+    {
+        std::wstringstream stream(iniContent);
+        std::wstring line;
+        std::wstring currentSection;
+        const std::wstring delimiter = L" :: ";
+
+        while (std::getline(stream, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+
+            if (line[0] == L'[' && line.back() == L']') {
+                currentSection = line;
+                continue;
+            }
+
+            // 仅预加载 [Before] 区域的变量
+            if (_wcsicmp(currentSection.c_str(), L"[Before]") == 0) {
+                size_t delimiterPos = line.find(L'=');
+                if (delimiterPos != std::wstring::npos) {
+                    std::wstring key = trim(line.substr(0, delimiterPos));
+
+                    if (_wcsicmp(key.c_str(), L"uservar") == 0) {
+                        std::wstring value = trim(line.substr(delimiterPos + 1));
+                        auto parts = split_string(value, delimiter);
+                        if (parts.size() == 2) {
+                            // 解析变量并立即加入 map 支持变量嵌套 (如 Z: 依赖于其他变量)
+                            variables[parts[0]] = ExpandVariables(parts[1], variables);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
 
     wchar_t launcherBaseName[MAX_PATH];
