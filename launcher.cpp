@@ -2827,15 +2827,39 @@ void PerformDirectoryBackup(const BackupEntry& entry) {
 void PerformFileBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.source.c_str())) return;
 
+    // 1. [新增] 自动创建目标父目录
+    // 无论是覆盖模式还是时间戳模式 都需要确保目标文件夹存在
+    wchar_t destDir[MAX_PATH];
+    wcscpy_s(destDir, MAX_PATH, entry.destination.c_str());
+    PathRemoveFileSpecW(destDir);
+    if (wcslen(destDir) > 0) {
+        // SHCreateDirectoryExW 会自动创建多级目录 如果目录已存在则忽略
+        SHCreateDirectoryExW(NULL, destDir, NULL);
+    }
+
     if (entry.overwrite) {
         // 保持原始的覆盖逻辑
         std::wstring backupDest = entry.destination + L"_Backup";
+
         if (PathFileExistsW(entry.destination.c_str())) {
+            // [新增] 如果临时备份文件已存在（可能是上次意外残留的只读文件） 先强制删除
+            if (PathFileExistsW(backupDest.c_str())) {
+                ActionHelpers::ForceDeleteFile(backupDest.c_str());
+            }
+            // 将现有文件移动为备份
             MoveFileW(entry.destination.c_str(), backupDest.c_str());
         }
+
         if (CopyFileW(entry.source.c_str(), entry.destination.c_str(), FALSE)) {
+            // 复制成功
             if (PathFileExistsW(backupDest.c_str())) {
-                DeleteFileW(backupDest.c_str());
+                // [修改] 使用强制删除函数删除临时备份 (解决只读文件无法删除的问题)
+                ActionHelpers::ForceDeleteFile(backupDest.c_str());
+            }
+        } else {
+            // [新增] 复制失败时的回滚逻辑：尝试将备份文件恢复回去
+            if (PathFileExistsW(backupDest.c_str())) {
+                MoveFileW(backupDest.c_str(), entry.destination.c_str());
             }
         }
     } else {
