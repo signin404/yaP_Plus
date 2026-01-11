@@ -1406,6 +1406,100 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
+    // [新增] 路径通配符展开辅助函数
+    // 将包含通配符的路径模式 (如 "Data\CLR_*") 展开为实际存在的目录列表
+    std::vector<std::wstring> ExpandDirectoryPattern(const std::wstring& pathPattern) {
+        std::vector<std::wstring> currentPaths;
+        if (pathPattern.empty() || pathPattern == L".") {
+            currentPaths.push_back(L".");
+            return currentPaths;
+        }
+
+        std::vector<std::wstring> segments;
+        std::wstringstream ss(pathPattern);
+        std::wstring segment;
+
+        // 分割路径
+        while (std::getline(ss, segment, L'\\')) {
+            segments.push_back(segment);
+        }
+
+        if (segments.empty()) return {};
+
+        size_t startIndex = 0;
+
+        // 初始化起始路径
+        if (segments[0].size() == 2 && segments[0][1] == L':') {
+            // 绝对路径 (C:\...)
+            currentPaths.push_back(segments[0] + L"\\");
+            startIndex = 1;
+        }
+        else if (segments[0].empty()) {
+            // 根路径 (\...)
+            currentPaths.push_back(L"\\");
+            startIndex = 1;
+        }
+        else {
+            // 相对路径
+            currentPaths.push_back(L".");
+            startIndex = 0;
+        }
+
+        // 逐层遍历
+        for (size_t i = startIndex; i < segments.size(); ++i) {
+            std::wstring part = segments[i];
+            if (part.empty()) continue;
+
+            std::vector<std::wstring> nextPaths;
+            bool hasWildcard = (part.find(L'*') != std::wstring::npos || part.find(L'?') != std::wstring::npos);
+
+            for (const auto& basePath : currentPaths) {
+                std::wstring searchPath;
+
+                // 构建搜索路径
+                if (basePath == L".") searchPath = part;
+                else if (basePath.back() == L'\\') searchPath = basePath + part;
+                else searchPath = basePath + L"\\" + part;
+
+                if (hasWildcard) {
+                    // 如果当前层级包含通配符 则查找匹配的目录
+                    WIN32_FIND_DATAW findData;
+                    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+                    if (hFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                                wcscmp(findData.cFileName, L".") != 0 &&
+                                wcscmp(findData.cFileName, L"..") != 0) {
+
+                                // [核心修正] 使用严格的 WildcardMatch 再次校验
+                                // FindFirstFile 的 ? 匹配规则比较宽松（可能匹配空字符） 这里强制要求 ? 必须匹配一个字符
+                                if (::WildcardMatch(findData.cFileName, part.c_str())) {
+                                    std::wstring foundName = findData.cFileName;
+                                    std::wstring newPath;
+                                    if (basePath == L".") newPath = foundName;
+                                    else if (basePath.back() == L'\\') newPath = basePath + foundName;
+                                    else newPath = basePath + L"\\" + foundName;
+
+                                    nextPaths.push_back(newPath);
+                                }
+                            }
+                        } while (FindNextFileW(hFind, &findData));
+                        FindClose(hFind);
+                    }
+                } else {
+                    // 如果是普通名称 检查是否存在
+                    DWORD attrs = GetFileAttributesW(searchPath.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                        nextPaths.push_back(searchPath);
+                    }
+                }
+            }
+            currentPaths = nextPaths;
+            if (currentPaths.empty()) return {}; // 路径中断 无匹配
+        }
+        return currentPaths;
+    }
+
      // [完全替换] 支持递归遍历的删除文件函数
     void HandleDeleteFile(const std::wstring& pathPattern) {
         // 检查是否存在递归标记 "\*\"
@@ -1413,50 +1507,61 @@ namespace ActionHelpers {
         size_t tokenPos = pathPattern.find(recursiveToken);
 
         if (tokenPos != std::wstring::npos) {
-            // --- 递归模式 ---
-            // 提取根目录: "Data\*\*.txt" -> "Data"
-            std::wstring rootDir = pathPattern.substr(0, tokenPos);
-            // 提取文件模式: "Data\*\*.txt" -> "*.txt"
+            // --- 递归模式 (例如: Data\CLR_*\*\*.txt) ---
+            // 提取目录模式: "Data\CLR_*"
+            std::wstring rootDirPattern = pathPattern.substr(0, tokenPos);
+            // 提取文件模式: "*.txt"
             std::wstring filePattern = pathPattern.substr(tokenPos + recursiveToken.length());
 
-            // 如果根目录为空（例如 "\*\*.txt"） 则默认为当前目录
-            if (rootDir.empty()) rootDir = L".";
+            if (rootDirPattern.empty()) rootDirPattern = L".";
 
-            DeleteFilesRecursive(rootDir, filePattern);
+            // 1. 展开目录通配符 获取所有匹配的根目录
+            std::vector<std::wstring> directories = ExpandDirectoryPattern(rootDirPattern);
+
+            // 2. 对每个匹配的目录执行递归删除
+            for (const auto& dir : directories) {
+                DeleteFilesRecursive(dir, filePattern);
+            }
         } else {
-            // --- 原有扁平模式 (仅当前目录) ---
-            wchar_t dirPath_w[MAX_PATH];
-            wcscpy_s(dirPath_w, pathPattern.c_str());
-            PathRemoveFileSpecW(dirPath_w);
-            std::wstring dirPath = dirPath_w;
+            // --- 扁平模式 (例如: Data\CLR_*\*.txt) ---
+            // 分离目录部分和文件模式部分
 
-            const wchar_t* filePattern = PathFindFileNameW(pathPattern.c_str());
+            size_t lastSlash = pathPattern.find_last_of(L'\\');
+            std::wstring dirPattern;
+            std::wstring filePattern;
 
-            if (dirPath == pathPattern) {
-                dirPath = L".";
+            if (lastSlash == std::wstring::npos) {
+                dirPattern = L".";
+                filePattern = pathPattern;
+            } else {
+                dirPattern = pathPattern.substr(0, lastSlash);
+                filePattern = pathPattern.substr(lastSlash + 1);
             }
 
-            std::wstring searchPattern = dirPath + L"\\*";
+            // 1. 展开目录通配符
+            std::vector<std::wstring> directories = ExpandDirectoryPattern(dirPattern);
 
-            WIN32_FIND_DATAW findData;
-            HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
-            if (hFind == INVALID_HANDLE_VALUE) {
-                return;
-            }
-
-            do {
-                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // 2. 在每个匹配的目录中删除文件 (非递归)
+            for (const auto& dir : directories) {
+                std::wstring searchPattern = dir + L"\\" + filePattern;
+                WIN32_FIND_DATAW findData;
+                HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
+                if (hFind == INVALID_HANDLE_VALUE) {
                     continue;
                 }
 
-                if (WildcardMatch(findData.cFileName, filePattern)) {
-                    std::wstring fullPathToDelete = dirPath + L"\\" + findData.cFileName;
-                    // 使用强制删除函数
-                    ForceDeleteFile(fullPathToDelete);
-                }
-            } while (FindNextFileW(hFind, &findData));
+                do {
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        // [核心修正] 同样对文件名进行严格匹配校验
+                        if (::WildcardMatch(findData.cFileName, filePattern.c_str())) {
+                            std::wstring fullPathToDelete = dir + L"\\" + findData.cFileName;
+                            ForceDeleteFile(fullPathToDelete);
+                        }
+                    }
+                } while (FindNextFileW(hFind, &findData));
 
-            FindClose(hFind);
+                FindClose(hFind);
+            }
         }
     }
 
@@ -1509,48 +1614,71 @@ namespace ActionHelpers {
         size_t tokenPos = pathPattern.find(recursiveToken);
 
         if (tokenPos != std::wstring::npos) {
-            // --- 递归模式 ---
-            // 提取根目录: "Data\*\cache*" -> "Data"
-            std::wstring rootDir = pathPattern.substr(0, tokenPos);
-            // 提取目录模式: "Data\*\cache*" -> "cache*"
-            std::wstring dirPattern = pathPattern.substr(tokenPos + recursiveToken.length());
+            // --- 递归模式 (例如: Data*\*\NEW-*) ---
+            // 提取根目录模式: "Data*" (支持通配符)
+            std::wstring rootDirPattern = pathPattern.substr(0, tokenPos);
+            // 提取目标目录模式: "NEW-*"
+            std::wstring targetDirPattern = pathPattern.substr(tokenPos + recursiveToken.length());
 
-            // 如果根目录为空 默认为当前目录
-            if (rootDir.empty()) rootDir = L".";
+            if (rootDirPattern.empty()) rootDirPattern = L".";
 
-            DeleteDirsRecursive(rootDir, dirPattern, ifEmpty);
+            // 1. 展开根目录通配符 获取所有匹配的起始目录
+            std::vector<std::wstring> roots = ExpandDirectoryPattern(rootDirPattern);
+
+            // 2. 在每个起始目录下递归查找并删除
+            for (const auto& root : roots) {
+                DeleteDirsRecursive(root, targetDirPattern, ifEmpty);
+            }
         } else {
-            // --- 原有扁平模式 (仅当前目录) ---
-            wchar_t dirPart_w[MAX_PATH];
-            wcscpy_s(dirPart_w, pathPattern.c_str());
-            PathRemoveFileSpecW(dirPart_w);
-            std::wstring dirPart = dirPart_w;
-            std::wstring patternPart = PathFindFileNameW(pathPattern.c_str());
+            // --- 扁平模式 (例如: Data*\NEW-*) ---
+            size_t lastSlash = pathPattern.find_last_of(L'\\');
+            std::wstring parentDirPattern;
+            std::wstring targetDirPattern;
 
-            if (dirPart == pathPattern) {
-                dirPart = L".";
+            if (lastSlash == std::wstring::npos) {
+                parentDirPattern = L".";
+                targetDirPattern = pathPattern;
+            } else {
+                parentDirPattern = pathPattern.substr(0, lastSlash);
+                targetDirPattern = pathPattern.substr(lastSlash + 1);
             }
 
-            WIN32_FIND_DATAW findData;
-            HANDLE hFind = FindFirstFileW((dirPart + L"\\*").c_str(), &findData);
-            if (hFind == INVALID_HANDLE_VALUE) {
-                return;
-            }
-            do {
-                if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(findData.cFileName, L".") != 0 && wcscmp(findData.cFileName, L"..") != 0) {
-                    if (WildcardMatch(findData.cFileName, patternPart.c_str())) {
-                        std::wstring fullPath = dirPart + L"\\" + findData.cFileName;
-                        if (ifEmpty) {
-                            if (PathIsDirectoryEmptyW(fullPath.c_str())) {
-                                RemoveDirectoryW(fullPath.c_str());
+            // 1. 展开父目录通配符
+            std::vector<std::wstring> parents = ExpandDirectoryPattern(parentDirPattern);
+
+            // 2. 在每个父目录下查找匹配的子目录
+            for (const auto& parent : parents) {
+                std::wstring searchPattern = parent + L"\\" + targetDirPattern;
+                WIN32_FIND_DATAW findData;
+                HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
+                if (hFind == INVALID_HANDLE_VALUE) {
+                    continue;
+                }
+
+                do {
+                    if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                        wcscmp(findData.cFileName, L".") != 0 &&
+                        wcscmp(findData.cFileName, L"..") != 0) {
+
+                        // [核心修正] 使用严格的 WildcardMatch 进行二次校验
+                        // 确保 ? 不会匹配空字符
+                        if (::WildcardMatch(findData.cFileName, targetDirPattern.c_str())) {
+                            std::wstring fullPath = parent + L"\\" + findData.cFileName;
+
+                            if (ifEmpty) {
+                                // 如果指定了 ifEmpty 仅当目录为空时删除
+                                if (PathIsDirectoryEmptyW(fullPath.c_str())) {
+                                    RemoveDirectoryW(fullPath.c_str());
+                                }
+                            } else {
+                                // 否则强制删除整个目录树
+                                PerformFileSystemOperation(FO_DELETE, fullPath);
                             }
-                        } else {
-                            PerformFileSystemOperation(FO_DELETE, fullPath);
                         }
                     }
-                }
-            } while (FindNextFileW(hFind, &findData));
-            FindClose(hFind);
+                } while (FindNextFileW(hFind, &findData));
+                FindClose(hFind);
+            }
         }
     }
 
