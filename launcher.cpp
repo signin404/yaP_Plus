@@ -1868,6 +1868,12 @@ namespace ActionHelpers {
             SHCreateDirectoryExW(NULL, dirPath, NULL);
         }
 
+        // [新增] 覆盖模式下 如果目标存在 使用强制删除以处理只读属性
+        // 这避免了 std::ofstream 无法打开只读文件进行截断写入的问题
+        if (op.overwrite && PathFileExistsW(op.path.c_str())) {
+            ForceDeleteFile(op.path.c_str());
+        }
+
         std::wstring lineBreak;
         if (op.format == TextFormat::Unix) lineBreak = L"\n";
         else if (op.format == TextFormat::Mac) lineBreak = L"\r";
@@ -2004,11 +2010,16 @@ namespace ActionHelpers {
 
         if (op.overwrite && PathFileExistsW(op.destPath.c_str())) {
             std::wstring backupPath = op.destPath + L"_Backup";
-            if (PathIsDirectoryW(backupPath.c_str())) {
-                 PerformFileSystemOperation(FO_DELETE, backupPath);
-            } else {
-                DeleteFileW(backupPath.c_str());
+
+            // [修改] 如果备份路径已存在 先强制删除
+            if (PathFileExistsW(backupPath.c_str())) {
+                if (PathIsDirectoryW(backupPath.c_str())) {
+                     PerformFileSystemOperation(FO_DELETE, backupPath);
+                } else {
+                    ForceDeleteFile(backupPath.c_str());
+                }
             }
+
             MoveFileW(op.destPath.c_str(), backupPath.c_str());
         }
 
@@ -2039,7 +2050,8 @@ namespace ActionHelpers {
             if (op.isDirectory) {
                 PerformFileSystemOperation(FO_DELETE, backupPath);
             } else {
-                DeleteFileW(backupPath.c_str());
+                // [修改] 使用强制删除清理备份 防止因只读属性导致残留
+                ForceDeleteFile(backupPath.c_str());
             }
         }
     }
