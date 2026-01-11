@@ -1471,13 +1471,17 @@ namespace ActionHelpers {
                                 wcscmp(findData.cFileName, L".") != 0 &&
                                 wcscmp(findData.cFileName, L"..") != 0) {
 
-                                std::wstring foundName = findData.cFileName;
-                                std::wstring newPath;
-                                if (basePath == L".") newPath = foundName;
-                                else if (basePath.back() == L'\\') newPath = basePath + foundName;
-                                else newPath = basePath + L"\\" + foundName;
+                                // [核心修正] 使用严格的 WildcardMatch 再次校验
+                                // FindFirstFile 的 ? 匹配规则比较宽松（可能匹配空字符），这里强制要求 ? 必须匹配一个字符
+                                if (::WildcardMatch(findData.cFileName, part.c_str())) {
+                                    std::wstring foundName = findData.cFileName;
+                                    std::wstring newPath;
+                                    if (basePath == L".") newPath = foundName;
+                                    else if (basePath.back() == L'\\') newPath = basePath + foundName;
+                                    else newPath = basePath + L"\\" + foundName;
 
-                                nextPaths.push_back(newPath);
+                                    nextPaths.push_back(newPath);
+                                }
                             }
                         } while (FindNextFileW(hFind, &findData));
                         FindClose(hFind);
@@ -1548,8 +1552,11 @@ namespace ActionHelpers {
 
                 do {
                     if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                        std::wstring fullPathToDelete = dir + L"\\" + findData.cFileName;
-                        ForceDeleteFile(fullPathToDelete);
+                        // [核心修正] 同样对文件名进行严格匹配校验
+                        if (::WildcardMatch(findData.cFileName, filePattern.c_str())) {
+                            std::wstring fullPathToDelete = dir + L"\\" + findData.cFileName;
+                            ForceDeleteFile(fullPathToDelete);
+                        }
                     }
                 } while (FindNextFileW(hFind, &findData));
 
