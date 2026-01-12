@@ -100,8 +100,10 @@
     *   如果软件不支持符号链接且配置文件很大 会导致大量写入
 *   **使用此方案的软件:**
     *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
+    *   [PortableApps Compiler & Management](https://github.com/daemondevin/pac-man)
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
+    *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
 
 ### 虚拟化
 

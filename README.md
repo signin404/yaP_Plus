@@ -100,8 +100,10 @@ Just copy and paste to create portable software.
     *   If the software doesn't support symbolic links and the configuration file is large, it could result in excessive data writes.
 *   **Software using this solution:**
     *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
+    *   [PortableApps Compiler & Management](https://github.com/daemondevin/pac-man)
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
+    *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
 
 ### Virtualization
 
