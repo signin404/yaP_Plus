@@ -271,7 +271,7 @@ struct AfterOperation {
 
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
-    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, // Startup/Shutdown types
+    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp, // Startup/Shutdown types
     ActionOpData // One-shot types (using the variant directly)
 >;
 struct BeforeOperation {
