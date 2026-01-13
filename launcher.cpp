@@ -110,8 +110,12 @@ struct FirewallOp {
     bool ruleCreated = false;
 };
 
+struct RegDllOp {
+    std::wstring dllPath;
+};
+
 // This variant is now only used for the shutdown stack
-using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp>;
+using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp>;
 struct StartupShutdownOperation {
     StartupShutdownOperationData data;
 };
@@ -128,11 +132,6 @@ struct RunOp {
 
 struct RegImportOp {
     std::wstring regPath;
-};
-
-struct RegDllOp {
-    std::wstring dllPath;
-    bool unregister;
 };
 
 struct DeleteFileOp {
@@ -251,7 +250,7 @@ struct EnvVarOp {
 
 // A variant for one-shot actions, used by [Before] and [After] sections
 using ActionOpData = std::variant<
-    RunOp, RegImportOp, RegDllOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
+    RunOp, RegImportOp, DeleteFileOp, DeleteDirOp, DeleteRegKeyOp, DeleteRegValueOp,
     CreateDirOp, DelayOp, KillProcessOp, CreateFileOp, CreateRegKeyOp, CreateRegValueOp,
     CopyMoveOp, AttributesOp, IniWriteOp, ReplaceOp, ReplaceLineOp,
     EnvVarOp
@@ -3156,6 +3155,14 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
         }
+        // [新增] 处理 DLL 注册
+        else if constexpr (std::is_same_v<T, RegDllOp>) {
+            wchar_t systemPath[MAX_PATH];
+            GetSystemDirectoryW(systemPath, MAX_PATH);
+            std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
+            std::wstring args = L"/s \"" + arg.dllPath + L"\"";
+            ExecuteProcess(regsvrPath, args, L"", true, true);
+        }
     }, opData);
 }
 
@@ -3265,6 +3272,14 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                 DeleteFirewallRule(arg.ruleName);
             }
         }
+        // [新增] 处理 DLL 反注册 (自动清理)
+        else if constexpr (std::is_same_v<T, RegDllOp>) {
+            wchar_t systemPath[MAX_PATH];
+            GetSystemDirectoryW(systemPath, MAX_PATH);
+            std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
+            std::wstring args = L"/s /u \"" + arg.dllPath + L"\"";
+            ExecuteProcess(regsvrPath, args, L"", true, true);
+        }
     }, opData);
 }
 
@@ -3296,13 +3311,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
         }
         else if (_wcsicmp(key.c_str(), L"regimport") == 0) {
             return RegImportOp{value};
-        } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
-            auto parts = split_string(value, delimiter);
-            if (!parts.empty() && !parts[0].empty()) {
-                RegDllOp op; op.dllPath = parts[0];
-                op.unregister = (parts.size() > 1 && _wcsicmp(parts[1].c_str(), L"unregister") == 0);
-                return op;
-            }
         } else if (_wcsicmp(key.c_str(), L"-file") == 0) {
             return DeleteFileOp{value};
         } else if (_wcsicmp(key.c_str(), L"-dir") == 0) {
@@ -3636,6 +3644,14 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     f_op.appPath = ResolveToAbsolutePath(ExpandVariables(parts[3], variables), variables);
                     beforeOp.data = f_op; op_created = true;
                 }
+            } else if (_wcsicmp(key.c_str(), L"regdll") == 0) {
+                auto parts = split_string(value, delimiter);
+                if (!parts.empty() && !parts[0].empty()) {
+                    RegDllOp op;
+                    op.dllPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
+                    beforeOp.data = op;
+                    op_created = true;
+                }
             } else if (_wcsicmp(key.c_str(), L"(regvalue)") == 0 || _wcsicmp(key.c_str(), L"(regkey)") == 0 || _wcsicmp(key.c_str(), L"regvalue") == 0 || _wcsicmp(key.c_str(), L"regkey") == 0) {
                 RegistryOp r_op; r_op.isKey = (key.find(L"key") != std::wstring::npos); r_op.isSaveRestore = (key.front() != L'(');
                 std::wstring regPathRaw = value;
@@ -3718,16 +3734,6 @@ void ExecuteActionOperation(const ActionOpData& opData, std::map<std::wstring, s
         else if constexpr (std::is_same_v<T, RegImportOp>) {
             std::wstring finalPath = ExpandVariables(arg.regPath, variables);
             ImportRegistryFile(ResolveToAbsolutePath(finalPath, variables));
-        } else if constexpr (std::is_same_v<T, RegDllOp>) {
-            std::wstring finalPath = ExpandVariables(arg.dllPath, variables);
-            wchar_t systemPath[MAX_PATH];
-            GetSystemDirectoryW(systemPath, MAX_PATH);
-            std::wstring regsvrPath = std::wstring(systemPath) + L"\\regsvr32.exe";
-            std::wstring args = L"/s \"" + ResolveToAbsolutePath(finalPath, variables) + L"\"";
-            if (arg.unregister) {
-                args = L"/u " + args;
-            }
-            ExecuteProcess(regsvrPath, args, L"", true, true);
         } else if constexpr (std::is_same_v<T, DeleteFileOp>) {
             std::wstring finalPath = ExpandVariables(arg.pathPattern, variables);
             ActionHelpers::HandleDeleteFile(ResolveToAbsolutePath(finalPath, variables));
