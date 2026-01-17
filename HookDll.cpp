@@ -4280,7 +4280,7 @@ void SetupHooks() {
     // 检查根目录是否获取成功
     if (g_SandboxRoot[0] == L'\0') {
         DebugLog(L"Init Failed: YAP_HOOK_PATH not found");
-        return 0;
+        return;
     }
 
     // 6. 初始化特殊目录 NT 路径
