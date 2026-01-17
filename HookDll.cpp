@@ -18,7 +18,9 @@
 #include <shared_mutex>
 #include <mswsock.h>
 #include <shellapi.h>
+#include <psapi.h>
 
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -571,6 +573,22 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+
+// [新增] 定义入口点函数类型
+using Startup = int(*)();
+Startup fpExeMain = NULL; // 保存原始入口点
+
+// [新增] 前向声明初始化函数 (原 InitHookThread)
+void SetupHooks();
+
+// [新增] 我们的 Loader 函数，将替换 EXE 的入口点
+int Loader() {
+    // 1. 执行我们的初始化逻辑 (同步执行，确保 Hook 在主程序运行前就绪)
+    SetupHooks();
+
+    // 2. 调用原始入口点，启动主程序
+    return fpExeMain();
+}
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -4123,7 +4141,31 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
     return L"\\??\\" + shortPath;
 }
 
-DWORD WINAPI InitHookThread(LPVOID) {
+// [新增] 安装 OEP Hook
+void InstallOepHook() {
+    // 1. 初始化 MinHook
+    if (MH_Initialize() != MH_OK) {
+        return;
+    }
+
+    // 2. 获取当前进程的主模块信息
+    MODULEINFO mi = { 0 };
+    if (!GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof(MODULEINFO))) {
+        return;
+    }
+
+    // 3. Hook 入口点
+    // mi.EntryPoint 是 EXE 的入口地址
+    // Loader 是我们的代理函数
+    // fpExeMain 将保存原始入口地址
+    MH_CreateHook(mi.EntryPoint, &Loader, reinterpret_cast<LPVOID*>(&fpExeMain));
+
+    // 4. 立即启用 OEP Hook
+    // 这样当 DllMain 返回后，系统跳转到 EntryPoint 时，实际上会进入 Loader
+    MH_EnableHook(mi.EntryPoint);
+}
+
+void SetupHooks() {
     // [新增] 初始化管道前缀
     InitPipeVirtualization();
     // [新增] 启用特权以支持短文件名设置
@@ -4290,9 +4332,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
 
-    // 7. 初始化 MinHook
-    if (MH_Initialize() != MH_OK) return 0;
-
     // =======================================================
     // 分组挂钩逻辑
     // =======================================================
@@ -4455,13 +4494,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
         CloseHandle(hEvent);
     }
 
-    return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
-        CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
+
+        InstallOepHook();
+
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
     }
