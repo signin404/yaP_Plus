@@ -1896,6 +1896,47 @@ struct RecursionGuard {
 
 // --- NTDLL Hooks ---
 
+bool WildcardMatch(const wchar_t* pattern, const wchar_t* str) {
+    const wchar_t* p = pattern;
+    const wchar_t* s = str;
+    const wchar_t* star = NULL;
+    const wchar_t* ss = str;
+
+    while (*s) {
+        if (*p == L'?') {
+            p++; s++;
+        }
+        else if (*p == L'*') {
+            star = p++;
+            ss = s;
+        }
+        else if (towlower(*p) == towlower(*s)) {
+            p++; s++;
+        }
+        else {
+            if (star) {
+                p = star + 1;
+                s = ++ss;
+            }
+            else {
+                return false;
+            }
+        }
+    }
+    while (*p == L'*') p++;
+    return !*p;
+}
+
+// [新增] 生成简单的 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    std::hash<std::wstring> hasher;
+    // 简单的哈希 确保非零
+    size_t h = hasher(name);
+    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
+    return id;
+}
+
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap, HANDLE hExistingDir = NULL) {
     HANDLE hDir = hExistingDir;
@@ -1992,16 +2033,6 @@ bool IsDriveRoot(const std::wstring& path) {
     // 匹配 C:\ (注意：不匹配 C:\Windows)
     if (path.length() == 3 && path[1] == L':' && path[2] == L'\\') return true;
     return false;
-}
-
-// [新增] 生成简单的 FileId (基于文件名哈希)
-LARGE_INTEGER GenerateFileId(const std::wstring& name) {
-    LARGE_INTEGER id;
-    std::hash<std::wstring> hasher;
-    // 简单的哈希 确保非零
-    size_t h = hasher(name);
-    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
-    return id;
 }
 
 // 核心：构建合并后的文件列表
@@ -2810,37 +2841,6 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
     }
 
     return status;
-}
-
-bool WildcardMatch(const wchar_t* pattern, const wchar_t* str) {
-    const wchar_t* p = pattern;
-    const wchar_t* s = str;
-    const wchar_t* star = NULL;
-    const wchar_t* ss = str;
-
-    while (*s) {
-        if (*p == L'?') {
-            p++; s++;
-        }
-        else if (*p == L'*') {
-            star = p++;
-            ss = s;
-        }
-        else if (towlower(*p) == towlower(*s)) {
-            p++; s++;
-        }
-        else {
-            if (star) {
-                p = star + 1;
-                s = ++ss;
-            }
-            else {
-                return false;
-            }
-        }
-    }
-    while (*p == L'*') p++;
-    return !*p;
 }
 
 // [新增] 内部公共查询逻辑
