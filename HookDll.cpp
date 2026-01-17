@@ -947,9 +947,10 @@ void RefreshDeviceMap() {
 
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
-    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
-    if (g_DeviceMap.empty()) return devicePath;
+    // 如果映射表为空，尝试立即刷新一次 (防止初始化竞态条件)
+    if (g_DeviceMap.empty()) {
+        RefreshDeviceMap();
+    }
 
     for (const auto& pair : g_DeviceMap) {
         const std::wstring& devPrefix = pair.first;
@@ -1197,20 +1198,13 @@ bool IsPipeOrDevice(LPCWSTR path) {
 }
 
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
-    if (ntPath.rfind(L"\\??\\", 0) == 0) {
-        return ntPath.substr(4);
-    }
-    
-    // [修复] 尝试处理设备路径
+    if (ntPath.rfind(L"\\??\\", 0) == 0) return ntPath.substr(4);
+    // 尝试处理设备路径
     if (ntPath.find(L"\\Device\\") == 0) {
         std::wstring converted = DevicePathToNtPath(ntPath);
-        if (converted.rfind(L"\\??\\", 0) == 0) {
-            return converted.substr(4);
-        }
-        // 如果转换失败，确实无法转为 DOS 路径
+        if (converted.rfind(L"\\??\\", 0) == 0) return converted.substr(4);
         return L"";
     }
-    
     return ntPath;
 }
 
@@ -2105,27 +2099,24 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
     }
 }
 
-// 辅助：检查 NT 路径对应的文件是否存在
-bool NtPathExists(const std::wstring& ntPath) {
-    // 使用 NT API 检查文件是否存在，避免 Win32 API (GetFileAttributesW) 的路径转换问题
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uStr;
+// [新增] 重载：直接使用 OBJECT_ATTRIBUTES 检查文件是否存在 (最稳健)
+bool NtPathExists(POBJECT_ATTRIBUTES oa) {
     FILE_NETWORK_OPEN_INFORMATION info;
-    
+    // 直接使用原始的 OA (包含 RootDirectory 句柄) 查询
+    // 这样可以完美处理相对路径，无需我们自己拼接字符串
+    NTSTATUS status = fpNtQueryFullAttributesFile(oa, &info);
+    return NT_SUCCESS(status);
+}
+
+// [修改] 原有函数：仅用于检查沙盒路径 (绝对路径)
+bool NtPathExists(const std::wstring& ntPath) {
+    UNICODE_STRING uStr;
     RtlInitUnicodeString(&uStr, ntPath.c_str());
+    
+    OBJECT_ATTRIBUTES oa;
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
     
-    // 注意：这里使用原始函数指针，避免递归
-    NTSTATUS status = fpNtQueryFullAttributesFile(&oa, &info);
-    
-    if (NT_SUCCESS(status)) return true;
-    
-    // 如果失败，尝试 DOS 路径回退 (兼容旧逻辑)
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
-        return false;
-    }
-    
-    return false;
+    return NtPathExists(&oa);
 }
 
 // [新增] 初始化管道前缀 (在 InitHookThread 中调用)
@@ -2318,7 +2309,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         }
 
         bool sandboxExists = NtPathExists(targetNtPath);
-        bool realExists = NtPathExists(fullNtPath);
+        bool realExists = NtPathExists(ObjectAttributes);
 
         // [Mode 3] 可见性检查：如果真实文件存在但被隐藏 视为不存在
         if (g_HookMode == 3 && realExists) {
