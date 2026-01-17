@@ -18,6 +18,8 @@
 #include <shared_mutex>
 #include <mswsock.h>
 #include <shellapi.h>
+#include <string_view>
+#include <numeric>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -533,6 +535,174 @@ typedef BOOL(WINAPI* P_CreateProcessAsUserA)(HANDLE, LPCSTR, LPSTR, LPSECURITY_A
 typedef BOOL(WINAPI* P_CreateProcessWithTokenW)(HANDLE, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessWithLogonW)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef DWORD(WINAPI* P_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
+
+// 命令行处理工具集
+namespace CmdUtils {
+
+    bool IsWhitespace(wchar_t ch) {
+        return wcschr(L" \t\n\r", ch) != nullptr;
+    }
+
+    // 移除字符串末尾的空白
+    void TrimTrailingWhitespace(std::wstring& text) {
+        while (!text.empty() && IsWhitespace(text.back())) {
+            text.pop_back();
+        }
+    }
+
+    // 查找独立的开关（确保不是另一个单词的子串）
+    // [修改] 使用 const std::wstring& 代替 std::wstring_view
+    size_t FindStandaloneSwitch(
+        const std::wstring& command_line,
+        const std::wstring& flag) {
+        auto pos = command_line.find(flag);
+        while (pos != std::wstring::npos) {
+            const bool at_start = pos == 0 || IsWhitespace(command_line[pos - 1]);
+            const auto after = pos + flag.size();
+            const bool at_end =
+                after >= command_line.size() || IsWhitespace(command_line[after]);
+            if (at_start && at_end) {
+                return pos;
+            }
+            pos = command_line.find(flag, pos + flag.size());
+        }
+        return std::wstring::npos;
+    }
+
+    // 处理 --single-argument 这种特殊情况
+    // 返回值: {前半部分(可解析), 后半部分(保留原样)}
+    std::pair<std::wstring, std::wstring> SplitSingleArgumentSwitch(
+        const std::wstring& command_line) {
+        // [修改] 移除 constexpr string_view
+        const std::wstring kSingleArgument = L"--single-argument";
+        const auto single_argument_pos =
+            FindStandaloneSwitch(command_line, kSingleArgument);
+
+        if (single_argument_pos == std::wstring::npos) {
+            return { command_line, L"" };
+        }
+
+        std::wstring prefix = command_line.substr(0, single_argument_pos);
+        std::wstring suffix = command_line.substr(single_argument_pos);
+        TrimTrailingWhitespace(prefix);
+
+        return { std::move(prefix), std::move(suffix) };
+    }
+
+    // 使用系统 API 解析命令行参数
+    std::vector<std::wstring> ParseCommandLineArgs(const std::wstring& command_line) {
+        std::vector<std::wstring> args;
+        if (command_line.empty()) return args;
+
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(command_line.c_str(), &argc);
+        if (!argv) return args;
+
+        for (int i = 0; i < argc; ++i) {
+            args.emplace_back(argv[i]);
+        }
+        LocalFree(argv);
+        return args;
+    }
+
+    // 辅助：给参数加引号（如果包含空格）
+    std::wstring QuoteArg(const std::wstring& arg) {
+        if (arg.empty()) return L"\"\"";
+        if (arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
+
+        std::wstring quoted;
+        quoted.push_back(L'"');
+        for (auto it = arg.begin(); it != arg.end(); ++it) {
+            if (*it == L'"') {
+                int backslash_count = 0;
+                auto back_it = it;
+                while (back_it != arg.begin() && *(--back_it) == L'\\') {
+                    backslash_count++;
+                }
+                quoted.append(backslash_count, L'\\');
+                quoted.append(L"\\\"");
+            }
+            else {
+                quoted.push_back(*it);
+            }
+        }
+        if (quoted.back() == L'\\') {
+            int backslash_count = 0;
+            auto back_it = quoted.end();
+            while (back_it != quoted.begin() && *(--back_it) == L'\\') {
+                backslash_count++;
+            }
+            quoted.append(backslash_count, L'\\');
+        }
+        quoted.push_back(L'"');
+        return quoted;
+    }
+
+    // 核心逻辑：合并参数并处理 Feature Flags
+    std::wstring ProcessAndReassemble(
+        const std::wstring& raw_cmd_line,
+        const std::vector<std::wstring>& extra_args
+    ) {
+        // [修改] 移除结构化绑定 auto [a, b] = ...
+        std::pair<std::wstring, std::wstring> split_res = SplitSingleArgumentSwitch(raw_cmd_line);
+        std::wstring main_cmd = split_res.first;
+        std::wstring suffix = split_res.second;
+
+        auto args = ParseCommandLineArgs(main_cmd);
+
+        if (!args.empty()) {
+            args.insert(args.begin() + 1, extra_args.begin(), extra_args.end());
+        } else {
+            args = extra_args;
+        }
+
+        std::vector<std::wstring> final_args;
+        final_args.reserve(args.size());
+
+        std::wstring combined_disable_features;
+        std::wstring combined_enable_features;
+
+        const std::wstring disable_prefix = L"--disable-features=";
+        const std::wstring enable_prefix = L"--enable-features=";
+
+        for (const auto& arg : args) {
+            if (arg.rfind(disable_prefix, 0) == 0) {
+                if (!combined_disable_features.empty()) combined_disable_features.append(L",");
+                combined_disable_features.append(arg.substr(disable_prefix.length()));
+            }
+            else if (arg.rfind(enable_prefix, 0) == 0) {
+                if (!combined_enable_features.empty()) combined_enable_features.append(L",");
+                combined_enable_features.append(arg.substr(enable_prefix.length()));
+            }
+            else {
+                final_args.push_back(arg);
+            }
+        }
+
+        if (!combined_disable_features.empty()) {
+            final_args.push_back(disable_prefix + combined_disable_features);
+        }
+
+        if (!combined_enable_features.empty()) {
+            final_args.push_back(enable_prefix + combined_enable_features);
+        }
+
+        std::wstring result;
+        for (size_t i = 0; i < final_args.size(); ++i) {
+            result.append(QuoteArg(final_args[i]));
+            if (i < final_args.size() - 1) {
+                result.push_back(L' ');
+            }
+        }
+
+        if (!suffix.empty()) {
+            if (!result.empty()) result.push_back(L' ');
+            result.append(suffix);
+        }
+
+        return result;
+    }
+}
 
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
@@ -3330,31 +3500,50 @@ BOOL CreateProcessInternal(
     LPPROCESS_INFORMATION lpProcessInformation,
     bool isAnsi
 ) {
-    // 1. 处理 ApplicationName (EXE 路径)
+    // 1. 输入参数转换为 Wide String 以便统一处理
     std::wstring exePathW;
-    if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
-    else exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+    if (isAnsi && lpApplicationName) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
+    else exePathW = (lpApplicationName) ? (LPCWSTR)lpApplicationName : L"";
 
     std::wstring cmdLineW;
-    if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
-    else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    if (isAnsi && lpCommandLine) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
+    else cmdLineW = (lpCommandLine) ? (LPCWSTR)lpCommandLine : L"";
 
+    // 2. 路径重定向逻辑 (Portable Mode)
+    // 获取目标 EXE 路径 (优先用 lpApplicationName 没有则解析命令行)
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+
+    // 尝试重定向 EXE 路径
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
-    // 2. 处理 CurrentDirectory (工作目录)
+    // 尝试重定向工作目录
     std::wstring curDirW;
-    if (isAnsi) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
-    else curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+    if (isAnsi && lpCurrentDirectory) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
+    else curDirW = (lpCurrentDirectory) ? (LPCWSTR)lpCurrentDirectory : L"";
 
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
-    // 3. 准备新的参数
+    // 3. Chromium 命令行智能处理 (--single-argument, --disable-features 合并)
+    // 这里可以定义需要强制注入的额外参数 目前留空
+    std::vector<std::wstring> extraArgs;
+
+    // 如果 cmdLineW 为空且 lpApplicationName 不为空 CreateProcess 会用 lpApplicationName 作为命令行
+    // 但为了处理 Feature Flags 我们主要关注显式传入的 cmdLineW
+    if (!cmdLineW.empty()) {
+        cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
+    }
+
+    // 4. 准备最终参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
 
-    std::string ansiExe, ansiDir; // 保持生命周期
+    // 用于保持生命周期的容器
+    std::string ansiExe, ansiDir, ansiCmd;
+    std::vector<wchar_t> wideCmdBuffer;
+    std::vector<char> ansiCmdBuffer;
+    void* finalCmdLinePtr = nullptr;
 
+    // 处理 EXE 路径替换
     if (!redirectedExe.empty()) {
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
         if (isAnsi) {
@@ -3365,6 +3554,7 @@ BOOL CreateProcessInternal(
         }
     }
 
+    // 处理工作目录替换
     if (!redirectedDir.empty()) {
         DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
         if (isAnsi) {
@@ -3375,31 +3565,76 @@ BOOL CreateProcessInternal(
         }
     }
 
-    // 4. 调用原始函数
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result;
+    // 处理命令行 (CreateProcess 要求命令行缓冲区可写)
     if (isAnsi) {
-        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
+        ansiCmd = WideToAnsi(cmdLineW.c_str());
+        // 复制到可写缓冲区
+        ansiCmdBuffer.assign(ansiCmd.begin(), ansiCmd.end());
+        ansiCmdBuffer.push_back('\0');
+        finalCmdLinePtr = ansiCmdBuffer.data();
     } else {
-        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
+        // 复制到可写缓冲区
+        wideCmdBuffer.assign(cmdLineW.begin(), cmdLineW.end());
+        wideCmdBuffer.push_back(L'\0');
+        finalCmdLinePtr = wideCmdBuffer.data();
     }
 
-    // 5. 注入与恢复
+    // 5. 准备注入相关的标志位
+    PROCESS_INFORMATION localPI = { 0 };
+    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+
+    // 检查调用者是否本来就想挂起进程
+    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+    // 强制挂起以便注入
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+
+    // 6. 调用原始函数
+    BOOL result;
+    if (isAnsi) {
+        result = ((P_CreateProcessA)originalFunc)(
+            (LPCSTR)finalAppName,
+            (LPSTR)finalCmdLinePtr,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            newCreationFlags,
+            lpEnvironment,
+            (LPCSTR)finalCurDir,
+            (LPSTARTUPINFOA)lpStartupInfo,
+            pPI
+        );
+    } else {
+        result = ((P_CreateProcessW)originalFunc)(
+            (LPCWSTR)finalAppName,
+            (LPWSTR)finalCmdLinePtr,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            newCreationFlags,
+            lpEnvironment,
+            (LPCWSTR)finalCurDir,
+            (LPSTARTUPINFOW)lpStartupInfo,
+            pPI
+        );
+    }
+
+    // 7. 注入与恢复
     if (result) {
-        // [修改] 增加白名单检查逻辑
-        // 只有当 ShouldHookChildProcess 返回 true 时才请求注入
+        // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
             RequestInjectionFromLauncher(pPI->dwProcessId);
         } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
         }
 
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
+        if (!callerWantedSuspended) {
+            ResumeThread(pPI->hThread);
+        }
+
+        // 清理内部使用的结构
+        if (!lpProcessInformation) {
+            CloseHandle(localPI.hProcess);
+            CloseHandle(localPI.hThread);
+        }
     }
 
     return result;
@@ -4298,9 +4533,17 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // =======================================================
 
     // --- 组 A: 文件系统 Hook ---
-    if (g_HookMode > 0 || g_HookVolumeId) {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-        if (hNtdll) {
+    if (hNtdll) {
+        // 1. 预先初始化必要的函数指针
+        // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
+        // 如果 g_HookMode=0 我们不会挂钩 NtQueryObject 因此必须手动获取其原始地址
+        // 否则 fpNtQueryObject 为 NULL 会导致崩溃
+        if (fpNtQueryObject == NULL) {
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+        }
+
+        // 2. 文件重定向挂钩 (仅当 Mode > 0 时启用)
+        if (g_HookMode > 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
@@ -4311,11 +4554,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [修改] 挂钩 NtQueryObject 以支持路径欺骗
-            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-            if (pNtQueryObject) {
-                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
-            }
+            // 挂钩 NtQueryObject (用于路径伪装)
+            // 注意：MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             // [新增] 挂钩 NtCreateNamedPipeFile
             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
@@ -4328,20 +4569,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
             }
 
-            // [新增] 挂钩 NtQueryVolumeInformationFile
-            if (g_HookVolumeId) {
-                void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
-                if (pNtQueryVolumeInformationFile) {
-                    MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
+            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+            if (hKernel32) {
+                void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+                if (pGetFinalPathNameByHandleW) {
+                    MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
                 }
             }
         }
 
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
-            if (pGetFinalPathNameByHandleW) {
-                MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        // 3. 卷序列号挂钩 (独立控制)
+        if (g_HookVolumeId) {
+            void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
+            if (pNtQueryVolumeInformationFile) {
+                MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
             }
         }
     }

@@ -4268,7 +4268,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -4950,6 +4950,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
             int netBlockMode = _wtoi(netBlockVal.c_str());
 
+            // [新增] 解析 hookvolumeid (修复未声明标识符错误)
+            std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
+
             // 2. [新增] 解析 Injector 配置 (检查是否有第三方DLL)
             bool hasThirdPartyDlls = false;
             {
@@ -4977,7 +4980,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
-            if (hookMode == 0 && netBlockMode == 0 && !hasThirdPartyDlls) {
+            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && !hasThirdPartyDlls) {
                 LaunchApplication(iniContent, variables);
             }
             else {
