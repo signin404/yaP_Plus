@@ -20,6 +20,7 @@
 #include <shellapi.h>
 #include <string_view>
 #include <numeric>
+#include <intrin.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -30,24 +31,116 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// 导出函数转发
-#pragma comment(linker, "/export:GetFileVersionInfoA=C:\\Windows\\System32\\version.GetFileVersionInfoA")
-#pragma comment(linker, "/export:GetFileVersionInfoByHandle=C:\\Windows\\System32\\version.GetFileVersionInfoByHandle")
-#pragma comment(linker, "/export:GetFileVersionInfoExA=C:\\Windows\\System32\\version.GetFileVersionInfoExA")
-#pragma comment(linker, "/export:GetFileVersionInfoExW=C:\\Windows\\System32\\version.GetFileVersionInfoExW")
-#pragma comment(linker, "/export:GetFileVersionInfoSizeA=C:\\Windows\\System32\\version.GetFileVersionInfoSizeA")
-#pragma comment(linker, "/export:GetFileVersionInfoSizeExA=C:\\Windows\\System32\\version.GetFileVersionInfoSizeExA")
-#pragma comment(linker, "/export:GetFileVersionInfoSizeExW=C:\\Windows\\System32\\version.GetFileVersionInfoSizeExW")
-#pragma comment(linker, "/export:GetFileVersionInfoSizeW=C:\\Windows\\System32\\version.GetFileVersionInfoSizeW")
-#pragma comment(linker, "/export:GetFileVersionInfoW=C:\\Windows\\System32\\version.GetFileVersionInfoW")
-#pragma comment(linker, "/export:VerFindFileA=C:\\Windows\\System32\\version.VerFindFileA")
-#pragma comment(linker, "/export:VerFindFileW=C:\\Windows\\System32\\version.VerFindFileW")
-#pragma comment(linker, "/export:VerInstallFileA=C:\\Windows\\System32\\version.VerInstallFileA")
-#pragma comment(linker, "/export:VerInstallFileW=C:\\Windows\\System32\\version.VerInstallFileW")
-#pragma comment(linker, "/export:VerLanguageNameA=C:\\Windows\\System32\\version.VerLanguageNameA")
-#pragma comment(linker, "/export:VerLanguageNameW=C:\\Windows\\System32\\version.VerLanguageNameW")
-#pragma comment(linker, "/export:VerQueryValueA=C:\\Windows\\System32\\version.VerQueryValueA")
-#pragma comment(linker, "/export:VerQueryValueW=C:\\Windows\\System32\\version.VerQueryValueW")
+// [新增] Dynamic Self-Detouring (移植自 hijack.cc)
+// 1. 定义防止优化的宏 (填充 NOP 指令并返回唯一计数器)
+// 这确保了每个导出函数的函数体都是独一无二的 防止编译器合并地址
+#define NOP_FUNC \
+  { \
+    __nop(); __nop(); __nop(); __nop(); \
+    __nop(); __nop(); __nop(); __nop(); \
+    __nop(); __nop(); __nop(); __nop(); \
+    __nop(); __nop(); __nop(); __nop(); \
+    return __COUNTER__; \
+  }
+
+// 定义导出函数的宏
+#define EXPORT_FUNC(api) int __cdecl api() NOP_FUNC
+
+// 2. 定义导出函数 (位于 hijack 命名空间 避免命名冲突)
+namespace hijack {
+    EXPORT_FUNC(GetFileVersionInfoA)
+    EXPORT_FUNC(GetFileVersionInfoByHandle)
+    EXPORT_FUNC(GetFileVersionInfoExA)
+    EXPORT_FUNC(GetFileVersionInfoExW)
+    EXPORT_FUNC(GetFileVersionInfoSizeA)
+    EXPORT_FUNC(GetFileVersionInfoSizeExA)
+    EXPORT_FUNC(GetFileVersionInfoSizeExW)
+    EXPORT_FUNC(GetFileVersionInfoSizeW)
+    EXPORT_FUNC(GetFileVersionInfoW)
+    EXPORT_FUNC(VerFindFileA)
+    EXPORT_FUNC(VerFindFileW)
+    EXPORT_FUNC(VerInstallFileA)
+    EXPORT_FUNC(VerInstallFileW)
+    EXPORT_FUNC(VerLanguageNameA)
+    EXPORT_FUNC(VerLanguageNameW)
+    EXPORT_FUNC(VerQueryValueA)
+    EXPORT_FUNC(VerQueryValueW)
+}
+
+// 3. 导出指令 (将导出名指向 hijack 命名空间中的内部函数)
+// 注意：这里的修饰名 (?GetFileVersionInfoA@hijack@@YAHXZ) 是 MSVC C++ 的标准修饰
+#pragma comment(linker, "/export:GetFileVersionInfoA=?GetFileVersionInfoA@hijack@@YAHXZ,@1")
+#pragma comment(linker, "/export:GetFileVersionInfoByHandle=?GetFileVersionInfoByHandle@hijack@@YAHXZ,@2")
+#pragma comment(linker, "/export:GetFileVersionInfoExA=?GetFileVersionInfoExA@hijack@@YAHXZ,@3")
+#pragma comment(linker, "/export:GetFileVersionInfoExW=?GetFileVersionInfoExW@hijack@@YAHXZ,@4")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeA=?GetFileVersionInfoSizeA@hijack@@YAHXZ,@5")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeExA=?GetFileVersionInfoSizeExA@hijack@@YAHXZ,@6")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeExW=?GetFileVersionInfoSizeExW@hijack@@YAHXZ,@7")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeW=?GetFileVersionInfoSizeW@hijack@@YAHXZ,@8")
+#pragma comment(linker, "/export:GetFileVersionInfoW=?GetFileVersionInfoW@hijack@@YAHXZ,@9")
+#pragma comment(linker, "/export:VerFindFileA=?VerFindFileA@hijack@@YAHXZ,@10")
+#pragma comment(linker, "/export:VerFindFileW=?VerFindFileW@hijack@@YAHXZ,@11")
+#pragma comment(linker, "/export:VerInstallFileA=?VerInstallFileA@hijack@@YAHXZ,@12")
+#pragma comment(linker, "/export:VerInstallFileW=?VerInstallFileW@hijack@@YAHXZ,@13")
+#pragma comment(linker, "/export:VerLanguageNameA=?VerLanguageNameA@hijack@@YAHXZ,@14")
+#pragma comment(linker, "/export:VerLanguageNameW=?VerLanguageNameW@hijack@@YAHXZ,@15")
+#pragma comment(linker, "/export:VerQueryValueA=?VerQueryValueA@hijack@@YAHXZ,@16")
+#pragma comment(linker, "/export:VerQueryValueW=?VerQueryValueW@hijack@@YAHXZ,@17")
+
+// 4. 动态挂钩逻辑 (核心实现)
+// 该函数会遍历当前 DLL 的导出表 找到上述虚假函数 并将其 Hook 到系统真实的 version.dll 上
+void LoadSysDll(HMODULE hModule) {
+    // 获取当前模块的基址和 DOS 头
+    PBYTE imageBase = (PBYTE)hModule;
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)imageBase;
+
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+    // 获取 NT 头
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(imageBase + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
+
+    // 获取导出表 RVA
+    DWORD exportDirRva = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (exportDirRva == 0) return;
+
+    PIMAGE_EXPORT_DIRECTORY exportDir = (PIMAGE_EXPORT_DIRECTORY)(imageBase + exportDirRva);
+
+    // 获取导出表中的数组指针
+    DWORD* names = (DWORD*)(imageBase + exportDir->AddressOfNames);
+    DWORD* funcs = (DWORD*)(imageBase + exportDir->AddressOfFunctions);
+    WORD* ordinals = (WORD*)(imageBase + exportDir->AddressOfNameOrdinals);
+
+    // 加载系统原始 version.dll
+    wchar_t systemDir[MAX_PATH];
+    GetSystemDirectoryW(systemDir, MAX_PATH);
+    std::wstring sysDllPath = std::wstring(systemDir) + L"\\version.dll";
+
+    HMODULE hSysDll = LoadLibraryW(sysDllPath.c_str());
+    if (!hSysDll) return;
+
+    // 遍历当前 DLL 的导出函数
+    for (DWORD i = 0; i < exportDir->NumberOfNames; ++i) {
+        // 获取导出函数名 (例如 "GetFileVersionInfoA")
+        char* funcName = (char*)(imageBase + names[i]);
+
+        // 获取当前 DLL 中该函数的地址 (即我们的 NOP_FUNC)
+        void* pMyFunc = (void*)(imageBase + funcs[ordinals[i]]);
+
+        // 获取系统 DLL 中同名函数的地址 (真实实现)
+        void* pRealFunc = (void*)GetProcAddress(hSysDll, funcName);
+
+        if (pMyFunc && pRealFunc) {
+            // 使用 MinHook 将我们的虚假函数重定向到系统真实函数
+            // 这样当程序调用我们的导出函数时 会直接跳转到系统函数
+            MH_CreateHook(pMyFunc, pRealFunc, NULL);
+            MH_QueueEnableHook(pMyFunc);
+        }
+    }
+
+    // 批量启用 Hook
+    MH_ApplyQueued();
+}
 
 // -----------------------------------------------------------
 // 1. 常量和宏补全
@@ -723,6 +816,7 @@ std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
 DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
+HMODULE g_hModule = NULL;
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3510,7 +3604,7 @@ BOOL CreateProcessInternal(
     else cmdLineW = (lpCommandLine) ? (LPCWSTR)lpCommandLine : L"";
 
     // 2. 路径重定向逻辑 (Portable Mode)
-    // 获取目标 EXE 路径 (优先用 lpApplicationName，没有则解析命令行)
+    // 获取目标 EXE 路径 (优先用 lpApplicationName 没有则解析命令行)
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
 
     // 尝试重定向 EXE 路径
@@ -3524,11 +3618,11 @@ BOOL CreateProcessInternal(
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
     // 3. Chromium 命令行智能处理 (--single-argument, --disable-features 合并)
-    // 这里可以定义需要强制注入的额外参数，目前留空
+    // 这里可以定义需要强制注入的额外参数 目前留空
     std::vector<std::wstring> extraArgs;
 
-    // 如果 cmdLineW 为空且 lpApplicationName 不为空，CreateProcess 会用 lpApplicationName 作为命令行
-    // 但为了处理 Feature Flags，我们主要关注显式传入的 cmdLineW
+    // 如果 cmdLineW 为空且 lpApplicationName 不为空 CreateProcess 会用 lpApplicationName 作为命令行
+    // 但为了处理 Feature Flags 我们主要关注显式传入的 cmdLineW
     if (!cmdLineW.empty()) {
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
     }
@@ -4528,6 +4622,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 7. 初始化 MinHook
     if (MH_Initialize() != MH_OK) return 0;
 
+    // [新增] 加载系统 DLL 并挂钩导出函数 (Dynamic Self-Detouring)
+    // 必须在 MH_Initialize 之后调用
+    if (g_hModule) {
+        LoadSysDll(g_hModule);
+    }
+
     // =======================================================
     // 分组挂钩逻辑
     // =======================================================
@@ -4696,6 +4796,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        g_hModule = hinst; // [新增] 保存句柄
         CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
