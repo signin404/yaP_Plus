@@ -4533,7 +4533,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // =======================================================
 
     // --- 组 A: 文件系统 Hook ---
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         // 1. 预先初始化必要的函数指针
         // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
