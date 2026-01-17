@@ -4145,24 +4145,41 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 void InstallOepHook() {
     // 1. 初始化 MinHook
     if (MH_Initialize() != MH_OK) {
+        DebugLog(L"OEP: MH_Initialize failed");
         return;
     }
 
     // 2. 获取当前进程的主模块信息
     MODULEINFO mi = { 0 };
-    if (!GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof(MODULEINFO))) {
+    HMODULE hModule = GetModuleHandleW(NULL);
+    if (!GetModuleInformation(GetCurrentProcess(), hModule, &mi, sizeof(MODULEINFO))) {
+        DebugLog(L"OEP: GetModuleInformation failed");
         return;
     }
 
     // 3. Hook 入口点
-    // mi.EntryPoint 是 EXE 的入口地址
-    // Loader 是我们的代理函数
-    // fpExeMain 将保存原始入口地址
-    MH_CreateHook(mi.EntryPoint, &Loader, reinterpret_cast<LPVOID*>(&fpExeMain));
+    // 这里的 fpExeMain 必须初始化为 NULL
+    if (MH_CreateHook(mi.EntryPoint, &Loader, reinterpret_cast<LPVOID*>(&fpExeMain)) != MH_OK) {
+        DebugLog(L"OEP: MH_CreateHook failed");
+        return;
+    }
 
     // 4. 立即启用 OEP Hook
-    // 这样当 DllMain 返回后，系统跳转到 EntryPoint 时，实际上会进入 Loader
-    MH_EnableHook(mi.EntryPoint);
+    if (MH_EnableHook(mi.EntryPoint) != MH_OK) {
+        DebugLog(L"OEP: MH_EnableHook failed");
+        return;
+    }
+
+    // [新增] 5. 在此处发送“就绪”信号
+    // 告诉 Launcher：DLL 已注入，OEP Hook 已就绪，可以恢复主线程了
+    std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
+    HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
+    if (hEvent) {
+        SetEvent(hEvent);
+        CloseHandle(hEvent);
+    }
+
+    // DebugLog(L"OEP: Hook installed at %p", mi.EntryPoint);
 }
 
 void SetupHooks() {
@@ -4486,22 +4503,13 @@ void SetupHooks() {
     // MinHook 只会启用之前调用过 MH_CreateHook 的函数 未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
-    // 10. 通知启动器就绪
-    std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
-    HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
-    if (hEvent) {
-        SetEvent(hEvent);
-        CloseHandle(hEvent);
-    }
-
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
-
+        // 直接调用安装函数
         InstallOepHook();
-
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
     }
