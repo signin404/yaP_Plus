@@ -1900,9 +1900,10 @@ struct RecursionGuard {
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap, HANDLE hExistingDir = NULL) {
     HANDLE hDir = hExistingDir;
     bool closeHandle = false;
+    bool useExisting = (hDir != NULL);
 
-    // 只有在没有现有句柄时才尝试打开新句柄
-    if (!hDir) {
+    // 如果没有现有句柄，或者后续需要回退，则打开新句柄
+    if (!useExisting) {
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING uStr;
         IO_STATUS_BLOCK iosb;
@@ -1918,7 +1919,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
         closeHandle = true;
     }
 
-    const size_t bufSize = 4096;
+    const size_t bufSize = 16384; // 增大缓冲区以减少调用次数
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
     IO_STATUS_BLOCK iosb;
@@ -1928,22 +1929,45 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
     if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
 
     while (true) {
-        // 注意：如果是复用 hExistingDir，RestartScan=TRUE (firstQuery) 会重置扫描位置，这是正确的
+        // 使用 FileBothDirectoryInformation (3) 代替 FileIdBoth... 以提高兼容性
         NTSTATUS status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                        FileIdBothDirectoryInformation, FALSE, NULL, firstQuery);
+                                        FileBothDirectoryInformation, FALSE, NULL, firstQuery);
+        
+        // 如果复用句柄失败 (例如权限不足)，且尚未尝试打开新句柄，则尝试回退
+        if (useExisting && !NT_SUCCESS(status) && status != STATUS_NO_MORE_FILES) {
+            useExisting = false; // 标记不再使用现有句柄
+            
+            // 尝试打开新句柄
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, ntPath.c_str());
+            InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            
+            NTSTATUS openStatus = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                           FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+            
+            if (NT_SUCCESS(openStatus)) {
+                closeHandle = true; // 新句柄需要关闭
+                firstQuery = true;  // 重置查询
+                continue;           // 重试循环
+            }
+            // 如果打开也失败，则无法枚举，退出
+            break;
+        }
+
         firstQuery = false;
 
         if (status == STATUS_NO_MORE_FILES) break;
         if (!NT_SUCCESS(status)) break;
 
-        PFILE_ID_BOTH_DIR_INFORMATION info = (PFILE_ID_BOTH_DIR_INFORMATION)buffer.data();
+        PFILE_BOTH_DIR_INFORMATION info = (PFILE_BOTH_DIR_INFORMATION)buffer.data();
         while (true) {
             if (info->FileNameLength > 0) {
                 std::wstring fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
 
                 if (fileName != L"." && fileName != L"..") {
 
-                    // [新增] 核心修复：Mode 3 下对真实目录的子项进行二次过滤
                     bool isVisible = true;
                     if (g_HookMode == 3 && !isSandbox) {
                         std::wstring fullChildPath = pathPrefix + fileName;
@@ -1965,7 +1989,8 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                         entry.ChangeTime = info->ChangeTime;
                         entry.EndOfFile = info->EndOfFile;
                         entry.AllocationSize = info->AllocationSize;
-                        entry.FileId = info->FileId;
+                        // FileBothDirectoryInformation 不包含 ID，生成哈希 ID
+                        entry.FileId = GenerateFileId(fileName);
 
                         if (isSandbox) {
                             ToggleFileIdScramble(&entry.FileId);
@@ -1979,7 +2004,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
             }
 
             if (info->NextEntryOffset == 0) break;
-            info = (PFILE_ID_BOTH_DIR_INFORMATION)((BYTE*)info + info->NextEntryOffset);
+            info = (PFILE_BOTH_DIR_INFORMATION)((BYTE*)info + info->NextEntryOffset);
         }
     }
 
@@ -2015,12 +2040,12 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
 
             // --- 智能 WOW64 重定向控制 ---
-            // 如果传入了 hRealDir，说明句柄已经打开，无需禁用重定向 (句柄已指向正确位置)
             PVOID oldRedirectionValue = NULL;
             BOOL isWow64 = FALSE;
             bool needDisable = false;
 
-            if (hRealDir == NULL) { // 仅当打开新句柄时才需要处理重定向
+            // 仅当需要打开新句柄时才处理重定向 (如果 hRealDir 有效，则它已经指向正确位置)
+            if (hRealDir == NULL) {
                 IsWow64Process(GetCurrentProcess(), &isWow64);
                 if (isWow64) {
                     if (ContainsCaseInsensitive(realNtPath, L"System32")) {
@@ -2032,7 +2057,6 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
                 }
             }
 
-            // [修改] 传入 hRealDir
             EnumerateFilesNt(realNtPath, false, mergedMap, hRealDir);
 
             if (needDisable) {
@@ -2879,10 +2903,13 @@ NTSTATUS HandleDirectoryQuery(
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
-    std::wstring currentPattern = L"*"; 
-
+    
+    // [关键修复] 仅当 FileName 有效时才更新 Pattern
+    // 如果 FileName 为 NULL，则保持现有 Pattern (默认为 *)
+    // 这解决了 PowerShell 在 RestartScan 时传入 NULL 导致 Pattern 被错误重置为 * 的问题
+    std::wstring newPattern = L"";
     if (FileName && FileName->Length > 0) {
-        currentPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
+        newPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
     }
 
     {
@@ -2901,8 +2928,7 @@ NTSTATUS HandleDirectoryQuery(
     }
 
     if (needsBuild) {
-        // [修改] 传入 FileHandle 作为真实目录句柄
-        // 这样 EnumerateFilesNt 可以直接复用它，避免重新打开失败
+        // 传入 FileHandle 以便复用
         BuildMergedDirectoryList(ntDirPath, targetPath, localEntries, FileHandle);
     }
 
@@ -2932,12 +2958,14 @@ NTSTATUS HandleDirectoryQuery(
             ctx->IsInitialized = true;
         }
 
-        if (RestartScan || (FileName && FileName->Length > 0)) {
-            ctx->SearchPattern = currentPattern;
-        }
-        if (ctx->SearchPattern.empty()) {
+        // [关键修复] 更新 Pattern 逻辑
+        if (!newPattern.empty()) {
+            ctx->SearchPattern = newPattern;
+        } else if (ctx->SearchPattern.empty()) {
+            // 如果是首次创建且没有指定 Pattern，则默认为 *
             ctx->SearchPattern = L"*";
         }
+        // 如果 newPattern 为空且 ctx 已有 Pattern (例如 RestartScan)，则保持原 Pattern
     }
 
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
@@ -2955,7 +2983,7 @@ NTSTATUS HandleDirectoryQuery(
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        // [修改] 使用 WildcardMatch
+        // 使用 WildcardMatch
         if (!WildcardMatch(ctx->SearchPattern.c_str(), entry.FileName.c_str())) {
             ctx->CurrentIndex++;
             continue;
