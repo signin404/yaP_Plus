@@ -18,9 +18,9 @@
 #include <shared_mutex>
 #include <mswsock.h>
 #include <shellapi.h>
-#include <psapi.h>
+#include <string_view>
+#include <numeric>
 
-#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -536,6 +536,185 @@ typedef BOOL(WINAPI* P_CreateProcessWithTokenW)(HANDLE, DWORD, LPCWSTR, LPWSTR, 
 typedef BOOL(WINAPI* P_CreateProcessWithLogonW)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef DWORD(WINAPI* P_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
 
+// 命令行处理工具集
+namespace CmdUtils {
+
+    bool IsWhitespace(wchar_t ch) {
+        return wcschr(L" \t\n\r", ch) != nullptr;
+    }
+
+    // 移除字符串末尾的空白
+    void TrimTrailingWhitespace(std::wstring& text) {
+        while (!text.empty() && IsWhitespace(text.back())) {
+            text.pop_back();
+        }
+    }
+
+    // 查找独立的开关（确保不是另一个单词的子串）
+    // 例如：查找 "--foo" 时，不会匹配 "--foobar"
+    std::wstring_view::size_type FindStandaloneSwitch(
+        std::wstring_view command_line,
+        std::wstring_view flag) {
+        auto pos = command_line.find(flag);
+        while (pos != std::wstring_view::npos) {
+            const bool at_start = pos == 0 || IsWhitespace(command_line[pos - 1]);
+            const auto after = pos + flag.size();
+            const bool at_end =
+                after >= command_line.size() || IsWhitespace(command_line[after]);
+            if (at_start && at_end) {
+                return pos;
+            }
+            pos = command_line.find(flag, pos + flag.size());
+        }
+        return std::wstring_view::npos;
+    }
+
+    // 处理 --single-argument 这种特殊情况
+    // 返回值: {前半部分(可解析), 后半部分(保留原样)}
+    std::pair<std::wstring, std::wstring> SplitSingleArgumentSwitch(
+        const std::wstring& command_line) {
+        constexpr std::wstring_view kSingleArgument = L"--single-argument";
+        const auto single_argument_pos =
+            FindStandaloneSwitch(command_line, kSingleArgument);
+
+        if (single_argument_pos == std::wstring_view::npos) {
+            return { command_line, L"" };
+        }
+
+        std::wstring prefix = command_line.substr(0, single_argument_pos);
+        std::wstring suffix = command_line.substr(single_argument_pos);
+        TrimTrailingWhitespace(prefix);
+
+        return { std::move(prefix), std::move(suffix) };
+    }
+
+    // 使用系统 API 解析命令行参数
+    std::vector<std::wstring> ParseCommandLineArgs(const std::wstring& command_line) {
+        std::vector<std::wstring> args;
+        if (command_line.empty()) return args;
+
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(command_line.c_str(), &argc);
+        if (!argv) return args;
+
+        // 注意：CommandLineToArgvW 第一个参数通常是程序路径，这里我们也保留它
+        // 以便后续处理逻辑统一，如果不需要可以从索引 1 开始
+        for (int i = 0; i < argc; ++i) {
+            args.emplace_back(argv[i]);
+        }
+        LocalFree(argv);
+        return args;
+    }
+
+    // 辅助：给参数加引号（如果包含空格）
+    std::wstring QuoteArg(const std::wstring& arg) {
+        if (arg.empty()) return L"\"\"";
+        if (arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
+
+        std::wstring quoted;
+        quoted.push_back(L'"');
+        for (auto it = arg.begin(); it != arg.end(); ++it) {
+            if (*it == L'"') {
+                // 转义引号
+                int backslash_count = 0;
+                auto back_it = it;
+                while (back_it != arg.begin() && *(--back_it) == L'\\') {
+                    backslash_count++;
+                }
+                // 输出双倍的反斜杠
+                quoted.append(backslash_count, L'\\');
+                quoted.append(L"\\\"");
+            }
+            else {
+                quoted.push_back(*it);
+            }
+        }
+        // 处理末尾的反斜杠
+        if (quoted.back() == L'\\') {
+            int backslash_count = 0;
+            auto back_it = quoted.end();
+            while (back_it != quoted.begin() && *(--back_it) == L'\\') {
+                backslash_count++;
+            }
+            quoted.append(backslash_count, L'\\');
+        }
+        quoted.push_back(L'"');
+        return quoted;
+    }
+
+    // 核心逻辑：合并参数并处理 Feature Flags
+    std::wstring ProcessAndReassemble(
+        const std::wstring& raw_cmd_line,
+        const std::vector<std::wstring>& extra_args // 想要注入的额外参数
+    ) {
+        // 1. 分离 --single-argument
+        auto [main_cmd, suffix] = SplitSingleArgumentSwitch(raw_cmd_line);
+
+        // 2. 解析主部分
+        auto args = ParseCommandLineArgs(main_cmd);
+
+        // 3. 插入额外参数 (跳过 argv[0] 程序名)
+        if (!args.empty()) {
+            args.insert(args.begin() + 1, extra_args.begin(), extra_args.end());
+        } else {
+            // 极端情况：命令行是空的
+            args = extra_args;
+        }
+
+        // 4. 处理合并逻辑
+        std::vector<std::wstring> final_args;
+        final_args.reserve(args.size());
+
+        std::wstring combined_disable_features;
+        std::wstring combined_enable_features;
+
+        const std::wstring disable_prefix = L"--disable-features=";
+        const std::wstring enable_prefix = L"--enable-features=";
+
+        for (const auto& arg : args) {
+            if (arg.rfind(disable_prefix, 0) == 0) {
+                if (!combined_disable_features.empty()) combined_disable_features.append(L",");
+                combined_disable_features.append(arg.substr(disable_prefix.length()));
+            }
+            else if (arg.rfind(enable_prefix, 0) == 0) {
+                if (!combined_enable_features.empty()) combined_enable_features.append(L",");
+                combined_enable_features.append(arg.substr(enable_prefix.length()));
+            }
+            else {
+                final_args.push_back(arg);
+            }
+        }
+
+        // 5. 将合并后的 Feature Flags 加回去
+        if (!combined_disable_features.empty()) {
+            // 可以在这里追加硬编码的禁用项，例如：
+            // combined_disable_features.append(L",WebUIInProcessResourceLoading");
+            final_args.push_back(disable_prefix + combined_disable_features);
+        }
+
+        if (!combined_enable_features.empty()) {
+            final_args.push_back(enable_prefix + combined_enable_features);
+        }
+
+        // 6. 重新组装字符串
+        std::wstring result;
+        for (size_t i = 0; i < final_args.size(); ++i) {
+            result.append(QuoteArg(final_args[i]));
+            if (i < final_args.size() - 1) {
+                result.push_back(L' ');
+            }
+        }
+
+        // 7. 接回后缀
+        if (!suffix.empty()) {
+            if (!result.empty()) result.push_back(L' ');
+            result.append(suffix);
+        }
+
+        return result;
+    }
+}
+
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
@@ -573,22 +752,6 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
-
-// [新增] 定义入口点函数类型
-using Startup = int(*)();
-Startup fpExeMain = NULL; // 保存原始入口点
-
-// [新增] 前向声明初始化函数 (原 InitHookThread)
-void SetupHooks();
-
-// [新增] 我们的 Loader 函数，将替换 EXE 的入口点
-int Loader() {
-    // 1. 执行我们的初始化逻辑 (同步执行，确保 Hook 在主程序运行前就绪)
-    SetupHooks();
-
-    // 2. 调用原始入口点，启动主程序
-    return fpExeMain();
-}
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -3348,31 +3511,50 @@ BOOL CreateProcessInternal(
     LPPROCESS_INFORMATION lpProcessInformation,
     bool isAnsi
 ) {
-    // 1. 处理 ApplicationName (EXE 路径)
+    // 1. 输入参数转换为 Wide String 以便统一处理
     std::wstring exePathW;
-    if (isAnsi) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
-    else exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
+    if (isAnsi && lpApplicationName) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
+    else exePathW = (lpApplicationName) ? (LPCWSTR)lpApplicationName : L"";
 
     std::wstring cmdLineW;
-    if (isAnsi) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
-    else cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    if (isAnsi && lpCommandLine) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
+    else cmdLineW = (lpCommandLine) ? (LPCWSTR)lpCommandLine : L"";
 
+    // 2. 路径重定向逻辑 (Portable Mode)
+    // 获取目标 EXE 路径 (优先用 lpApplicationName，没有则解析命令行)
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+
+    // 尝试重定向 EXE 路径
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
-    // 2. 处理 CurrentDirectory (工作目录)
+    // 尝试重定向工作目录
     std::wstring curDirW;
-    if (isAnsi) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
-    else curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+    if (isAnsi && lpCurrentDirectory) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
+    else curDirW = (lpCurrentDirectory) ? (LPCWSTR)lpCurrentDirectory : L"";
 
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
-    // 3. 准备新的参数
+    // 3. Chromium 命令行智能处理 (--single-argument, --disable-features 合并)
+    // 这里可以定义需要强制注入的额外参数，目前留空
+    std::vector<std::wstring> extraArgs;
+
+    // 如果 cmdLineW 为空且 lpApplicationName 不为空，CreateProcess 会用 lpApplicationName 作为命令行
+    // 但为了处理 Feature Flags，我们主要关注显式传入的 cmdLineW
+    if (!cmdLineW.empty()) {
+        cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
+    }
+
+    // 4. 准备最终参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
 
-    std::string ansiExe, ansiDir; // 保持生命周期
+    // 用于保持生命周期的容器
+    std::string ansiExe, ansiDir, ansiCmd;
+    std::vector<wchar_t> wideCmdBuffer;
+    std::vector<char> ansiCmdBuffer;
+    void* finalCmdLinePtr = nullptr;
 
+    // 处理 EXE 路径替换
     if (!redirectedExe.empty()) {
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
         if (isAnsi) {
@@ -3383,6 +3565,7 @@ BOOL CreateProcessInternal(
         }
     }
 
+    // 处理工作目录替换
     if (!redirectedDir.empty()) {
         DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
         if (isAnsi) {
@@ -3393,31 +3576,76 @@ BOOL CreateProcessInternal(
         }
     }
 
-    // 4. 调用原始函数
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result;
+    // 处理命令行 (CreateProcess 要求命令行缓冲区可写)
     if (isAnsi) {
-        result = ((P_CreateProcessA)originalFunc)((LPCSTR)finalAppName, (LPSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCSTR)finalCurDir, (LPSTARTUPINFOA)lpStartupInfo, pPI);
+        ansiCmd = WideToAnsi(cmdLineW.c_str());
+        // 复制到可写缓冲区
+        ansiCmdBuffer.assign(ansiCmd.begin(), ansiCmd.end());
+        ansiCmdBuffer.push_back('\0');
+        finalCmdLinePtr = ansiCmdBuffer.data();
     } else {
-        result = ((P_CreateProcessW)originalFunc)((LPCWSTR)finalAppName, (LPWSTR)lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, (LPCWSTR)finalCurDir, (LPSTARTUPINFOW)lpStartupInfo, pPI);
+        // 复制到可写缓冲区
+        wideCmdBuffer.assign(cmdLineW.begin(), cmdLineW.end());
+        wideCmdBuffer.push_back(L'\0');
+        finalCmdLinePtr = wideCmdBuffer.data();
     }
 
-    // 5. 注入与恢复
+    // 5. 准备注入相关的标志位
+    PROCESS_INFORMATION localPI = { 0 };
+    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+
+    // 检查调用者是否本来就想挂起进程
+    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+    // 强制挂起以便注入
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+
+    // 6. 调用原始函数
+    BOOL result;
+    if (isAnsi) {
+        result = ((P_CreateProcessA)originalFunc)(
+            (LPCSTR)finalAppName,
+            (LPSTR)finalCmdLinePtr,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            newCreationFlags,
+            lpEnvironment,
+            (LPCSTR)finalCurDir,
+            (LPSTARTUPINFOA)lpStartupInfo,
+            pPI
+        );
+    } else {
+        result = ((P_CreateProcessW)originalFunc)(
+            (LPCWSTR)finalAppName,
+            (LPWSTR)finalCmdLinePtr,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            newCreationFlags,
+            lpEnvironment,
+            (LPCWSTR)finalCurDir,
+            (LPSTARTUPINFOW)lpStartupInfo,
+            pPI
+        );
+    }
+
+    // 7. 注入与恢复
     if (result) {
-        // [修改] 增加白名单检查逻辑
-        // 只有当 ShouldHookChildProcess 返回 true 时才请求注入
+        // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
             RequestInjectionFromLauncher(pPI->dwProcessId);
         } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
         }
 
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
+        if (!callerWantedSuspended) {
+            ResumeThread(pPI->hThread);
+        }
+
+        // 清理内部使用的结构
+        if (!lpProcessInformation) {
+            CloseHandle(localPI.hProcess);
+            CloseHandle(localPI.hThread);
+        }
     }
 
     return result;
@@ -4141,48 +4369,7 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
     return L"\\??\\" + shortPath;
 }
 
-// [新增] 安装 OEP Hook
-void InstallOepHook() {
-    // 1. 初始化 MinHook
-    if (MH_Initialize() != MH_OK) {
-        DebugLog(L"OEP: MH_Initialize failed");
-        return;
-    }
-
-    // 2. 获取当前进程的主模块信息
-    MODULEINFO mi = { 0 };
-    HMODULE hModule = GetModuleHandleW(NULL);
-    if (!GetModuleInformation(GetCurrentProcess(), hModule, &mi, sizeof(MODULEINFO))) {
-        DebugLog(L"OEP: GetModuleInformation failed");
-        return;
-    }
-
-    // 3. Hook 入口点
-    // 这里的 fpExeMain 必须初始化为 NULL
-    if (MH_CreateHook(mi.EntryPoint, &Loader, reinterpret_cast<LPVOID*>(&fpExeMain)) != MH_OK) {
-        DebugLog(L"OEP: MH_CreateHook failed");
-        return;
-    }
-
-    // 4. 立即启用 OEP Hook
-    if (MH_EnableHook(mi.EntryPoint) != MH_OK) {
-        DebugLog(L"OEP: MH_EnableHook failed");
-        return;
-    }
-
-    // [新增] 5. 在此处发送“就绪”信号
-    // 告诉 Launcher：DLL 已注入，OEP Hook 已就绪，可以恢复主线程了
-    std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
-    HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
-    if (hEvent) {
-        SetEvent(hEvent);
-        CloseHandle(hEvent);
-    }
-
-    // DebugLog(L"OEP: Hook installed at %p", mi.EntryPoint);
-}
-
-void SetupHooks() {
+DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 初始化管道前缀
     InitPipeVirtualization();
     // [新增] 启用特权以支持短文件名设置
@@ -4297,7 +4484,7 @@ void SetupHooks() {
     // 检查根目录是否获取成功
     if (g_SandboxRoot[0] == L'\0') {
         DebugLog(L"Init Failed: YAP_HOOK_PATH not found");
-        return;
+        return 0;
     }
 
     // 6. 初始化特殊目录 NT 路径
@@ -4348,6 +4535,9 @@ void SetupHooks() {
     InitSpoofing();
 
     DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
+
+    // 7. 初始化 MinHook
+    if (MH_Initialize() != MH_OK) return 0;
 
     // =======================================================
     // 分组挂钩逻辑
@@ -4503,13 +4693,21 @@ void SetupHooks() {
     // MinHook 只会启用之前调用过 MH_CreateHook 的函数 未创建的会被忽略
     MH_EnableHook(MH_ALL_HOOKS);
 
+    // 10. 通知启动器就绪
+    std::wstring eventName = GetReadyEventName(GetCurrentProcessId());
+    HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
+    if (hEvent) {
+        SetEvent(hEvent);
+        CloseHandle(hEvent);
+    }
+
+    return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
-        // 直接调用安装函数
-        InstallOepHook();
+        CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
     }
