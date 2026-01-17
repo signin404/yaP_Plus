@@ -551,12 +551,12 @@ namespace CmdUtils {
     }
 
     // 查找独立的开关（确保不是另一个单词的子串）
-    // 例如：查找 "--foo" 时，不会匹配 "--foobar"
-    std::wstring_view::size_type FindStandaloneSwitch(
-        std::wstring_view command_line,
-        std::wstring_view flag) {
+    // [修改] 使用 const std::wstring& 代替 std::wstring_view
+    size_t FindStandaloneSwitch(
+        const std::wstring& command_line,
+        const std::wstring& flag) {
         auto pos = command_line.find(flag);
-        while (pos != std::wstring_view::npos) {
+        while (pos != std::wstring::npos) {
             const bool at_start = pos == 0 || IsWhitespace(command_line[pos - 1]);
             const auto after = pos + flag.size();
             const bool at_end =
@@ -566,18 +566,19 @@ namespace CmdUtils {
             }
             pos = command_line.find(flag, pos + flag.size());
         }
-        return std::wstring_view::npos;
+        return std::wstring::npos;
     }
 
     // 处理 --single-argument 这种特殊情况
     // 返回值: {前半部分(可解析), 后半部分(保留原样)}
     std::pair<std::wstring, std::wstring> SplitSingleArgumentSwitch(
         const std::wstring& command_line) {
-        constexpr std::wstring_view kSingleArgument = L"--single-argument";
+        // [修改] 移除 constexpr string_view
+        const std::wstring kSingleArgument = L"--single-argument";
         const auto single_argument_pos =
             FindStandaloneSwitch(command_line, kSingleArgument);
 
-        if (single_argument_pos == std::wstring_view::npos) {
+        if (single_argument_pos == std::wstring::npos) {
             return { command_line, L"" };
         }
 
@@ -597,8 +598,6 @@ namespace CmdUtils {
         LPWSTR* argv = CommandLineToArgvW(command_line.c_str(), &argc);
         if (!argv) return args;
 
-        // 注意：CommandLineToArgvW 第一个参数通常是程序路径，这里我们也保留它
-        // 以便后续处理逻辑统一，如果不需要可以从索引 1 开始
         for (int i = 0; i < argc; ++i) {
             args.emplace_back(argv[i]);
         }
@@ -615,13 +614,11 @@ namespace CmdUtils {
         quoted.push_back(L'"');
         for (auto it = arg.begin(); it != arg.end(); ++it) {
             if (*it == L'"') {
-                // 转义引号
                 int backslash_count = 0;
                 auto back_it = it;
                 while (back_it != arg.begin() && *(--back_it) == L'\\') {
                     backslash_count++;
                 }
-                // 输出双倍的反斜杠
                 quoted.append(backslash_count, L'\\');
                 quoted.append(L"\\\"");
             }
@@ -629,7 +626,6 @@ namespace CmdUtils {
                 quoted.push_back(*it);
             }
         }
-        // 处理末尾的反斜杠
         if (quoted.back() == L'\\') {
             int backslash_count = 0;
             auto back_it = quoted.end();
@@ -645,23 +641,21 @@ namespace CmdUtils {
     // 核心逻辑：合并参数并处理 Feature Flags
     std::wstring ProcessAndReassemble(
         const std::wstring& raw_cmd_line,
-        const std::vector<std::wstring>& extra_args // 想要注入的额外参数
+        const std::vector<std::wstring>& extra_args
     ) {
-        // 1. 分离 --single-argument
-        auto [main_cmd, suffix] = SplitSingleArgumentSwitch(raw_cmd_line);
+        // [修改] 移除结构化绑定 auto [a, b] = ...
+        std::pair<std::wstring, std::wstring> split_res = SplitSingleArgumentSwitch(raw_cmd_line);
+        std::wstring main_cmd = split_res.first;
+        std::wstring suffix = split_res.second;
 
-        // 2. 解析主部分
         auto args = ParseCommandLineArgs(main_cmd);
 
-        // 3. 插入额外参数 (跳过 argv[0] 程序名)
         if (!args.empty()) {
             args.insert(args.begin() + 1, extra_args.begin(), extra_args.end());
         } else {
-            // 极端情况：命令行是空的
             args = extra_args;
         }
 
-        // 4. 处理合并逻辑
         std::vector<std::wstring> final_args;
         final_args.reserve(args.size());
 
@@ -685,10 +679,7 @@ namespace CmdUtils {
             }
         }
 
-        // 5. 将合并后的 Feature Flags 加回去
         if (!combined_disable_features.empty()) {
-            // 可以在这里追加硬编码的禁用项，例如：
-            // combined_disable_features.append(L",WebUIInProcessResourceLoading");
             final_args.push_back(disable_prefix + combined_disable_features);
         }
 
@@ -696,7 +687,6 @@ namespace CmdUtils {
             final_args.push_back(enable_prefix + combined_enable_features);
         }
 
-        // 6. 重新组装字符串
         std::wstring result;
         for (size_t i = 0; i < final_args.size(); ++i) {
             result.append(QuoteArg(final_args[i]));
@@ -705,7 +695,6 @@ namespace CmdUtils {
             }
         }
 
-        // 7. 接回后缀
         if (!suffix.empty()) {
             if (!result.empty()) result.push_back(L' ');
             result.append(suffix);
