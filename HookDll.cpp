@@ -1897,32 +1897,39 @@ struct RecursionGuard {
 // --- NTDLL Hooks ---
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
-void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
-    HANDLE hDir = INVALID_HANDLE_VALUE;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uStr;
-    IO_STATUS_BLOCK iosb;
+void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap, HANDLE hExistingDir = NULL) {
+    HANDLE hDir = hExistingDir;
+    bool closeHandle = false;
 
-    RtlInitUnicodeString(&uStr, ntPath.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    // 只有在没有现有句柄时才尝试打开新句柄
+    if (!hDir) {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING uStr;
+        IO_STATUS_BLOCK iosb;
 
-    // 打开目录
-    NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                   FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+        RtlInitUnicodeString(&uStr, ntPath.c_str());
+        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    if (!NT_SUCCESS(status)) return;
+        NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+
+        if (!NT_SUCCESS(status)) return;
+        closeHandle = true;
+    }
 
     const size_t bufSize = 4096;
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
+    IO_STATUS_BLOCK iosb;
 
     // [新增] 预先计算路径前缀 用于子项可见性检查
     std::wstring pathPrefix = ntPath;
     if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
 
     while (true) {
-        status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
+        // 注意：如果是复用 hExistingDir，RestartScan=TRUE (firstQuery) 会重置扫描位置，这是正确的
+        NTSTATUS status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
                                         FileIdBothDirectoryInformation, FALSE, NULL, firstQuery);
         firstQuery = false;
 
@@ -1975,7 +1982,8 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
             info = (PFILE_ID_BOTH_DIR_INFORMATION)((BYTE*)info + info->NextEntryOffset);
         }
     }
-    fpNtClose(hDir);
+
+    if (closeHandle) fpNtClose(hDir);
 }
 
 // [修复] 辅助：判断是否为驱动器根目录 (如 C: 或 C:\)
@@ -1999,31 +2007,33 @@ LARGE_INTEGER GenerateFileId(const std::wstring& name) {
 }
 
 // 核心：构建合并后的文件列表
-void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList) {
+void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList, HANDLE hRealDir = NULL) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
     // 1. 扫描真实目录
     if (!realNtPath.empty()) {
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
 
-            // --- 智能 WOW64 重定向控制 (保持原有逻辑) ---
+            // --- 智能 WOW64 重定向控制 ---
+            // 如果传入了 hRealDir，说明句柄已经打开，无需禁用重定向 (句柄已指向正确位置)
             PVOID oldRedirectionValue = NULL;
             BOOL isWow64 = FALSE;
             bool needDisable = false;
 
-            IsWow64Process(GetCurrentProcess(), &isWow64);
-            if (isWow64) {
-                // 简单判断：如果包含 System32 则尝试禁用重定向以读取原生内容
-                if (ContainsCaseInsensitive(realNtPath, L"System32")) {
-                    needDisable = true;
+            if (hRealDir == NULL) { // 仅当打开新句柄时才需要处理重定向
+                IsWow64Process(GetCurrentProcess(), &isWow64);
+                if (isWow64) {
+                    if (ContainsCaseInsensitive(realNtPath, L"System32")) {
+                        needDisable = true;
+                    }
+                }
+                if (needDisable) {
+                    Wow64DisableWow64FsRedirection(&oldRedirectionValue);
                 }
             }
 
-            if (needDisable) {
-                Wow64DisableWow64FsRedirection(&oldRedirectionValue);
-            }
-
-            EnumerateFilesNt(realNtPath, false, mergedMap);
+            // [修改] 传入 hRealDir
+            EnumerateFilesNt(realNtPath, false, mergedMap, hRealDir);
 
             if (needDisable) {
                 Wow64RevertWow64FsRedirection(oldRedirectionValue);
@@ -2031,9 +2041,9 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         }
     }
 
-    // 2. 扫描沙盒目录
+    // 2. 扫描沙盒目录 (始终打开新句柄)
     if (!sandboxNtPath.empty()) {
-        EnumerateFilesNt(sandboxNtPath, true, mergedMap);
+        EnumerateFilesNt(sandboxNtPath, true, mergedMap, NULL);
     }
 
     // 3. 扫描沙盒内的 Sysnative 目录 (仅 32 位进程)
@@ -2041,23 +2051,18 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
     IsWow64Process(GetCurrentProcess(), &isWow64);
 
     if (isWow64 && !sandboxNtPath.empty()) {
-        // 查找 System32 (不区分大小写)
         const wchar_t* pSys32 = StrStrIW(sandboxNtPath.c_str(), L"\\System32");
         if (pSys32) {
             std::wstring sysnativePath = sandboxNtPath;
             size_t pos = pSys32 - sandboxNtPath.c_str();
             sysnativePath.replace(pos + 1, 8, L"Sysnative");
-
-            // 枚举 Sysnative (视为沙盒内容 混淆 ID)
-            EnumerateFilesNt(sysnativePath, true, mergedMap);
+            EnumerateFilesNt(sysnativePath, true, mergedMap, NULL);
         }
     }
 
     // 4. 添加 . 和 ..
-    // 判断是否为根目录 (例如 \??\C: 或 \??\C:\)
     bool isRoot = false;
     if (realNtPath.length() <= 7 && realNtPath.find(L"\\??\\") == 0 && realNtPath.find(L":") != std::wstring::npos) {
-        // 简单检查：如果是盘符根目录
         if (realNtPath.back() == L':' || realNtPath.back() == L'\\') isRoot = true;
     }
 
@@ -2065,7 +2070,6 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
         dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-        // . 和 .. 的 ID 通常由文件系统动态生成 这里可以留空或生成假 ID
         dotEntry.FileId = GenerateFileId(L".");
         outList.push_back(dotEntry);
 
@@ -2875,20 +2879,14 @@ NTSTATUS HandleDirectoryQuery(
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
-    std::wstring currentPattern = L"*"; // 默认匹配所有
+    std::wstring currentPattern = L"*"; 
 
-    // 获取请求的 Pattern (如果有)
     if (FileName && FileName->Length > 0) {
         currentPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
     }
 
-    // --- 阶段 1: 检查是否需要构建 ---
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
-
-        // 逻辑变更：只要 Context 存在且已初始化 就不需要重新构建 (除非 RestartScan)
-        // 我们总是构建完整的列表 (*) 所以不需要根据 FileName 重新构建
-
         if (RestartScan) {
             needsBuild = true;
         } else {
@@ -2902,14 +2900,12 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
-    // --- 阶段 2: 执行 I/O (无锁) ---
     if (needsBuild) {
-        // [修改] 直接传递 NT 路径 不再转换为 DOS 路径
-        // BuildMergedDirectoryList 内部已改为使用 NT API
-        BuildMergedDirectoryList(ntDirPath, targetPath, localEntries);
+        // [修改] 传入 FileHandle 作为真实目录句柄
+        // 这样 EnumerateFilesNt 可以直接复用它，避免重新打开失败
+        BuildMergedDirectoryList(ntDirPath, targetPath, localEntries, FileHandle);
     }
 
-    // --- 阶段 3: 更新上下文 ---
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
 
@@ -2936,19 +2932,14 @@ NTSTATUS HandleDirectoryQuery(
             ctx->IsInitialized = true;
         }
 
-        // [关键修复] 更新搜索模式
-        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL) 更新 Pattern
-        // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
         }
-        // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
             ctx->SearchPattern = L"*";
         }
     }
 
-    // --- 阶段 4: 填充缓冲区 ---
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
 
     if (!ctx || !ctx->IsInitialized) {
@@ -2961,12 +2952,10 @@ NTSTATUS HandleDirectoryQuery(
     ULONG offset = 0;
     void* prevEntryPtr = nullptr;
 
-    // 遍历列表
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        // [关键修复] 过滤逻辑：使用内置 WildcardMatch 替代 PathMatchSpecW
-        // PathMatchSpecW 依赖 shlwapi.dll 且可能在某些环境下行为不一致
+        // [修改] 使用 WildcardMatch
         if (!WildcardMatch(ctx->SearchPattern.c_str(), entry.FileName.c_str())) {
             ctx->CurrentIndex++;
             continue;
@@ -2975,7 +2964,6 @@ NTSTATUS HandleDirectoryQuery(
         ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
         ULONG entrySize = 0;
 
-        // 计算大小
         switch (FileInformationClass) {
             case FileDirectoryInformation: entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes; break;
             case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
@@ -2989,7 +2977,7 @@ NTSTATUS HandleDirectoryQuery(
                 return STATUS_INVALID_INFO_CLASS;
         }
 
-        entrySize = (entrySize + 7) & ~7; // 8字节对齐
+        entrySize = (entrySize + 7) & ~7; 
 
         if (offset + entrySize > Length) {
             if (prevEntryPtr) {
@@ -3007,15 +2995,9 @@ NTSTATUS HandleDirectoryQuery(
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
-        // [修改] 使用 entry 中存储的真实/混淆后的 FileId
         LARGE_INTEGER fileId = entry.FileId;
+        if (fileId.QuadPart == 0) fileId = GenerateFileId(entry.FileName);
 
-        // 兜底：如果 ID 为 0 (异常情况) 回退到哈希生成
-        if (fileId.QuadPart == 0) {
-             fileId = GenerateFileId(entry.FileName);
-        }
-
-        // 填充数据
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
@@ -3124,7 +3106,6 @@ NTSTATUS HandleDirectoryQuery(
         *(ULONG*)prevEntryPtr = 0;
     }
 
-    // 如果没有写入任何字节 说明没有更多文件了 (或者过滤后没有匹配项)
     if (bytesWritten == 0) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
