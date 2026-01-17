@@ -1200,11 +1200,17 @@ std::wstring NtPathToDosPath(const std::wstring& ntPath) {
     if (ntPath.rfind(L"\\??\\", 0) == 0) {
         return ntPath.substr(4);
     }
-    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
-    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
+    
+    // [修复] 尝试处理设备路径
     if (ntPath.find(L"\\Device\\") == 0) {
+        std::wstring converted = DevicePathToNtPath(ntPath);
+        if (converted.rfind(L"\\??\\", 0) == 0) {
+            return converted.substr(4);
+        }
+        // 如果转换失败，确实无法转为 DOS 路径
         return L"";
     }
+    
     return ntPath;
 }
 
@@ -1611,8 +1617,17 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
 
 std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
+    bool isAbsolute = false;
 
-    if (attr->RootDirectory) {
+    // 1. 检查 ObjectName 是否为绝对路径
+    if (attr->ObjectName && attr->ObjectName->Buffer && attr->ObjectName->Length > 0) {
+        if (attr->ObjectName->Buffer[0] == L'\\') {
+            isAbsolute = true;
+        }
+    }
+
+    // 2. 如果不是绝对路径且有 RootDirectory，则解析 RootDirectory
+    if (!isAbsolute && attr->RootDirectory) {
         ULONG len = 0;
         fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
         if (len > 0) {
@@ -1620,7 +1635,15 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
             if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
                 POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
                 if (nameInfo->Name.Buffer) {
-                    fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                    std::wstring rootPath(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                    
+                    // [修复] 尝试将设备路径转换为 NT 路径 (\Device\HarddiskVolume1 -> \??\C:)
+                    if (rootPath.find(L"\\Device\\") == 0) {
+                        std::wstring converted = DevicePathToNtPath(rootPath);
+                        if (!converted.empty()) rootPath = converted;
+                    }
+                    
+                    fullPath = rootPath;
                 }
             }
         }
@@ -1896,91 +1919,47 @@ struct RecursionGuard {
 
 // --- NTDLL Hooks ---
 
-bool WildcardMatch(const wchar_t* pattern, const wchar_t* str) {
-    const wchar_t* p = pattern;
-    const wchar_t* s = str;
-    const wchar_t* star = NULL;
-    const wchar_t* ss = str;
-
-    while (*s) {
-        if (*p == L'?') {
-            p++; s++;
-        }
-        else if (*p == L'*') {
-            star = p++;
-            ss = s;
-        }
-        else if (towlower(*p) == towlower(*s)) {
-            p++; s++;
-        }
-        else {
-            if (star) {
-                p = star + 1;
-                s = ++ss;
-            }
-            else {
-                return false;
-            }
-        }
-    }
-    while (*p == L'*') p++;
-    return !*p;
-}
-
-// [新增] 生成简单的 FileId (基于文件名哈希)
-LARGE_INTEGER GenerateFileId(const std::wstring& name) {
-    LARGE_INTEGER id;
-    std::hash<std::wstring> hasher;
-    // 简单的哈希 确保非零
-    size_t h = hasher(name);
-    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
-    return id;
-}
-
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
-void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap, HANDLE hExistingDir = NULL) {
-    HANDLE hDir = hExistingDir;
-    bool closeHandle = false;
+void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
+    HANDLE hDir = INVALID_HANDLE_VALUE;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    IO_STATUS_BLOCK iosb;
 
-    if (!hDir) {
-        OBJECT_ATTRIBUTES oa;
-        UNICODE_STRING uStr;
-        IO_STATUS_BLOCK iosb;
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        RtlInitUnicodeString(&uStr, ntPath.c_str());
-        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    // 打开目录
+    NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
 
-        NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
-
-        if (!NT_SUCCESS(status)) return;
-        closeHandle = true;
-    }
+    if (!NT_SUCCESS(status)) return;
 
     const size_t bufSize = 4096;
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
-    IO_STATUS_BLOCK iosb;
 
+    // [新增] 预先计算路径前缀 用于子项可见性检查
     std::wstring pathPrefix = ntPath;
     if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
 
     while (true) {
-        // 使用 FileBothDirectoryInformation (更通用)
-        NTSTATUS status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                        FileBothDirectoryInformation, FALSE, NULL, firstQuery);
+        status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
+                                        FileIdBothDirectoryInformation, FALSE, NULL, firstQuery);
         firstQuery = false;
 
         if (status == STATUS_NO_MORE_FILES) break;
         if (!NT_SUCCESS(status)) break;
 
-        PFILE_BOTH_DIR_INFORMATION info = (PFILE_BOTH_DIR_INFORMATION)buffer.data();
+        PFILE_ID_BOTH_DIR_INFORMATION info = (PFILE_ID_BOTH_DIR_INFORMATION)buffer.data();
         while (true) {
             if (info->FileNameLength > 0) {
                 std::wstring fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
 
                 if (fileName != L"." && fileName != L"..") {
+
+                    // [新增] 核心修复：Mode 3 下对真实目录的子项进行二次过滤
                     bool isVisible = true;
                     if (g_HookMode == 3 && !isSandbox) {
                         std::wstring fullChildPath = pathPrefix + fileName;
@@ -2002,9 +1981,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                         entry.ChangeTime = info->ChangeTime;
                         entry.EndOfFile = info->EndOfFile;
                         entry.AllocationSize = info->AllocationSize;
-                        
-                        // 手动生成 ID，因为 FileBothDirectoryInformation 不包含 ID
-                        entry.FileId = GenerateFileId(fileName);
+                        entry.FileId = info->FileId;
 
                         if (isSandbox) {
                             ToggleFileIdScramble(&entry.FileId);
@@ -2018,11 +1995,10 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
             }
 
             if (info->NextEntryOffset == 0) break;
-            info = (PFILE_BOTH_DIR_INFORMATION)((BYTE*)info + info->NextEntryOffset);
+            info = (PFILE_ID_BOTH_DIR_INFORMATION)((BYTE*)info + info->NextEntryOffset);
         }
     }
-
-    if (closeHandle) fpNtClose(hDir);
+    fpNtClose(hDir);
 }
 
 // [修复] 辅助：判断是否为驱动器根目录 (如 C: 或 C:\)
@@ -2035,29 +2011,42 @@ bool IsDriveRoot(const std::wstring& path) {
     return false;
 }
 
+// [新增] 生成简单的 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    std::hash<std::wstring> hasher;
+    // 简单的哈希 确保非零
+    size_t h = hasher(name);
+    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
+    return id;
+}
+
 // 核心：构建合并后的文件列表
-void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList, HANDLE hRealDir = NULL) {
+void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
+    // 1. 扫描真实目录
     if (!realNtPath.empty()) {
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
+
+            // --- 智能 WOW64 重定向控制 (保持原有逻辑) ---
             PVOID oldRedirectionValue = NULL;
             BOOL isWow64 = FALSE;
             bool needDisable = false;
 
-            if (hRealDir == NULL) {
-                IsWow64Process(GetCurrentProcess(), &isWow64);
-                if (isWow64) {
-                    if (ContainsCaseInsensitive(realNtPath, L"System32")) {
-                        needDisable = true;
-                    }
-                }
-                if (needDisable) {
-                    Wow64DisableWow64FsRedirection(&oldRedirectionValue);
+            IsWow64Process(GetCurrentProcess(), &isWow64);
+            if (isWow64) {
+                // 简单判断：如果包含 System32 则尝试禁用重定向以读取原生内容
+                if (ContainsCaseInsensitive(realNtPath, L"System32")) {
+                    needDisable = true;
                 }
             }
 
-            EnumerateFilesNt(realNtPath, false, mergedMap, hRealDir);
+            if (needDisable) {
+                Wow64DisableWow64FsRedirection(&oldRedirectionValue);
+            }
+
+            EnumerateFilesNt(realNtPath, false, mergedMap);
 
             if (needDisable) {
                 Wow64RevertWow64FsRedirection(oldRedirectionValue);
@@ -2065,24 +2054,33 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         }
     }
 
+    // 2. 扫描沙盒目录
     if (!sandboxNtPath.empty()) {
-        EnumerateFilesNt(sandboxNtPath, true, mergedMap, NULL);
+        EnumerateFilesNt(sandboxNtPath, true, mergedMap);
     }
 
+    // 3. 扫描沙盒内的 Sysnative 目录 (仅 32 位进程)
     BOOL isWow64 = FALSE;
     IsWow64Process(GetCurrentProcess(), &isWow64);
+
     if (isWow64 && !sandboxNtPath.empty()) {
+        // 查找 System32 (不区分大小写)
         const wchar_t* pSys32 = StrStrIW(sandboxNtPath.c_str(), L"\\System32");
         if (pSys32) {
             std::wstring sysnativePath = sandboxNtPath;
             size_t pos = pSys32 - sandboxNtPath.c_str();
             sysnativePath.replace(pos + 1, 8, L"Sysnative");
-            EnumerateFilesNt(sysnativePath, true, mergedMap, NULL);
+
+            // 枚举 Sysnative (视为沙盒内容 混淆 ID)
+            EnumerateFilesNt(sysnativePath, true, mergedMap);
         }
     }
 
+    // 4. 添加 . 和 ..
+    // 判断是否为根目录 (例如 \??\C: 或 \??\C:\)
     bool isRoot = false;
     if (realNtPath.length() <= 7 && realNtPath.find(L"\\??\\") == 0 && realNtPath.find(L":") != std::wstring::npos) {
+        // 简单检查：如果是盘符根目录
         if (realNtPath.back() == L':' || realNtPath.back() == L'\\') isRoot = true;
     }
 
@@ -2090,6 +2088,7 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         CachedDirEntry dotEntry = {};
         dotEntry.FileName = L".";
         dotEntry.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        // . 和 .. 的 ID 通常由文件系统动态生成 这里可以留空或生成假 ID
         dotEntry.FileId = GenerateFileId(L".");
         outList.push_back(dotEntry);
 
@@ -2100,6 +2099,7 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         outList.push_back(dotDotEntry);
     }
 
+    // 5. 转为 Vector
     for (const auto& pair : mergedMap) {
         outList.push_back(pair.second);
     }
@@ -2107,9 +2107,25 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
 
 // 辅助：检查 NT 路径对应的文件是否存在
 bool NtPathExists(const std::wstring& ntPath) {
-    std::wstring dosPath = NtPathToDosPath(ntPath);
-    DWORD attrs = GetFileAttributesW(dosPath.c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES;
+    // 使用 NT API 检查文件是否存在，避免 Win32 API (GetFileAttributesW) 的路径转换问题
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    FILE_NETWORK_OPEN_INFORMATION info;
+    
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    
+    // 注意：这里使用原始函数指针，避免递归
+    NTSTATUS status = fpNtQueryFullAttributesFile(&oa, &info);
+    
+    if (NT_SUCCESS(status)) return true;
+    
+    // 如果失败，尝试 DOS 路径回退 (兼容旧逻辑)
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
+        return false;
+    }
+    
+    return false;
 }
 
 // [新增] 初始化管道前缀 (在 InitHookThread 中调用)
@@ -2867,14 +2883,20 @@ NTSTATUS HandleDirectoryQuery(
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
-    std::wstring currentPattern = L"*"; 
+    std::wstring currentPattern = L"*"; // 默认匹配所有
 
+    // 获取请求的 Pattern (如果有)
     if (FileName && FileName->Length > 0) {
         currentPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
     }
 
+    // --- 阶段 1: 检查是否需要构建 ---
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
+
+        // 逻辑变更：只要 Context 存在且已初始化 就不需要重新构建 (除非 RestartScan)
+        // 我们总是构建完整的列表 (*) 所以不需要根据 FileName 重新构建
+
         if (RestartScan) {
             needsBuild = true;
         } else {
@@ -2888,10 +2910,14 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
+    // --- 阶段 2: 执行 I/O (无锁) ---
     if (needsBuild) {
-        BuildMergedDirectoryList(ntDirPath, targetPath, localEntries, FileHandle);
+        // [修改] 直接传递 NT 路径 不再转换为 DOS 路径
+        // BuildMergedDirectoryList 内部已改为使用 NT API
+        BuildMergedDirectoryList(ntDirPath, targetPath, localEntries);
     }
 
+    // --- 阶段 3: 更新上下文 ---
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
 
@@ -2918,14 +2944,19 @@ NTSTATUS HandleDirectoryQuery(
             ctx->IsInitialized = true;
         }
 
+        // [关键修复] 更新搜索模式
+        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL) 更新 Pattern
+        // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
         }
+        // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
             ctx->SearchPattern = L"*";
         }
     }
 
+    // --- 阶段 4: 填充缓冲区 ---
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
 
     if (!ctx || !ctx->IsInitialized) {
@@ -2938,10 +2969,13 @@ NTSTATUS HandleDirectoryQuery(
     ULONG offset = 0;
     void* prevEntryPtr = nullptr;
 
+    // 遍历列表
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        if (!WildcardMatch(ctx->SearchPattern.c_str(), entry.FileName.c_str())) {
+        // [关键修复] 过滤逻辑：使用 PathMatchSpecW 进行通配符匹配
+        // 如果不匹配 跳过此条目 继续下一个
+        if (!PathMatchSpecW(entry.FileName.c_str(), ctx->SearchPattern.c_str())) {
             ctx->CurrentIndex++;
             continue;
         }
@@ -2949,6 +2983,7 @@ NTSTATUS HandleDirectoryQuery(
         ULONG fileNameBytes = (ULONG)(entry.FileName.length() * sizeof(wchar_t));
         ULONG entrySize = 0;
 
+        // 计算大小
         switch (FileInformationClass) {
             case FileDirectoryInformation: entrySize = FIELD_OFFSET(FILE_DIRECTORY_INFORMATION, FileName) + fileNameBytes; break;
             case FileFullDirectoryInformation: entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + fileNameBytes; break;
@@ -2962,7 +2997,7 @@ NTSTATUS HandleDirectoryQuery(
                 return STATUS_INVALID_INFO_CLASS;
         }
 
-        entrySize = (entrySize + 7) & ~7; 
+        entrySize = (entrySize + 7) & ~7; // 8字节对齐
 
         if (offset + entrySize > Length) {
             if (prevEntryPtr) {
@@ -2980,9 +3015,15 @@ NTSTATUS HandleDirectoryQuery(
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
+        // [修改] 使用 entry 中存储的真实/混淆后的 FileId
         LARGE_INTEGER fileId = entry.FileId;
-        if (fileId.QuadPart == 0) fileId = GenerateFileId(entry.FileName);
 
+        // 兜底：如果 ID 为 0 (异常情况) 回退到哈希生成
+        if (fileId.QuadPart == 0) {
+             fileId = GenerateFileId(entry.FileName);
+        }
+
+        // 填充数据
         switch (FileInformationClass) {
             case FileDirectoryInformation: {
                 FILE_DIRECTORY_INFORMATION* info = (FILE_DIRECTORY_INFORMATION*)entryPtr;
@@ -3091,17 +3132,8 @@ NTSTATUS HandleDirectoryQuery(
         *(ULONG*)prevEntryPtr = 0;
     }
 
+    // 如果没有写入任何字节 说明没有更多文件了 (或者过滤后没有匹配项)
     if (bytesWritten == 0) {
-        // [关键修复] 如果是第一次扫描且没有找到文件，必须返回 STATUS_NO_SUCH_FILE
-        // 否则 cmd/PowerShell 会认为目录为空，而不是文件不存在，从而停止搜索 PATHEXT
-        if (RestartScan) {
-             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND; // 0xC0000034L (STATUS_OBJECT_NAME_NOT_FOUND) 或 STATUS_NO_SUCH_FILE (0xC000000F)
-             // 注意：NtQueryDirectoryFile 通常返回 STATUS_NO_SUCH_FILE
-             // 但 STATUS_OBJECT_NAME_NOT_FOUND 也是常见的等价错误
-             // 为了保险，使用 STATUS_NO_SUCH_FILE
-             return ((NTSTATUS)0xC000000FL); 
-        }
-
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
         return STATUS_NO_MORE_FILES;
