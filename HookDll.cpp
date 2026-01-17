@@ -947,10 +947,9 @@ void RefreshDeviceMap() {
 
 // 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // 如果映射表为空，尝试立即刷新一次 (防止初始化竞态条件)
-    if (g_DeviceMap.empty()) {
-        RefreshDeviceMap();
-    }
+    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
+    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
+    if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
         const std::wstring& devPrefix = pair.first;
@@ -1198,11 +1197,12 @@ bool IsPipeOrDevice(LPCWSTR path) {
 }
 
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
-    if (ntPath.rfind(L"\\??\\", 0) == 0) return ntPath.substr(4);
-    // 尝试处理设备路径
+    if (ntPath.rfind(L"\\??\\", 0) == 0) {
+        return ntPath.substr(4);
+    }
+    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
+    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
     if (ntPath.find(L"\\Device\\") == 0) {
-        std::wstring converted = DevicePathToNtPath(ntPath);
-        if (converted.rfind(L"\\??\\", 0) == 0) return converted.substr(4);
         return L"";
     }
     return ntPath;
@@ -1611,17 +1611,8 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
 
 std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
-    bool isAbsolute = false;
 
-    // 1. 检查 ObjectName 是否为绝对路径
-    if (attr->ObjectName && attr->ObjectName->Buffer && attr->ObjectName->Length > 0) {
-        if (attr->ObjectName->Buffer[0] == L'\\') {
-            isAbsolute = true;
-        }
-    }
-
-    // 2. 如果不是绝对路径且有 RootDirectory，则解析 RootDirectory
-    if (!isAbsolute && attr->RootDirectory) {
+    if (attr->RootDirectory) {
         ULONG len = 0;
         fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
         if (len > 0) {
@@ -1629,15 +1620,7 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
             if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
                 POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
                 if (nameInfo->Name.Buffer) {
-                    std::wstring rootPath(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-                    
-                    // [修复] 尝试将设备路径转换为 NT 路径 (\Device\HarddiskVolume1 -> \??\C:)
-                    if (rootPath.find(L"\\Device\\") == 0) {
-                        std::wstring converted = DevicePathToNtPath(rootPath);
-                        if (!converted.empty()) rootPath = converted;
-                    }
-                    
-                    fullPath = rootPath;
+                    fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
                 }
             }
         }
@@ -2099,24 +2082,11 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
     }
 }
 
-// [新增] 重载：直接使用 OBJECT_ATTRIBUTES 检查文件是否存在 (最稳健)
-bool NtPathExists(POBJECT_ATTRIBUTES oa) {
-    FILE_NETWORK_OPEN_INFORMATION info;
-    // 直接使用原始的 OA (包含 RootDirectory 句柄) 查询
-    // 这样可以完美处理相对路径，无需我们自己拼接字符串
-    NTSTATUS status = fpNtQueryFullAttributesFile(oa, &info);
-    return NT_SUCCESS(status);
-}
-
-// [修改] 原有函数：仅用于检查沙盒路径 (绝对路径)
+// 辅助：检查 NT 路径对应的文件是否存在
 bool NtPathExists(const std::wstring& ntPath) {
-    UNICODE_STRING uStr;
-    RtlInitUnicodeString(&uStr, ntPath.c_str());
-    
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    
-    return NtPathExists(&oa);
+    std::wstring dosPath = NtPathToDosPath(ntPath);
+    DWORD attrs = GetFileAttributesW(dosPath.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
 // [新增] 初始化管道前缀 (在 InitHookThread 中调用)
@@ -2309,7 +2279,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         }
 
         bool sandboxExists = NtPathExists(targetNtPath);
-        bool realExists = NtPathExists(ObjectAttributes);
+        bool realExists = NtPathExists(fullNtPath);
 
         // [Mode 3] 可见性检查：如果真实文件存在但被隐藏 视为不存在
         if (g_HookMode == 3 && realExists) {
@@ -4563,9 +4533,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // =======================================================
 
     // --- 组 A: 文件系统 Hook ---
-    if (g_HookMode > 0 || g_HookVolumeId) {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-        if (hNtdll) {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        // 1. 预先初始化必要的函数指针
+        // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
+        // 如果 g_HookMode=0 我们不会挂钩 NtQueryObject 因此必须手动获取其原始地址
+        // 否则 fpNtQueryObject 为 NULL 会导致崩溃
+        if (fpNtQueryObject == NULL) {
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+        }
+
+        // 2. 文件重定向挂钩 (仅当 Mode > 0 时启用)
+        if (g_HookMode > 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
@@ -4576,11 +4555,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
 
-            // [修改] 挂钩 NtQueryObject 以支持路径欺骗
-            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-            if (pNtQueryObject) {
-                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
-            }
+            // 挂钩 NtQueryObject (用于路径伪装)
+            // 注意：MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             // [新增] 挂钩 NtCreateNamedPipeFile
             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
@@ -4593,20 +4570,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 MH_CreateHook(pNtQueryDirectoryFileEx, &Detour_NtQueryDirectoryFileEx, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFileEx));
             }
 
-            // [新增] 挂钩 NtQueryVolumeInformationFile
-            if (g_HookVolumeId) {
-                void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
-                if (pNtQueryVolumeInformationFile) {
-                    MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
+            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+            if (hKernel32) {
+                void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+                if (pGetFinalPathNameByHandleW) {
+                    MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
                 }
             }
         }
 
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
-            if (pGetFinalPathNameByHandleW) {
-                MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+        // 3. 卷序列号挂钩 (独立控制)
+        if (g_HookVolumeId) {
+            void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
+            if (pNtQueryVolumeInformationFile) {
+                MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
             }
         }
     }
