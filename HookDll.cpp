@@ -1900,10 +1900,8 @@ struct RecursionGuard {
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap, HANDLE hExistingDir = NULL) {
     HANDLE hDir = hExistingDir;
     bool closeHandle = false;
-    bool useExisting = (hDir != NULL);
 
-    // 如果没有现有句柄，或者后续需要回退，则打开新句柄
-    if (!useExisting) {
+    if (!hDir) {
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING uStr;
         IO_STATUS_BLOCK iosb;
@@ -1919,43 +1917,18 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
         closeHandle = true;
     }
 
-    const size_t bufSize = 16384; // 增大缓冲区以减少调用次数
+    const size_t bufSize = 4096;
     std::vector<BYTE> buffer(bufSize);
     bool firstQuery = true;
     IO_STATUS_BLOCK iosb;
 
-    // [新增] 预先计算路径前缀 用于子项可见性检查
     std::wstring pathPrefix = ntPath;
     if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
 
     while (true) {
-        // 使用 FileBothDirectoryInformation (3) 代替 FileIdBoth... 以提高兼容性
+        // 使用 FileBothDirectoryInformation (更通用)
         NTSTATUS status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
                                         FileBothDirectoryInformation, FALSE, NULL, firstQuery);
-        
-        // 如果复用句柄失败 (例如权限不足)，且尚未尝试打开新句柄，则尝试回退
-        if (useExisting && !NT_SUCCESS(status) && status != STATUS_NO_MORE_FILES) {
-            useExisting = false; // 标记不再使用现有句柄
-            
-            // 尝试打开新句柄
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, ntPath.c_str());
-            InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            
-            NTSTATUS openStatus = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
-                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                           FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
-            
-            if (NT_SUCCESS(openStatus)) {
-                closeHandle = true; // 新句柄需要关闭
-                firstQuery = true;  // 重置查询
-                continue;           // 重试循环
-            }
-            // 如果打开也失败，则无法枚举，退出
-            break;
-        }
-
         firstQuery = false;
 
         if (status == STATUS_NO_MORE_FILES) break;
@@ -1967,7 +1940,6 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                 std::wstring fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
 
                 if (fileName != L"." && fileName != L"..") {
-
                     bool isVisible = true;
                     if (g_HookMode == 3 && !isSandbox) {
                         std::wstring fullChildPath = pathPrefix + fileName;
@@ -1989,7 +1961,8 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                         entry.ChangeTime = info->ChangeTime;
                         entry.EndOfFile = info->EndOfFile;
                         entry.AllocationSize = info->AllocationSize;
-                        // FileBothDirectoryInformation 不包含 ID，生成哈希 ID
+                        
+                        // 手动生成 ID，因为 FileBothDirectoryInformation 不包含 ID
                         entry.FileId = GenerateFileId(fileName);
 
                         if (isSandbox) {
@@ -2035,16 +2008,12 @@ LARGE_INTEGER GenerateFileId(const std::wstring& name) {
 void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedDirEntry>& outList, HANDLE hRealDir = NULL) {
     std::map<std::wstring, CachedDirEntry> mergedMap;
 
-    // 1. 扫描真实目录
     if (!realNtPath.empty()) {
         if (g_HookMode != 3 || IsPathVisible(realNtPath)) {
-
-            // --- 智能 WOW64 重定向控制 ---
             PVOID oldRedirectionValue = NULL;
             BOOL isWow64 = FALSE;
             bool needDisable = false;
 
-            // 仅当需要打开新句柄时才处理重定向 (如果 hRealDir 有效，则它已经指向正确位置)
             if (hRealDir == NULL) {
                 IsWow64Process(GetCurrentProcess(), &isWow64);
                 if (isWow64) {
@@ -2065,15 +2034,12 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         }
     }
 
-    // 2. 扫描沙盒目录 (始终打开新句柄)
     if (!sandboxNtPath.empty()) {
         EnumerateFilesNt(sandboxNtPath, true, mergedMap, NULL);
     }
 
-    // 3. 扫描沙盒内的 Sysnative 目录 (仅 32 位进程)
     BOOL isWow64 = FALSE;
     IsWow64Process(GetCurrentProcess(), &isWow64);
-
     if (isWow64 && !sandboxNtPath.empty()) {
         const wchar_t* pSys32 = StrStrIW(sandboxNtPath.c_str(), L"\\System32");
         if (pSys32) {
@@ -2084,7 +2050,6 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         }
     }
 
-    // 4. 添加 . 和 ..
     bool isRoot = false;
     if (realNtPath.length() <= 7 && realNtPath.find(L"\\??\\") == 0 && realNtPath.find(L":") != std::wstring::npos) {
         if (realNtPath.back() == L':' || realNtPath.back() == L'\\') isRoot = true;
@@ -2104,7 +2069,6 @@ void BuildMergedDirectoryList(const std::wstring& realNtPath, const std::wstring
         outList.push_back(dotDotEntry);
     }
 
-    // 5. 转为 Vector
     for (const auto& pair : mergedMap) {
         outList.push_back(pair.second);
     }
@@ -2903,13 +2867,10 @@ NTSTATUS HandleDirectoryQuery(
     std::vector<CachedDirEntry> localEntries;
     bool needsBuild = false;
     DirContext* ctx = nullptr;
-    
-    // [关键修复] 仅当 FileName 有效时才更新 Pattern
-    // 如果 FileName 为 NULL，则保持现有 Pattern (默认为 *)
-    // 这解决了 PowerShell 在 RestartScan 时传入 NULL 导致 Pattern 被错误重置为 * 的问题
-    std::wstring newPattern = L"";
+    std::wstring currentPattern = L"*"; 
+
     if (FileName && FileName->Length > 0) {
-        newPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
+        currentPattern.assign(FileName->Buffer, FileName->Length / sizeof(wchar_t));
     }
 
     {
@@ -2928,7 +2889,6 @@ NTSTATUS HandleDirectoryQuery(
     }
 
     if (needsBuild) {
-        // 传入 FileHandle 以便复用
         BuildMergedDirectoryList(ntDirPath, targetPath, localEntries, FileHandle);
     }
 
@@ -2958,14 +2918,12 @@ NTSTATUS HandleDirectoryQuery(
             ctx->IsInitialized = true;
         }
 
-        // [关键修复] 更新 Pattern 逻辑
-        if (!newPattern.empty()) {
-            ctx->SearchPattern = newPattern;
-        } else if (ctx->SearchPattern.empty()) {
-            // 如果是首次创建且没有指定 Pattern，则默认为 *
+        if (RestartScan || (FileName && FileName->Length > 0)) {
+            ctx->SearchPattern = currentPattern;
+        }
+        if (ctx->SearchPattern.empty()) {
             ctx->SearchPattern = L"*";
         }
-        // 如果 newPattern 为空且 ctx 已有 Pattern (例如 RestartScan)，则保持原 Pattern
     }
 
     std::shared_lock<std::shared_mutex> readLock(g_DirContextMutex);
@@ -2983,7 +2941,6 @@ NTSTATUS HandleDirectoryQuery(
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        // 使用 WildcardMatch
         if (!WildcardMatch(ctx->SearchPattern.c_str(), entry.FileName.c_str())) {
             ctx->CurrentIndex++;
             continue;
@@ -3135,6 +3092,16 @@ NTSTATUS HandleDirectoryQuery(
     }
 
     if (bytesWritten == 0) {
+        // [关键修复] 如果是第一次扫描且没有找到文件，必须返回 STATUS_NO_SUCH_FILE
+        // 否则 cmd/PowerShell 会认为目录为空，而不是文件不存在，从而停止搜索 PATHEXT
+        if (RestartScan) {
+             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND; // 0xC0000034L (STATUS_OBJECT_NAME_NOT_FOUND) 或 STATUS_NO_SUCH_FILE (0xC000000F)
+             // 注意：NtQueryDirectoryFile 通常返回 STATUS_NO_SUCH_FILE
+             // 但 STATUS_OBJECT_NAME_NOT_FOUND 也是常见的等价错误
+             // 为了保险，使用 STATUS_NO_SUCH_FILE
+             return ((NTSTATUS)0xC000000FL); 
+        }
+
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
         return STATUS_NO_MORE_FILES;
