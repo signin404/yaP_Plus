@@ -2804,22 +2804,123 @@ BackupEntry ParseBackupEntry(const std::wstring& entry, const std::map<std::wstr
     return result;
 }
 
-// <-- [修改] 目录备份函数 以处理新的 "no overwrite" 逻辑
+// <-- [新增] 获取文件最后修改时间的辅助函数
+bool GetFileLastWriteTime(const std::wstring& path, FILETIME& ft) {
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        ft = data.ftLastWriteTime;
+        return true;
+    }
+    return false;
+}
+
+// <-- [新增] 递归增量同步目录 (源 -> 目标)
+void SyncDirectoryRecursive(const std::wstring& srcDir, const std::wstring& destDir) {
+    // 1. 确保目标目录存在
+    if (!PathFileExistsW(destDir.c_str())) {
+        SHCreateDirectoryExW(NULL, destDir.c_str(), NULL);
+    }
+
+    // 2. 索引目标目录中的所有项 (用于后续判断删除)
+    // Map: 文件名 -> 是否为目录
+    std::map<std::wstring, bool> destItems;
+    WIN32_FIND_DATAW fdDest;
+    std::wstring searchDest = destDir + L"\\*";
+    HANDLE hFindDest = FindFirstFileW(searchDest.c_str(), &fdDest);
+    if (hFindDest != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fdDest.cFileName, L".") == 0 || wcscmp(fdDest.cFileName, L"..") == 0) continue;
+            destItems[fdDest.cFileName] = (fdDest.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+        } while (FindNextFileW(hFindDest, &fdDest));
+        FindClose(hFindDest);
+    }
+
+    // 3. 遍历源目录 执行复制或覆盖
+    WIN32_FIND_DATAW fdSrc;
+    std::wstring searchSrc = srcDir + L"\\*";
+    HANDLE hFindSrc = FindFirstFileW(searchSrc.c_str(), &fdSrc);
+
+    if (hFindSrc != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fdSrc.cFileName, L".") == 0 || wcscmp(fdSrc.cFileName, L"..") == 0) continue;
+
+            std::wstring fileName = fdSrc.cFileName;
+            std::wstring srcPath = srcDir + L"\\" + fileName;
+            std::wstring destPath = destDir + L"\\" + fileName;
+            bool isSrcDir = (fdSrc.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+            // 检查目标是否存在同名项
+            auto it = destItems.find(fileName);
+            bool existsInDest = (it != destItems.end());
+
+            if (existsInDest) {
+                bool isDestDir = it->second;
+                // 从待删除列表中移除 (因为源中存在)
+                destItems.erase(it);
+
+                // 如果类型不匹配 (一个是文件 一个是目录) 先删除目标
+                if (isSrcDir != isDestDir) {
+                    if (isDestDir) PerformFileSystemOperation(FO_DELETE, destPath);
+                    else ActionHelpers::ForceDeleteFile(destPath.c_str());
+                    existsInDest = false;
+                }
+            }
+
+            if (isSrcDir) {
+                // 递归处理子目录
+                SyncDirectoryRecursive(srcPath, destPath);
+            } else {
+                // 处理文件
+                bool needCopy = true;
+                if (existsInDest) {
+                    FILETIME ftDest;
+                    // 对比修改时间
+                    if (GetFileLastWriteTime(destPath, ftDest)) {
+                        if (CompareFileTime(&fdSrc.ftLastWriteTime, &ftDest) == 0) {
+                            needCopy = false; // 时间一致 跳过
+                        }
+                    }
+                }
+
+                if (needCopy) {
+                    // 如果目标存在且只读 CopyFile 可能会失败 所以先尝试移除只读属性
+                    if (existsInDest) {
+                        DWORD attrs = GetFileAttributesW(destPath.c_str());
+                        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                            SetFileAttributesW(destPath.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                        }
+                    }
+                    CopyFileW(srcPath.c_str(), destPath.c_str(), FALSE);
+                }
+            }
+
+        } while (FindNextFileW(hFindSrc, &fdSrc));
+        FindClose(hFindSrc);
+    }
+
+    // 4. 删除目标中有但源中没有的项 (清理旧文件)
+    for (const auto& item : destItems) {
+        std::wstring pathToDelete = destDir + L"\\" + item.first;
+        if (item.second) {
+            // 删除目录
+            PerformFileSystemOperation(FO_DELETE, pathToDelete);
+        } else {
+            // 删除文件
+            ActionHelpers::ForceDeleteFile(pathToDelete.c_str());
+        }
+    }
+}
+
+// <-- [修改] 目录备份函数 以处理新的 "no overwrite" 逻辑 和 "overwrite" 的增量同步逻辑
 void PerformDirectoryBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.source.c_str())) return;
 
     if (entry.overwrite) {
-        // 保持原始的覆盖逻辑
-        std::wstring backupDest = entry.destination + L"_Backup";
-        if (PathFileExistsW(entry.destination.c_str())) {
-            MoveFileW(entry.destination.c_str(), backupDest.c_str());
-        }
-        PerformFileSystemOperation(FO_COPY, entry.source, entry.destination);
-        if (PathFileExistsW(backupDest.c_str())) {
-            PerformFileSystemOperation(FO_DELETE, backupDest);
-        }
+        // [修改] 增量备份模式 (Sync)
+        // 不再暴力删除重建 而是对比时间戳同步
+        SyncDirectoryRecursive(entry.source, entry.destination);
     } else {
-        // 新的、已修正的时间戳备份逻辑
+        // 新的、已修正的时间戳备份逻辑 (保持不变)
         wchar_t destParentDir[MAX_PATH];
         wcscpy_s(destParentDir, entry.destination.c_str());
         PathRemoveFileSpecW(destParentDir); // 获取目标父目录, e.g., "Data\#Backup"
@@ -2834,7 +2935,7 @@ void PerformDirectoryBackup(const BackupEntry& entry) {
     }
 }
 
-// <-- [修改] 文件备份函数 以处理新的 "no overwrite" 逻辑
+// <-- [修改] 文件备份函数 以处理新的 "no overwrite" 逻辑 和 "overwrite" 的增量同步逻辑
 void PerformFileBackup(const BackupEntry& entry) {
     if (!PathFileExistsW(entry.source.c_str())) return;
 
@@ -2849,32 +2950,33 @@ void PerformFileBackup(const BackupEntry& entry) {
     }
 
     if (entry.overwrite) {
-        // 保持原始的覆盖逻辑
-        std::wstring backupDest = entry.destination + L"_Backup";
+        // [修改] 增量备份模式 (仅对比时间)
+        bool needCopy = true;
 
         if (PathFileExistsW(entry.destination.c_str())) {
-            // [新增] 如果临时备份文件已存在（可能是上次意外残留的只读文件） 先强制删除
-            if (PathFileExistsW(backupDest.c_str())) {
-                ActionHelpers::ForceDeleteFile(backupDest.c_str());
+            FILETIME ftSrc, ftDest;
+            if (GetFileLastWriteTime(entry.source.c_str(), ftSrc) &&
+                GetFileLastWriteTime(entry.destination.c_str(), ftDest)) {
+                // 只要时间不一致就覆盖
+                if (CompareFileTime(&ftSrc, &ftDest) == 0) {
+                    needCopy = false;
+                }
             }
-            // 将现有文件移动为备份
-            MoveFileW(entry.destination.c_str(), backupDest.c_str());
+
+            // 如果需要覆盖 且目标只读 先处理属性
+            if (needCopy) {
+                DWORD attrs = GetFileAttributesW(entry.destination.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                    SetFileAttributesW(entry.destination.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+            }
         }
 
-        if (CopyFileW(entry.source.c_str(), entry.destination.c_str(), FALSE)) {
-            // 复制成功
-            if (PathFileExistsW(backupDest.c_str())) {
-                // [修改] 使用强制删除函数删除临时备份 (解决只读文件无法删除的问题)
-                ActionHelpers::ForceDeleteFile(backupDest.c_str());
-            }
-        } else {
-            // [新增] 复制失败时的回滚逻辑：尝试将备份文件恢复回去
-            if (PathFileExistsW(backupDest.c_str())) {
-                MoveFileW(backupDest.c_str(), entry.destination.c_str());
-            }
+        if (needCopy) {
+            CopyFileW(entry.source.c_str(), entry.destination.c_str(), FALSE);
         }
     } else {
-        // 新的、已修正的时间戳备份逻辑
+        // 新的、已修正的时间戳备份逻辑 (保持不变)
         wchar_t destParentDir[MAX_PATH];
         wcscpy_s(destParentDir, entry.destination.c_str());
         PathRemoveFileSpecW(destParentDir); // 获取目标父目录, e.g., "Data\#Backup"
