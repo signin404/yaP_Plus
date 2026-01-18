@@ -4357,7 +4357,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     // [新增] 解析 hookcopysize 配置 (单位: MB)
     std::wstring hookCopySizeVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookcopysize");
-    if (!hookCopySizeVal.empty()) {
+    if (hookMode > 0 && !hookCopySizeVal.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
     } else {
         SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
