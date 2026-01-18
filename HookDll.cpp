@@ -546,7 +546,7 @@ P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
 typedef int GpStatus;
 typedef void GpFontCollection;
 typedef void GpFontFamily;
-typedef GpStatus(stdcall* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
+typedef GpStatus(WINAPI* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
 P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
 
 // 命令行处理工具集
@@ -3430,7 +3430,8 @@ HFONT WINAPI Detour_CreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelf) {
 }
 
 // GDI+ 字体创建 Hook
-GpStatus stdcall Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCollection* fontCollection, GpFontFamily** fontFamily) {
+// [修改] 使用 WINAPI 代替 stdcall
+GpStatus WINAPI Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCollection* fontCollection, GpFontFamily** fontFamily) {
     if (!g_OverrideFontName.empty()) {
         // 直接使用覆盖的字体名称调用原始函数
         return fpGdipCreateFontFamilyFromName(g_OverrideFontName.c_str(), fontCollection, fontFamily);
