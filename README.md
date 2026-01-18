@@ -54,6 +54,7 @@ Just copy and paste to create portable software.
 - [x] (Experimental) Hook Redirect File Operations
 - [x] (Experimental) Hook Forged volume serial number
 - [x] (Experimental) Hook to prevent network connection
+- [x] (Experimental) Hook to replace font
 - [x] (Experimental) Injecting a third-party DLL
 
 ## Unported Features
