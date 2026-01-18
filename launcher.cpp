@@ -4267,8 +4267,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
     }
 
+    // [新增] 解析 hookfont 配置
+    std::wstring hookFontVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfont");
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookFontVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -4323,6 +4326,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
+
+        SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
@@ -4951,7 +4956,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             int netBlockMode = _wtoi(netBlockVal.c_str());
 
             // [新增] 解析 hookvolumeid (修复未声明标识符错误)
-            std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
+            std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid")
+            // [新增] 解析 hookfont
+            std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
 
             // 2. [新增] 解析 Injector 配置 (检查是否有第三方DLL)
             bool hasThirdPartyDlls = false;
@@ -4980,7 +4987,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
-            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && !hasThirdPartyDlls) {
+            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookFontVal.empty() && !hasThirdPartyDlls) {
                 LaunchApplication(iniContent, variables);
             }
             else {
