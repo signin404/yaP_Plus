@@ -542,6 +542,10 @@ P_CreateFontIndirectW fpCreateFontIndirectW = NULL;
 typedef HFONT(WINAPI* P_CreateFontIndirectExW)(const ENUMLOGFONTEXDVW*);
 P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
 
+// [新增] GetStockObject 函数指针
+typedef HGDIOBJ(WINAPI* P_GetStockObject)(int);
+P_GetStockObject fpGetStockObject = NULL;
+
 // GDI+ 函数指针与类型
 typedef int GpStatus;
 typedef void GpFontCollection;
@@ -736,7 +740,8 @@ std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
 std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
 DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
-std::wstring g_OverrideFontName;
+std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
+HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3429,6 +3434,25 @@ HFONT WINAPI Detour_CreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelf) {
     return fpCreateFontIndirectExW(&newElf);
 }
 
+// [新增] GetStockObject 挂钩
+HGDIOBJ WINAPI Detour_GetStockObject(int i) {
+    // 拦截特定的老旧系统字体 ID
+    switch (i) {
+    case OEM_FIXED_FONT:
+    case ANSI_FIXED_FONT:
+    case ANSI_VAR_FONT:
+    case SYSTEM_FONT:
+    case DEVICE_DEFAULT_FONT:
+    case SYSTEM_FIXED_FONT:
+        // 如果我们成功创建了替换字体 则返回它
+        if (g_hNewGSOFont) {
+            return g_hNewGSOFont;
+        }
+        break;
+    }
+    return fpGetStockObject(i);
+}
+
 // GDI+ 字体创建 Hook
 // [修改] 使用 WINAPI 代替 stdcall
 GpStatus WINAPI Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCollection* fontCollection, GpFontFamily** fontFamily) {
@@ -4749,15 +4773,33 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (!g_OverrideFontName.empty()) {
         HMODULE hGdi32 = LoadLibraryW(L"gdi32.dll");
         if (hGdi32) {
+            // 1. 挂钩 CreateFontIndirect 系列
             void* pCreateFontIndirectW = (void*)GetProcAddress(hGdi32, "CreateFontIndirectW");
             if (pCreateFontIndirectW) MH_CreateHook(pCreateFontIndirectW, &Detour_CreateFontIndirectW, reinterpret_cast<LPVOID*>(&fpCreateFontIndirectW));
 
             void* pCreateFontIndirectExW = (void*)GetProcAddress(hGdi32, "CreateFontIndirectExW");
             if (pCreateFontIndirectExW) MH_CreateHook(pCreateFontIndirectExW, &Detour_CreateFontIndirectExW, reinterpret_cast<LPVOID*>(&fpCreateFontIndirectExW));
+
+            // 2. [新增] 准备 GetStockObject 的替换字体
+            // 获取系统当前的非客户区指标（包含标准的界面字体 如 Segoe UI 或 Microsoft YaHei）
+            NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
+            // 注意：在不同 Windows 版本下 sizeof 可能不同 通常这样写兼容性尚可
+            if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+                // 使用 hookfont 指定的名称覆盖系统默认名称
+                wcsncpy_s(ncm.lfMessageFont.lfFaceName, LF_FACESIZE, g_OverrideFontName.c_str(), _TRUNCATE);
+
+                // 创建替换用的字体对象
+                g_hNewGSOFont = CreateFontIndirectW(&ncm.lfMessageFont);
+            }
+
+            // 3. [新增] 挂钩 GetStockObject
+            void* pGetStockObject = (void*)GetProcAddress(hGdi32, "GetStockObject");
+            if (pGetStockObject) {
+                MH_CreateHook(pGetStockObject, &Detour_GetStockObject, reinterpret_cast<LPVOID*>(&fpGetStockObject));
+            }
         }
 
-        // GDI+ Hook (尝试加载 如果程序不使用 GDI+ 则忽略)
-        // 注意：很多现代程序使用 GDI+ 绘制文字
+        // GDI+ Hook ... (保持不变)
         HMODULE hGdiPlus = GetModuleHandleW(L"gdiplus.dll");
         if (!hGdiPlus) hGdiPlus = LoadLibraryW(L"gdiplus.dll");
 
