@@ -1116,6 +1116,15 @@ namespace ActionHelpers {
         DeleteFileW(path.c_str());
     }
 
+    // [新增] 确保文件可写（移除只读属性）
+    // 用于 iniwrite, replace, replaceline 等需要修改现有文件的操作
+    void EnsureFileWritable(const std::wstring& path) {
+        DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+        }
+    }
+
     // Helper to collect all 'path' values from the INI for a specific scope
     std::vector<std::wstring> CollectPathValuesFromIni(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables, EnvVarType type) {
         std::vector<std::wstring> paths;
@@ -2189,6 +2198,9 @@ namespace ActionHelpers {
 
 
     bool WriteFileWithFormat(const std::wstring& path, const std::vector<std::wstring>& lines, const FileContentInfo& info) {
+        // [新增] 写入前确保文件可写 (解决只读文件无法打开的问题)
+        EnsureFileWritable(path);
+
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) return false;
 
