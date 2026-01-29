@@ -5097,8 +5097,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
             int netBlockMode = _wtoi(netBlockVal.c_str());
 
-            // [新增] 解析 hookvolumeid (修复未声明标识符错误)
+            // [新增] 解析 hookvolumeid
             std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
+            // [新增] 解析 hookcd
+            std::wstring hookCdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcd");
             // [新增] 解析 hookfont
             std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
 
