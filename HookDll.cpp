@@ -555,6 +555,31 @@ typedef void GpFontFamily;
 typedef GpStatus(WINAPI* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
 P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
 
+// --- [新增] NLS 函数指针 ---
+typedef UINT(WINAPI* P_GetACP)(void);
+P_GetACP fpGetACP = NULL;
+
+typedef UINT(WINAPI* P_GetOEMCP)(void);
+P_GetOEMCP fpGetOEMCP = NULL;
+
+typedef LCID(WINAPI* P_GetUserDefaultLCID)(void);
+P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
+
+typedef LCID(WINAPI* P_GetSystemDefaultLCID)(void);
+P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
+
+typedef LCID(WINAPI* P_GetThreadLocale)(void);
+P_GetThreadLocale fpGetThreadLocale = NULL;
+
+typedef LANGID(WINAPI* P_GetUserDefaultLangID)(void);
+P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
+
+typedef LANGID(WINAPI* P_GetSystemDefaultLangID)(void);
+P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
+
+typedef int(WINAPI* P_GetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int);
+P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -744,6 +769,10 @@ DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
+
+// --- [新增] 区域伪造全局变量 ---
+UINT g_FakeACP = 0;
+LCID g_FakeLCID = 0;
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3465,6 +3494,53 @@ GpStatus WINAPI Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCol
     return fpGdipCreateFontFamilyFromName(name, fontCollection, fontFamily);
 }
 
+// --- [新增] 区域伪造 Hook 实现 ---
+
+UINT WINAPI Detour_GetACP(void) {
+    return g_FakeACP ? g_FakeACP : fpGetACP();
+}
+
+UINT WINAPI Detour_GetOEMCP(void) {
+    return g_FakeACP ? g_FakeACP : fpGetOEMCP(); // 通常 OEMCP 与 ACP 保持一致以避免兼容性问题
+}
+
+LCID WINAPI Detour_GetUserDefaultLCID(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetUserDefaultLCID();
+}
+
+LCID WINAPI Detour_GetSystemDefaultLCID(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetSystemDefaultLCID();
+}
+
+LCID WINAPI Detour_GetThreadLocale(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetThreadLocale();
+}
+
+LANGID WINAPI Detour_GetUserDefaultLangID(void) {
+    return g_FakeLCID ? LANGIDFROMLCID(g_FakeLCID) : fpGetUserDefaultLangID();
+}
+
+LANGID WINAPI Detour_GetSystemDefaultLangID(void) {
+    return g_FakeLCID ? LANGIDFROMLCID(g_FakeLCID) : fpGetSystemDefaultLangID();
+}
+
+// 拦截 GetLocaleInfoW 以确保返回正确的代码页信息 (例如 CP_ACP)
+int WINAPI Detour_GetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData, int cchData) {
+    // 如果查询的是当前伪造的 Locale 且查询的是代码页
+    if (g_FakeLCID && (Locale == g_FakeLCID || Locale == LOCALE_USER_DEFAULT || Locale == LOCALE_SYSTEM_DEFAULT)) {
+        if ((LCType & ~LOCALE_NOUSEROVERRIDE) == LOCALE_IDEFAULTANSICODEPAGE ||
+            (LCType & ~LOCALE_NOUSEROVERRIDE) == LOCALE_IDEFAULTCODEPAGE) {
+
+            if (cchData == 0) return 6; // 返回所需长度 (最多5位数字+NULL)
+
+            if (lpLCData && cchData > 0) {
+                return swprintf_s(lpLCData, cchData, L"%u", g_FakeACP) > 0 ? (int)wcslen(lpLCData) + 1 : 0;
+            }
+        }
+    }
+    return fpGetLocaleInfoW(Locale, LCType, lpLCData, cchData);
+}
+
 // --- 路径处理辅助函数 ---
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
@@ -4531,6 +4607,28 @@ DWORD WINAPI InitHookThread(LPVOID) {
         DebugLog(L"FontHook: Override font set to '%s'", g_OverrideFontName.c_str());
     }
 
+    // --- [新增] 读取 hooklocale 配置并计算 LCID ---
+    wchar_t localeBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_LOCALE", localeBuffer, 64) > 0) {
+        int cp = _wtoi(localeBuffer);
+        if (cp > 0) {
+            g_FakeACP = (UINT)cp;
+
+            // 根据代码页映射 LCID (常用映射)
+            switch (cp) {
+            case 932: g_FakeLCID = 0x0411; break; // ja-JP
+            case 936: g_FakeLCID = 0x0804; break; // zh-CN
+            case 949: g_FakeLCID = 0x0412; break; // ko-KR
+            case 950: g_FakeLCID = 0x0404; break; // zh-TW
+            case 1250: g_FakeLCID = 0x0405; break; // cs-CZ (Central Europe)
+            case 1251: g_FakeLCID = 0x0419; break; // ru-RU
+            case 1252: g_FakeLCID = 0x0409; break; // en-US
+            default: g_FakeLCID = 0x0409; break;  // 默认回退
+            }
+            DebugLog(L"LocaleHook: Spoofing CP=%u, LCID=%04X", g_FakeACP, g_FakeLCID);
+        }
+    }
+
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -4810,6 +4908,21 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pGdipCreateFontFamilyFromName) {
                 MH_CreateHook(pGdipCreateFontFamilyFromName, &Detour_GdipCreateFontFamilyFromName, reinterpret_cast<LPVOID*>(&fpGdipCreateFontFamilyFromName));
             }
+        }
+    }
+
+    // --- [新增] 组 E: 区域语言 Hook (仅当 hooklocale 有值时启用) ---
+    if (g_FakeACP != 0) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            MH_CreateHook(GetProcAddress(hKernel32, "GetACP"), &Detour_GetACP, reinterpret_cast<LPVOID*>(&fpGetACP));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetOEMCP"), &Detour_GetOEMCP, reinterpret_cast<LPVOID*>(&fpGetOEMCP));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLCID"), &Detour_GetUserDefaultLCID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLCID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultLCID"), &Detour_GetSystemDefaultLCID, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultLCID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetThreadLocale"), &Detour_GetThreadLocale, reinterpret_cast<LPVOID*>(&fpGetThreadLocale));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLangID"), &Detour_GetUserDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLangID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultLangID"), &Detour_GetSystemDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultLangID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetLocaleInfoW"), &Detour_GetLocaleInfoW, reinterpret_cast<LPVOID*>(&fpGetLocaleInfoW));
         }
     }
 
