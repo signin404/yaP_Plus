@@ -693,6 +693,14 @@ P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
 typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
 P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
 
+// --- [新增] 窗口过程与底层退出函数指针 ---
+typedef LRESULT(WINAPI* P_CallWindowProcA)(WNDPROC, HWND, UINT, WPARAM, LPARAM);
+P_CallWindowProcA fpCallWindowProcA = NULL;
+typedef VOID(NTAPI* P_RtlExitUserProcess)(NTSTATUS);
+P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
+typedef VOID(WINAPI* P_PostQuitMessage)(int);
+P_PostQuitMessage fpPostQuitMessage = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -4238,6 +4246,46 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
 }
 
+// --- [新增] CallWindowProcA Hook (解决主菜单/动态更新时的标题乱码) ---
+LRESULT WINAPI Detour_CallWindowProcA(WNDPROC lpPrevWndFunc, HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            // 1. 将 Shift-JIS 转换为 Unicode
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+
+            // 2. 调用 Unicode 版 CallWindowProc
+            // 即使 lpPrevWndFunc 是 ANSI 地址 Windows 也会自动处理转换
+            // 关键是我们传递了正确的 Unicode 字符串给系统
+            return CallWindowProcW(lpPrevWndFunc, hWnd, Msg, wParam, (LPARAM)wText.c_str());
+        }
+    }
+    return fpCallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] 底层退出 Hook (解决进程残留) ---
+
+// Ntdll 级别的退出函数 比 ExitProcess 更底层
+void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
+    // 强制终止当前进程 不等待任何线程清理
+    TerminateProcess(GetCurrentProcess(), Status);
+}
+
+// 看门狗线程：防止 PostQuitMessage 后主循环卡死
+DWORD WINAPI SuicideWatchdog(LPVOID) {
+    Sleep(2000); // 给主程序 2 秒时间正常退出
+    TerminateProcess(GetCurrentProcess(), 0); // 2秒后强制杀进程
+    return 0;
+}
+
+void WINAPI Detour_PostQuitMessage(int nExitCode) {
+    // 当程序请求退出消息循环时 启动一个看门狗线程
+    // 如果程序在 2 秒内没有通过正常途径退出 看门狗会强制杀死它
+    HANDLE hThread = CreateThread(NULL, 0, SuicideWatchdog, NULL, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+
+    fpPostQuitMessage(nExitCode);
+}
+
 // --- 路径处理辅助函数 ---
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
@@ -5752,6 +5800,25 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hGdi32) {
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesExA"), &Detour_EnumFontFamiliesExA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExA));
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesA"), &Detour_EnumFontFamiliesA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesA));
+        }
+    }
+
+    // --- [新增] 组 I: 深度补丁 (CallWindowProc & RtlExitUserProcess) ---
+    if (g_FakeACP != 0) {
+        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+
+        if (hUser32) {
+            // 拦截子类化消息传递 修复动态标题乱码
+            MH_CreateHook(GetProcAddress(hUser32, "CallWindowProcA"), &Detour_CallWindowProcA, reinterpret_cast<LPVOID*>(&fpCallWindowProcA));
+
+            // 拦截退出消息 启动看门狗
+            MH_CreateHook(GetProcAddress(hUser32, "PostQuitMessage"), &Detour_PostQuitMessage, reinterpret_cast<LPVOID*>(&fpPostQuitMessage));
+        }
+
+        if (hNtdll) {
+            // 拦截最底层的用户态退出函数
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlExitUserProcess"), &Detour_RtlExitUserProcess, reinterpret_cast<LPVOID*>(&fpRtlExitUserProcess));
         }
     }
 
