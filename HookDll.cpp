@@ -701,6 +701,38 @@ P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
 typedef VOID(WINAPI* P_PostQuitMessage)(int);
 P_PostQuitMessage fpPostQuitMessage = NULL;
 
+// --- [新增] 窗口属性函数指针 ---
+typedef LONG(WINAPI* P_SetWindowLongA)(HWND, int, LONG);
+P_SetWindowLongA fpSetWindowLongA = NULL;
+typedef LONG(WINAPI* P_GetWindowLongA)(HWND, int);
+P_GetWindowLongA fpGetWindowLongA = NULL;
+
+// 64位兼容定义
+#ifdef _WIN64
+typedef LONG_PTR(WINAPI* P_SetWindowLongPtrA)(HWND, int, LONG_PTR);
+P_SetWindowLongPtrA fpSetWindowLongPtrA = NULL;
+
+typedef LONG_PTR(WINAPI* P_GetWindowLongPtrA)(HWND, int);
+P_GetWindowLongPtrA fpGetWindowLongPtrA = NULL;
+#else
+#define P_SetWindowLongPtrA P_SetWindowLongA
+#define fpSetWindowLongPtrA fpSetWindowLongA
+#define P_GetWindowLongPtrA P_GetWindowLongA
+#define fpGetWindowLongPtrA fpGetWindowLongA
+#endif
+
+typedef BOOL(WINAPI* P_IsWindowUnicode)(HWND);
+P_IsWindowUnicode fpIsWindowUnicode = NULL;
+
+// --- [新增] 窗口过程子类化管理 ---
+// 映射: HWND -> Game's ANSI WndProc
+std::map<HWND, WNDPROC> g_WindowProcMap;
+std::shared_mutex g_WindowProcMutex;
+
+// 映射: HWND -> 是否由我们创建 (用于 IsWindowUnicode 欺骗)
+std::map<HWND, bool> g_HookedWindows;
+std::shared_mutex g_HookedWindowsMutex;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -4107,7 +4139,7 @@ HWND WINAPI Detour_CreateWindowExA(
 
         // 3. 调用 Unicode 版本 API (CreateWindowExW)
         // 这样 Windows 接收到的就是正确的 Unicode 字符 不会乱码
-        return CreateWindowExW(
+        HWND hWnd = CreateWindowExW(
             dwExStyle,
             lpWClass,
             wWindowName.c_str(),
@@ -4118,6 +4150,14 @@ HWND WINAPI Detour_CreateWindowExA(
             hInstance,
             lpParam
         );
+
+        // [新增] 标记窗口
+        if (hWnd) {
+            std::unique_lock<std::shared_mutex> lock(g_HookedWindowsMutex);
+            g_HookedWindows[hWnd] = true;
+        }
+        return hWnd;
+
     }
     return fpCreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 }
@@ -4244,6 +4284,117 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     // EnumFontFamiliesA 比较古老 通常没有 CharSet 参数 直接透传即可
     // 如果需要更严格的控制 可以转码后调用 W 版 但通常没必要
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
+}
+
+// --- [新增] 代理窗口过程 (核心修复：保持窗口为 Unicode) ---
+LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC gameProc = NULL;
+
+    // 1. 获取游戏原始的 ANSI 过程
+    {
+        std::shared_lock<std::shared_mutex> lock(g_WindowProcMutex);
+        auto it = g_WindowProcMap.find(hWnd);
+        if (it != g_WindowProcMap.end()) {
+            gameProc = it->second;
+        }
+    }
+
+    if (!gameProc) {
+        return DefWindowProcW(hWnd, Msg, wParam, lParam);
+    }
+
+    // 2. 消息转码 (Unicode -> Shift-JIS)
+    if (g_FakeACP != 0) {
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            // 系统发来 Unicode，转为 Shift-JIS 给游戏
+            std::string aText = SpoofWideToAnsi((LPCWSTR)lParam);
+            return CallWindowProcA(gameProc, hWnd, Msg, wParam, (LPARAM)aText.c_str());
+        }
+    }
+
+    // 3. 透传其他消息
+    return CallWindowProcA(gameProc, hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] 窗口子类化 Hook ---
+void SubclassWindowInternal(HWND hWnd, LONG_PTR newProc) {
+    if (!newProc) return;
+
+    // 1. 保存游戏的 Proc
+    {
+        std::unique_lock<std::shared_mutex> lock(g_WindowProcMutex);
+        g_WindowProcMap[hWnd] = (WNDPROC)newProc;
+    }
+
+    // 2. 标记窗口
+    {
+        std::unique_lock<std::shared_mutex> lock(g_HookedWindowsMutex);
+        g_HookedWindows[hWnd] = true;
+    }
+
+    // 3. 设置我们的 Unicode 代理 Proc
+    // 关键：调用 W 版 API，强制窗口保持 Unicode 模式
+#ifdef _WIN64
+    SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)ProxyWndProc);
+#else
+    SetWindowLongW(hWnd, GWL_WNDPROC, (LONG)ProxyWndProc);
+#endif
+}
+
+#ifdef _WIN64
+LONG_PTR WINAPI Detour_SetWindowLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLong) {
+    if (g_FakeACP != 0 && nIndex == GWLP_WNDPROC) {
+        SubclassWindowInternal(hWnd, dwNewLong);
+        return (LONG_PTR)fpGetWindowLongPtrA(hWnd, nIndex);
+    }
+    return fpSetWindowLongPtrA(hWnd, nIndex, dwNewLong);
+}
+
+LONG_PTR WINAPI Detour_GetWindowLongPtrA(HWND hWnd, int nIndex) {
+    if (g_FakeACP != 0 && nIndex == GWLP_WNDPROC) {
+        std::shared_lock<std::shared_mutex> lock(g_WindowProcMutex);
+        auto it = g_WindowProcMap.find(hWnd);
+        if (it != g_WindowProcMap.end()) return (LONG_PTR)it->second;
+    }
+    return fpGetWindowLongPtrA(hWnd, nIndex);
+}
+#else
+LONG WINAPI Detour_SetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong) {
+    if (g_FakeACP != 0 && nIndex == GWL_WNDPROC) {
+        SubclassWindowInternal(hWnd, dwNewLong);
+        return fpGetWindowLongA(hWnd, nIndex);
+    }
+    return fpSetWindowLongA(hWnd, nIndex, dwNewLong);
+}
+
+LONG WINAPI Detour_GetWindowLongA(HWND hWnd, int nIndex) {
+    if (g_FakeACP != 0 && nIndex == GWL_WNDPROC) {
+        std::shared_lock<std::shared_mutex> lock(g_WindowProcMutex);
+        auto it = g_WindowProcMap.find(hWnd);
+        if (it != g_WindowProcMap.end()) return (LONG)it->second;
+    }
+    return fpGetWindowLongA(hWnd, nIndex);
+}
+#endif
+
+// 欺骗游戏：即使窗口是 Unicode，也告诉它是 ANSI
+BOOL WINAPI Detour_IsWindowUnicode(HWND hWnd) {
+    if (g_FakeACP != 0) {
+        std::shared_lock<std::shared_mutex> lock(g_HookedWindowsMutex);
+        if (g_HookedWindows.count(hWnd)) return FALSE;
+    }
+    return fpIsWindowUnicode(hWnd);
+}
+
+// --- [新增] CallWindowProcA Hook (辅助修复) ---
+LRESULT WINAPI Detour_CallWindowProcA(WNDPROC lpPrevWndFunc, HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+            return CallWindowProcW(lpPrevWndFunc, hWnd, Msg, wParam, (LPARAM)wText.c_str());
+        }
+    }
+    return fpCallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
 }
 
 // --- [新增] CallWindowProcA Hook (解决主菜单/动态更新时的标题乱码) ---
@@ -5803,21 +5954,31 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- [新增] 组 I: 深度补丁 (CallWindowProc & RtlExitUserProcess) ---
+    // --- [新增] 组 I: 深度补丁 (Subclassing & Exit) ---
     if (g_FakeACP != 0) {
         HMODULE hUser32 = LoadLibraryW(L"user32.dll");
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
 
         if (hUser32) {
-            // 拦截子类化消息传递 修复动态标题乱码
+            // 拦截子类化，防止窗口降级为 ANSI
+            #ifdef _WIN64
+            MH_CreateHook(GetProcAddress(hUser32, "SetWindowLongPtrA"), &Detour_SetWindowLongPtrA, reinterpret_cast<LPVOID*>(&fpSetWindowLongPtrA));
+            MH_CreateHook(GetProcAddress(hUser32, "GetWindowLongPtrA"), &Detour_GetWindowLongPtrA, reinterpret_cast<LPVOID*>(&fpGetWindowLongPtrA));
+            #else
+            MH_CreateHook(GetProcAddress(hUser32, "SetWindowLongA"), &Detour_SetWindowLongA, reinterpret_cast<LPVOID*>(&fpSetWindowLongA));
+            MH_CreateHook(GetProcAddress(hUser32, "GetWindowLongA"), &Detour_GetWindowLongA, reinterpret_cast<LPVOID*>(&fpGetWindowLongA));
+            #endif
+            MH_CreateHook(GetProcAddress(hUser32, "IsWindowUnicode"), &Detour_IsWindowUnicode, reinterpret_cast<LPVOID*>(&fpIsWindowUnicode));
+
+            // 拦截消息传递
             MH_CreateHook(GetProcAddress(hUser32, "CallWindowProcA"), &Detour_CallWindowProcA, reinterpret_cast<LPVOID*>(&fpCallWindowProcA));
 
-            // 拦截退出消息 启动看门狗
+            // 拦截退出消息
             MH_CreateHook(GetProcAddress(hUser32, "PostQuitMessage"), &Detour_PostQuitMessage, reinterpret_cast<LPVOID*>(&fpPostQuitMessage));
         }
 
         if (hNtdll) {
-            // 拦截最底层的用户态退出函数
+            // 拦截最底层的退出函数
             MH_CreateHook(GetProcAddress(hNtdll, "RtlExitUserProcess"), &Detour_RtlExitUserProcess, reinterpret_cast<LPVOID*>(&fpRtlExitUserProcess));
         }
     }
