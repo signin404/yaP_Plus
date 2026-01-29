@@ -679,6 +679,20 @@ P_DefWindowProcA fpDefWindowProcA = NULL;
 // 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
 #define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
 
+// --- [新增] 消息与进程退出函数指针 ---
+typedef LRESULT(WINAPI* P_SendMessageA)(HWND, UINT, WPARAM, LPARAM);
+P_SendMessageA fpSendMessageA = NULL;
+typedef VOID(WINAPI* P_ExitProcess)(UINT);
+P_ExitProcess fpExitProcess = NULL;
+typedef NTSTATUS(NTAPI* P_NtTerminateProcess)(HANDLE, NTSTATUS);
+P_NtTerminateProcess fpNtTerminateProcess = NULL;
+
+// --- [新增] ANSI 字体枚举指针 ---
+typedef int (WINAPI* P_EnumFontFamiliesExA)(HDC, LPLOGFONTA, FONTENUMPROCA, LPARAM, DWORD);
+P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
+typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
+P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -3522,7 +3536,7 @@ int CALLBACK ProxyEnumFontFamExProc(const LOGFONTW* lpelfe, const TEXTMETRICW* l
     EnumFontContext* ctx = (EnumFontContext*)lParam;
 
     // 欺骗程序：告诉它这个字体支持我们伪造的字符集
-    // 即使系统字体实际上不支持 很多程序只要看到 CharSet 匹配就会尝试使用 
+    // 即使系统字体实际上不支持 很多程序只要看到 CharSet 匹配就会尝试使用
     // 而 Windows 的字体链接机制通常能兜底显示正确的字符
     if (g_FakeCharSet != 0) {
         LOGFONTW spoofedLF = *lpelfe;
@@ -4144,6 +4158,84 @@ LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
         }
     }
     return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] SendMessageA Hook (解决标题栏/控件乱码) ---
+LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        // 拦截设置文本的消息
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            // 1. 将 Shift-JIS 转换为 Unicode
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+            // 2. 调用 Unicode 版 SendMessage
+            return SendMessageW(hWnd, Msg, wParam, (LPARAM)wText.c_str());
+        }
+
+        // 拦截获取文本长度的消息 (配合 GetWindowText)
+        // 部分程序先发 WM_GETTEXTLENGTH 再发 WM_GETTEXT
+        if (Msg == WM_GETTEXTLENGTH) {
+            return SendMessageW(hWnd, Msg, wParam, lParam);
+        }
+
+        // 拦截获取文本的消息
+        if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
+            // 1. 调用 Unicode 版获取文本
+            // 注意：wParam 是缓冲区大小（字符数）
+            std::vector<wchar_t> wBuf(wParam + 1);
+            LRESULT wResult = SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+            // 2. 转回 Shift-JIS
+            std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+            // 3. 复制回缓冲区
+            size_t copyLen = min((size_t)wParam - 1, aStr.length());
+            memcpy((void*)lParam, aStr.c_str(), copyLen);
+            ((char*)lParam)[copyLen] = 0;
+
+            return copyLen;
+        }
+    }
+    return fpSendMessageA(hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] 强制退出 Hook (解决进程残留) ---
+
+void WINAPI Detour_ExitProcess(UINT uExitCode) {
+    // 这里的关键是使用 TerminateProcess 而不是 ExitProcess
+    // ExitProcess 会尝试通知所有 DLL (DLL_PROCESS_DETACH) 并等待线程结束 容易导致死锁
+    // TerminateProcess 是内核级强制查杀 瞬间结束 不留后患
+    TerminateProcess(GetCurrentProcess(), uExitCode);
+}
+
+NTSTATUS NTAPI Detour_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
+    // 如果程序尝试结束自己
+    if (!ProcessHandle || ProcessHandle == GetCurrentProcess()) {
+        TerminateProcess(GetCurrentProcess(), 0); // 强制退出
+        return STATUS_SUCCESS; // 实际上永远不会执行到这里
+    }
+    return fpNtTerminateProcess(ProcessHandle, ExitStatus);
+}
+
+// --- [新增] ANSI 字体枚举 Hook (补充) ---
+// 某些游戏使用 ANSI 版枚举字体 如果不 Hook 传入的 Shift-JIS 字体名会被错误解析
+
+int WINAPI Detour_EnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpEnumFontFamExProc, LPARAM lParam, DWORD dwFlags) {
+    if (g_FakeCharSet != 0 && lpLogfont) {
+        // 强制修改请求的字符集
+        if (lpLogfont->lfCharSet == DEFAULT_CHARSET || lpLogfont->lfCharSet == ANSI_CHARSET) {
+            // 我们不能直接修改 const 指针指向的内容 所以复制一份
+            LOGFONTA newLf = *lpLogfont;
+            newLf.lfCharSet = g_FakeCharSet;
+            return fpEnumFontFamiliesExA(hdc, &newLf, lpEnumFontFamExProc, lParam, dwFlags);
+        }
+    }
+    return fpEnumFontFamiliesExA(hdc, lpLogfont, lpEnumFontFamExProc, lParam, dwFlags);
+}
+
+int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lpEnumFontFamProc, LPARAM lParam) {
+    // EnumFontFamiliesA 比较古老 通常没有 CharSet 参数 直接透传即可
+    // 如果需要更严格的控制 可以转码后调用 W 版 但通常没必要
+    return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
 }
 
 // --- 路径处理辅助函数 ---
@@ -5635,6 +5727,31 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hUser32, "SetWindowTextA"), &Detour_SetWindowTextA, reinterpret_cast<LPVOID*>(&fpSetWindowTextA));
             MH_CreateHook(GetProcAddress(hUser32, "GetWindowTextA"), &Detour_GetWindowTextA, reinterpret_cast<LPVOID*>(&fpGetWindowTextA));
             MH_CreateHook(GetProcAddress(hUser32, "DefWindowProcA"), &Detour_DefWindowProcA, reinterpret_cast<LPVOID*>(&fpDefWindowProcA));
+        }
+    }
+
+    // --- [新增] 组 H: 消息与退出 Hook (解决残留和剩余乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE hGdi32 = GetModuleHandleW(L"gdi32.dll");
+
+        if (hUser32) {
+            MH_CreateHook(GetProcAddress(hUser32, "SendMessageA"), &Detour_SendMessageA, reinterpret_cast<LPVOID*>(&fpSendMessageA));
+        }
+
+        if (hKernel32) {
+            MH_CreateHook(GetProcAddress(hKernel32, "ExitProcess"), &Detour_ExitProcess, reinterpret_cast<LPVOID*>(&fpExitProcess));
+        }
+
+        if (hNtdll) {
+            MH_CreateHook(GetProcAddress(hNtdll, "NtTerminateProcess"), &Detour_NtTerminateProcess, reinterpret_cast<LPVOID*>(&fpNtTerminateProcess));
+        }
+
+        if (hGdi32) {
+             MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesExA"), &Detour_EnumFontFamiliesExA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExA));
+             MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesA"), &Detour_EnumFontFamiliesA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesA));
         }
     }
 
