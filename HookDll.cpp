@@ -4874,23 +4874,28 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
             HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
             if (hKernel32) {
+                // 1. 路径欺骗挂钩 (原有)
                 void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
                 if (pGetFinalPathNameByHandleW) {
                     MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
                 }
+
+                // 2. 驱动器枚举与类型挂钩 (新增，用于 hookcd)
+                // 只要 hookcd 启用 (无论是否分配了虚拟盘符，GetDriveTypeW 都需要挂钩以处理路径匹配)
+                if (!g_HookCdPath.empty()) {
+                    void* pGetDriveTypeW = (void*)GetProcAddress(hKernel32, "GetDriveTypeW");
+                    if (pGetDriveTypeW) MH_CreateHook(pGetDriveTypeW, &Detour_GetDriveTypeW, reinterpret_cast<LPVOID*>(&fpGetDriveTypeW));
+                }
+
+                // 3. 虚拟盘符专用挂钩 (仅当分配了虚拟盘符时)
+                if (g_VirtualCdDrive != 0) {
+                    void* pGetLogicalDrives = (void*)GetProcAddress(hKernel32, "GetLogicalDrives");
+                    if (pGetLogicalDrives) MH_CreateHook(pGetLogicalDrives, &Detour_GetLogicalDrives, reinterpret_cast<LPVOID*>(&fpGetLogicalDrives));
+
+                    void* pGetLogicalDriveStringsW = (void*)GetProcAddress(hKernel32, "GetLogicalDriveStringsW");
+                    if (pGetLogicalDriveStringsW) MH_CreateHook(pGetLogicalDriveStringsW, &Detour_GetLogicalDriveStringsW, reinterpret_cast<LPVOID*>(&fpGetLogicalDriveStringsW));
+                }
             }
-        }
-
-        // [新增] 挂钩驱动器枚举 API (仅当 hookcd 启用且分配了虚拟盘符时)
-        if (g_VirtualCdDrive != 0) {
-            void* pGetDriveTypeW = (void*)GetProcAddress(hKernel32, "GetDriveTypeW");
-            if (pGetDriveTypeW) MH_CreateHook(pGetDriveTypeW, &Detour_GetDriveTypeW, reinterpret_cast<LPVOID*>(&fpGetDriveTypeW));
-
-            void* pGetLogicalDrives = (void*)GetProcAddress(hKernel32, "GetLogicalDrives");
-            if (pGetLogicalDrives) MH_CreateHook(pGetLogicalDrives, &Detour_GetLogicalDrives, reinterpret_cast<LPVOID*>(&fpGetLogicalDrives));
-
-            void* pGetLogicalDriveStringsW = (void*)GetProcAddress(hKernel32, "GetLogicalDriveStringsW");
-            if (pGetLogicalDriveStringsW) MH_CreateHook(pGetLogicalDriveStringsW, &Detour_GetLogicalDriveStringsW, reinterpret_cast<LPVOID*>(&fpGetLogicalDriveStringsW));
         }
 
         // 3. 卷序列号挂钩 (独立控制)
