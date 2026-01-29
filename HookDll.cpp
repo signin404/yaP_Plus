@@ -667,6 +667,18 @@ P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegEnumValueA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
 P_RegEnumValueA fpRegEnumValueA = NULL;
 
+// --- [新增] User32 窗口函数指针 ---
+typedef HWND(WINAPI* P_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+P_CreateWindowExA fpCreateWindowExA = NULL;
+typedef BOOL(WINAPI* P_SetWindowTextA)(HWND, LPCSTR);
+P_SetWindowTextA fpSetWindowTextA = NULL;
+typedef int(WINAPI* P_GetWindowTextA)(HWND, LPSTR, int);
+P_GetWindowTextA fpGetWindowTextA = NULL;
+typedef LRESULT(WINAPI* P_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
+P_DefWindowProcA fpDefWindowProcA = NULL;
+// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
+#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -3442,9 +3454,9 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     if (NT_SUCCESS(status) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
 
         // 3. 检查是否查询的是 ACP 或 OEMCP
-        // 注意：为了性能，这里只比较 ValueName。
-        // 严格来说应该检查 KeyHandle 是否指向 Control\Nls\CodePage，但在 HookDLL 中维护句柄映射太重了。
-        // 由于 ACP/OEMCP 名字很特殊，误伤概率极低。
+        // 注意：为了性能 这里只比较 ValueName
+        // 严格来说应该检查 KeyHandle 是否指向 Control\Nls\CodePage 但在 HookDLL 中维护句柄映射太重了
+        // 由于 ACP/OEMCP 名字很特殊 误伤概率极低
 
         bool isACP = (_wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && ValueName->Length == 6);
         bool isOEMCP = (_wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && ValueName->Length == 10);
@@ -3510,13 +3522,13 @@ int CALLBACK ProxyEnumFontFamExProc(const LOGFONTW* lpelfe, const TEXTMETRICW* l
     EnumFontContext* ctx = (EnumFontContext*)lParam;
 
     // 欺骗程序：告诉它这个字体支持我们伪造的字符集
-    // 即使系统字体实际上不支持，很多程序只要看到 CharSet 匹配就会尝试使用，
-    // 而 Windows 的字体链接机制通常能兜底显示正确的字符。
+    // 即使系统字体实际上不支持 很多程序只要看到 CharSet 匹配就会尝试使用 
+    // 而 Windows 的字体链接机制通常能兜底显示正确的字符
     if (g_FakeCharSet != 0) {
         LOGFONTW spoofedLF = *lpelfe;
         spoofedLF.lfCharSet = g_FakeCharSet;
 
-        // 如果是 TEXTMETRIC (TrueType)，也修改
+        // 如果是 TEXTMETRIC (TrueType) 也修改
         TEXTMETRICW spoofedTM = *lpntme;
         spoofedTM.tmCharSet = g_FakeCharSet;
 
@@ -3542,7 +3554,7 @@ int WINAPI Detour_EnumFontFamiliesExW(HDC hdc, LPLOGFONTW lpLogfont, FONTENUMPRO
     return fpEnumFontFamiliesExW(hdc, lpLogfont, lpEnumFontFamExProc, lParam, dwFlags);
 }
 
-// EnumFontsW 和 EnumFontFamiliesW 逻辑类似，通常现代程序用 Ex，为了保险可以一并挂钩
+// EnumFontsW 和 EnumFontFamiliesW 逻辑类似 通常现代程序用 Ex 为了保险可以一并挂钩
 int WINAPI Detour_EnumFontFamiliesW(HDC hdc, LPCWSTR lpszFamily, FONTENUMPROCW lpEnumFontFamProc, LPARAM lParam) {
     if (g_FakeCharSet != 0) {
         EnumFontContext ctx;
@@ -3665,7 +3677,7 @@ void OverrideLogFontName(LPWSTR faceName) {
 
 // [修改] 更新字体 Hook 以强制字符集
 HFONT WINAPI Detour_CreateFontIndirectW(const LOGFONTW* lplf) {
-    // 如果没有启用字体替换且没有启用区域伪造，直接返回
+    // 如果没有启用字体替换且没有启用区域伪造 直接返回
     if (g_OverrideFontName.empty() && g_FakeCharSet == 0) return fpCreateFontIndirectW(lplf);
 
     LOGFONTW newLf = *lplf;
@@ -3676,7 +3688,7 @@ HFONT WINAPI Detour_CreateFontIndirectW(const LOGFONTW* lplf) {
     }
 
     // 2. [新增] 强制字符集 (解决乱码的关键)
-    // 如果程序请求默认字符集，强制改为目标语言字符集
+    // 如果程序请求默认字符集 强制改为目标语言字符集
     if (g_FakeCharSet != 0) {
         if (newLf.lfCharSet == DEFAULT_CHARSET || newLf.lfCharSet == ANSI_CHARSET) {
             newLf.lfCharSet = g_FakeCharSet;
@@ -3786,7 +3798,7 @@ int WINAPI Detour_GetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData, in
 
 // 拦截 ANSI -> Unicode 转换
 int WINAPI Detour_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar) {
-    // 如果程序请求使用系统默认 ANSI 代码页，强制替换为我们伪造的代码页
+    // 如果程序请求使用系统默认 ANSI 代码页 强制替换为我们伪造的代码页
     if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
         CodePage = g_FakeACP;
     }
@@ -3804,13 +3816,13 @@ int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWid
 // --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
 // 很多程序内部使用这个函数而不是 MultiByteToWideChar
 NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
-    // 这里的逻辑稍微复杂，因为 Rtl 函数不接受 CodePage 参数，它默认使用系统当前 ANSI 代码页。
-    // 我们必须手动实现转换，强制使用 g_FakeACP。
+    // 这里的逻辑稍微复杂 因为 Rtl 函数不接受 CodePage 参数 它默认使用系统当前 ANSI 代码页
+    // 我们必须手动实现转换 强制使用 g_FakeACP
 
     if (g_FakeACP != 0) {
         int wLen = 0;
         // 计算所需长度
-        // 注意：MaxBytesInUnicodeString 是字节数，不是字符数
+        // 注意：MaxBytesInUnicodeString 是字节数 不是字符数
         int maxChars = MaxBytesInUnicodeString / sizeof(WCHAR);
 
         // 如果只查询长度 (UnicodeString == NULL)
@@ -3856,7 +3868,7 @@ HFONT WINAPI Detour_CreateFontIndirectA(const LOGFONTA* lplf) {
 
     // 1. 将 LOGFONTA 转换为 LOGFONTW
     // 关键点：使用 g_FakeACP 进行转换！
-    // 如果不 Hook 这里，系统会用 CP_ACP (如 936) 转换 Shift-JIS 名字，结果就是乱码。
+    // 如果不 Hook 这里 系统会用 CP_ACP (如 936) 转换 Shift-JIS 名字 结果就是乱码
     LOGFONTW lfw = { 0 };
 
     lfw.lfHeight = lplf->lfHeight;
@@ -3888,8 +3900,8 @@ HFONT WINAPI Detour_CreateFontIndirectA(const LOGFONTA* lplf) {
         OverrideLogFontName(lfw.lfFaceName);
     }
 
-    // 4. 调用 Wide 版本 (它已经被我们 Hook 了，或者直接调用原始的)
-    // 这里直接调用 CreateFontIndirectW，系统会自动处理
+    // 4. 调用 Wide 版本 (它已经被我们 Hook 了 或者直接调用原始的)
+    // 这里直接调用 CreateFontIndirectW 系统会自动处理
     return CreateFontIndirectW(&lfw);
 }
 
@@ -3975,7 +3987,7 @@ LSTATUS WINAPI Detour_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lp
         LSTATUS status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, NULL, &wSize);
         if (status != ERROR_SUCCESS) return status;
 
-        // 2. 如果是字符串类型，需要转码
+        // 2. 如果是字符串类型 需要转码
         if (type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ) {
             std::vector<BYTE> wData(wSize);
             status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, wData.data(), &wSize);
@@ -4015,7 +4027,7 @@ LSTATUS WINAPI Detour_RegSetValueExA(HKEY hKey, LPCSTR lpValueName, DWORD Reserv
         if (dwType == REG_SZ || dwType == REG_EXPAND_SZ || dwType == REG_MULTI_SZ) {
             // 将写入的 Shift-JIS 内容转为 Unicode
             std::wstring wData = SpoofAnsiToWide((LPCSTR)lpData);
-            // 注意：cbData 是字节数，RegSetValueExW 需要字节数 (len * 2)
+            // 注意：cbData 是字节数 RegSetValueExW 需要字节数 (len * 2)
             return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, (const BYTE*)wData.c_str(), (DWORD)(wData.length() + 1) * sizeof(wchar_t));
         } else {
             return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, lpData, cbData);
@@ -4038,6 +4050,100 @@ LSTATUS WINAPI Detour_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName) {
         return RegDeleteValueW(hKey, wValueName.c_str());
     }
     return fpRegDeleteValueA(hKey, lpValueName);
+}
+
+// --- [新增] 窗口标题乱码修复 Hook ---
+
+HWND WINAPI Detour_CreateWindowExA(
+    DWORD dwExStyle,
+    LPCSTR lpClassName,
+    LPCSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam
+) {
+    if (g_FakeACP != 0) {
+        // 1. 转码窗口标题 (WindowName)
+        std::wstring wWindowName = SpoofAnsiToWide(lpWindowName);
+
+        // 2. 转码窗口类名 (ClassName) - 注意类名可能是 ATOM
+        std::wstring wClassName;
+        LPCWSTR lpWClass = NULL;
+
+        if (IS_ATOM(lpClassName)) {
+            lpWClass = (LPCWSTR)lpClassName; // ATOM 直接透传
+        } else {
+            wClassName = SpoofAnsiToWide(lpClassName);
+            lpWClass = wClassName.c_str();
+        }
+
+        // 3. 调用 Unicode 版本 API (CreateWindowExW)
+        // 这样 Windows 接收到的就是正确的 Unicode 字符 不会乱码
+        return CreateWindowExW(
+            dwExStyle,
+            lpWClass,
+            wWindowName.c_str(),
+            dwStyle,
+            X, Y, nWidth, nHeight,
+            hWndParent,
+            hMenu,
+            hInstance,
+            lpParam
+        );
+    }
+    return fpCreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+}
+
+BOOL WINAPI Detour_SetWindowTextA(HWND hWnd, LPCSTR lpString) {
+    if (g_FakeACP != 0) {
+        // 转码后调用 Unicode 版本
+        std::wstring wString = SpoofAnsiToWide(lpString);
+        return SetWindowTextW(hWnd, wString.c_str());
+    }
+    return fpSetWindowTextA(hWnd, lpString);
+}
+
+int WINAPI Detour_GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) {
+    if (g_FakeACP != 0 && nMaxCount > 0) {
+        // 1. 获取 Unicode 标题
+        int wLen = GetWindowTextLengthW(hWnd);
+        if (wLen == 0) {
+            if (lpString) lpString[0] = 0;
+            return 0;
+        }
+
+        std::vector<wchar_t> wBuf(wLen + 1);
+        GetWindowTextW(hWnd, wBuf.data(), wLen + 1);
+
+        // 2. 转回 Shift-JIS (欺骗程序它读到的是 ANSI)
+        std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+        // 3. 复制到缓冲区
+        int copyLen = min((int)aStr.length(), nMaxCount - 1);
+        memcpy(lpString, aStr.c_str(), copyLen);
+        lpString[copyLen] = 0;
+
+        return copyLen;
+    }
+    return fpGetWindowTextA(hWnd, lpString, nMaxCount);
+}
+
+// 拦截默认窗口过程 处理 WM_SETTEXT 消息
+LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            // 如果程序通过 SendMessageA(WM_SETTEXT) 设置标题
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+            return DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wText.c_str());
+        }
+    }
+    return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
 // --- 路径处理辅助函数 ---
@@ -5474,8 +5580,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         // [新增] 注册表 Hook (NtQueryValueKey)
         if (hNtdll) {
-            // 注意：如果之前在文件系统 Hook 中已经获取了 fpNtQueryValueKey，这里直接使用
-            // 如果没有，需要 GetProcAddress
+            // 注意：如果之前在文件系统 Hook 中已经获取了 fpNtQueryValueKey 这里直接使用
+            // 如果没有 需要 GetProcAddress
             void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
             if (pNtQueryValueKey) {
                 MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
@@ -5509,15 +5615,26 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteKeyA"), &Detour_RegDeleteKeyA, reinterpret_cast<LPVOID*>(&fpRegDeleteKeyA));
             MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteValueA"), &Detour_RegDeleteValueA, reinterpret_cast<LPVOID*>(&fpRegDeleteValueA));
 
-            // 很多旧程序使用 RegOpenKeyA (它是 RegOpenKeyExA 的包装，但也需要 Hook)
+            // 很多旧程序使用 RegOpenKeyA (它是 RegOpenKeyExA 的包装 但也需要 Hook)
             // 注意：RegOpenKeyA 在 advapi32 中通常直接导出
             void* pRegOpenKeyA = (void*)GetProcAddress(hAdvapi32, "RegOpenKeyA");
             if (pRegOpenKeyA) {
-                // 我们可以直接重定向到 Detour_RegOpenKeyExA 的逻辑，或者简单地实现一个 Detour_RegOpenKeyA
-                // 这里为了简单，假设程序主要用 Ex，如果用了非 Ex，通常也会被上面的 Ex 捕获（如果它是通过 Ex 实现的）
-                // 但为了保险，建议也 Hook 它。
-                // 由于参数不同，这里暂不展开，通常 Ex 足够覆盖 95% 的情况。
+                // 我们可以直接重定向到 Detour_RegOpenKeyExA 的逻辑 或者简单地实现一个 Detour_RegOpenKeyA
+                // 这里为了简单 假设程序主要用 Ex 如果用了非 Ex 通常也会被上面的 Ex 捕获（如果它是通过 Ex 实现的）
+                // 但为了保险 建议也 Hook 它
+                // 由于参数不同 这里暂不展开 通常 Ex 足够覆盖 95% 的情况
             }
+        }
+    }
+
+    // --- [新增] 组 G: User32 窗口 Hook (解决标题栏乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+        if (hUser32) {
+            MH_CreateHook(GetProcAddress(hUser32, "CreateWindowExA"), &Detour_CreateWindowExA, reinterpret_cast<LPVOID*>(&fpCreateWindowExA));
+            MH_CreateHook(GetProcAddress(hUser32, "SetWindowTextA"), &Detour_SetWindowTextA, reinterpret_cast<LPVOID*>(&fpSetWindowTextA));
+            MH_CreateHook(GetProcAddress(hUser32, "GetWindowTextA"), &Detour_GetWindowTextA, reinterpret_cast<LPVOID*>(&fpGetWindowTextA));
+            MH_CreateHook(GetProcAddress(hUser32, "DefWindowProcA"), &Detour_DefWindowProcA, reinterpret_cast<LPVOID*>(&fpDefWindowProcA));
         }
     }
 
