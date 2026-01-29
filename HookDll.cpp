@@ -580,6 +580,13 @@ P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
 typedef int(WINAPI* P_GetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int);
 P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
 
+// [新增] 字符串转换函数指针
+typedef int(WINAPI* P_MultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
+P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
+
+typedef int(WINAPI* P_WideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
+P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -773,6 +780,7 @@ HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字�
 // --- [新增] 区域伪造全局变量 ---
 UINT g_FakeACP = 0;
 LCID g_FakeLCID = 0;
+BYTE g_FakeCharSet = 0; // [新增] 字体字符集 (例如 128 = Shift-JIS)
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -3445,22 +3453,45 @@ void OverrideLogFontName(LPWSTR faceName) {
     }
 }
 
+// [修改] 更新字体 Hook 以强制字符集
 HFONT WINAPI Detour_CreateFontIndirectW(const LOGFONTW* lplf) {
-    if (g_OverrideFontName.empty()) return fpCreateFontIndirectW(lplf);
+    // 如果没有启用字体替换且没有启用区域伪造，直接返回
+    if (g_OverrideFontName.empty() && g_FakeCharSet == 0) return fpCreateFontIndirectW(lplf);
 
-    // 复制 LOGFONTW 结构以修改
     LOGFONTW newLf = *lplf;
-    OverrideLogFontName(newLf.lfFaceName);
+
+    // 1. 字体名称替换
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(newLf.lfFaceName);
+    }
+
+    // 2. [新增] 强制字符集 (解决乱码的关键)
+    // 如果程序请求默认字符集，强制改为目标语言字符集
+    if (g_FakeCharSet != 0) {
+        if (newLf.lfCharSet == DEFAULT_CHARSET || newLf.lfCharSet == ANSI_CHARSET) {
+            newLf.lfCharSet = g_FakeCharSet;
+        }
+    }
 
     return fpCreateFontIndirectW(&newLf);
 }
 
 HFONT WINAPI Detour_CreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelf) {
-    if (g_OverrideFontName.empty()) return fpCreateFontIndirectExW(lpelf);
+    if (g_OverrideFontName.empty() && g_FakeCharSet == 0) return fpCreateFontIndirectExW(lpelf);
 
-    // 复制 ENUMLOGFONTEXDVW 结构以修改
     ENUMLOGFONTEXDVW newElf = *lpelf;
-    OverrideLogFontName(newElf.elfEnumLogfontEx.elfLogFont.lfFaceName);
+
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(newElf.elfEnumLogfontEx.elfLogFont.lfFaceName);
+    }
+
+    // [新增] 强制字符集
+    if (g_FakeCharSet != 0) {
+        if (newElf.elfEnumLogfontEx.elfLogFont.lfCharSet == DEFAULT_CHARSET ||
+            newElf.elfEnumLogfontEx.elfLogFont.lfCharSet == ANSI_CHARSET) {
+            newElf.elfEnumLogfontEx.elfLogFont.lfCharSet = g_FakeCharSet;
+        }
+    }
 
     return fpCreateFontIndirectExW(&newElf);
 }
@@ -3539,6 +3570,25 @@ int WINAPI Detour_GetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData, in
         }
     }
     return fpGetLocaleInfoW(Locale, LCType, lpLCData, cchData);
+}
+
+// --- [新增] 核心防乱码 Hook ---
+
+// 拦截 ANSI -> Unicode 转换
+int WINAPI Detour_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar) {
+    // 如果程序请求使用系统默认 ANSI 代码页，强制替换为我们伪造的代码页
+    if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
+        CodePage = g_FakeACP;
+    }
+    return fpMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+}
+
+// 拦截 Unicode -> ANSI 转换
+int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr, int cchWideChar, LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar) {
+    if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
+        CodePage = g_FakeACP;
+    }
+    return fpWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
 }
 
 // --- 路径处理辅助函数 ---
@@ -4607,25 +4657,49 @@ DWORD WINAPI InitHookThread(LPVOID) {
         DebugLog(L"FontHook: Override font set to '%s'", g_OverrideFontName.c_str());
     }
 
-    // --- [新增] 读取 hooklocale 配置并计算 LCID ---
+    // --- [修改] 读取 hooklocale 配置并计算 LCID 和 CharSet ---
     wchar_t localeBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_LOCALE", localeBuffer, 64) > 0) {
         int cp = _wtoi(localeBuffer);
         if (cp > 0) {
             g_FakeACP = (UINT)cp;
 
-            // 根据代码页映射 LCID (常用映射)
+            // 根据代码页映射 LCID 和 CharSet
             switch (cp) {
-            case 932: g_FakeLCID = 0x0411; break; // ja-JP
-            case 936: g_FakeLCID = 0x0804; break; // zh-CN
-            case 949: g_FakeLCID = 0x0412; break; // ko-KR
-            case 950: g_FakeLCID = 0x0404; break; // zh-TW
-            case 1250: g_FakeLCID = 0x0405; break; // cs-CZ (Central Europe)
-            case 1251: g_FakeLCID = 0x0419; break; // ru-RU
-            case 1252: g_FakeLCID = 0x0409; break; // en-US
-            default: g_FakeLCID = 0x0409; break;  // 默认回退
+            case 932: // 日语
+                g_FakeLCID = 0x0411;
+                g_FakeCharSet = 128; // SHIFTJIS_CHARSET
+                break;
+            case 936: // 简体中文
+                g_FakeLCID = 0x0804;
+                g_FakeCharSet = 134; // GB2312_CHARSET
+                break;
+            case 949: // 韩语
+                g_FakeLCID = 0x0412;
+                g_FakeCharSet = 129; // HANGEUL_CHARSET
+                break;
+            case 950: // 繁体中文
+                g_FakeLCID = 0x0404;
+                g_FakeCharSet = 136; // CHINESEBIG5_CHARSET
+                break;
+            case 1250: // 中欧
+                g_FakeLCID = 0x0405;
+                g_FakeCharSet = 238; // EASTEUROPE_CHARSET
+                break;
+            case 1251: // 俄语
+                g_FakeLCID = 0x0419;
+                g_FakeCharSet = 204; // RUSSIAN_CHARSET
+                break;
+            case 1252: // 西欧
+                g_FakeLCID = 0x0409;
+                g_FakeCharSet = 0;   // ANSI_CHARSET
+                break;
+            default:
+                g_FakeLCID = 0x0409;
+                g_FakeCharSet = 0;
+                break;
             }
-            DebugLog(L"LocaleHook: Spoofing CP=%u, LCID=%04X", g_FakeACP, g_FakeLCID);
+            DebugLog(L"LocaleHook: Spoofing CP=%u, LCID=%04X, CharSet=%u", g_FakeACP, g_FakeLCID, g_FakeCharSet);
         }
     }
 
@@ -4915,6 +4989,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (g_FakeACP != 0) {
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         if (hKernel32) {
+            // 基础信息查询
             MH_CreateHook(GetProcAddress(hKernel32, "GetACP"), &Detour_GetACP, reinterpret_cast<LPVOID*>(&fpGetACP));
             MH_CreateHook(GetProcAddress(hKernel32, "GetOEMCP"), &Detour_GetOEMCP, reinterpret_cast<LPVOID*>(&fpGetOEMCP));
             MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLCID"), &Detour_GetUserDefaultLCID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLCID));
@@ -4923,6 +4998,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLangID"), &Detour_GetUserDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLangID));
             MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultLangID"), &Detour_GetSystemDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultLangID));
             MH_CreateHook(GetProcAddress(hKernel32, "GetLocaleInfoW"), &Detour_GetLocaleInfoW, reinterpret_cast<LPVOID*>(&fpGetLocaleInfoW));
+
+            // [新增] 字符串转换 Hook (解决乱码的核心)
+            MH_CreateHook(GetProcAddress(hKernel32, "MultiByteToWideChar"), &Detour_MultiByteToWideChar, reinterpret_cast<LPVOID*>(&fpMultiByteToWideChar));
+            MH_CreateHook(GetProcAddress(hKernel32, "WideCharToMultiByte"), &Detour_WideCharToMultiByte, reinterpret_cast<LPVOID*>(&fpWideCharToMultiByte));
         }
     }
 
