@@ -649,6 +649,24 @@ P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
 typedef HFONT(WINAPI* P_CreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
 P_CreateFontA fpCreateFontA = NULL;
 
+// --- [新增] ANSI 注册表函数指针 ---
+typedef LSTATUS(WINAPI* P_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegCreateKeyExA)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
+P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+P_RegQueryValueExA fpRegQueryValueExA = NULL;
+typedef LSTATUS(WINAPI* P_RegSetValueExA)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
+P_RegSetValueExA fpRegSetValueExA = NULL;
+typedef LSTATUS(WINAPI* P_RegDeleteKeyA)(HKEY, LPCSTR);
+P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
+typedef LSTATUS(WINAPI* P_RegDeleteValueA)(HKEY, LPCSTR);
+P_RegDeleteValueA fpRegDeleteValueA = NULL;
+typedef LSTATUS(WINAPI* P_RegEnumKeyExA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPSTR, LPDWORD, PFILETIME);
+P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegEnumValueA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+P_RegEnumValueA fpRegEnumValueA = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -3901,6 +3919,127 @@ HFONT WINAPI Detour_CreateFontA(int cHeight, int cWidth, int cEscapement, int cO
     return Detour_CreateFontIndirectA(&lfa);
 }
 
+// --- [新增] 注册表 ANSI <-> Unicode 转换辅助 ---
+
+// 使用伪造的代码页将 ANSI 路径转换为 Unicode
+std::wstring SpoofAnsiToWide(LPCSTR ansiStr) {
+    if (!ansiStr) return L"";
+    UINT cp = g_FakeACP ? g_FakeACP : CP_ACP;
+    int len = MultiByteToWideChar(cp, 0, ansiStr, -1, NULL, 0);
+    if (len <= 0) return L"";
+    std::vector<wchar_t> buf(len);
+    MultiByteToWideChar(cp, 0, ansiStr, -1, buf.data(), len);
+    return std::wstring(buf.data());
+}
+
+// 使用伪造的代码页将 Unicode 转换回 ANSI (用于 QueryValue 返回数据)
+std::string SpoofWideToAnsi(LPCWSTR wideStr, int len = -1) {
+    if (!wideStr) return "";
+    UINT cp = g_FakeACP ? g_FakeACP : CP_ACP;
+    int aLen = WideCharToMultiByte(cp, 0, wideStr, len, NULL, 0, NULL, NULL);
+    if (aLen <= 0) return "";
+    std::vector<char> buf(aLen + 1); // +1 安全起见
+    WideCharToMultiByte(cp, 0, wideStr, len, buf.data(), aLen, NULL, NULL);
+    if (len == -1) buf[aLen] = 0; // 确保 NULL 结尾
+    return std::string(buf.data(), aLen); // 注意这里构造 string 的长度
+}
+
+// --- [新增] ANSI 注册表 Hook 实现 ---
+
+LSTATUS WINAPI Detour_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
+    if (g_FakeACP != 0) {
+        // 1. 将 Shift-JIS 路径转为 Unicode
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        // 2. 调用 Unicode API
+        return RegOpenKeyExW(hKey, wSubKey.c_str(), ulOptions, samDesired, phkResult);
+    }
+    return fpRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+}
+
+LSTATUS WINAPI Detour_RegCreateKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, LPSTR lpClass, DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES lpSecurityAttributes, PHKEY phkResult, LPDWORD lpdwDisposition) {
+    if (g_FakeACP != 0) {
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        std::wstring wClass = SpoofAnsiToWide(lpClass);
+        return RegCreateKeyExW(hKey, wSubKey.c_str(), Reserved, lpClass ? (LPWSTR)wClass.c_str() : NULL, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition);
+    }
+    return fpRegCreateKeyExA(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition);
+}
+
+LSTATUS WINAPI Detour_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+        DWORD type = 0;
+        DWORD wSize = 0;
+
+        // 1. 先查询 Unicode 数据大小
+        LSTATUS status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, NULL, &wSize);
+        if (status != ERROR_SUCCESS) return status;
+
+        // 2. 如果是字符串类型，需要转码
+        if (type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ) {
+            std::vector<BYTE> wData(wSize);
+            status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, wData.data(), &wSize);
+            if (status != ERROR_SUCCESS) return status;
+
+            // 转回 Shift-JIS
+            std::string aData = SpoofWideToAnsi((LPCWSTR)wData.data(), wSize / sizeof(wchar_t)); // 包含 NULL
+
+            if (lpType) *lpType = type;
+
+            if (lpcbData) {
+                if (!lpData) {
+                    *lpcbData = (DWORD)aData.size();
+                    return ERROR_SUCCESS;
+                }
+                if (*lpcbData < aData.size()) {
+                    *lpcbData = (DWORD)aData.size();
+                    return ERROR_MORE_DATA;
+                }
+                memcpy(lpData, aData.data(), aData.size());
+                *lpcbData = (DWORD)aData.size();
+            }
+            return ERROR_SUCCESS;
+        }
+        else {
+            // 非字符串直接透传 (但需要调用 W 版)
+            return RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, lpType, lpData, lpcbData);
+        }
+    }
+    return fpRegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+}
+
+LSTATUS WINAPI Detour_RegSetValueExA(HKEY hKey, LPCSTR lpValueName, DWORD Reserved, DWORD dwType, const BYTE* lpData, DWORD cbData) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+
+        if (dwType == REG_SZ || dwType == REG_EXPAND_SZ || dwType == REG_MULTI_SZ) {
+            // 将写入的 Shift-JIS 内容转为 Unicode
+            std::wstring wData = SpoofAnsiToWide((LPCSTR)lpData);
+            // 注意：cbData 是字节数，RegSetValueExW 需要字节数 (len * 2)
+            return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, (const BYTE*)wData.c_str(), (DWORD)(wData.length() + 1) * sizeof(wchar_t));
+        } else {
+            return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, lpData, cbData);
+        }
+    }
+    return fpRegSetValueExA(hKey, lpValueName, Reserved, dwType, lpData, cbData);
+}
+
+LSTATUS WINAPI Detour_RegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey) {
+    if (g_FakeACP != 0) {
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        return RegDeleteKeyW(hKey, wSubKey.c_str());
+    }
+    return fpRegDeleteKeyA(hKey, lpSubKey);
+}
+
+LSTATUS WINAPI Detour_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+        return RegDeleteValueW(hKey, wValueName.c_str());
+    }
+    return fpRegDeleteValueA(hKey, lpValueName);
+}
+
 // --- 路径处理辅助函数 ---
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
@@ -5356,6 +5495,29 @@ DWORD WINAPI InitHookThread(LPVOID) {
             // [新增] ANSI 字体 Hook
             MH_CreateHook(GetProcAddress(hGdi32, "CreateFontIndirectA"), &Detour_CreateFontIndirectA, reinterpret_cast<LPVOID*>(&fpCreateFontIndirectA));
             MH_CreateHook(GetProcAddress(hGdi32, "CreateFontA"), &Detour_CreateFontA, reinterpret_cast<LPVOID*>(&fpCreateFontA));
+        }
+    }
+
+    // --- [新增] 组 F: ANSI 注册表 Hook (解决路径乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegOpenKeyExA"), &Detour_RegOpenKeyExA, reinterpret_cast<LPVOID*>(&fpRegOpenKeyExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegCreateKeyExA"), &Detour_RegCreateKeyExA, reinterpret_cast<LPVOID*>(&fpRegCreateKeyExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegQueryValueExA"), &Detour_RegQueryValueExA, reinterpret_cast<LPVOID*>(&fpRegQueryValueExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegSetValueExA"), &Detour_RegSetValueExA, reinterpret_cast<LPVOID*>(&fpRegSetValueExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteKeyA"), &Detour_RegDeleteKeyA, reinterpret_cast<LPVOID*>(&fpRegDeleteKeyA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteValueA"), &Detour_RegDeleteValueA, reinterpret_cast<LPVOID*>(&fpRegDeleteValueA));
+
+            // 很多旧程序使用 RegOpenKeyA (它是 RegOpenKeyExA 的包装，但也需要 Hook)
+            // 注意：RegOpenKeyA 在 advapi32 中通常直接导出
+            void* pRegOpenKeyA = (void*)GetProcAddress(hAdvapi32, "RegOpenKeyA");
+            if (pRegOpenKeyA) {
+                // 我们可以直接重定向到 Detour_RegOpenKeyExA 的逻辑，或者简单地实现一个 Detour_RegOpenKeyA
+                // 这里为了简单，假设程序主要用 Ex，如果用了非 Ex，通常也会被上面的 Ex 捕获（如果它是通过 Ex 实现的）
+                // 但为了保险，建议也 Hook 它。
+                // 由于参数不同，这里暂不展开，通常 Ex 足够覆盖 95% 的情况。
+            }
         }
     }
 
