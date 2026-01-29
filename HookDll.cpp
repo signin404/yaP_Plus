@@ -637,6 +637,18 @@ P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
 typedef int (WINAPI* P_EnumFontsW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
 P_EnumFontsW fpEnumFontsW = NULL;
 
+// --- [新增] Ntdll 字符串函数指针 ---
+typedef NTSTATUS(NTAPI* P_RtlMultiByteToUnicodeN)(PWCH, ULONG, PULONG, PCSTR, ULONG);
+P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
+typedef NTSTATUS(NTAPI* P_RtlUnicodeToMultiByteN)(PCHAR, ULONG, PULONG, PCWSTR, ULONG);
+P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
+
+// --- [新增] ANSI 字体函数指针 ---
+typedef HFONT(WINAPI* P_CreateFontIndirectA)(const LOGFONTA*);
+P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
+typedef HFONT(WINAPI* P_CreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
+P_CreateFontA fpCreateFontA = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -3771,6 +3783,124 @@ int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWid
     return fpWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
 }
 
+// --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
+// 很多程序内部使用这个函数而不是 MultiByteToWideChar
+NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
+    // 这里的逻辑稍微复杂，因为 Rtl 函数不接受 CodePage 参数，它默认使用系统当前 ANSI 代码页。
+    // 我们必须手动实现转换，强制使用 g_FakeACP。
+
+    if (g_FakeACP != 0) {
+        int wLen = 0;
+        // 计算所需长度
+        // 注意：MaxBytesInUnicodeString 是字节数，不是字符数
+        int maxChars = MaxBytesInUnicodeString / sizeof(WCHAR);
+
+        // 如果只查询长度 (UnicodeString == NULL)
+        if (!UnicodeString) {
+            wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, NULL, 0);
+            if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
+            return STATUS_SUCCESS;
+        }
+
+        // 执行转换
+        wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, UnicodeString, maxChars);
+
+        if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
+        return STATUS_SUCCESS;
+    }
+
+    return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
+}
+
+NTSTATUS NTAPI Detour_RtlUnicodeToMultiByteN(PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString, PCWSTR UnicodeString, ULONG BytesInUnicodeString) {
+    if (g_FakeACP != 0) {
+        int aLen = 0;
+        int charsInUnicode = BytesInUnicodeString / sizeof(WCHAR);
+
+        if (!MultiByteString) {
+            aLen = WideCharToMultiByte(g_FakeACP, 0, UnicodeString, charsInUnicode, NULL, 0, NULL, NULL);
+            if (BytesInMultiByteString) *BytesInMultiByteString = aLen;
+            return STATUS_SUCCESS;
+        }
+
+        aLen = WideCharToMultiByte(g_FakeACP, 0, UnicodeString, charsInUnicode, MultiByteString, MaxBytesInMultiByteString, NULL, NULL);
+
+        if (BytesInMultiByteString) *BytesInMultiByteString = aLen;
+        return STATUS_SUCCESS;
+    }
+
+    return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
+}
+
+// --- [新增] ANSI 字体创建 Hook (解决字体名乱码) ---
+HFONT WINAPI Detour_CreateFontIndirectA(const LOGFONTA* lplf) {
+    if (g_FakeACP == 0) return fpCreateFontIndirectA(lplf);
+
+    // 1. 将 LOGFONTA 转换为 LOGFONTW
+    // 关键点：使用 g_FakeACP 进行转换！
+    // 如果不 Hook 这里，系统会用 CP_ACP (如 936) 转换 Shift-JIS 名字，结果就是乱码。
+    LOGFONTW lfw = { 0 };
+
+    lfw.lfHeight = lplf->lfHeight;
+    lfw.lfWidth = lplf->lfWidth;
+    lfw.lfEscapement = lplf->lfEscapement;
+    lfw.lfOrientation = lplf->lfOrientation;
+    lfw.lfWeight = lplf->lfWeight;
+    lfw.lfItalic = lplf->lfItalic;
+    lfw.lfUnderline = lplf->lfUnderline;
+    lfw.lfStrikeOut = lplf->lfStrikeOut;
+    lfw.lfCharSet = lplf->lfCharSet;
+    lfw.lfOutPrecision = lplf->lfOutPrecision;
+    lfw.lfClipPrecision = lplf->lfClipPrecision;
+    lfw.lfQuality = lplf->lfQuality;
+    lfw.lfPitchAndFamily = lplf->lfPitchAndFamily;
+
+    // 使用伪造的代码页转换字体名称
+    MultiByteToWideChar(g_FakeACP, 0, lplf->lfFaceName, -1, lfw.lfFaceName, LF_FACESIZE);
+
+    // 2. 强制字符集 (双重保险)
+    if (g_FakeCharSet != 0) {
+        if (lfw.lfCharSet == DEFAULT_CHARSET || lfw.lfCharSet == ANSI_CHARSET) {
+            lfw.lfCharSet = g_FakeCharSet;
+        }
+    }
+
+    // 3. 字体名称替换 (如果配置了 hookfont)
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(lfw.lfFaceName);
+    }
+
+    // 4. 调用 Wide 版本 (它已经被我们 Hook 了，或者直接调用原始的)
+    // 这里直接调用 CreateFontIndirectW，系统会自动处理
+    return CreateFontIndirectW(&lfw);
+}
+
+HFONT WINAPI Detour_CreateFontA(int cHeight, int cWidth, int cEscapement, int cOrientation, int cWeight, DWORD bItalic, DWORD bUnderline, DWORD bStrikeOut, DWORD iCharSet, DWORD iOutPrecision, DWORD iClipPrecision, DWORD iQuality, DWORD iPitchAndFamily, LPCSTR pszFaceName) {
+    // 构造 LOGFONTA 并转发给 Detour_CreateFontIndirectA
+    LOGFONTA lfa;
+    lfa.lfHeight = cHeight;
+    lfa.lfWidth = cWidth;
+    lfa.lfEscapement = cEscapement;
+    lfa.lfOrientation = cOrientation;
+    lfa.lfWeight = cWeight;
+    lfa.lfItalic = (BYTE)bItalic;
+    lfa.lfUnderline = (BYTE)bUnderline;
+    lfa.lfStrikeOut = (BYTE)bStrikeOut;
+    lfa.lfCharSet = (BYTE)iCharSet;
+    lfa.lfOutPrecision = (BYTE)iOutPrecision;
+    lfa.lfClipPrecision = (BYTE)iClipPrecision;
+    lfa.lfQuality = (BYTE)iQuality;
+    lfa.lfPitchAndFamily = (BYTE)iPitchAndFamily;
+
+    if (pszFaceName) {
+        strncpy_s(lfa.lfFaceName, pszFaceName, LF_FACESIZE - 1);
+    } else {
+        lfa.lfFaceName[0] = 0;
+    }
+
+    return Detour_CreateFontIndirectA(&lfa);
+}
+
 // --- 路径处理辅助函数 ---
 
 // 辅助：尝试重定向 DOS 路径 (输入 C:\... 输出 Z:\Portable\Data\C\...)
@@ -4870,13 +5000,30 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 g_FakeLangID = 0x0404;
                 g_FakeCharSet = 136; // CHINESEBIG5_CHARSET
                 break;
-            // ... 其他 case 保持不变 ...
+            case 1250: // 中欧
+                g_FakeLCID = 0x0405;
+                g_FakeCharSet = 238; // EASTEUROPE_CHARSET
+                break;
+            case 1251: // 俄语
+                g_FakeLCID = 0x0419;
+                g_FakeCharSet = 204; // RUSSIAN_CHARSET
+                break;
+            case 1252: // 西欧
+                g_FakeLCID = 0x0409;
+                g_FakeCharSet = 0;   // ANSI_CHARSET
+                break;
             default:
                 g_FakeLCID = 0x0409;
                 g_FakeLangID = 0x0409;
                 g_FakeCharSet = 0;
                 break;
             }
+            // [新增] 立即设置当前线程的 Locale
+            // 这对于初始化时加载资源的程序非常重要
+            if (g_FakeLCID != 0) {
+                SetThreadLocale(g_FakeLCID);
+            }
+
             DebugLog(L"LocaleHook: Spoofing CP=%s, LCID=%04X, CharSet=%u", g_FakeACPStr.c_str(), g_FakeLCID, g_FakeCharSet);
         }
     }
@@ -5193,6 +5340,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
             if (pNtQueryValueKey) {
                 MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
+                MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
+                MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
             }
         }
 
@@ -5203,6 +5352,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
             void* pEnumFontFamiliesW = (void*)GetProcAddress(hGdi32, "EnumFontFamiliesW");
             if (pEnumFontFamiliesW) MH_CreateHook(pEnumFontFamiliesW, &Detour_EnumFontFamiliesW, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesW));
+
+            // [新增] ANSI 字体 Hook
+            MH_CreateHook(GetProcAddress(hGdi32, "CreateFontIndirectA"), &Detour_CreateFontIndirectA, reinterpret_cast<LPVOID*>(&fpCreateFontIndirectA));
+            MH_CreateHook(GetProcAddress(hGdi32, "CreateFontA"), &Detour_CreateFontA, reinterpret_cast<LPVOID*>(&fpCreateFontA));
         }
     }
 
