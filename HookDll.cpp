@@ -199,6 +199,10 @@ typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
 #define FILE_READ_ONLY_DEVICE 0x00000002
 #endif
 
+#ifndef FILE_REMOVABLE_MEDIA
+#define FILE_REMOVABLE_MEDIA 0x00000001
+#endif
+
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
     FileFsVolumeInformation = 1,
@@ -3423,6 +3427,71 @@ NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
     return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
+// [新增] 拦截 GetLogicalDrives (位掩码)
+DWORD WINAPI Detour_GetLogicalDrives(void) {
+    DWORD drives = fpGetLogicalDrives();
+    if (g_VirtualCdDrive != 0) {
+        // 将虚拟盘符对应的位设为 1 (A=0, B=1, ...)
+        drives |= (1 << (g_VirtualCdDrive - L'A'));
+    }
+    return drives;
+}
+
+// [新增] 拦截 GetLogicalDriveStringsW (字符串列表)
+DWORD WINAPI Detour_GetLogicalDriveStringsW(DWORD nBufferLength, LPWSTR lpBuffer) {
+    // 1. 调用原始函数
+    DWORD ret = fpGetLogicalDriveStringsW(nBufferLength, lpBuffer);
+
+    if (g_VirtualCdDrive != 0 && lpBuffer) {
+        // 检查缓冲区是否足够容纳额外的 "M:\" (4个字符)
+        // ret 是不包含末尾双NULL的长度
+        if (ret + 4 <= nBufferLength) {
+            // 移动指针到末尾 (跳过现有的驱动器字符串)
+            LPWSTR pEnd = lpBuffer + ret;
+
+            // 构造新驱动器字符串 "M:\"
+            pEnd[0] = g_VirtualCdDrive;
+            pEnd[1] = L':';
+            pEnd[2] = L'\\';
+            pEnd[3] = L'\0'; // 字符串结束符
+            pEnd[4] = L'\0'; // 列表结束符 (双NULL)
+
+            return ret + 4;
+        }
+    }
+    return ret;
+}
+
+// [修改] 拦截 GetDriveTypeW (合并了虚拟盘符和路径匹配逻辑)
+UINT WINAPI Detour_GetDriveTypeW(LPCWSTR lpRootPathName) {
+    if (!lpRootPathName) return DRIVE_UNKNOWN;
+
+    // 1. 检查是否为虚拟盘符 (例如 "M:", "M:\")
+    if (g_VirtualCdDrive != 0) {
+        if (towupper(lpRootPathName[0]) == g_VirtualCdDrive && lpRootPathName[1] == L':') {
+            return DRIVE_CDROM;
+        }
+    }
+
+    // 2. 检查是否为指定的伪装路径 (兼容旧逻辑)
+    if (!g_HookCdPath.empty()) {
+        std::wstring queryPath = lpRootPathName;
+        // 检查完全匹配
+        if (_wcsnicmp(queryPath.c_str(), g_HookCdPath.c_str(), queryPath.length()) == 0) {
+             return DRIVE_CDROM;
+        }
+        // 检查是否查询的是伪装目录所在的盘符根目录
+        if (g_HookCdPath.length() >= 3 && queryPath.length() >= 3) {
+            if (towupper(g_HookCdPath[0]) == towupper(queryPath[0]) &&
+                g_HookCdPath[1] == L':' && queryPath[1] == L':') {
+                return DRIVE_CDROM;
+            }
+        }
+    }
+    return fpGetDriveTypeW(lpRootPathName);
+}
+
+// [修改] Detour_NtQueryVolumeInformationFile (合并了 VolumeID 和 CD 伪装逻辑)
 NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -3433,35 +3502,67 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     // 1. 调用原始函数
     NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
 
-    // 2. 如果成功且查询的是卷信息 (FileFsVolumeInformation = 1)
-    if (NT_SUCCESS(status) && FsInformationClass == FileFsVolumeInformation && g_HookVolumeId) {
+    if (!NT_SUCCESS(status)) return status;
 
-        // 3. 检查是否为目标驱动器 (系统盘 或 启动器盘)
-        // 获取句柄对应的路径
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            // 转换为 NT 路径 (例如 \Device\HarddiskVolume1 -> \??\C:)
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
+    // 获取句柄对应的路径
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) return status;
+    std::wstring ntPath = DevicePathToNtPath(rawPath);
 
-            bool shouldFake = false;
+    // 逻辑 A: 修改卷序列号 (hookvolumeid)
+    if (g_HookVolumeId && FsInformationClass == FileFsVolumeInformation) {
+        bool shouldFake = false;
+        if (!g_SystemDriveNt.empty() && (ntPath.find(g_SystemDriveNt) == 0)) shouldFake = true;
+        else if (!g_LauncherDriveNt.empty() && (ntPath.find(g_LauncherDriveNt) == 0)) shouldFake = true;
 
-            // 检查系统盘
-            if (!g_SystemDriveNt.empty() &&
-                (ntPath.size() >= g_SystemDriveNt.size() &&
-                 _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
-                shouldFake = true;
+        if (shouldFake) {
+            PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
+            info->VolumeSerialNumber = g_FakeVolumeSerial;
+        }
+    }
+
+    // 逻辑 B: 伪装光驱属性 (hookcd)
+    if (!g_HookCdPath.empty()) {
+        // 检查是否在伪装路径内
+        std::wstring hookCdNtPrefix = L"\\??\\" + g_HookCdPath;
+        bool isTarget = false;
+        if (ntPath.size() >= hookCdNtPrefix.size() &&
+            _wcsnicmp(ntPath.c_str(), hookCdNtPrefix.c_str(), hookCdNtPrefix.size()) == 0) {
+            isTarget = true;
+        }
+
+        // 或者是虚拟盘符
+        if (!isTarget && g_VirtualCdDrive != 0) {
+             // 检查路径是否包含虚拟盘符前缀 (例如 \??\M:\...)
+             if (ntPath.size() >= g_VirtualCdNtPrefix.size() &&
+                 _wcsnicmp(ntPath.c_str(), g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.size()) == 0) {
+                 isTarget = true;
+             }
+        }
+
+        if (isTarget) {
+            // 伪装设备类型为光驱
+            if (FsInformationClass == FileFsDeviceInformation) {
+                if (Length >= sizeof(FILE_FS_DEVICE_INFORMATION)) {
+                    PFILE_FS_DEVICE_INFORMATION info = (PFILE_FS_DEVICE_INFORMATION)FsInformation;
+                    info->DeviceType = FILE_DEVICE_CD_ROM;
+                    info->Characteristics |= (FILE_READ_ONLY_DEVICE | FILE_REMOVABLE_MEDIA);
+                }
             }
-            // 检查启动器盘
-            else if (!g_LauncherDriveNt.empty() &&
-                     (ntPath.size() >= g_LauncherDriveNt.size() &&
-                      _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
-                shouldFake = true;
-            }
+            // 伪装文件系统名称为 CDFS
+            else if (FsInformationClass == FileFsAttributeInformation) {
+                if (Length >= sizeof(FILE_FS_ATTRIBUTE_INFORMATION)) {
+                    PFILE_FS_ATTRIBUTE_INFORMATION info = (PFILE_FS_ATTRIBUTE_INFORMATION)FsInformation;
 
-            // 4. 修改序列号
-            if (shouldFake) {
-                PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
-                info->VolumeSerialNumber = g_FakeVolumeSerial;
+                    const wchar_t* fsName = L"CDFS";
+                    size_t fsNameLen = wcslen(fsName) * sizeof(wchar_t);
+
+                    if (Length >= FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + fsNameLen) {
+                        info->FileSystemAttributes |= FILE_READ_ONLY_VOLUME;
+                        info->FileSystemNameLength = (ULONG)fsNameLen;
+                        memcpy(info->FileSystemName, fsName, fsNameLen);
+                    }
+                }
             }
         }
     }
@@ -4071,172 +4172,6 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     }
 
     return result;
-}
-
-// [新增] 拦截 GetLogicalDrives (位掩码)
-DWORD WINAPI Detour_GetLogicalDrives(void) {
-    DWORD drives = fpGetLogicalDrives();
-    if (g_VirtualCdDrive != 0) {
-        // 将虚拟盘符对应的位设为 1 (A=0, B=1, ...)
-        drives |= (1 << (g_VirtualCdDrive - L'A'));
-    }
-    return drives;
-}
-
-// [新增] 拦截 GetLogicalDriveStringsW (字符串列表)
-DWORD WINAPI Detour_GetLogicalDriveStringsW(DWORD nBufferLength, LPWSTR lpBuffer) {
-    // 1. 调用原始函数
-    DWORD ret = fpGetLogicalDriveStringsW(nBufferLength, lpBuffer);
-
-    if (g_VirtualCdDrive != 0 && lpBuffer) {
-        // 检查缓冲区是否足够容纳额外的 "M:\" (4个字符)
-        // ret 是不包含末尾双NULL的长度
-        if (ret + 4 <= nBufferLength) {
-            // 移动指针到末尾 (跳过现有的驱动器字符串)
-            LPWSTR pEnd = lpBuffer + ret;
-
-            // 构造新驱动器字符串 "M:\"
-            pEnd[0] = g_VirtualCdDrive;
-            pEnd[1] = L':';
-            pEnd[2] = L'\\';
-            pEnd[3] = L'\0'; // 字符串结束符
-            pEnd[4] = L'\0'; // 列表结束符 (双NULL)
-
-            return ret + 4;
-        }
-    }
-    return ret;
-}
-
-// [修改] 拦截 GetDriveTypeW
-UINT WINAPI Detour_GetDriveTypeW(LPCWSTR lpRootPathName) {
-    if (!lpRootPathName) return DRIVE_UNKNOWN;
-
-    // 1. 检查是否为虚拟盘符 (例如 "M:", "M:\", "M:\SubDir")
-    if (g_VirtualCdDrive != 0) {
-        if (towupper(lpRootPathName[0]) == g_VirtualCdDrive && lpRootPathName[1] == L':') {
-            return DRIVE_CDROM;
-        }
-    }
-
-    // 2. 原有的路径匹配逻辑 (保留以防万一)
-    if (!g_HookCdPath.empty()) {
-        std::wstring queryPath = lpRootPathName;
-        if (_wcsnicmp(queryPath.c_str(), g_HookCdPath.c_str(), queryPath.length()) == 0) {
-             return DRIVE_CDROM;
-        }
-    }
-    return fpGetDriveTypeW(lpRootPathName);
-}
-
-// [新增] 拦截 GetDriveTypeW
-UINT WINAPI Detour_GetDriveTypeW(LPCWSTR lpRootPathName) {
-    // 如果查询的路径是我们指定的伪装目录 (或其子目录/根目录)
-    if (!g_HookCdPath.empty() && lpRootPathName) {
-        std::wstring queryPath = lpRootPathName;
-
-        // 简单处理：如果查询路径是伪装路径的前缀，或者伪装路径是查询路径的前缀
-        // 例如：g_HookCdPath = "Z:\ISO", query = "Z:\" -> 匹配
-        // 注意：GetDriveType 通常只传入 "C:\" 格式
-
-        // 转换为 NT 路径进行比较可能更准确，但 GetDriveType 输入是 DOS 路径
-        // 这里进行简单的字符串包含检查
-
-        // 1. 检查完全匹配
-        if (_wcsnicmp(queryPath.c_str(), g_HookCdPath.c_str(), queryPath.length()) == 0) {
-             return DRIVE_CDROM;
-        }
-
-        // 2. 检查是否查询的是伪装目录所在的盘符根目录 (例如 g_HookCdPath="Z:\ISO", query="Z:\")
-        if (g_HookCdPath.length() >= 3 && queryPath.length() >= 3) {
-            if (g_HookCdPath[0] == queryPath[0] && g_HookCdPath[1] == ':' && queryPath[1] == ':') {
-                // 如果伪装目录就是整个盘 (例如 Z:\)，或者位于该盘
-                // 这里策略比较激进：如果伪装目录在 Z: 盘，则 Z: 盘被报告为光驱
-                return DRIVE_CDROM;
-            }
-        }
-    }
-    return fpGetDriveTypeW(lpRootPathName);
-}
-
-// [修改] Detour_NtQueryVolumeInformationFile
-NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
-    HANDLE FileHandle,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    PVOID FsInformation,
-    ULONG Length,
-    FS_INFORMATION_CLASS FsInformationClass
-) {
-    // 1. 调用原始函数
-    NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
-
-    if (!NT_SUCCESS(status)) return status;
-
-    // 获取句柄对应的路径
-    std::wstring rawPath = GetPathFromHandle(FileHandle);
-    if (rawPath.empty()) return status;
-    std::wstring ntPath = DevicePathToNtPath(rawPath);
-
-    // 检查是否命中 hookvolumeid (原有逻辑)
-    if (g_HookVolumeId && FsInformationClass == FileFsVolumeInformation) {
-        bool shouldFake = false;
-        if (!g_SystemDriveNt.empty() && (ntPath.find(g_SystemDriveNt) == 0)) shouldFake = true;
-        else if (!g_LauncherDriveNt.empty() && (ntPath.find(g_LauncherDriveNt) == 0)) shouldFake = true;
-
-        if (shouldFake) {
-            PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
-            info->VolumeSerialNumber = g_FakeVolumeSerial;
-        }
-    }
-
-    // [新增] 检查是否命中 hookcd
-    if (!g_HookCdPath.empty()) {
-        // 构造 NT 格式的 HookCdPath 用于比较
-        // g_HookCdPath 是 DOS 路径 (Z:\ISO)，ntPath 是 NT 路径 (\??\Z:\ISO)
-        // 简单比较：检查 ntPath 是否包含 g_HookCdPath
-
-        // 更加严谨的判断：
-        // 如果句柄指向的文件在 g_HookCdPath 内部，则伪装卷信息
-
-        // 将 g_HookCdPath 转为 NT 前缀形式
-        std::wstring hookCdNtPrefix = L"\\??\\" + g_HookCdPath;
-
-        bool isTarget = false;
-        if (ntPath.size() >= hookCdNtPrefix.size() &&
-            _wcsnicmp(ntPath.c_str(), hookCdNtPrefix.c_str(), hookCdNtPrefix.size()) == 0) {
-            isTarget = true;
-        }
-
-        if (isTarget) {
-            // 伪装设备类型为光驱
-            if (FsInformationClass == FileFsDeviceInformation) {
-                if (Length >= sizeof(FILE_FS_DEVICE_INFORMATION)) {
-                    PFILE_FS_DEVICE_INFORMATION info = (PFILE_FS_DEVICE_INFORMATION)FsInformation;
-                    info->DeviceType = FILE_DEVICE_CD_ROM;
-                    // 光驱通常是只读且可移动的
-                    info->Characteristics |= (FILE_READ_ONLY_DEVICE | FILE_REMOVABLE_MEDIA);
-                }
-            }
-            // 伪装文件系统名称为 CDFS
-            else if (FsInformationClass == FileFsAttributeInformation) {
-                if (Length >= sizeof(FILE_FS_ATTRIBUTE_INFORMATION)) {
-                    PFILE_FS_ATTRIBUTE_INFORMATION info = (PFILE_FS_ATTRIBUTE_INFORMATION)FsInformation;
-
-                    const wchar_t* fsName = L"CDFS";
-                    size_t fsNameLen = wcslen(fsName) * sizeof(wchar_t);
-
-                    // 检查缓冲区是否足够 (结构体自带1个WCHAR，所以总长度是 offset + nameLen)
-                    if (Length >= FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + fsNameLen) {
-                        info->FileSystemAttributes |= FILE_READ_ONLY_VOLUME;
-                        info->FileSystemNameLength = (ULONG)fsNameLen;
-                        memcpy(info->FileSystemName, fsName, fsNameLen);
-                    }
-                }
-            }
-        }
-    }
-
-    return status;
 }
 
 // --- Winsock Hooks ---
