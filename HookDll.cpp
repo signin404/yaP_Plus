@@ -670,8 +670,6 @@ P_RegEnumValueA fpRegEnumValueA = NULL;
 // --- [新增] User32 窗口函数指针 ---
 typedef HWND(WINAPI* P_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 P_CreateWindowExA fpCreateWindowExA = NULL;
-typedef BOOL(WINAPI* P_SetWindowTextA)(HWND, LPCSTR);
-P_SetWindowTextA fpSetWindowTextA = NULL;
 typedef int(WINAPI* P_GetWindowTextA)(HWND, LPSTR, int);
 P_GetWindowTextA fpGetWindowTextA = NULL;
 typedef LRESULT(WINAPI* P_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
@@ -694,8 +692,6 @@ typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
 P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
 
 // --- [新增] 窗口过程与底层退出函数指针 ---
-typedef LRESULT(WINAPI* P_CallWindowProcA)(WNDPROC, HWND, UINT, WPARAM, LPARAM);
-P_CallWindowProcA fpCallWindowProcA = NULL;
 typedef VOID(NTAPI* P_RtlExitUserProcess)(NTSTATUS);
 P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
 typedef VOID(WINAPI* P_PostQuitMessage)(int);
@@ -4122,13 +4118,6 @@ HWND WINAPI Detour_CreateWindowExA(
     return fpCreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
 }
 
-// --- [修正] SetWindowTextA Hook ---
-BOOL WINAPI Detour_SetWindowTextA(HWND hWnd, LPCSTR lpString) {
-    // [修正] 直接透传原始 Shift-JIS 字符串
-    // 依赖底层的 DefWindowProcA Hook 来处理最终显示
-    return fpSetWindowTextA(hWnd, lpString);
-}
-
 int WINAPI Detour_GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) {
     if (g_FakeACP != 0 && nMaxCount > 0) {
         // 1. 获取 Unicode 标题
@@ -4157,18 +4146,18 @@ int WINAPI Detour_GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) {
 // 拦截默认窗口过程 处理 WM_SETTEXT 消息
 LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
     if (g_FakeACP != 0) {
-        // 当消息到达这里时，lParam 依然是 Shift-JIS 编码
-        // 我们在这里将其转为 Unicode，并交给 Unicode 版的 DefWindowProc 进行绘制
+        // 当消息到达这里时 lParam 依然是 Shift-JIS 编码
+        // 我们在这里将其转为 Unicode 并交给 Unicode 版的 DefWindowProc 进行绘制
         if (Msg == WM_SETTEXT && lParam != 0) {
             std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
             return DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wText.c_str());
         }
-        
+
         // 处理获取标题
         if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
             std::vector<wchar_t> wBuf(wParam + 1);
             LRESULT wResult = DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
-            
+
             std::string aStr = SpoofWideToAnsi(wBuf.data());
             size_t copyLen = min((size_t)wParam - 1, aStr.length());
             memcpy((void*)lParam, aStr.c_str(), copyLen);
@@ -4182,21 +4171,21 @@ LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
 // --- [新增] SendMessageA Hook (解决标题栏/控件乱码) ---
 LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
     if (g_FakeACP != 0) {
-        // [修正] 移除 WM_SETTEXT 的拦截，防止系统错误的二次转换
-        
+        // [修正] 移除 WM_SETTEXT 的拦截 防止系统错误的二次转换
+
         // 保持 WM_GETTEXT 的拦截 (因为我们需要把 Unicode 转回 Shift-JIS 给游戏)
         if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
             std::vector<wchar_t> wBuf(wParam + 1);
             // 调用 W 版获取正确的 Unicode 标题
             LRESULT wResult = SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
-            
+
             // 转回 Shift-JIS 欺骗游戏
             std::string aStr = SpoofWideToAnsi(wBuf.data());
-            
+
             size_t copyLen = min((size_t)wParam - 1, aStr.length());
             memcpy((void*)lParam, aStr.c_str(), copyLen);
             ((char*)lParam)[copyLen] = 0;
-            
+
             return copyLen;
         }
     }
@@ -4241,16 +4230,6 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     // EnumFontFamiliesA 比较古老 通常没有 CharSet 参数 直接透传即可
     // 如果需要更严格的控制 可以转码后调用 W 版 但通常没必要
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
-}
-
-// --- [修正] CallWindowProcA Hook ---
-LRESULT WINAPI Detour_CallWindowProcA(WNDPROC lpPrevWndFunc, HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
-    // [修正] 不要在这里拦截 WM_SETTEXT
-    // 如果在这里转码并调用 W 版，系统发现目标 WndProc 是 ANSI 时，
-    // 会再次用系统默认代码页把 Unicode 转回 ANSI，导致二次乱码。
-    // 我们让原始的 Shift-JIS 字节流直接流向 DefWindowProcA。
-    
-    return fpCallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
 }
 
 // --- [新增] 底层退出 Hook (解决进程残留) ---
@@ -5763,7 +5742,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         HMODULE hUser32 = LoadLibraryW(L"user32.dll");
         if (hUser32) {
             MH_CreateHook(GetProcAddress(hUser32, "CreateWindowExA"), &Detour_CreateWindowExA, reinterpret_cast<LPVOID*>(&fpCreateWindowExA));
-            MH_CreateHook(GetProcAddress(hUser32, "SetWindowTextA"), &Detour_SetWindowTextA, reinterpret_cast<LPVOID*>(&fpSetWindowTextA));
             MH_CreateHook(GetProcAddress(hUser32, "GetWindowTextA"), &Detour_GetWindowTextA, reinterpret_cast<LPVOID*>(&fpGetWindowTextA));
             MH_CreateHook(GetProcAddress(hUser32, "DefWindowProcA"), &Detour_DefWindowProcA, reinterpret_cast<LPVOID*>(&fpDefWindowProcA));
         }
@@ -5778,6 +5756,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         if (hUser32) {
             MH_CreateHook(GetProcAddress(hUser32, "SendMessageA"), &Detour_SendMessageA, reinterpret_cast<LPVOID*>(&fpSendMessageA));
+
+            // 拦截退出消息 启动看门狗
+            MH_CreateHook(GetProcAddress(hUser32, "PostQuitMessage"), &Detour_PostQuitMessage, reinterpret_cast<LPVOID*>(&fpPostQuitMessage));
         }
 
         if (hKernel32) {
@@ -5786,30 +5767,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         if (hNtdll) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtTerminateProcess"), &Detour_NtTerminateProcess, reinterpret_cast<LPVOID*>(&fpNtTerminateProcess));
+
+            // 拦截最底层的用户态退出函数
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlExitUserProcess"), &Detour_RtlExitUserProcess, reinterpret_cast<LPVOID*>(&fpRtlExitUserProcess));
         }
 
         if (hGdi32) {
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesExA"), &Detour_EnumFontFamiliesExA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExA));
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesA"), &Detour_EnumFontFamiliesA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesA));
-        }
-    }
-
-    // --- [新增] 组 I: 深度补丁 (CallWindowProc & RtlExitUserProcess) ---
-    if (g_FakeACP != 0) {
-        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-
-        if (hUser32) {
-            // 拦截子类化消息传递 修复动态标题乱码
-            MH_CreateHook(GetProcAddress(hUser32, "CallWindowProcA"), &Detour_CallWindowProcA, reinterpret_cast<LPVOID*>(&fpCallWindowProcA));
-
-            // 拦截退出消息 启动看门狗
-            MH_CreateHook(GetProcAddress(hUser32, "PostQuitMessage"), &Detour_PostQuitMessage, reinterpret_cast<LPVOID*>(&fpPostQuitMessage));
-        }
-
-        if (hNtdll) {
-            // 拦截最底层的用户态退出函数
-            MH_CreateHook(GetProcAddress(hNtdll, "RtlExitUserProcess"), &Detour_RtlExitUserProcess, reinterpret_cast<LPVOID*>(&fpRtlExitUserProcess));
         }
     }
 
