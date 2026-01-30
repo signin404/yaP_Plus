@@ -177,6 +177,15 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// 注册表 TZI 二进制结构定义
+typedef struct _REG_TZI_FORMAT {
+    LONG Bias;
+    LONG StandardBias;
+    LONG DaylightBias;
+    SYSTEMTIME StandardDate;
+    SYSTEMTIME DaylightDate;
+} REG_TZI_FORMAT;
+
 // --- [新增] 补全注册表相关结构体与枚举 ---
 #ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
 #define _KEY_VALUE_INFORMATION_CLASS_DEFINED
@@ -697,6 +706,12 @@ P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
 typedef VOID(WINAPI* P_PostQuitMessage)(int);
 P_PostQuitMessage fpPostQuitMessage = NULL;
 
+// --- [新增] 时区伪造相关 ---
+typedef DWORD(WINAPI* P_GetTimeZoneInformation)(LPTIME_ZONE_INFORMATION);
+P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
+typedef DWORD(WINAPI* P_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
+P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -895,6 +910,10 @@ std::wstring g_FakeACPStr;   // 存储 "932"
 std::wstring g_FakeOEMCPStr; // 存储 "932"
 LANGID g_FakeLangID = 0;     // 存储 0x0411
 
+// 全局伪造的时区信息
+DYNAMIC_TIME_ZONE_INFORMATION g_FakeDTZI = { 0 };
+bool g_EnableTimeZoneHook = false;
+
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
 P_IcmpSendEcho fpIcmpSendEcho = NULL;
@@ -912,6 +931,7 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -4232,6 +4252,113 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
 }
 
+// --- [新增] 从注册表加载时区信息 ---
+bool LoadTimeZoneFromRegistry(const std::wstring& timeZoneName) {
+    std::wstring keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\" + timeZoneName;
+    HKEY hKey;
+
+    // 打开 HKLM 下的时区键
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        DebugLog(L"TimeZone: Failed to open registry key for '%s'", timeZoneName.c_str());
+        return false;
+    }
+
+    DWORD type, size;
+    REG_TZI_FORMAT tziBin = { 0 };
+
+    // 1. 读取 TZI 二进制数据
+    size = sizeof(tziBin);
+    if (RegQueryValueExW(hKey, L"TZI", NULL, &type, (LPBYTE)&tziBin, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    // 2. 读取显示名称 (Std / Dlt)
+    wchar_t stdName[32] = { 0 };
+    wchar_t dltName[32] = { 0 };
+
+    size = sizeof(stdName);
+    RegQueryValueExW(hKey, L"Std", NULL, NULL, (LPBYTE)stdName, &size);
+
+    size = sizeof(dltName);
+    RegQueryValueExW(hKey, L"Dlt", NULL, NULL, (LPBYTE)dltName, &size);
+
+    RegCloseKey(hKey);
+
+    // 3. 填充全局结构
+    ZeroMemory(&g_FakeDTZI, sizeof(g_FakeDTZI));
+    g_FakeDTZI.Bias = tziBin.Bias;
+    g_FakeDTZI.StandardBias = tziBin.StandardBias;
+    g_FakeDTZI.DaylightBias = tziBin.DaylightBias;
+    g_FakeDTZI.StandardDate = tziBin.StandardDate;
+    g_FakeDTZI.DaylightDate = tziBin.DaylightDate;
+
+    wcscpy_s(g_FakeDTZI.StandardName, stdName);
+    wcscpy_s(g_FakeDTZI.DaylightName, dltName);
+    // TimeZoneKeyName 设为请求的名称
+    wcscpy_s(g_FakeDTZI.TimeZoneKeyName, timeZoneName.c_str());
+
+    // 禁用动态夏令时 (通常老游戏不需要 且简化处理)
+    g_FakeDTZI.DynamicDaylightTimeDisabled = TRUE;
+
+    return true;
+}
+
+// --- [新增] 时区 Hook 实现 ---
+
+DWORD WINAPI Detour_GetTimeZoneInformation(LPTIME_ZONE_INFORMATION lpTimeZoneInformation) {
+    if (g_EnableTimeZoneHook && lpTimeZoneInformation) {
+        // 将 Dynamic 结构转为普通结构
+        lpTimeZoneInformation->Bias = g_FakeDTZI.Bias;
+        wcscpy_s(lpTimeZoneInformation->StandardName, g_FakeDTZI.StandardName);
+        lpTimeZoneInformation->StandardDate = g_FakeDTZI.StandardDate;
+        lpTimeZoneInformation->StandardBias = g_FakeDTZI.StandardBias;
+        wcscpy_s(lpTimeZoneInformation->DaylightName, g_FakeDTZI.DaylightName);
+        lpTimeZoneInformation->DaylightDate = g_FakeDTZI.DaylightDate;
+        lpTimeZoneInformation->DaylightBias = g_FakeDTZI.DaylightBias;
+
+        return TIME_ZONE_ID_STANDARD; // 假装当前处于标准时间
+    }
+    return fpGetTimeZoneInformation(lpTimeZoneInformation);
+}
+
+DWORD WINAPI Detour_GetDynamicTimeZoneInformation(PDYNAMIC_TIME_ZONE_INFORMATION pTimeZoneInformation) {
+    if (g_EnableTimeZoneHook && pTimeZoneInformation) {
+        *pTimeZoneInformation = g_FakeDTZI;
+        return TIME_ZONE_ID_STANDARD;
+    }
+    return fpGetDynamicTimeZoneInformation(pTimeZoneInformation);
+}
+
+// 拦截 Ntdll 的系统信息查询 (很多底层库使用此 API 获取时区)
+NTSTATUS NTAPI Detour_NtQuerySystemInformation(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+) {
+    // SystemCurrentTimeZoneInformation = 44
+    if (g_EnableTimeZoneHook && (int)SystemInformationClass == 44) {
+        if (SystemInformation && SystemInformationLength >= sizeof(RTL_TIME_ZONE_INFORMATION)) {
+            // RTL_TIME_ZONE_INFORMATION 结构与 TIME_ZONE_INFORMATION 几乎一致
+            LPTIME_ZONE_INFORMATION pTzi = (LPTIME_ZONE_INFORMATION)SystemInformation;
+
+            pTzi->Bias = g_FakeDTZI.Bias;
+            wcscpy_s(pTzi->StandardName, g_FakeDTZI.StandardName);
+            pTzi->StandardDate = g_FakeDTZI.StandardDate;
+            pTzi->StandardBias = g_FakeDTZI.StandardBias;
+            wcscpy_s(pTzi->DaylightName, g_FakeDTZI.DaylightName);
+            pTzi->DaylightDate = g_FakeDTZI.DaylightDate;
+            pTzi->DaylightBias = g_FakeDTZI.DaylightBias;
+
+            if (ReturnLength) *ReturnLength = sizeof(RTL_TIME_ZONE_INFORMATION);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    return fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+}
+
 // --- [新增] 底层退出 Hook (解决进程残留) ---
 
 // Ntdll 级别的退出函数 比 ExitProcess 更底层
@@ -5331,41 +5458,54 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
             // [新增] 生成注册表伪造所需的字符串
             g_FakeACPStr = std::to_wstring(g_FakeACP);
-            g_FakeOEMCPStr = g_FakeACPStr; // 通常保持一致
+            g_FakeOEMCPStr = g_FakeACPStr;
 
-            // 根据代码页映射 LCID, CharSet, LangID
+            const wchar_t* autoTimeZone = nullptr;
+
+            // 根据代码页映射 LCID, CharSet, LangID 和 TimeZone
             switch (cp) {
             case 932: // 日语
                 g_FakeLCID = 0x0411;
                 g_FakeLangID = 0x0411;
                 g_FakeCharSet = 128; // SHIFTJIS_CHARSET
+                autoTimeZone = L"Tokyo Standard Time"; // UTC+9
                 break;
             case 936: // 简体中文
                 g_FakeLCID = 0x0804;
                 g_FakeLangID = 0x0804;
                 g_FakeCharSet = 134; // GB2312_CHARSET
+                autoTimeZone = L"China Standard Time"; // UTC+8
                 break;
             case 949: // 韩语
                 g_FakeLCID = 0x0412;
                 g_FakeLangID = 0x0412;
                 g_FakeCharSet = 129; // HANGEUL_CHARSET
+                autoTimeZone = L"Korea Standard Time"; // UTC+9
                 break;
             case 950: // 繁体中文
                 g_FakeLCID = 0x0404;
                 g_FakeLangID = 0x0404;
                 g_FakeCharSet = 136; // CHINESEBIG5_CHARSET
+                autoTimeZone = L"Taipei Standard Time"; // UTC+8
                 break;
-            case 1250: // 中欧
-                g_FakeLCID = 0x0405;
+            case 1250: // 中欧 (捷克/波兰等)
+                g_FakeLCID = 0x0405; // cs-CZ
+                g_FakeLangID = 0x0405;
                 g_FakeCharSet = 238; // EASTEUROPE_CHARSET
+                autoTimeZone = L"Central Europe Standard Time"; // UTC+1
                 break;
             case 1251: // 俄语
                 g_FakeLCID = 0x0419;
+                g_FakeLangID = 0x0419;
                 g_FakeCharSet = 204; // RUSSIAN_CHARSET
+                autoTimeZone = L"Russian Standard Time"; // UTC+3 (Moscow)
                 break;
-            case 1252: // 西欧
-                g_FakeLCID = 0x0409;
+            case 1252: // 西欧 (英语/法语/德语等)
+                g_FakeLCID = 0x0409; // en-US
+                g_FakeLangID = 0x0409;
                 g_FakeCharSet = 0;   // ANSI_CHARSET
+                // 西欧常用时区 这里选巴黎/马德里/柏林作为代表
+                autoTimeZone = L"Romance Standard Time"; // UTC+1
                 break;
             default:
                 g_FakeLCID = 0x0409;
@@ -5373,10 +5513,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 g_FakeCharSet = 0;
                 break;
             }
-            // [新增] 立即设置当前线程的 Locale
-            // 这对于初始化时加载资源的程序非常重要
+
+            // 设置线程 Locale
             if (g_FakeLCID != 0) {
                 SetThreadLocale(g_FakeLCID);
+            }
+
+            // [新增] 自动加载对应的时区
+            if (autoTimeZone != nullptr) {
+                if (LoadTimeZoneFromRegistry(autoTimeZone)) {
+                    g_EnableTimeZoneHook = true;
+                    DebugLog(L"LocaleHook: Auto-set TimeZone to '%s'", autoTimeZone);
+                }
             }
 
             DebugLog(L"LocaleHook: Spoofing CP=%s, LCID=%04X, CharSet=%u", g_FakeACPStr.c_str(), g_FakeLCID, g_FakeCharSet);
@@ -5775,6 +5923,30 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hGdi32) {
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesExA"), &Detour_EnumFontFamiliesExA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExA));
              MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesA"), &Detour_EnumFontFamiliesA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesA));
+        }
+    }
+
+    // --- [新增] 组 I: 时区 Hook ---
+    if (g_EnableTimeZoneHook) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+
+        if (hKernel32) {
+            MH_CreateHook(GetProcAddress(hKernel32, "GetTimeZoneInformation"), &Detour_GetTimeZoneInformation, reinterpret_cast<LPVOID*>(&fpGetTimeZoneInformation));
+            // GetDynamicTimeZoneInformation 在 XP 上可能不存在 需要判断
+            void* pGetDynamic = (void*)GetProcAddress(hKernel32, "GetDynamicTimeZoneInformation");
+            if (pGetDynamic) {
+                MH_CreateHook(pGetDynamic, &Detour_GetDynamicTimeZoneInformation, reinterpret_cast<LPVOID*>(&fpGetDynamicTimeZoneInformation));
+            }
+        }
+
+        if (hNtdll) {
+            // 如果之前没有 Hook NtQuerySystemInformation 这里 Hook
+            // 如果之前在其他组已经 Hook 了 需要合并逻辑 (通常建议只 Hook 一次 在 Detour 函数里分发)
+            // 假设这是第一次 Hook：
+            if (fpNtQuerySystemInformation == NULL) {
+                 MH_CreateHook(GetProcAddress(hNtdll, "NtQuerySystemInformation"), &Detour_NtQuerySystemInformation, reinterpret_cast<LPVOID*>(&fpNtQuerySystemInformation));
+            }
         }
     }
 
