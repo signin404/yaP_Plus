@@ -589,6 +589,7 @@ typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
 P_NtResumeProcess fpNtResumeProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -964,6 +965,7 @@ HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字�
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
 std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
+std::wstring g_HookCdDevicePath; // [新增] 真实路径 (Device): \Device\HarddiskVolume1\Other\ISO
 wchar_t g_VirtualCdDrive = 0;   // 虚拟盘符: 'M'
 std::wstring g_VirtualCdNtPrefix; // 虚拟盘符前缀: \??\M:
 
@@ -996,7 +998,6 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
-P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -2379,6 +2380,53 @@ bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath
     return false;
 }
 
+// [新增] 虚拟光驱路径重定向辅助类 (RAII)
+class VirtualCdRedirector {
+public:
+    VirtualCdRedirector(POBJECT_ATTRIBUTES attr) : m_attr(attr) {
+        if (g_VirtualCdDrive != 0 && m_attr && m_attr->ObjectName) {
+            // 检查路径是否以虚拟盘符前缀开头 (例如 \??\M:)
+            if (m_attr->ObjectName->Length >= g_VirtualCdNtPrefix.length() * sizeof(wchar_t)) {
+                if (_wcsnicmp(m_attr->ObjectName->Buffer, g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.length()) == 0) {
+
+                    // 构造重定向后的路径: \??\M:\Setup.exe -> \??\Z:\Other\ISO\Setup.exe
+                    std::wstring originalPath(m_attr->ObjectName->Buffer, m_attr->ObjectName->Length / sizeof(wchar_t));
+                    m_newPath = g_HookCdNtPath + originalPath.substr(g_VirtualCdNtPrefix.length());
+
+                    // 初始化新的 UNICODE_STRING
+                    // 注意：RtlInitUnicodeString 使用 m_newPath.c_str() 必须确保 m_newPath 在对象生命周期内有效
+                    RtlInitUnicodeString(&m_newStr, m_newPath.c_str());
+
+                    // 备份原始值
+                    m_oldName = m_attr->ObjectName;
+                    m_oldRoot = m_attr->RootDirectory;
+
+                    // 替换为新路径 (绝对路径 忽略 RootDirectory)
+                    m_attr->ObjectName = &m_newStr;
+                    m_attr->RootDirectory = NULL;
+                    m_redirected = true;
+                }
+            }
+        }
+    }
+
+    ~VirtualCdRedirector() {
+        if (m_redirected) {
+            // 还原原始值
+            m_attr->ObjectName = m_oldName;
+            m_attr->RootDirectory = m_oldRoot;
+        }
+    }
+
+private:
+    POBJECT_ATTRIBUTES m_attr;
+    std::wstring m_newPath;
+    UNICODE_STRING m_newStr;
+    PUNICODE_STRING m_oldName = nullptr;
+    HANDLE m_oldRoot = NULL;
+    bool m_redirected = false;
+};
+
 NTSTATUS NTAPI Detour_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -2395,46 +2443,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
 
-    // [新增] 虚拟光驱路径重定向
-    // 必须在 ResolvePathFromAttr 之前处理 因为 ObjectAttributes 可能直接包含虚拟路径
-    if (g_VirtualCdDrive != 0 && ObjectAttributes && ObjectAttributes->ObjectName) {
-        // 简单的检查：如果路径以 \??\M: 开头
-        // 注意：ObjectAttributes->ObjectName 是 UNICODE_STRING 不一定以 NULL 结尾
-        if (ObjectAttributes->ObjectName->Length >= g_VirtualCdNtPrefix.length() * sizeof(wchar_t)) {
-            if (_wcsnicmp(ObjectAttributes->ObjectName->Buffer, g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.length()) == 0) {
-
-                // 构造重定向后的路径
-                // 原始: \??\M:\Setup.exe
-                // 目标: \??\Z:\Other\ISO\Setup.exe
-
-                std::wstring originalPath(ObjectAttributes->ObjectName->Buffer, ObjectAttributes->ObjectName->Length / sizeof(wchar_t));
-                std::wstring newPath = g_HookCdNtPath + originalPath.substr(g_VirtualCdNtPrefix.length());
-
-                // 修改 ObjectAttributes
-                // 注意：这里我们需要分配新的 UNICODE_STRING 并在函数结束前还原 或者让它泄露(不推荐)
-                // 由于 Detour_NtCreateFile 内部逻辑复杂 我们采用临时替换策略
-
-                UNICODE_STRING uStr;
-                RtlInitUnicodeString(&uStr, newPath.c_str());
-
-                PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-                HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
-                ObjectAttributes->ObjectName = &uStr;
-                ObjectAttributes->RootDirectory = NULL; // 虚拟盘符是绝对路径 忽略 RootDirectory
-
-                // 递归调用自身 (让新路径走一遍正常的 Hook 流程 包括 CoW、日志等)
-                // 这样可以确保重定向后的真实路径也能享受到其他 Hook 功能
-                NTSTATUS status = Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-
-                // 还原
-                ObjectAttributes->ObjectName = oldName;
-                ObjectAttributes->RootDirectory = oldRoot;
-
-                return status;
-            }
-        }
-    }
+    // [修改] 使用辅助类处理虚拟光驱重定向 (\??\M: -> \??\Z:\ISO)
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     // [新增] 处理按 ID 打开 (FILE_OPEN_BY_FILE_ID)
     // 移植自 file.c: File_GetName_FromFileId
@@ -2707,6 +2717,9 @@ void CreateDummyFile(const std::wstring& path) {
 NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
     RecursionGuard guard;
+
+    // [新增] 虚拟光驱重定向 (虽然光驱通常只读 但为了兼容性加上)
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
 
@@ -3021,6 +3034,9 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     if (g_IsInHook) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
 
+    // [新增] 虚拟光驱重定向
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
+
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
@@ -3061,6 +3077,9 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
 NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_NETWORK_OPEN_INFORMATION FileInformation) {
     if (g_IsInHook) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
+
+    // [新增] 虚拟光驱重定向
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     // 1. 路径解析与规范化 (处理短文件名、Symlink)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
@@ -5653,8 +5672,21 @@ DWORD WINAPI InitHookThread(LPVOID) {
             g_HookCdPath.pop_back();
         }
 
-        // 构造 NT 格式的真实路径 (\??\Z:\Other\ISO)
         g_HookCdNtPath = L"\\??\\" + g_HookCdPath;
+
+        // [新增] 获取真实路径的设备路径 (用于反向匹配)
+        // g_HookCdPath = Z:\Other\ISO
+        // 需要解析 Z: -> \Device\HarddiskVolume1
+        if (g_HookCdPath.length() >= 2 && g_HookCdPath[1] == L':') {
+            wchar_t driveStr[] = { g_HookCdPath[0], L':', L'\0' };
+            wchar_t devBuf[MAX_PATH];
+            if (QueryDosDeviceW(driveStr, devBuf, MAX_PATH)) {
+                g_HookCdDevicePath = devBuf; // \Device\HarddiskVolume1
+                if (g_HookCdPath.length() > 2) {
+                    g_HookCdDevicePath += g_HookCdPath.substr(2); // + \Other\ISO
+                }
+            }
+        }
 
         // 寻找未使用的盘符 (从 Z 倒序查找 或者从 D 顺序查找)
         DWORD drives = GetLogicalDrives();
@@ -5869,12 +5901,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
             fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
         }
 
-        // 2. 文件重定向挂钩 (仅当 Mode > 0 时启用)
-        if (g_HookMode > 0) {
+        // [修改] 启用文件重定向挂钩的条件
+        // 1. hookfile > 0 (常规重定向)
+        // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
+        if (g_HookMode > 0 || g_VirtualCdDrive != 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
+            // 下面这些通常只在 hookfile 启用时才需要 但为了保险起见也可以挂钩
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
