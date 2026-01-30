@@ -203,6 +203,78 @@ typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
 #define FILE_REMOVABLE_MEDIA 0x00000001
 #endif
 
+// 注册表 TZI 二进制结构定义
+typedef struct _REG_TZI_FORMAT {
+    LONG Bias;
+    LONG StandardBias;
+    LONG DaylightBias;
+    SYSTEMTIME StandardDate;
+    SYSTEMTIME DaylightDate;
+} REG_TZI_FORMAT;
+
+typedef struct _TIME_FIELDS {
+    SHORT Year;
+    SHORT Month;
+    SHORT Day;
+    SHORT Hour;
+    SHORT Minute;
+    SHORT Second;
+    SHORT Milliseconds;
+    SHORT Weekday;
+} TIME_FIELDS, *PTIME_FIELDS;
+
+typedef struct _RTL_TIME_ZONE_INFORMATION {
+    LONG Bias;
+    WCHAR StandardName[32];
+    TIME_FIELDS StandardStart;
+    LONG StandardBias;
+    WCHAR DaylightName[32];
+    TIME_FIELDS DaylightStart;
+    LONG DaylightBias;
+} RTL_TIME_ZONE_INFORMATION, *PRTL_TIME_ZONE_INFORMATION;
+
+// --- [新增] 补全注册表相关结构体与枚举 ---
+#ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
+#define _KEY_VALUE_INFORMATION_CLASS_DEFINED
+typedef enum _KEY_VALUE_INFORMATION_CLASS {
+    KeyValueBasicInformation = 0,
+    KeyValueFullInformation,
+    KeyValuePartialInformation,
+    KeyValueFullInformationAlign64,
+    KeyValuePartialInformationAlign64,
+    MaxKeyValueInfoClass
+} KEY_VALUE_INFORMATION_CLASS;
+#endif
+
+typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
+    ULONG TitleIndex;
+    ULONG Type;
+    ULONG DataLength;
+    UCHAR Data[1];
+} KEY_VALUE_PARTIAL_INFORMATION, *PKEY_VALUE_PARTIAL_INFORMATION;
+
+typedef struct _KEY_VALUE_FULL_INFORMATION {
+    ULONG TitleIndex;
+    ULONG Type;
+    ULONG DataOffset;
+    ULONG DataLength;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_VALUE_FULL_INFORMATION, *PKEY_VALUE_FULL_INFORMATION;
+
+typedef struct _KEY_VALUE_BASIC_INFORMATION {
+    ULONG TitleIndex;
+    ULONG Type;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_VALUE_BASIC_INFORMATION, *PKEY_VALUE_BASIC_INFORMATION;
+
+typedef struct _KEY_VALUE_PARTIAL_INFORMATION_ALIGN64 {
+    ULONG Type;
+    ULONG DataLength;
+    UCHAR Data[1];
+} KEY_VALUE_PARTIAL_INFORMATION_ALIGN64, *PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64;
+
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
     FileFsVolumeInformation = 1,
@@ -496,6 +568,8 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+P_NtQueryValueKey fpNtQueryValueKey = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 typedef NTSTATUS(NTAPI* P_NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PFILE_BASIC_INFORMATION);
@@ -513,6 +587,8 @@ typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
 P_NtResumeProcess fpNtResumeProcess = NULL;
+typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -581,6 +657,110 @@ typedef void GpFontFamily;
 typedef GpStatus(WINAPI* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
 P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
 
+// --- [新增] NLS 函数指针 ---
+typedef UINT(WINAPI* P_GetACP)(void);
+P_GetACP fpGetACP = NULL;
+typedef UINT(WINAPI* P_GetOEMCP)(void);
+P_GetOEMCP fpGetOEMCP = NULL;
+typedef LCID(WINAPI* P_GetUserDefaultLCID)(void);
+P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
+typedef LCID(WINAPI* P_GetSystemDefaultLCID)(void);
+P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
+typedef LCID(WINAPI* P_GetThreadLocale)(void);
+P_GetThreadLocale fpGetThreadLocale = NULL;
+typedef LANGID(WINAPI* P_GetUserDefaultLangID)(void);
+P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
+typedef LANGID(WINAPI* P_GetSystemDefaultLangID)(void);
+P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
+typedef int(WINAPI* P_GetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int);
+P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
+
+// [新增] 字符串转换函数指针
+typedef int(WINAPI* P_MultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
+P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
+typedef int(WINAPI* P_WideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
+P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
+
+// --- [新增] UI语言函数指针 ---
+typedef LANGID(WINAPI* P_GetUserDefaultUILanguage)(void);
+P_GetUserDefaultUILanguage fpGetUserDefaultUILanguage = NULL;
+typedef LANGID(WINAPI* P_GetSystemDefaultUILanguage)(void);
+P_GetSystemDefaultUILanguage fpGetSystemDefaultUILanguage = NULL;
+
+// --- [新增] 字体枚举函数指针 ---
+typedef int (WINAPI* P_EnumFontFamiliesExW)(HDC, LPLOGFONTW, FONTENUMPROCW, LPARAM, DWORD);
+P_EnumFontFamiliesExW fpEnumFontFamiliesExW = NULL;
+typedef int (WINAPI* P_EnumFontFamiliesW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
+P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
+typedef int (WINAPI* P_EnumFontsW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
+P_EnumFontsW fpEnumFontsW = NULL;
+
+// --- [新增] Ntdll 字符串函数指针 ---
+typedef NTSTATUS(NTAPI* P_RtlMultiByteToUnicodeN)(PWCH, ULONG, PULONG, PCSTR, ULONG);
+P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
+typedef NTSTATUS(NTAPI* P_RtlUnicodeToMultiByteN)(PCHAR, ULONG, PULONG, PCWSTR, ULONG);
+P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
+
+// --- [新增] ANSI 字体函数指针 ---
+typedef HFONT(WINAPI* P_CreateFontIndirectA)(const LOGFONTA*);
+P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
+typedef HFONT(WINAPI* P_CreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
+P_CreateFontA fpCreateFontA = NULL;
+
+// --- [新增] ANSI 注册表函数指针 ---
+typedef LSTATUS(WINAPI* P_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegCreateKeyExA)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
+P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+P_RegQueryValueExA fpRegQueryValueExA = NULL;
+typedef LSTATUS(WINAPI* P_RegSetValueExA)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
+P_RegSetValueExA fpRegSetValueExA = NULL;
+typedef LSTATUS(WINAPI* P_RegDeleteKeyA)(HKEY, LPCSTR);
+P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
+typedef LSTATUS(WINAPI* P_RegDeleteValueA)(HKEY, LPCSTR);
+P_RegDeleteValueA fpRegDeleteValueA = NULL;
+typedef LSTATUS(WINAPI* P_RegEnumKeyExA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPSTR, LPDWORD, PFILETIME);
+P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
+typedef LSTATUS(WINAPI* P_RegEnumValueA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+P_RegEnumValueA fpRegEnumValueA = NULL;
+
+// --- [新增] User32 窗口函数指针 ---
+typedef HWND(WINAPI* P_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+P_CreateWindowExA fpCreateWindowExA = NULL;
+typedef int(WINAPI* P_GetWindowTextA)(HWND, LPSTR, int);
+P_GetWindowTextA fpGetWindowTextA = NULL;
+typedef LRESULT(WINAPI* P_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
+P_DefWindowProcA fpDefWindowProcA = NULL;
+// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
+#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
+
+// --- [新增] 消息与进程退出函数指针 ---
+typedef LRESULT(WINAPI* P_SendMessageA)(HWND, UINT, WPARAM, LPARAM);
+P_SendMessageA fpSendMessageA = NULL;
+typedef VOID(WINAPI* P_ExitProcess)(UINT);
+P_ExitProcess fpExitProcess = NULL;
+typedef NTSTATUS(NTAPI* P_NtTerminateProcess)(HANDLE, NTSTATUS);
+P_NtTerminateProcess fpNtTerminateProcess = NULL;
+
+// --- [新增] ANSI 字体枚举指针 ---
+typedef int (WINAPI* P_EnumFontFamiliesExA)(HDC, LPLOGFONTA, FONTENUMPROCA, LPARAM, DWORD);
+P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
+typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
+P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
+
+// --- [新增] 窗口过程与底层退出函数指针 ---
+typedef VOID(NTAPI* P_RtlExitUserProcess)(NTSTATUS);
+P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
+typedef VOID(WINAPI* P_PostQuitMessage)(int);
+P_PostQuitMessage fpPostQuitMessage = NULL;
+
+// --- [新增] 时区伪造相关 ---
+typedef DWORD(WINAPI* P_GetTimeZoneInformation)(LPTIME_ZONE_INFORMATION);
+P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
+typedef DWORD(WINAPI* P_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
+P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
+
 // GetDriveTypeW 函数指针
 typedef UINT(WINAPI* P_GetDriveTypeW)(LPCWSTR);
 P_GetDriveTypeW fpGetDriveTypeW = NULL;
@@ -588,7 +768,6 @@ P_GetDriveTypeW fpGetDriveTypeW = NULL;
 // [新增] 驱动器枚举函数指针
 typedef DWORD(WINAPI* P_GetLogicalDrives)(void);
 P_GetLogicalDrives fpGetLogicalDrives = NULL;
-
 typedef DWORD(WINAPI* P_GetLogicalDriveStringsW)(DWORD, LPWSTR);
 P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
 
@@ -781,10 +960,24 @@ DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
+
+// --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
 std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
 wchar_t g_VirtualCdDrive = 0;   // 虚拟盘符: 'M'
 std::wstring g_VirtualCdNtPrefix; // 虚拟盘符前缀: \??\M:
+
+// --- [新增] 区域伪造全局变量 ---
+UINT g_FakeACP = 0;
+LCID g_FakeLCID = 0;
+BYTE g_FakeCharSet = 0; // [新增] 字体字符集 (例如 128 = Shift-JIS)
+std::wstring g_FakeACPStr;   // 存储 "932"
+std::wstring g_FakeOEMCPStr; // 存储 "932"
+LANGID g_FakeLangID = 0;     // 存储 0x0411
+
+// 全局伪造的时区信息
+DYNAMIC_TIME_ZONE_INFORMATION g_FakeDTZI = { 0 };
+bool g_EnableTimeZoneHook = false;
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -803,6 +996,7 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -2202,10 +2396,10 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     RecursionGuard guard;
 
     // [新增] 虚拟光驱路径重定向
-    // 必须在 ResolvePathFromAttr 之前处理，因为 ObjectAttributes 可能直接包含虚拟路径
+    // 必须在 ResolvePathFromAttr 之前处理 因为 ObjectAttributes 可能直接包含虚拟路径
     if (g_VirtualCdDrive != 0 && ObjectAttributes && ObjectAttributes->ObjectName) {
         // 简单的检查：如果路径以 \??\M: 开头
-        // 注意：ObjectAttributes->ObjectName 是 UNICODE_STRING，不一定以 NULL 结尾
+        // 注意：ObjectAttributes->ObjectName 是 UNICODE_STRING 不一定以 NULL 结尾
         if (ObjectAttributes->ObjectName->Length >= g_VirtualCdNtPrefix.length() * sizeof(wchar_t)) {
             if (_wcsnicmp(ObjectAttributes->ObjectName->Buffer, g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.length()) == 0) {
 
@@ -2217,8 +2411,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 std::wstring newPath = g_HookCdNtPath + originalPath.substr(g_VirtualCdNtPrefix.length());
 
                 // 修改 ObjectAttributes
-                // 注意：这里我们需要分配新的 UNICODE_STRING，并在函数结束前还原，或者让它泄露(不推荐)
-                // 由于 Detour_NtCreateFile 内部逻辑复杂，我们采用临时替换策略
+                // 注意：这里我们需要分配新的 UNICODE_STRING 并在函数结束前还原 或者让它泄露(不推荐)
+                // 由于 Detour_NtCreateFile 内部逻辑复杂 我们采用临时替换策略
 
                 UNICODE_STRING uStr;
                 RtlInitUnicodeString(&uStr, newPath.c_str());
@@ -2227,9 +2421,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
                 ObjectAttributes->ObjectName = &uStr;
-                ObjectAttributes->RootDirectory = NULL; // 虚拟盘符是绝对路径，忽略 RootDirectory
+                ObjectAttributes->RootDirectory = NULL; // 虚拟盘符是绝对路径 忽略 RootDirectory
 
-                // 递归调用自身 (让新路径走一遍正常的 Hook 流程，包括 CoW、日志等)
+                // 递归调用自身 (让新路径走一遍正常的 Hook 流程 包括 CoW、日志等)
                 // 这样可以确保重定向后的真实路径也能享受到其他 Hook 功能
                 NTSTATUS status = Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
@@ -3388,6 +3582,133 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     return status;
 }
 
+// --- [新增] 注册表伪造核心 ---
+NTSTATUS NTAPI Detour_NtQueryValueKey(
+    HANDLE KeyHandle,
+    PUNICODE_STRING ValueName,
+    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    PVOID KeyValueInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
+    // 1. 调用原始函数
+    NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    // 2. 如果查询成功且启用了区域伪造
+    if (NT_SUCCESS(status) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
+
+        // 3. 检查是否查询的是 ACP 或 OEMCP
+        // 注意：为了性能 这里只比较 ValueName
+        // 严格来说应该检查 KeyHandle 是否指向 Control\Nls\CodePage 但在 HookDLL 中维护句柄映射太重了
+        // 由于 ACP/OEMCP 名字很特殊 误伤概率极低
+
+        bool isACP = (_wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && ValueName->Length == 6);
+        bool isOEMCP = (_wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && ValueName->Length == 10);
+
+        if (isACP || isOEMCP) {
+            const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
+            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t));
+
+            // 处理 PartialInformation (最常用的查询方式)
+            if (KeyValueInformationClass == KeyValuePartialInformation) {
+                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+
+                // 检查缓冲区是否足够
+                if (Length >= FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize) {
+                    info->Type = REG_SZ;
+                    info->DataLength = fakeDataSize;
+                    memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
+                    // DebugLog(L"RegHook: Spoofed %s -> %s", ValueName->Buffer, fakeVal.c_str());
+                } else {
+                    status = STATUS_BUFFER_OVERFLOW;
+                    if (ResultLength) *ResultLength = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
+                }
+            }
+            // 处理 FullInformation (部分程序使用)
+            else if (KeyValueInformationClass == KeyValueFullInformation) {
+                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+                ULONG dataOffset = info->DataOffset;
+
+                if (Length >= dataOffset + fakeDataSize) {
+                    info->Type = REG_SZ;
+                    info->DataLength = fakeDataSize;
+                    memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
+                } else {
+                    status = STATUS_BUFFER_OVERFLOW;
+                    if (ResultLength) *ResultLength = dataOffset + fakeDataSize;
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
+// --- [新增] UI 语言 Hook ---
+LANGID WINAPI Detour_GetUserDefaultUILanguage(void) {
+    return g_FakeLangID ? g_FakeLangID : fpGetUserDefaultUILanguage();
+}
+
+LANGID WINAPI Detour_GetSystemDefaultUILanguage(void) {
+    return g_FakeLangID ? g_FakeLangID : fpGetSystemDefaultUILanguage();
+}
+
+// --- [新增] 字体枚举 Hook (解决字体选择乱码) ---
+
+// 代理回调上下文
+struct EnumFontContext {
+    FONTENUMPROCW originalProc;
+    LPARAM originalLParam;
+};
+
+// 代理回调函数
+int CALLBACK ProxyEnumFontFamExProc(const LOGFONTW* lpelfe, const TEXTMETRICW* lpntme, DWORD FontType, LPARAM lParam) {
+    EnumFontContext* ctx = (EnumFontContext*)lParam;
+
+    // 欺骗程序：告诉它这个字体支持我们伪造的字符集
+    // 即使系统字体实际上不支持 很多程序只要看到 CharSet 匹配就会尝试使用
+    // 而 Windows 的字体链接机制通常能兜底显示正确的字符
+    if (g_FakeCharSet != 0) {
+        LOGFONTW spoofedLF = *lpelfe;
+        spoofedLF.lfCharSet = g_FakeCharSet;
+
+        // 如果是 TEXTMETRIC (TrueType) 也修改
+        TEXTMETRICW spoofedTM = *lpntme;
+        spoofedTM.tmCharSet = g_FakeCharSet;
+
+        return ctx->originalProc(&spoofedLF, &spoofedTM, FontType, ctx->originalLParam);
+    }
+
+    return ctx->originalProc(lpelfe, lpntme, FontType, ctx->originalLParam);
+}
+
+int WINAPI Detour_EnumFontFamiliesExW(HDC hdc, LPLOGFONTW lpLogfont, FONTENUMPROCW lpEnumFontFamExProc, LPARAM lParam, DWORD dwFlags) {
+    if (g_FakeCharSet != 0) {
+        // 修改输入请求：强制请求目标字符集的字体
+        LOGFONTW spoofedRequest = *lpLogfont;
+        spoofedRequest.lfCharSet = g_FakeCharSet;
+
+        // 挂钩回调
+        EnumFontContext ctx;
+        ctx.originalProc = lpEnumFontFamExProc;
+        ctx.originalLParam = lParam;
+
+        return fpEnumFontFamiliesExW(hdc, &spoofedRequest, ProxyEnumFontFamExProc, (LPARAM)&ctx, dwFlags);
+    }
+    return fpEnumFontFamiliesExW(hdc, lpLogfont, lpEnumFontFamExProc, lParam, dwFlags);
+}
+
+// EnumFontsW 和 EnumFontFamiliesW 逻辑类似 通常现代程序用 Ex 为了保险可以一并挂钩
+int WINAPI Detour_EnumFontFamiliesW(HDC hdc, LPCWSTR lpszFamily, FONTENUMPROCW lpEnumFontFamProc, LPARAM lParam) {
+    if (g_FakeCharSet != 0) {
+        EnumFontContext ctx;
+        ctx.originalProc = lpEnumFontFamProc;
+        ctx.originalLParam = lParam;
+        return fpEnumFontFamiliesW(hdc, lpszFamily, ProxyEnumFontFamExProc, (LPARAM)&ctx);
+    }
+    return fpEnumFontFamiliesW(hdc, lpszFamily, lpEnumFontFamProc, lParam);
+}
+
 // [新增] Hook NtCreateNamedPipeFile (用于创建管道服务端)
 NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
@@ -3595,22 +3916,45 @@ void OverrideLogFontName(LPWSTR faceName) {
     }
 }
 
+// [修改] 更新字体 Hook 以强制字符集
 HFONT WINAPI Detour_CreateFontIndirectW(const LOGFONTW* lplf) {
-    if (g_OverrideFontName.empty()) return fpCreateFontIndirectW(lplf);
+    // 如果没有启用字体替换且没有启用区域伪造 直接返回
+    if (g_OverrideFontName.empty() && g_FakeCharSet == 0) return fpCreateFontIndirectW(lplf);
 
-    // 复制 LOGFONTW 结构以修改
     LOGFONTW newLf = *lplf;
-    OverrideLogFontName(newLf.lfFaceName);
+
+    // 1. 字体名称替换
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(newLf.lfFaceName);
+    }
+
+    // 2. [新增] 强制字符集 (解决乱码的关键)
+    // 如果程序请求默认字符集 强制改为目标语言字符集
+    if (g_FakeCharSet != 0) {
+        if (newLf.lfCharSet == DEFAULT_CHARSET || newLf.lfCharSet == ANSI_CHARSET) {
+            newLf.lfCharSet = g_FakeCharSet;
+        }
+    }
 
     return fpCreateFontIndirectW(&newLf);
 }
 
 HFONT WINAPI Detour_CreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelf) {
-    if (g_OverrideFontName.empty()) return fpCreateFontIndirectExW(lpelf);
+    if (g_OverrideFontName.empty() && g_FakeCharSet == 0) return fpCreateFontIndirectExW(lpelf);
 
-    // 复制 ENUMLOGFONTEXDVW 结构以修改
     ENUMLOGFONTEXDVW newElf = *lpelf;
-    OverrideLogFontName(newElf.elfEnumLogfontEx.elfLogFont.lfFaceName);
+
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(newElf.elfEnumLogfontEx.elfLogFont.lfFaceName);
+    }
+
+    // [新增] 强制字符集
+    if (g_FakeCharSet != 0) {
+        if (newElf.elfEnumLogfontEx.elfLogFont.lfCharSet == DEFAULT_CHARSET ||
+            newElf.elfEnumLogfontEx.elfLogFont.lfCharSet == ANSI_CHARSET) {
+            newElf.elfEnumLogfontEx.elfLogFont.lfCharSet = g_FakeCharSet;
+        }
+    }
 
     return fpCreateFontIndirectExW(&newElf);
 }
@@ -3642,6 +3986,604 @@ GpStatus WINAPI Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCol
         return fpGdipCreateFontFamilyFromName(g_OverrideFontName.c_str(), fontCollection, fontFamily);
     }
     return fpGdipCreateFontFamilyFromName(name, fontCollection, fontFamily);
+}
+
+// --- [新增] 区域伪造 Hook 实现 ---
+
+UINT WINAPI Detour_GetACP(void) {
+    return g_FakeACP ? g_FakeACP : fpGetACP();
+}
+
+UINT WINAPI Detour_GetOEMCP(void) {
+    return g_FakeACP ? g_FakeACP : fpGetOEMCP(); // 通常 OEMCP 与 ACP 保持一致以避免兼容性问题
+}
+
+LCID WINAPI Detour_GetUserDefaultLCID(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetUserDefaultLCID();
+}
+
+LCID WINAPI Detour_GetSystemDefaultLCID(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetSystemDefaultLCID();
+}
+
+LCID WINAPI Detour_GetThreadLocale(void) {
+    return g_FakeLCID ? g_FakeLCID : fpGetThreadLocale();
+}
+
+LANGID WINAPI Detour_GetUserDefaultLangID(void) {
+    return g_FakeLCID ? LANGIDFROMLCID(g_FakeLCID) : fpGetUserDefaultLangID();
+}
+
+LANGID WINAPI Detour_GetSystemDefaultLangID(void) {
+    return g_FakeLCID ? LANGIDFROMLCID(g_FakeLCID) : fpGetSystemDefaultLangID();
+}
+
+// 拦截 GetLocaleInfoW 以确保返回正确的代码页信息 (例如 CP_ACP)
+int WINAPI Detour_GetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData, int cchData) {
+    // 如果查询的是当前伪造的 Locale 且查询的是代码页
+    if (g_FakeLCID && (Locale == g_FakeLCID || Locale == LOCALE_USER_DEFAULT || Locale == LOCALE_SYSTEM_DEFAULT)) {
+        if ((LCType & ~LOCALE_NOUSEROVERRIDE) == LOCALE_IDEFAULTANSICODEPAGE ||
+            (LCType & ~LOCALE_NOUSEROVERRIDE) == LOCALE_IDEFAULTCODEPAGE) {
+
+            if (cchData == 0) return 6; // 返回所需长度 (最多5位数字+NULL)
+
+            if (lpLCData && cchData > 0) {
+                return swprintf_s(lpLCData, cchData, L"%u", g_FakeACP) > 0 ? (int)wcslen(lpLCData) + 1 : 0;
+            }
+        }
+    }
+    return fpGetLocaleInfoW(Locale, LCType, lpLCData, cchData);
+}
+
+// --- [新增] 核心防乱码 Hook ---
+
+// 拦截 ANSI -> Unicode 转换
+int WINAPI Detour_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar) {
+    // 如果程序请求使用系统默认 ANSI 代码页 强制替换为我们伪造的代码页
+    if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
+        CodePage = g_FakeACP;
+    }
+    return fpMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+}
+
+// 拦截 Unicode -> ANSI 转换
+int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr, int cchWideChar, LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar) {
+    if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
+        CodePage = g_FakeACP;
+    }
+    return fpWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
+}
+
+// --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
+// 很多程序内部使用这个函数而不是 MultiByteToWideChar
+NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
+    // 这里的逻辑稍微复杂 因为 Rtl 函数不接受 CodePage 参数 它默认使用系统当前 ANSI 代码页
+    // 我们必须手动实现转换 强制使用 g_FakeACP
+
+    if (g_FakeACP != 0) {
+        int wLen = 0;
+        // 计算所需长度
+        // 注意：MaxBytesInUnicodeString 是字节数 不是字符数
+        int maxChars = MaxBytesInUnicodeString / sizeof(WCHAR);
+
+        // 如果只查询长度 (UnicodeString == NULL)
+        if (!UnicodeString) {
+            wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, NULL, 0);
+            if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
+            return STATUS_SUCCESS;
+        }
+
+        // 执行转换
+        wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, UnicodeString, maxChars);
+
+        if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
+        return STATUS_SUCCESS;
+    }
+
+    return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
+}
+
+NTSTATUS NTAPI Detour_RtlUnicodeToMultiByteN(PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString, PCWSTR UnicodeString, ULONG BytesInUnicodeString) {
+    if (g_FakeACP != 0) {
+        int aLen = 0;
+        int charsInUnicode = BytesInUnicodeString / sizeof(WCHAR);
+
+        if (!MultiByteString) {
+            aLen = WideCharToMultiByte(g_FakeACP, 0, UnicodeString, charsInUnicode, NULL, 0, NULL, NULL);
+            if (BytesInMultiByteString) *BytesInMultiByteString = aLen;
+            return STATUS_SUCCESS;
+        }
+
+        aLen = WideCharToMultiByte(g_FakeACP, 0, UnicodeString, charsInUnicode, MultiByteString, MaxBytesInMultiByteString, NULL, NULL);
+
+        if (BytesInMultiByteString) *BytesInMultiByteString = aLen;
+        return STATUS_SUCCESS;
+    }
+
+    return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
+}
+
+// --- [新增] ANSI 字体创建 Hook (解决字体名乱码) ---
+HFONT WINAPI Detour_CreateFontIndirectA(const LOGFONTA* lplf) {
+    if (g_FakeACP == 0) return fpCreateFontIndirectA(lplf);
+
+    // 1. 将 LOGFONTA 转换为 LOGFONTW
+    // 关键点：使用 g_FakeACP 进行转换！
+    // 如果不 Hook 这里 系统会用 CP_ACP (如 936) 转换 Shift-JIS 名字 结果就是乱码
+    LOGFONTW lfw = { 0 };
+
+    lfw.lfHeight = lplf->lfHeight;
+    lfw.lfWidth = lplf->lfWidth;
+    lfw.lfEscapement = lplf->lfEscapement;
+    lfw.lfOrientation = lplf->lfOrientation;
+    lfw.lfWeight = lplf->lfWeight;
+    lfw.lfItalic = lplf->lfItalic;
+    lfw.lfUnderline = lplf->lfUnderline;
+    lfw.lfStrikeOut = lplf->lfStrikeOut;
+    lfw.lfCharSet = lplf->lfCharSet;
+    lfw.lfOutPrecision = lplf->lfOutPrecision;
+    lfw.lfClipPrecision = lplf->lfClipPrecision;
+    lfw.lfQuality = lplf->lfQuality;
+    lfw.lfPitchAndFamily = lplf->lfPitchAndFamily;
+
+    // 使用伪造的代码页转换字体名称
+    MultiByteToWideChar(g_FakeACP, 0, lplf->lfFaceName, -1, lfw.lfFaceName, LF_FACESIZE);
+
+    // 2. 强制字符集 (双重保险)
+    if (g_FakeCharSet != 0) {
+        if (lfw.lfCharSet == DEFAULT_CHARSET || lfw.lfCharSet == ANSI_CHARSET) {
+            lfw.lfCharSet = g_FakeCharSet;
+        }
+    }
+
+    // 3. 字体名称替换 (如果配置了 hookfont)
+    if (!g_OverrideFontName.empty()) {
+        OverrideLogFontName(lfw.lfFaceName);
+    }
+
+    // 4. 调用 Wide 版本 (它已经被我们 Hook 了 或者直接调用原始的)
+    // 这里直接调用 CreateFontIndirectW 系统会自动处理
+    return CreateFontIndirectW(&lfw);
+}
+
+HFONT WINAPI Detour_CreateFontA(int cHeight, int cWidth, int cEscapement, int cOrientation, int cWeight, DWORD bItalic, DWORD bUnderline, DWORD bStrikeOut, DWORD iCharSet, DWORD iOutPrecision, DWORD iClipPrecision, DWORD iQuality, DWORD iPitchAndFamily, LPCSTR pszFaceName) {
+    // 构造 LOGFONTA 并转发给 Detour_CreateFontIndirectA
+    LOGFONTA lfa;
+    lfa.lfHeight = cHeight;
+    lfa.lfWidth = cWidth;
+    lfa.lfEscapement = cEscapement;
+    lfa.lfOrientation = cOrientation;
+    lfa.lfWeight = cWeight;
+    lfa.lfItalic = (BYTE)bItalic;
+    lfa.lfUnderline = (BYTE)bUnderline;
+    lfa.lfStrikeOut = (BYTE)bStrikeOut;
+    lfa.lfCharSet = (BYTE)iCharSet;
+    lfa.lfOutPrecision = (BYTE)iOutPrecision;
+    lfa.lfClipPrecision = (BYTE)iClipPrecision;
+    lfa.lfQuality = (BYTE)iQuality;
+    lfa.lfPitchAndFamily = (BYTE)iPitchAndFamily;
+
+    if (pszFaceName) {
+        strncpy_s(lfa.lfFaceName, pszFaceName, LF_FACESIZE - 1);
+    } else {
+        lfa.lfFaceName[0] = 0;
+    }
+
+    return Detour_CreateFontIndirectA(&lfa);
+}
+
+// --- [新增] 注册表 ANSI <-> Unicode 转换辅助 ---
+
+// 使用伪造的代码页将 ANSI 路径转换为 Unicode
+std::wstring SpoofAnsiToWide(LPCSTR ansiStr) {
+    if (!ansiStr) return L"";
+    UINT cp = g_FakeACP ? g_FakeACP : CP_ACP;
+    int len = MultiByteToWideChar(cp, 0, ansiStr, -1, NULL, 0);
+    if (len <= 0) return L"";
+    std::vector<wchar_t> buf(len);
+    MultiByteToWideChar(cp, 0, ansiStr, -1, buf.data(), len);
+    return std::wstring(buf.data());
+}
+
+// 使用伪造的代码页将 Unicode 转换回 ANSI (用于 QueryValue 返回数据)
+std::string SpoofWideToAnsi(LPCWSTR wideStr, int len = -1) {
+    if (!wideStr) return "";
+    UINT cp = g_FakeACP ? g_FakeACP : CP_ACP;
+    int aLen = WideCharToMultiByte(cp, 0, wideStr, len, NULL, 0, NULL, NULL);
+    if (aLen <= 0) return "";
+    std::vector<char> buf(aLen + 1); // +1 安全起见
+    WideCharToMultiByte(cp, 0, wideStr, len, buf.data(), aLen, NULL, NULL);
+    if (len == -1) buf[aLen] = 0; // 确保 NULL 结尾
+    return std::string(buf.data(), aLen); // 注意这里构造 string 的长度
+}
+
+// --- [新增] ANSI 注册表 Hook 实现 ---
+
+LSTATUS WINAPI Detour_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
+    if (g_FakeACP != 0) {
+        // 1. 将 Shift-JIS 路径转为 Unicode
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        // 2. 调用 Unicode API
+        return RegOpenKeyExW(hKey, wSubKey.c_str(), ulOptions, samDesired, phkResult);
+    }
+    return fpRegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+}
+
+LSTATUS WINAPI Detour_RegCreateKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, LPSTR lpClass, DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES lpSecurityAttributes, PHKEY phkResult, LPDWORD lpdwDisposition) {
+    if (g_FakeACP != 0) {
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        std::wstring wClass = SpoofAnsiToWide(lpClass);
+        return RegCreateKeyExW(hKey, wSubKey.c_str(), Reserved, lpClass ? (LPWSTR)wClass.c_str() : NULL, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition);
+    }
+    return fpRegCreateKeyExA(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition);
+}
+
+LSTATUS WINAPI Detour_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+        DWORD type = 0;
+        DWORD wSize = 0;
+
+        // 1. 先查询 Unicode 数据大小
+        LSTATUS status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, NULL, &wSize);
+        if (status != ERROR_SUCCESS) return status;
+
+        // 2. 如果是字符串类型 需要转码
+        if (type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ) {
+            std::vector<BYTE> wData(wSize);
+            status = RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, &type, wData.data(), &wSize);
+            if (status != ERROR_SUCCESS) return status;
+
+            // 转回 Shift-JIS
+            std::string aData = SpoofWideToAnsi((LPCWSTR)wData.data(), wSize / sizeof(wchar_t)); // 包含 NULL
+
+            if (lpType) *lpType = type;
+
+            if (lpcbData) {
+                if (!lpData) {
+                    *lpcbData = (DWORD)aData.size();
+                    return ERROR_SUCCESS;
+                }
+                if (*lpcbData < aData.size()) {
+                    *lpcbData = (DWORD)aData.size();
+                    return ERROR_MORE_DATA;
+                }
+                memcpy(lpData, aData.data(), aData.size());
+                *lpcbData = (DWORD)aData.size();
+            }
+            return ERROR_SUCCESS;
+        }
+        else {
+            // 非字符串直接透传 (但需要调用 W 版)
+            return RegQueryValueExW(hKey, wValueName.c_str(), lpReserved, lpType, lpData, lpcbData);
+        }
+    }
+    return fpRegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+}
+
+LSTATUS WINAPI Detour_RegSetValueExA(HKEY hKey, LPCSTR lpValueName, DWORD Reserved, DWORD dwType, const BYTE* lpData, DWORD cbData) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+
+        if (dwType == REG_SZ || dwType == REG_EXPAND_SZ || dwType == REG_MULTI_SZ) {
+            // 将写入的 Shift-JIS 内容转为 Unicode
+            std::wstring wData = SpoofAnsiToWide((LPCSTR)lpData);
+            // 注意：cbData 是字节数 RegSetValueExW 需要字节数 (len * 2)
+            return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, (const BYTE*)wData.c_str(), (DWORD)(wData.length() + 1) * sizeof(wchar_t));
+        } else {
+            return RegSetValueExW(hKey, wValueName.c_str(), Reserved, dwType, lpData, cbData);
+        }
+    }
+    return fpRegSetValueExA(hKey, lpValueName, Reserved, dwType, lpData, cbData);
+}
+
+LSTATUS WINAPI Detour_RegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey) {
+    if (g_FakeACP != 0) {
+        std::wstring wSubKey = SpoofAnsiToWide(lpSubKey);
+        return RegDeleteKeyW(hKey, wSubKey.c_str());
+    }
+    return fpRegDeleteKeyA(hKey, lpSubKey);
+}
+
+LSTATUS WINAPI Detour_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName) {
+    if (g_FakeACP != 0) {
+        std::wstring wValueName = SpoofAnsiToWide(lpValueName);
+        return RegDeleteValueW(hKey, wValueName.c_str());
+    }
+    return fpRegDeleteValueA(hKey, lpValueName);
+}
+
+// --- [新增] 窗口标题乱码修复 Hook ---
+
+HWND WINAPI Detour_CreateWindowExA(
+    DWORD dwExStyle,
+    LPCSTR lpClassName,
+    LPCSTR lpWindowName,
+    DWORD dwStyle,
+    int X,
+    int Y,
+    int nWidth,
+    int nHeight,
+    HWND hWndParent,
+    HMENU hMenu,
+    HINSTANCE hInstance,
+    LPVOID lpParam
+) {
+    if (g_FakeACP != 0) {
+        // 1. 转码窗口标题 (WindowName)
+        std::wstring wWindowName = SpoofAnsiToWide(lpWindowName);
+
+        // 2. 转码窗口类名 (ClassName) - 注意类名可能是 ATOM
+        std::wstring wClassName;
+        LPCWSTR lpWClass = NULL;
+
+        if (IS_ATOM(lpClassName)) {
+            lpWClass = (LPCWSTR)lpClassName; // ATOM 直接透传
+        } else {
+            wClassName = SpoofAnsiToWide(lpClassName);
+            lpWClass = wClassName.c_str();
+        }
+
+        // 3. 调用 Unicode 版本 API (CreateWindowExW)
+        // 这样 Windows 接收到的就是正确的 Unicode 字符 不会乱码
+        return CreateWindowExW(
+            dwExStyle,
+            lpWClass,
+            wWindowName.c_str(),
+            dwStyle,
+            X, Y, nWidth, nHeight,
+            hWndParent,
+            hMenu,
+            hInstance,
+            lpParam
+        );
+    }
+    return fpCreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+}
+
+int WINAPI Detour_GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) {
+    if (g_FakeACP != 0 && nMaxCount > 0) {
+        // 1. 获取 Unicode 标题
+        int wLen = GetWindowTextLengthW(hWnd);
+        if (wLen == 0) {
+            if (lpString) lpString[0] = 0;
+            return 0;
+        }
+
+        std::vector<wchar_t> wBuf(wLen + 1);
+        GetWindowTextW(hWnd, wBuf.data(), wLen + 1);
+
+        // 2. 转回 Shift-JIS (欺骗程序它读到的是 ANSI)
+        std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+        // 3. 复制到缓冲区
+        int copyLen = min((int)aStr.length(), nMaxCount - 1);
+        memcpy(lpString, aStr.c_str(), copyLen);
+        lpString[copyLen] = 0;
+
+        return copyLen;
+    }
+    return fpGetWindowTextA(hWnd, lpString, nMaxCount);
+}
+
+// 拦截默认窗口过程 处理 WM_SETTEXT 消息
+LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        // 当消息到达这里时 lParam 依然是 Shift-JIS 编码
+        // 我们在这里将其转为 Unicode 并交给 Unicode 版的 DefWindowProc 进行绘制
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+            return DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wText.c_str());
+        }
+
+        // 处理获取标题
+        if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
+            std::vector<wchar_t> wBuf(wParam + 1);
+            LRESULT wResult = DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+            std::string aStr = SpoofWideToAnsi(wBuf.data());
+            size_t copyLen = min((size_t)wParam - 1, aStr.length());
+            memcpy((void*)lParam, aStr.c_str(), copyLen);
+            ((char*)lParam)[copyLen] = 0;
+            return copyLen;
+        }
+    }
+    return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] SendMessageA Hook (解决标题栏/控件乱码) ---
+LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (g_FakeACP != 0) {
+        // [修正] 移除 WM_SETTEXT 的拦截 防止系统错误的二次转换
+
+        // 保持 WM_GETTEXT 的拦截 (因为我们需要把 Unicode 转回 Shift-JIS 给游戏)
+        if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
+            std::vector<wchar_t> wBuf(wParam + 1);
+            // 调用 W 版获取正确的 Unicode 标题
+            LRESULT wResult = SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+            // 转回 Shift-JIS 欺骗游戏
+            std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+            size_t copyLen = min((size_t)wParam - 1, aStr.length());
+            memcpy((void*)lParam, aStr.c_str(), copyLen);
+            ((char*)lParam)[copyLen] = 0;
+
+            return copyLen;
+        }
+    }
+    return fpSendMessageA(hWnd, Msg, wParam, lParam);
+}
+
+// --- [新增] 强制退出 Hook (解决进程残留) ---
+
+void WINAPI Detour_ExitProcess(UINT uExitCode) {
+    // 这里的关键是使用 TerminateProcess 而不是 ExitProcess
+    // ExitProcess 会尝试通知所有 DLL (DLL_PROCESS_DETACH) 并等待线程结束 容易导致死锁
+    // TerminateProcess 是内核级强制查杀 瞬间结束 不留后患
+    TerminateProcess(GetCurrentProcess(), uExitCode);
+}
+
+NTSTATUS NTAPI Detour_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
+    // 如果程序尝试结束自己
+    if (!ProcessHandle || ProcessHandle == GetCurrentProcess()) {
+        TerminateProcess(GetCurrentProcess(), 0); // 强制退出
+        return STATUS_SUCCESS; // 实际上永远不会执行到这里
+    }
+    return fpNtTerminateProcess(ProcessHandle, ExitStatus);
+}
+
+// --- [新增] ANSI 字体枚举 Hook (补充) ---
+// 某些游戏使用 ANSI 版枚举字体 如果不 Hook 传入的 Shift-JIS 字体名会被错误解析
+
+int WINAPI Detour_EnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpEnumFontFamExProc, LPARAM lParam, DWORD dwFlags) {
+    if (g_FakeCharSet != 0 && lpLogfont) {
+        // 强制修改请求的字符集
+        if (lpLogfont->lfCharSet == DEFAULT_CHARSET || lpLogfont->lfCharSet == ANSI_CHARSET) {
+            // 我们不能直接修改 const 指针指向的内容 所以复制一份
+            LOGFONTA newLf = *lpLogfont;
+            newLf.lfCharSet = g_FakeCharSet;
+            return fpEnumFontFamiliesExA(hdc, &newLf, lpEnumFontFamExProc, lParam, dwFlags);
+        }
+    }
+    return fpEnumFontFamiliesExA(hdc, lpLogfont, lpEnumFontFamExProc, lParam, dwFlags);
+}
+
+int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lpEnumFontFamProc, LPARAM lParam) {
+    // EnumFontFamiliesA 比较古老 通常没有 CharSet 参数 直接透传即可
+    // 如果需要更严格的控制 可以转码后调用 W 版 但通常没必要
+    return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
+}
+
+// --- [新增] 从注册表加载时区信息 ---
+bool LoadTimeZoneFromRegistry(const std::wstring& timeZoneName) {
+    std::wstring keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\" + timeZoneName;
+    HKEY hKey;
+
+    // 打开 HKLM 下的时区键
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        DebugLog(L"TimeZone: Failed to open registry key for '%s'", timeZoneName.c_str());
+        return false;
+    }
+
+    DWORD type, size;
+    REG_TZI_FORMAT tziBin = { 0 };
+
+    // 1. 读取 TZI 二进制数据
+    size = sizeof(tziBin);
+    if (RegQueryValueExW(hKey, L"TZI", NULL, &type, (LPBYTE)&tziBin, &size) != ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    // 2. 读取显示名称 (Std / Dlt)
+    wchar_t stdName[32] = { 0 };
+    wchar_t dltName[32] = { 0 };
+
+    size = sizeof(stdName);
+    RegQueryValueExW(hKey, L"Std", NULL, NULL, (LPBYTE)stdName, &size);
+
+    size = sizeof(dltName);
+    RegQueryValueExW(hKey, L"Dlt", NULL, NULL, (LPBYTE)dltName, &size);
+
+    RegCloseKey(hKey);
+
+    // 3. 填充全局结构
+    ZeroMemory(&g_FakeDTZI, sizeof(g_FakeDTZI));
+    g_FakeDTZI.Bias = tziBin.Bias;
+    g_FakeDTZI.StandardBias = tziBin.StandardBias;
+    g_FakeDTZI.DaylightBias = tziBin.DaylightBias;
+    g_FakeDTZI.StandardDate = tziBin.StandardDate;
+    g_FakeDTZI.DaylightDate = tziBin.DaylightDate;
+
+    wcscpy_s(g_FakeDTZI.StandardName, stdName);
+    wcscpy_s(g_FakeDTZI.DaylightName, dltName);
+    // TimeZoneKeyName 设为请求的名称
+    wcscpy_s(g_FakeDTZI.TimeZoneKeyName, timeZoneName.c_str());
+
+    // 禁用动态夏令时 (通常老游戏不需要 且简化处理)
+    g_FakeDTZI.DynamicDaylightTimeDisabled = TRUE;
+
+    return true;
+}
+
+// --- [新增] 时区 Hook 实现 ---
+
+DWORD WINAPI Detour_GetTimeZoneInformation(LPTIME_ZONE_INFORMATION lpTimeZoneInformation) {
+    if (g_EnableTimeZoneHook && lpTimeZoneInformation) {
+        // 将 Dynamic 结构转为普通结构
+        lpTimeZoneInformation->Bias = g_FakeDTZI.Bias;
+        wcscpy_s(lpTimeZoneInformation->StandardName, g_FakeDTZI.StandardName);
+        lpTimeZoneInformation->StandardDate = g_FakeDTZI.StandardDate;
+        lpTimeZoneInformation->StandardBias = g_FakeDTZI.StandardBias;
+        wcscpy_s(lpTimeZoneInformation->DaylightName, g_FakeDTZI.DaylightName);
+        lpTimeZoneInformation->DaylightDate = g_FakeDTZI.DaylightDate;
+        lpTimeZoneInformation->DaylightBias = g_FakeDTZI.DaylightBias;
+
+        return TIME_ZONE_ID_STANDARD; // 假装当前处于标准时间
+    }
+    return fpGetTimeZoneInformation(lpTimeZoneInformation);
+}
+
+DWORD WINAPI Detour_GetDynamicTimeZoneInformation(PDYNAMIC_TIME_ZONE_INFORMATION pTimeZoneInformation) {
+    if (g_EnableTimeZoneHook && pTimeZoneInformation) {
+        *pTimeZoneInformation = g_FakeDTZI;
+        return TIME_ZONE_ID_STANDARD;
+    }
+    return fpGetDynamicTimeZoneInformation(pTimeZoneInformation);
+}
+
+// 拦截 Ntdll 的系统信息查询 (很多底层库使用此 API 获取时区)
+NTSTATUS NTAPI Detour_NtQuerySystemInformation(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+) {
+    // SystemCurrentTimeZoneInformation = 44
+    if (g_EnableTimeZoneHook && (int)SystemInformationClass == 44) {
+        if (SystemInformation && SystemInformationLength >= sizeof(RTL_TIME_ZONE_INFORMATION)) {
+            // RTL_TIME_ZONE_INFORMATION 结构与 TIME_ZONE_INFORMATION 几乎一致
+            LPTIME_ZONE_INFORMATION pTzi = (LPTIME_ZONE_INFORMATION)SystemInformation;
+
+            pTzi->Bias = g_FakeDTZI.Bias;
+            wcscpy_s(pTzi->StandardName, g_FakeDTZI.StandardName);
+            pTzi->StandardDate = g_FakeDTZI.StandardDate;
+            pTzi->StandardBias = g_FakeDTZI.StandardBias;
+            wcscpy_s(pTzi->DaylightName, g_FakeDTZI.DaylightName);
+            pTzi->DaylightDate = g_FakeDTZI.DaylightDate;
+            pTzi->DaylightBias = g_FakeDTZI.DaylightBias;
+
+            if (ReturnLength) *ReturnLength = sizeof(RTL_TIME_ZONE_INFORMATION);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    return fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+}
+
+// --- [新增] 底层退出 Hook (解决进程残留) ---
+
+// Ntdll 级别的退出函数 比 ExitProcess 更底层
+void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
+    // 强制终止当前进程 不等待任何线程清理
+    TerminateProcess(GetCurrentProcess(), Status);
+}
+
+// 看门狗线程：防止 PostQuitMessage 后主循环卡死
+DWORD WINAPI SuicideWatchdog(LPVOID) {
+    Sleep(2000); // 给主程序 2 秒时间正常退出
+    TerminateProcess(GetCurrentProcess(), 0); // 2秒后强制杀进程
+    return 0;
+}
+
+void WINAPI Detour_PostQuitMessage(int nExitCode) {
+    // 当程序请求退出消息循环时 启动一个看门狗线程
+    // 如果程序在 2 秒内没有通过正常途径退出 看门狗会强制杀死它
+    HANDLE hThread = CreateThread(NULL, 0, SuicideWatchdog, NULL, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+
+    fpPostQuitMessage(nExitCode);
 }
 
 // --- 路径处理辅助函数 ---
@@ -4703,7 +5645,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // [修改] 读取 hookcd 配置并分配虚拟盘符
+    // [新增] 读取 hookcd 配置
     wchar_t cdBuffer[MAX_PATH];
     if (GetEnvironmentVariableW(L"YAP_HOOK_CD", cdBuffer, MAX_PATH) > 0) {
         g_HookCdPath = cdBuffer;
@@ -4714,7 +5656,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // 构造 NT 格式的真实路径 (\??\Z:\Other\ISO)
         g_HookCdNtPath = L"\\??\\" + g_HookCdPath;
 
-        // 寻找未使用的盘符 (从 Z 倒序查找，或者从 D 顺序查找)
+        // 寻找未使用的盘符 (从 Z 倒序查找 或者从 D 顺序查找)
         DWORD drives = GetLogicalDrives();
         // 从 'E' 开始查找 (跳过 A, B, C, D)
         for (wchar_t drive = L'E'; drive <= L'Z'; ++drive) {
@@ -4724,7 +5666,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
-        // 如果找不到，尝试 D
+        // 如果找不到 尝试 D
         if (g_VirtualCdDrive == 0 && (drives & (1 << (L'D' - L'A'))) == 0) {
             g_VirtualCdDrive = L'D';
         }
@@ -4745,6 +5687,88 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"YAP_HOOK_FONT", fontBuffer, 64) > 0) {
         g_OverrideFontName = fontBuffer;
         DebugLog(L"FontHook: Override font set to '%s'", g_OverrideFontName.c_str());
+    }
+
+    // --- [修改] 读取 hooklocale 配置 ---
+    wchar_t localeBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_LOCALE", localeBuffer, 64) > 0) {
+        int cp = _wtoi(localeBuffer);
+        if (cp > 0) {
+            g_FakeACP = (UINT)cp;
+
+            // [新增] 生成注册表伪造所需的字符串
+            g_FakeACPStr = std::to_wstring(g_FakeACP);
+            g_FakeOEMCPStr = g_FakeACPStr;
+
+            const wchar_t* autoTimeZone = nullptr;
+
+            // 根据代码页映射 LCID, CharSet, LangID 和 TimeZone
+            switch (cp) {
+            case 932: // 日语
+                g_FakeLCID = 0x0411;
+                g_FakeLangID = 0x0411;
+                g_FakeCharSet = 128; // SHIFTJIS_CHARSET
+                autoTimeZone = L"Tokyo Standard Time"; // UTC+9
+                break;
+            case 936: // 简体中文
+                g_FakeLCID = 0x0804;
+                g_FakeLangID = 0x0804;
+                g_FakeCharSet = 134; // GB2312_CHARSET
+                autoTimeZone = L"China Standard Time"; // UTC+8
+                break;
+            case 949: // 韩语
+                g_FakeLCID = 0x0412;
+                g_FakeLangID = 0x0412;
+                g_FakeCharSet = 129; // HANGEUL_CHARSET
+                autoTimeZone = L"Korea Standard Time"; // UTC+9
+                break;
+            case 950: // 繁体中文
+                g_FakeLCID = 0x0404;
+                g_FakeLangID = 0x0404;
+                g_FakeCharSet = 136; // CHINESEBIG5_CHARSET
+                autoTimeZone = L"Taipei Standard Time"; // UTC+8
+                break;
+            case 1250: // 中欧 (捷克/波兰等)
+                g_FakeLCID = 0x0405; // cs-CZ
+                g_FakeLangID = 0x0405;
+                g_FakeCharSet = 238; // EASTEUROPE_CHARSET
+                autoTimeZone = L"Central Europe Standard Time"; // UTC+1
+                break;
+            case 1251: // 俄语
+                g_FakeLCID = 0x0419;
+                g_FakeLangID = 0x0419;
+                g_FakeCharSet = 204; // RUSSIAN_CHARSET
+                autoTimeZone = L"Russian Standard Time"; // UTC+3 (Moscow)
+                break;
+            case 1252: // 西欧 (英语/法语/德语等)
+                g_FakeLCID = 0x0409; // en-US
+                g_FakeLangID = 0x0409;
+                g_FakeCharSet = 0;   // ANSI_CHARSET
+                // 西欧常用时区 这里选巴黎/马德里/柏林作为代表
+                autoTimeZone = L"Romance Standard Time"; // UTC+1
+                break;
+            default:
+                g_FakeLCID = 0x0409;
+                g_FakeLangID = 0x0409;
+                g_FakeCharSet = 0;
+                break;
+            }
+
+            // 设置线程 Locale
+            if (g_FakeLCID != 0) {
+                SetThreadLocale(g_FakeLCID);
+            }
+
+            // [新增] 自动加载对应的时区
+            if (autoTimeZone != nullptr) {
+                if (LoadTimeZoneFromRegistry(autoTimeZone)) {
+                    g_EnableTimeZoneHook = true;
+                    DebugLog(L"LocaleHook: Auto-set TimeZone to '%s'", autoTimeZone);
+                }
+            }
+
+            DebugLog(L"LocaleHook: Spoofing CP=%s, LCID=%04X, CharSet=%u", g_FakeACPStr.c_str(), g_FakeLCID, g_FakeCharSet);
+        }
     }
 
     // 4. [新增] 获取系统盘符并初始化白名单
@@ -4880,8 +5904,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
                 }
 
-                // 2. 驱动器枚举与类型挂钩 (新增，用于 hookcd)
-                // 只要 hookcd 启用 (无论是否分配了虚拟盘符，GetDriveTypeW 都需要挂钩以处理路径匹配)
+                // 2. 驱动器枚举与类型挂钩 (新增 用于 hookcd)
+                // 只要 hookcd 启用 (无论是否分配了虚拟盘符 GetDriveTypeW 都需要挂钩以处理路径匹配)
                 if (!g_HookCdPath.empty()) {
                     void* pGetDriveTypeW = (void*)GetProcAddress(hKernel32, "GetDriveTypeW");
                     if (pGetDriveTypeW) MH_CreateHook(pGetDriveTypeW, &Detour_GetDriveTypeW, reinterpret_cast<LPVOID*>(&fpGetDriveTypeW));
@@ -5042,6 +6066,143 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pGdipCreateFontFamilyFromName = (void*)GetProcAddress(hGdiPlus, "GdipCreateFontFamilyFromName");
             if (pGdipCreateFontFamilyFromName) {
                 MH_CreateHook(pGdipCreateFontFamilyFromName, &Detour_GdipCreateFontFamilyFromName, reinterpret_cast<LPVOID*>(&fpGdipCreateFontFamilyFromName));
+            }
+        }
+    }
+
+    // --- [新增] 组 E: 区域语言 Hook (仅当 hooklocale 有值时启用) ---
+    if (g_FakeACP != 0) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll"); // 确保获取 ntdll
+        HMODULE hGdi32 = GetModuleHandleW(L"gdi32.dll");
+        if (hKernel32) {
+            // 基础信息查询
+            MH_CreateHook(GetProcAddress(hKernel32, "GetACP"), &Detour_GetACP, reinterpret_cast<LPVOID*>(&fpGetACP));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetOEMCP"), &Detour_GetOEMCP, reinterpret_cast<LPVOID*>(&fpGetOEMCP));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLCID"), &Detour_GetUserDefaultLCID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLCID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultLCID"), &Detour_GetSystemDefaultLCID, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultLCID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetThreadLocale"), &Detour_GetThreadLocale, reinterpret_cast<LPVOID*>(&fpGetThreadLocale));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultLangID"), &Detour_GetUserDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetUserDefaultLangID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultLangID"), &Detour_GetSystemDefaultLangID, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultLangID));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetLocaleInfoW"), &Detour_GetLocaleInfoW, reinterpret_cast<LPVOID*>(&fpGetLocaleInfoW));
+            MH_CreateHook(GetProcAddress(hKernel32, "MultiByteToWideChar"), &Detour_MultiByteToWideChar, reinterpret_cast<LPVOID*>(&fpMultiByteToWideChar));
+            MH_CreateHook(GetProcAddress(hKernel32, "WideCharToMultiByte"), &Detour_WideCharToMultiByte, reinterpret_cast<LPVOID*>(&fpWideCharToMultiByte));
+
+            // [新增] UI 语言 Hook
+            MH_CreateHook(GetProcAddress(hKernel32, "GetUserDefaultUILanguage"), &Detour_GetUserDefaultUILanguage, reinterpret_cast<LPVOID*>(&fpGetUserDefaultUILanguage));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultUILanguage"), &Detour_GetSystemDefaultUILanguage, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultUILanguage));
+        }
+
+        // [新增] 注册表 Hook (NtQueryValueKey)
+        if (hNtdll) {
+            // 注意：如果之前在文件系统 Hook 中已经获取了 fpNtQueryValueKey 这里直接使用
+            // 如果没有 需要 GetProcAddress
+            void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
+            if (pNtQueryValueKey) {
+                MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
+                MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
+                MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
+            }
+        }
+
+        // [新增] 字体枚举 Hook
+        if (hGdi32) {
+            void* pEnumFontFamiliesExW = (void*)GetProcAddress(hGdi32, "EnumFontFamiliesExW");
+            if (pEnumFontFamiliesExW) MH_CreateHook(pEnumFontFamiliesExW, &Detour_EnumFontFamiliesExW, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExW));
+
+            void* pEnumFontFamiliesW = (void*)GetProcAddress(hGdi32, "EnumFontFamiliesW");
+            if (pEnumFontFamiliesW) MH_CreateHook(pEnumFontFamiliesW, &Detour_EnumFontFamiliesW, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesW));
+
+            // [新增] ANSI 字体 Hook
+            MH_CreateHook(GetProcAddress(hGdi32, "CreateFontIndirectA"), &Detour_CreateFontIndirectA, reinterpret_cast<LPVOID*>(&fpCreateFontIndirectA));
+            MH_CreateHook(GetProcAddress(hGdi32, "CreateFontA"), &Detour_CreateFontA, reinterpret_cast<LPVOID*>(&fpCreateFontA));
+        }
+    }
+
+    // --- [新增] 组 F: ANSI 注册表 Hook (解决路径乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegOpenKeyExA"), &Detour_RegOpenKeyExA, reinterpret_cast<LPVOID*>(&fpRegOpenKeyExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegCreateKeyExA"), &Detour_RegCreateKeyExA, reinterpret_cast<LPVOID*>(&fpRegCreateKeyExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegQueryValueExA"), &Detour_RegQueryValueExA, reinterpret_cast<LPVOID*>(&fpRegQueryValueExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegSetValueExA"), &Detour_RegSetValueExA, reinterpret_cast<LPVOID*>(&fpRegSetValueExA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteKeyA"), &Detour_RegDeleteKeyA, reinterpret_cast<LPVOID*>(&fpRegDeleteKeyA));
+            MH_CreateHook(GetProcAddress(hAdvapi32, "RegDeleteValueA"), &Detour_RegDeleteValueA, reinterpret_cast<LPVOID*>(&fpRegDeleteValueA));
+
+            // 很多旧程序使用 RegOpenKeyA (它是 RegOpenKeyExA 的包装 但也需要 Hook)
+            // 注意：RegOpenKeyA 在 advapi32 中通常直接导出
+            void* pRegOpenKeyA = (void*)GetProcAddress(hAdvapi32, "RegOpenKeyA");
+            if (pRegOpenKeyA) {
+                // 我们可以直接重定向到 Detour_RegOpenKeyExA 的逻辑 或者简单地实现一个 Detour_RegOpenKeyA
+                // 这里为了简单 假设程序主要用 Ex 如果用了非 Ex 通常也会被上面的 Ex 捕获（如果它是通过 Ex 实现的）
+                // 但为了保险 建议也 Hook 它
+                // 由于参数不同 这里暂不展开 通常 Ex 足够覆盖 95% 的情况
+            }
+        }
+    }
+
+    // --- [新增] 组 G: User32 窗口 Hook (解决标题栏乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+        if (hUser32) {
+            MH_CreateHook(GetProcAddress(hUser32, "CreateWindowExA"), &Detour_CreateWindowExA, reinterpret_cast<LPVOID*>(&fpCreateWindowExA));
+            MH_CreateHook(GetProcAddress(hUser32, "GetWindowTextA"), &Detour_GetWindowTextA, reinterpret_cast<LPVOID*>(&fpGetWindowTextA));
+            MH_CreateHook(GetProcAddress(hUser32, "DefWindowProcA"), &Detour_DefWindowProcA, reinterpret_cast<LPVOID*>(&fpDefWindowProcA));
+        }
+    }
+
+    // --- [新增] 组 H: 消息与退出 Hook (解决残留和剩余乱码) ---
+    if (g_FakeACP != 0) {
+        HMODULE hUser32 = LoadLibraryW(L"user32.dll");
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE hGdi32 = GetModuleHandleW(L"gdi32.dll");
+
+        if (hUser32) {
+            MH_CreateHook(GetProcAddress(hUser32, "SendMessageA"), &Detour_SendMessageA, reinterpret_cast<LPVOID*>(&fpSendMessageA));
+
+            // 拦截退出消息 启动看门狗
+            MH_CreateHook(GetProcAddress(hUser32, "PostQuitMessage"), &Detour_PostQuitMessage, reinterpret_cast<LPVOID*>(&fpPostQuitMessage));
+        }
+
+        if (hKernel32) {
+            MH_CreateHook(GetProcAddress(hKernel32, "ExitProcess"), &Detour_ExitProcess, reinterpret_cast<LPVOID*>(&fpExitProcess));
+        }
+
+        if (hNtdll) {
+            MH_CreateHook(GetProcAddress(hNtdll, "NtTerminateProcess"), &Detour_NtTerminateProcess, reinterpret_cast<LPVOID*>(&fpNtTerminateProcess));
+
+            // 拦截最底层的用户态退出函数
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlExitUserProcess"), &Detour_RtlExitUserProcess, reinterpret_cast<LPVOID*>(&fpRtlExitUserProcess));
+        }
+
+        if (hGdi32) {
+             MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesExA"), &Detour_EnumFontFamiliesExA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesExA));
+             MH_CreateHook(GetProcAddress(hGdi32, "EnumFontFamiliesA"), &Detour_EnumFontFamiliesA, reinterpret_cast<LPVOID*>(&fpEnumFontFamiliesA));
+        }
+    }
+
+    // --- [新增] 组 I: 时区 Hook ---
+    if (g_EnableTimeZoneHook) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+
+        if (hKernel32) {
+            MH_CreateHook(GetProcAddress(hKernel32, "GetTimeZoneInformation"), &Detour_GetTimeZoneInformation, reinterpret_cast<LPVOID*>(&fpGetTimeZoneInformation));
+            // GetDynamicTimeZoneInformation 在 XP 上可能不存在 需要判断
+            void* pGetDynamic = (void*)GetProcAddress(hKernel32, "GetDynamicTimeZoneInformation");
+            if (pGetDynamic) {
+                MH_CreateHook(pGetDynamic, &Detour_GetDynamicTimeZoneInformation, reinterpret_cast<LPVOID*>(&fpGetDynamicTimeZoneInformation));
+            }
+        }
+
+        if (hNtdll) {
+            // 如果之前没有 Hook NtQuerySystemInformation 这里 Hook
+            // 如果之前在其他组已经 Hook 了 需要合并逻辑 (通常建议只 Hook 一次 在 Detour 函数里分发)
+            // 假设这是第一次 Hook：
+            if (fpNtQuerySystemInformation == NULL) {
+                 MH_CreateHook(GetProcAddress(hNtdll, "NtQuerySystemInformation"), &Detour_NtQuerySystemInformation, reinterpret_cast<LPVOID*>(&fpNtQuerySystemInformation));
             }
         }
     }

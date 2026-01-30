@@ -4412,8 +4412,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
     }
 
+    // --- [新增] 解析 hooklocale (语言区域伪造) ---
+    std::wstring hookLocaleVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooklocale");
+    if (!hookLocaleVal.empty()) {
+        SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", hookLocaleVal.c_str());
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -5101,6 +5107,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
             // [新增] 解析 hookcd
             std::wstring hookCdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcd");
+            // [新增] 解析 hooklocale
+            std::wstring hookLocaleVal = GetValueFromIniContent(iniContent, L"Hook", L"hooklocale");
             // [新增] 解析 hookfont
             std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
 
@@ -5131,7 +5139,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
-            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookCdVal.empty() && hookFontVal.empty() && !hasThirdPartyDlls) {
+            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookCdVal.empty() && hookLocaleVal.empty() && hookFontVal.empty() && !hasThirdPartyDlls) {
                 LaunchApplication(iniContent, variables);
             }
             else {
