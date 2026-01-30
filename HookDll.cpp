@@ -540,6 +540,8 @@ typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK
 P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
 P_NtResumeProcess fpNtResumeProcess = NULL;
+typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
