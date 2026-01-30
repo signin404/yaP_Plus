@@ -186,6 +186,16 @@ typedef struct _REG_TZI_FORMAT {
     SYSTEMTIME DaylightDate;
 } REG_TZI_FORMAT;
 
+typedef struct _RTL_TIME_ZONE_INFORMATION {
+       LONG Bias;
+       WCHAR StandardName[32];
+       TIME_FIELDS StandardStart;
+       LONG StandardBias;
+       WCHAR DaylightName[32];
+       TIME_FIELDS DaylightStart;
+       LONG DaylightBias;
+   } RTL_TIME_ZONE_INFORMATION, *PRTL_TIME_ZONE_INFORMATION;
+
 // --- [新增] 补全注册表相关结构体与枚举 ---
 #ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
 #define _KEY_VALUE_INFORMATION_CLASS_DEFINED
