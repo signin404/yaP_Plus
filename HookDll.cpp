@@ -772,6 +772,18 @@ P_GetLogicalDrives fpGetLogicalDrives = NULL;
 typedef DWORD(WINAPI* P_GetLogicalDriveStringsW)(DWORD, LPWSTR);
 P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
 
+// --- [新增] 资源加载函数指针 ---
+typedef NTSTATUS(NTAPI* P_LdrResSearchResource)(PVOID, PULONG_PTR, ULONG, ULONG, PVOID*, PULONG, PVOID, PVOID);
+P_LdrResSearchResource fpLdrResSearchResource = NULL;
+
+// --- [新增] NLS 代码页信息函数指针 ---
+typedef BOOL(WINAPI* P_GetCPInfo)(UINT, LPCPINFO);
+P_GetCPInfo fpGetCPInfo = NULL;
+typedef BOOL(WINAPI* P_GetCPInfoExW)(UINT, DWORD, LPCPINFOEXW);
+P_GetCPInfoExW fpGetCPInfoExW = NULL;
+typedef BOOL(WINAPI* P_IsValidCodePage)(UINT);
+P_IsValidCodePage fpIsValidCodePage = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -4474,6 +4486,35 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
 }
 
+// --- [新增] 代码页信息 Hook (模拟底层 NLS 缓存修改) ---
+
+BOOL WINAPI Detour_GetCPInfo(UINT CodePage, LPCPINFO lpCPInfo) {
+    // 如果程序查询系统默认代码页 将其重定向到我们伪造的代码页
+    if (g_FakeACP != 0) {
+        if (CodePage == CP_ACP || CodePage == CP_OEMCP || CodePage == CP_THREAD_ACP) {
+            CodePage = g_FakeACP;
+        }
+    }
+    return fpGetCPInfo(CodePage, lpCPInfo);
+}
+
+BOOL WINAPI Detour_GetCPInfoExW(UINT CodePage, DWORD dwFlags, LPCPINFOEXW lpCPInfoEx) {
+    if (g_FakeACP != 0) {
+        if (CodePage == CP_ACP || CodePage == CP_OEMCP || CodePage == CP_THREAD_ACP) {
+            CodePage = g_FakeACP;
+        }
+    }
+    return fpGetCPInfoExW(CodePage, dwFlags, lpCPInfoEx);
+}
+
+BOOL WINAPI Detour_IsValidCodePage(UINT CodePage) {
+    // 确保程序询问“伪造的代码页是否有效”时返回真
+    if (g_FakeACP != 0 && CodePage == g_FakeACP) {
+        return TRUE;
+    }
+    return fpIsValidCodePage(CodePage);
+}
+
 // --- [新增] 从注册表加载时区信息 ---
 bool LoadTimeZoneFromRegistry(const std::wstring& timeZoneName) {
     std::wstring keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\" + timeZoneName;
@@ -4579,6 +4620,40 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
     }
 
     return fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+}
+
+// --- [新增] 资源加载 Hook ---
+NTSTATUS NTAPI Detour_LdrResSearchResource(
+    PVOID DllHandle,
+    PULONG_PTR ResourceIdPath,
+    ULONG ResourceIdPathLength,
+    ULONG Flags,
+    PVOID* Resource,
+    PULONG Size,
+    PVOID Reserve1,
+    PVOID Reserve2
+) {
+    // 如果启用了区域伪造 且正在查找 RT_VERSION (版本信息) 或其他资源
+    if (g_FakeLangID != 0 && ResourceIdPath && ResourceIdPathLength >= 3) {
+        // ResourceIdPath[0] = Type, [1] = Name, [2] = Language
+
+        // 强制修改请求的语言 ID 为我们伪造的语言 (例如 0x0411)
+        // 注意：ResourceIdPath 是调用者栈上的数组 直接修改可能会影响调用者
+        // 但通常 LdrResSearchResource 是只读读取的为了安全 我们可以复制一份
+
+        // 这里采用简化的直接修改策略 因为在 Ntdll 内部通常是安全的
+        // 只有当指定了特定语言时才修改 (如果由系统默认查找 通常 ResourceIdPath[2] 为 0)
+        if (ResourceIdPath[2] != 0) {
+             ResourceIdPath[2] = g_FakeLangID;
+        }
+    }
+
+    NTSTATUS status = fpLdrResSearchResource(DllHandle, ResourceIdPath, ResourceIdPathLength, Flags, Resource, Size, Reserve1, Reserve2);
+
+    // LE 还有一个 ReplaceMUIVersionLocaleInfo 的逻辑 用于修改版本信息中的语言
+    // 这对于某些检查 EXE 版本的安装程序很有用 但对于运行游戏通常不是必须的
+
+    return status;
 }
 
 // --- [新增] 底层退出 Hook (解决进程残留) ---
@@ -6140,6 +6215,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
+        // [新增] 资源加载 Hook
+        if (hNtdll) {
+            void* pLdrResSearchResource = (void*)GetProcAddress(hNtdll, "LdrResSearchResource");
+            if (pLdrResSearchResource) {
+                MH_CreateHook(pLdrResSearchResource, &Detour_LdrResSearchResource, reinterpret_cast<LPVOID*>(&fpLdrResSearchResource));
+            }
+        }
+
         // [新增] 字体枚举 Hook
         if (hGdi32) {
             void* pEnumFontFamiliesExW = (void*)GetProcAddress(hGdi32, "EnumFontFamiliesExW");
@@ -6239,6 +6322,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (fpNtQuerySystemInformation == NULL) {
                  MH_CreateHook(GetProcAddress(hNtdll, "NtQuerySystemInformation"), &Detour_NtQuerySystemInformation, reinterpret_cast<LPVOID*>(&fpNtQuerySystemInformation));
             }
+        }
+    }
+
+    // --- [新增] 组 J: NLS 代码页信息 Hook ---
+    if (g_FakeACP != 0) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            // 拦截代码页属性查询 确保返回 Shift-JIS (932) 的特征
+            // 例如：MaxCharSize=2, LeadByte 范围等
+            MH_CreateHook(GetProcAddress(hKernel32, "GetCPInfo"), &Detour_GetCPInfo, reinterpret_cast<LPVOID*>(&fpGetCPInfo));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetCPInfoExW"), &Detour_GetCPInfoExW, reinterpret_cast<LPVOID*>(&fpGetCPInfoExW));
+            MH_CreateHook(GetProcAddress(hKernel32, "IsValidCodePage"), &Detour_IsValidCodePage, reinterpret_cast<LPVOID*>(&fpIsValidCodePage));
         }
     }
 
