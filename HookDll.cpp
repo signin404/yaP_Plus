@@ -4735,8 +4735,6 @@ void FileTimeToSystemTimeHelper(const FILETIME* ft, SYSTEMTIME* st) {
     FileTimeToSystemTime(ft, st);
 }
 
-// --- Kernel32 Detour 函数 ---
-
 VOID WINAPI Detour_GetSystemTime(LPSYSTEMTIME lpSystemTime) {
     // [关键修复] 如果已经在 Hook 链中（例如被其他 API 调用） 直接透传 不重复修改
     if (g_InTimeHook) {
@@ -4804,8 +4802,45 @@ VOID WINAPI Detour_GetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileT
     AddTimeOffset(lpSystemTimeAsFileTime);
 }
 
-// --- KernelBase 专用 Detour 函数 ---
+// 拦截底层系统调用 NtQuerySystemTime
+NTSTATUS NTAPI Detour_NtQuerySystemTime(PLARGE_INTEGER SystemTime) {
+    NTSTATUS status = fpNtQuerySystemTime(SystemTime);
 
+    // [修改] 增加 !g_InTimeHook 检查
+    // 只有当不是由高层 Hook 调用时 才在这里修改时间
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemTime && !g_InTimeHook) {
+        SystemTime->QuadPart += g_TimeOffset;
+    }
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtQuerySystemInformation_Time(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+) {
+    // 调用原始函数
+    NTSTATUS status = fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+
+    // SystemTimeOfDayInformation = 3
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
+        if (SystemInformationLength >= sizeof(YAP_SYSTEM_TIMEOFDAY_INFORMATION)) {
+            PYAP_SYSTEM_TIMEOFDAY_INFORMATION pInfo = (PYAP_SYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
+
+            // 修改当前时间
+            pInfo->CurrentTime.QuadPart += g_TimeOffset;
+
+            // 可选：修改启动时间 (BootTime)
+            // 如果程序通过 BootTime + TickCount 计算时间 也需要偏移 BootTime
+            pInfo->BootTime.QuadPart += g_TimeOffset;
+        }
+    }
+
+    return status;
+}
+
+// --- KernelBase 专用 Detour 函数 ---
 VOID WINAPI Detour_GetSystemTime_KB(LPSYSTEMTIME lpSystemTime) {
     if (g_InTimeHook) {
         fpGetSystemTime_KB(lpSystemTime);
