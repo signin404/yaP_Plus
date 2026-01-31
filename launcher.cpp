@@ -4398,6 +4398,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
     }
 
+    // [新增] 解析 hookcd 配置 (指定伪装成光驱的目录)
+    std::wstring hookCdVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookcd");
+    if (!hookCdVal.empty()) {
+        // 展开变量并转换为绝对路径
+        std::wstring finalCdPath = ResolveToAbsolutePath(ExpandVariables(hookCdVal, data->variables), data->variables);
+        SetEnvironmentVariableW(L"YAP_HOOK_CD", finalCdPath.c_str());
+    }
+
     // [新增] 解析 hookfont 配置
     std::wstring hookFontVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfont");
     if (!hookFontVal.empty()) {
@@ -4411,7 +4419,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -5095,8 +5103,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
             int netBlockMode = _wtoi(netBlockVal.c_str());
 
-            // [新增] 解析 hookvolumeid (修复未声明标识符错误)
+            // [新增] 解析 hookvolumeid
             std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
+            // [新增] 解析 hookcd
+            std::wstring hookCdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcd");
+            // [新增] 解析 hooklocale
+            std::wstring hookLocaleVal = GetValueFromIniContent(iniContent, L"Hook", L"hooklocale");
             // [新增] 解析 hookfont
             std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
 
@@ -5127,7 +5139,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
-            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookFontVal.empty() && !hasThirdPartyDlls) {
+            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookCdVal.empty() && hookLocaleVal.empty() && hookFontVal.empty() && !hasThirdPartyDlls) {
                 LaunchApplication(iniContent, variables);
             }
             else {

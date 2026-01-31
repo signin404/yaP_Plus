@@ -177,6 +177,32 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// [新增] 设备信息结构体 (用于伪装光驱)
+typedef struct _FILE_FS_DEVICE_INFORMATION {
+    ULONG DeviceType;
+    ULONG Characteristics;
+} FILE_FS_DEVICE_INFORMATION, *PFILE_FS_DEVICE_INFORMATION;
+
+// [新增] 属性信息结构体 (用于伪装 CDFS)
+typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
+    ULONG FileSystemAttributes;
+    LONG  MaximumComponentNameLength;
+    ULONG FileSystemNameLength;
+    WCHAR FileSystemName[1];
+} FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
+
+#ifndef FILE_DEVICE_CD_ROM
+#define FILE_DEVICE_CD_ROM 0x00000002
+#endif
+
+#ifndef FILE_READ_ONLY_DEVICE
+#define FILE_READ_ONLY_DEVICE 0x00000002
+#endif
+
+#ifndef FILE_REMOVABLE_MEDIA
+#define FILE_REMOVABLE_MEDIA 0x00000001
+#endif
+
 // 注册表 TZI 二进制结构定义
 typedef struct _REG_TZI_FORMAT {
     LONG Bias;
@@ -563,6 +589,7 @@ typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
 P_NtResumeProcess fpNtResumeProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
@@ -734,6 +761,28 @@ typedef DWORD(WINAPI* P_GetTimeZoneInformation)(LPTIME_ZONE_INFORMATION);
 P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
 typedef DWORD(WINAPI* P_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
 P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
+
+// GetDriveTypeW 函数指针
+typedef UINT(WINAPI* P_GetDriveTypeW)(LPCWSTR);
+P_GetDriveTypeW fpGetDriveTypeW = NULL;
+
+// [新增] 驱动器枚举函数指针
+typedef DWORD(WINAPI* P_GetLogicalDrives)(void);
+P_GetLogicalDrives fpGetLogicalDrives = NULL;
+typedef DWORD(WINAPI* P_GetLogicalDriveStringsW)(DWORD, LPWSTR);
+P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
+
+// --- [新增] 资源加载函数指针 ---
+typedef NTSTATUS(NTAPI* P_LdrResSearchResource)(PVOID, PULONG_PTR, ULONG, ULONG, PVOID*, PULONG, PVOID, PVOID);
+P_LdrResSearchResource fpLdrResSearchResource = NULL;
+
+// --- [新增] NLS 代码页信息函数指针 ---
+typedef BOOL(WINAPI* P_GetCPInfo)(UINT, LPCPINFO);
+P_GetCPInfo fpGetCPInfo = NULL;
+typedef BOOL(WINAPI* P_GetCPInfoExW)(UINT, DWORD, LPCPINFOEXW);
+P_GetCPInfoExW fpGetCPInfoExW = NULL;
+typedef BOOL(WINAPI* P_IsValidCodePage)(UINT);
+P_IsValidCodePage fpIsValidCodePage = NULL;
 
 // 命令行处理工具集
 namespace CmdUtils {
@@ -924,6 +973,13 @@ DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
+
+// --- 光驱伪装相关全局变量 ---
+std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
+std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
+std::wstring g_HookCdDevicePath; // [新增] 真实路径 (Device): \Device\HarddiskVolume1\Other\ISO
+wchar_t g_VirtualCdDrive = 0;   // 虚拟盘符: 'M'
+std::wstring g_VirtualCdNtPrefix; // 虚拟盘符前缀: \??\M:
 
 // --- [新增] 区域伪造全局变量 ---
 UINT g_FakeACP = 0;
@@ -2337,6 +2393,53 @@ bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath
     return false;
 }
 
+// [新增] 虚拟光驱路径重定向辅助类 (RAII)
+class VirtualCdRedirector {
+public:
+    VirtualCdRedirector(POBJECT_ATTRIBUTES attr) : m_attr(attr) {
+        if (g_VirtualCdDrive != 0 && m_attr && m_attr->ObjectName) {
+            // 检查路径是否以虚拟盘符前缀开头 (例如 \??\M:)
+            if (m_attr->ObjectName->Length >= g_VirtualCdNtPrefix.length() * sizeof(wchar_t)) {
+                if (_wcsnicmp(m_attr->ObjectName->Buffer, g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.length()) == 0) {
+
+                    // 构造重定向后的路径: \??\M:\Setup.exe -> \??\Z:\Other\ISO\Setup.exe
+                    std::wstring originalPath(m_attr->ObjectName->Buffer, m_attr->ObjectName->Length / sizeof(wchar_t));
+                    m_newPath = g_HookCdNtPath + originalPath.substr(g_VirtualCdNtPrefix.length());
+
+                    // 初始化新的 UNICODE_STRING
+                    // 注意：RtlInitUnicodeString 使用 m_newPath.c_str() 必须确保 m_newPath 在对象生命周期内有效
+                    RtlInitUnicodeString(&m_newStr, m_newPath.c_str());
+
+                    // 备份原始值
+                    m_oldName = m_attr->ObjectName;
+                    m_oldRoot = m_attr->RootDirectory;
+
+                    // 替换为新路径 (绝对路径 忽略 RootDirectory)
+                    m_attr->ObjectName = &m_newStr;
+                    m_attr->RootDirectory = NULL;
+                    m_redirected = true;
+                }
+            }
+        }
+    }
+
+    ~VirtualCdRedirector() {
+        if (m_redirected) {
+            // 还原原始值
+            m_attr->ObjectName = m_oldName;
+            m_attr->RootDirectory = m_oldRoot;
+        }
+    }
+
+private:
+    POBJECT_ATTRIBUTES m_attr;
+    std::wstring m_newPath;
+    UNICODE_STRING m_newStr;
+    PUNICODE_STRING m_oldName = nullptr;
+    HANDLE m_oldRoot = NULL;
+    bool m_redirected = false;
+};
+
 NTSTATUS NTAPI Detour_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -2352,6 +2455,9 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 ) {
     if (g_IsInHook) return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     RecursionGuard guard;
+
+    // [修改] 使用辅助类处理虚拟光驱重定向 (\??\M: -> \??\Z:\ISO)
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     // [新增] 处理按 ID 打开 (FILE_OPEN_BY_FILE_ID)
     // 移植自 file.c: File_GetName_FromFileId
@@ -2624,6 +2730,9 @@ void CreateDummyFile(const std::wstring& path) {
 NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     if (g_IsInHook) return fpNtDeleteFile(ObjectAttributes);
     RecursionGuard guard;
+
+    // [新增] 虚拟光驱重定向 (虽然光驱通常只读 但为了兼容性加上)
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
 
@@ -2938,6 +3047,9 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     if (g_IsInHook) return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
 
+    // [新增] 虚拟光驱重定向
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
+
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
@@ -2978,6 +3090,9 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
 NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes, PFILE_NETWORK_OPEN_INFORMATION FileInformation) {
     if (g_IsInHook) return fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     RecursionGuard guard;
+
+    // [新增] 虚拟光驱重定向
+    VirtualCdRedirector cdRedirect(ObjectAttributes);
 
     // 1. 路径解析与规范化 (处理短文件名、Symlink)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
@@ -3665,6 +3780,71 @@ NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
     return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
+// [新增] 拦截 GetLogicalDrives (位掩码)
+DWORD WINAPI Detour_GetLogicalDrives(void) {
+    DWORD drives = fpGetLogicalDrives();
+    if (g_VirtualCdDrive != 0) {
+        // 将虚拟盘符对应的位设为 1 (A=0, B=1, ...)
+        drives |= (1 << (g_VirtualCdDrive - L'A'));
+    }
+    return drives;
+}
+
+// [新增] 拦截 GetLogicalDriveStringsW (字符串列表)
+DWORD WINAPI Detour_GetLogicalDriveStringsW(DWORD nBufferLength, LPWSTR lpBuffer) {
+    // 1. 调用原始函数
+    DWORD ret = fpGetLogicalDriveStringsW(nBufferLength, lpBuffer);
+
+    if (g_VirtualCdDrive != 0 && lpBuffer) {
+        // 检查缓冲区是否足够容纳额外的 "M:\" (4个字符)
+        // ret 是不包含末尾双NULL的长度
+        if (ret + 4 <= nBufferLength) {
+            // 移动指针到末尾 (跳过现有的驱动器字符串)
+            LPWSTR pEnd = lpBuffer + ret;
+
+            // 构造新驱动器字符串 "M:\"
+            pEnd[0] = g_VirtualCdDrive;
+            pEnd[1] = L':';
+            pEnd[2] = L'\\';
+            pEnd[3] = L'\0'; // 字符串结束符
+            pEnd[4] = L'\0'; // 列表结束符 (双NULL)
+
+            return ret + 4;
+        }
+    }
+    return ret;
+}
+
+// [修改] 拦截 GetDriveTypeW (合并了虚拟盘符和路径匹配逻辑)
+UINT WINAPI Detour_GetDriveTypeW(LPCWSTR lpRootPathName) {
+    if (!lpRootPathName) return DRIVE_UNKNOWN;
+
+    // 1. 检查是否为虚拟盘符 (例如 "M:", "M:\")
+    if (g_VirtualCdDrive != 0) {
+        if (towupper(lpRootPathName[0]) == g_VirtualCdDrive && lpRootPathName[1] == L':') {
+            return DRIVE_CDROM;
+        }
+    }
+
+    // 2. 检查是否为指定的伪装路径 (兼容旧逻辑)
+    if (!g_HookCdPath.empty()) {
+        std::wstring queryPath = lpRootPathName;
+        // 检查完全匹配
+        if (_wcsnicmp(queryPath.c_str(), g_HookCdPath.c_str(), queryPath.length()) == 0) {
+             return DRIVE_CDROM;
+        }
+        // 检查是否查询的是伪装目录所在的盘符根目录
+        if (g_HookCdPath.length() >= 3 && queryPath.length() >= 3) {
+            if (towupper(g_HookCdPath[0]) == towupper(queryPath[0]) &&
+                g_HookCdPath[1] == L':' && queryPath[1] == L':') {
+                return DRIVE_CDROM;
+            }
+        }
+    }
+    return fpGetDriveTypeW(lpRootPathName);
+}
+
+// [修改] Detour_NtQueryVolumeInformationFile (合并了 VolumeID 和 CD 伪装逻辑)
 NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -3675,35 +3855,67 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     // 1. 调用原始函数
     NTSTATUS status = fpNtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass);
 
-    // 2. 如果成功且查询的是卷信息 (FileFsVolumeInformation = 1)
-    if (NT_SUCCESS(status) && FsInformationClass == FileFsVolumeInformation && g_HookVolumeId) {
+    if (!NT_SUCCESS(status)) return status;
 
-        // 3. 检查是否为目标驱动器 (系统盘 或 启动器盘)
-        // 获取句柄对应的路径
-        std::wstring rawPath = GetPathFromHandle(FileHandle);
-        if (!rawPath.empty()) {
-            // 转换为 NT 路径 (例如 \Device\HarddiskVolume1 -> \??\C:)
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
+    // 获取句柄对应的路径
+    std::wstring rawPath = GetPathFromHandle(FileHandle);
+    if (rawPath.empty()) return status;
+    std::wstring ntPath = DevicePathToNtPath(rawPath);
 
-            bool shouldFake = false;
+    // 逻辑 A: 修改卷序列号 (hookvolumeid)
+    if (g_HookVolumeId && FsInformationClass == FileFsVolumeInformation) {
+        bool shouldFake = false;
+        if (!g_SystemDriveNt.empty() && (ntPath.find(g_SystemDriveNt) == 0)) shouldFake = true;
+        else if (!g_LauncherDriveNt.empty() && (ntPath.find(g_LauncherDriveNt) == 0)) shouldFake = true;
 
-            // 检查系统盘
-            if (!g_SystemDriveNt.empty() &&
-                (ntPath.size() >= g_SystemDriveNt.size() &&
-                 _wcsnicmp(ntPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.size()) == 0)) {
-                shouldFake = true;
+        if (shouldFake) {
+            PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
+            info->VolumeSerialNumber = g_FakeVolumeSerial;
+        }
+    }
+
+    // 逻辑 B: 伪装光驱属性 (hookcd)
+    if (!g_HookCdPath.empty()) {
+        // 检查是否在伪装路径内
+        std::wstring hookCdNtPrefix = L"\\??\\" + g_HookCdPath;
+        bool isTarget = false;
+        if (ntPath.size() >= hookCdNtPrefix.size() &&
+            _wcsnicmp(ntPath.c_str(), hookCdNtPrefix.c_str(), hookCdNtPrefix.size()) == 0) {
+            isTarget = true;
+        }
+
+        // 或者是虚拟盘符
+        if (!isTarget && g_VirtualCdDrive != 0) {
+             // 检查路径是否包含虚拟盘符前缀 (例如 \??\M:\...)
+             if (ntPath.size() >= g_VirtualCdNtPrefix.size() &&
+                 _wcsnicmp(ntPath.c_str(), g_VirtualCdNtPrefix.c_str(), g_VirtualCdNtPrefix.size()) == 0) {
+                 isTarget = true;
+             }
+        }
+
+        if (isTarget) {
+            // 伪装设备类型为光驱
+            if (FsInformationClass == FileFsDeviceInformation) {
+                if (Length >= sizeof(FILE_FS_DEVICE_INFORMATION)) {
+                    PFILE_FS_DEVICE_INFORMATION info = (PFILE_FS_DEVICE_INFORMATION)FsInformation;
+                    info->DeviceType = FILE_DEVICE_CD_ROM;
+                    info->Characteristics |= (FILE_READ_ONLY_DEVICE | FILE_REMOVABLE_MEDIA);
+                }
             }
-            // 检查启动器盘
-            else if (!g_LauncherDriveNt.empty() &&
-                     (ntPath.size() >= g_LauncherDriveNt.size() &&
-                      _wcsnicmp(ntPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.size()) == 0)) {
-                shouldFake = true;
-            }
+            // 伪装文件系统名称为 CDFS
+            else if (FsInformationClass == FileFsAttributeInformation) {
+                if (Length >= sizeof(FILE_FS_ATTRIBUTE_INFORMATION)) {
+                    PFILE_FS_ATTRIBUTE_INFORMATION info = (PFILE_FS_ATTRIBUTE_INFORMATION)FsInformation;
 
-            // 4. 修改序列号
-            if (shouldFake) {
-                PFILE_FS_VOLUME_INFORMATION info = (PFILE_FS_VOLUME_INFORMATION)FsInformation;
-                info->VolumeSerialNumber = g_FakeVolumeSerial;
+                    const wchar_t* fsName = L"CDFS";
+                    size_t fsNameLen = wcslen(fsName) * sizeof(wchar_t);
+
+                    if (Length >= FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + fsNameLen) {
+                        info->FileSystemAttributes |= FILE_READ_ONLY_VOLUME;
+                        info->FileSystemNameLength = (ULONG)fsNameLen;
+                        memcpy(info->FileSystemName, fsName, fsNameLen);
+                    }
+                }
             }
         }
     }
@@ -4275,6 +4487,35 @@ int WINAPI Detour_EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lp
     return fpEnumFontFamiliesA(hdc, lpszFamily, lpEnumFontFamProc, lParam);
 }
 
+// --- [新增] 代码页信息 Hook (模拟底层 NLS 缓存修改) ---
+
+BOOL WINAPI Detour_GetCPInfo(UINT CodePage, LPCPINFO lpCPInfo) {
+    // 如果程序查询系统默认代码页 将其重定向到我们伪造的代码页
+    if (g_FakeACP != 0) {
+        if (CodePage == CP_ACP || CodePage == CP_OEMCP || CodePage == CP_THREAD_ACP) {
+            CodePage = g_FakeACP;
+        }
+    }
+    return fpGetCPInfo(CodePage, lpCPInfo);
+}
+
+BOOL WINAPI Detour_GetCPInfoExW(UINT CodePage, DWORD dwFlags, LPCPINFOEXW lpCPInfoEx) {
+    if (g_FakeACP != 0) {
+        if (CodePage == CP_ACP || CodePage == CP_OEMCP || CodePage == CP_THREAD_ACP) {
+            CodePage = g_FakeACP;
+        }
+    }
+    return fpGetCPInfoExW(CodePage, dwFlags, lpCPInfoEx);
+}
+
+BOOL WINAPI Detour_IsValidCodePage(UINT CodePage) {
+    // 确保程序询问“伪造的代码页是否有效”时返回真
+    if (g_FakeACP != 0 && CodePage == g_FakeACP) {
+        return TRUE;
+    }
+    return fpIsValidCodePage(CodePage);
+}
+
 // --- [新增] 从注册表加载时区信息 ---
 bool LoadTimeZoneFromRegistry(const std::wstring& timeZoneName) {
     std::wstring keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\" + timeZoneName;
@@ -4380,6 +4621,40 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
     }
 
     return fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+}
+
+// --- [新增] 资源加载 Hook ---
+NTSTATUS NTAPI Detour_LdrResSearchResource(
+    PVOID DllHandle,
+    PULONG_PTR ResourceIdPath,
+    ULONG ResourceIdPathLength,
+    ULONG Flags,
+    PVOID* Resource,
+    PULONG Size,
+    PVOID Reserve1,
+    PVOID Reserve2
+) {
+    // 如果启用了区域伪造 且正在查找 RT_VERSION (版本信息) 或其他资源
+    if (g_FakeLangID != 0 && ResourceIdPath && ResourceIdPathLength >= 3) {
+        // ResourceIdPath[0] = Type, [1] = Name, [2] = Language
+
+        // 强制修改请求的语言 ID 为我们伪造的语言 (例如 0x0411)
+        // 注意：ResourceIdPath 是调用者栈上的数组 直接修改可能会影响调用者
+        // 但通常 LdrResSearchResource 是只读读取的为了安全 我们可以复制一份
+
+        // 这里采用简化的直接修改策略 因为在 Ntdll 内部通常是安全的
+        // 只有当指定了特定语言时才修改 (如果由系统默认查找 通常 ResourceIdPath[2] 为 0)
+        if (ResourceIdPath[2] != 0) {
+             ResourceIdPath[2] = g_FakeLangID;
+        }
+    }
+
+    NTSTATUS status = fpLdrResSearchResource(DllHandle, ResourceIdPath, ResourceIdPathLength, Flags, Resource, Size, Reserve1, Reserve2);
+
+    // LE 还有一个 ReplaceMUIVersionLocaleInfo 的逻辑 用于修改版本信息中的语言
+    // 这对于某些检查 EXE 版本的安装程序很有用 但对于运行游戏通常不是必须的
+
+    return status;
 }
 
 // --- [新增] 底层退出 Hook (解决进程残留) ---
@@ -5465,6 +5740,56 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
+    // [新增] 读取 hookcd 配置
+    wchar_t cdBuffer[MAX_PATH];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_CD", cdBuffer, MAX_PATH) > 0) {
+        g_HookCdPath = cdBuffer;
+        if (!g_HookCdPath.empty() && g_HookCdPath.back() == L'\\') {
+            g_HookCdPath.pop_back();
+        }
+
+        g_HookCdNtPath = L"\\??\\" + g_HookCdPath;
+
+        // [新增] 获取真实路径的设备路径 (用于反向匹配)
+        // g_HookCdPath = Z:\Other\ISO
+        // 需要解析 Z: -> \Device\HarddiskVolume1
+        if (g_HookCdPath.length() >= 2 && g_HookCdPath[1] == L':') {
+            wchar_t driveStr[] = { g_HookCdPath[0], L':', L'\0' };
+            wchar_t devBuf[MAX_PATH];
+            if (QueryDosDeviceW(driveStr, devBuf, MAX_PATH)) {
+                g_HookCdDevicePath = devBuf; // \Device\HarddiskVolume1
+                if (g_HookCdPath.length() > 2) {
+                    g_HookCdDevicePath += g_HookCdPath.substr(2); // + \Other\ISO
+                }
+            }
+        }
+
+        // 寻找未使用的盘符 (从 Z 倒序查找 或者从 D 顺序查找)
+        DWORD drives = GetLogicalDrives();
+        // 从 'E' 开始查找 (跳过 A, B, C, D)
+        for (wchar_t drive = L'E'; drive <= L'Z'; ++drive) {
+            if ((drives & (1 << (drive - L'A'))) == 0) {
+                g_VirtualCdDrive = drive;
+                break;
+            }
+        }
+
+        // 如果找不到 尝试 D
+        if (g_VirtualCdDrive == 0 && (drives & (1 << (L'D' - L'A'))) == 0) {
+            g_VirtualCdDrive = L'D';
+        }
+
+        if (g_VirtualCdDrive != 0) {
+            g_VirtualCdNtPrefix = L"\\??\\";
+            g_VirtualCdNtPrefix += g_VirtualCdDrive;
+            g_VirtualCdNtPrefix += L":";
+
+            DebugLog(L"CDHook: Mapped Virtual Drive %c: -> %s", g_VirtualCdDrive, g_HookCdPath.c_str());
+        } else {
+            DebugLog(L"CDHook: Failed to find unused drive letter!");
+        }
+    }
+
     // [新增] 读取 hookfont 配置
     wchar_t fontBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_FONT", fontBuffer, 64) > 0) {
@@ -5652,12 +5977,15 @@ DWORD WINAPI InitHookThread(LPVOID) {
             fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
         }
 
-        // 2. 文件重定向挂钩 (仅当 Mode > 0 时启用)
-        if (g_HookMode > 0) {
+        // [修改] 启用文件重定向挂钩的条件
+        // 1. hookfile > 0 (常规重定向)
+        // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
+        if (g_HookMode > 0 || g_VirtualCdDrive != 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
+            // 下面这些通常只在 hookfile 启用时才需要 但为了保险起见也可以挂钩
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
@@ -5681,15 +6009,32 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
             HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
             if (hKernel32) {
+                // 1. 路径欺骗挂钩 (原有)
                 void* pGetFinalPathNameByHandleW = (void*)GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
                 if (pGetFinalPathNameByHandleW) {
                     MH_CreateHook(pGetFinalPathNameByHandleW, &Detour_GetFinalPathNameByHandleW, reinterpret_cast<LPVOID*>(&fpGetFinalPathNameByHandleW));
+                }
+
+                // 2. 驱动器枚举与类型挂钩 (新增 用于 hookcd)
+                // 只要 hookcd 启用 (无论是否分配了虚拟盘符 GetDriveTypeW 都需要挂钩以处理路径匹配)
+                if (!g_HookCdPath.empty()) {
+                    void* pGetDriveTypeW = (void*)GetProcAddress(hKernel32, "GetDriveTypeW");
+                    if (pGetDriveTypeW) MH_CreateHook(pGetDriveTypeW, &Detour_GetDriveTypeW, reinterpret_cast<LPVOID*>(&fpGetDriveTypeW));
+                }
+
+                // 3. 虚拟盘符专用挂钩 (仅当分配了虚拟盘符时)
+                if (g_VirtualCdDrive != 0) {
+                    void* pGetLogicalDrives = (void*)GetProcAddress(hKernel32, "GetLogicalDrives");
+                    if (pGetLogicalDrives) MH_CreateHook(pGetLogicalDrives, &Detour_GetLogicalDrives, reinterpret_cast<LPVOID*>(&fpGetLogicalDrives));
+
+                    void* pGetLogicalDriveStringsW = (void*)GetProcAddress(hKernel32, "GetLogicalDriveStringsW");
+                    if (pGetLogicalDriveStringsW) MH_CreateHook(pGetLogicalDriveStringsW, &Detour_GetLogicalDriveStringsW, reinterpret_cast<LPVOID*>(&fpGetLogicalDriveStringsW));
                 }
             }
         }
 
         // 3. 卷序列号挂钩 (独立控制)
-        if (g_HookVolumeId) {
+        if (g_HookVolumeId || !g_HookCdPath.empty()) {
             void* pNtQueryVolumeInformationFile = (void*)GetProcAddress(hNtdll, "NtQueryVolumeInformationFile");
             if (pNtQueryVolumeInformationFile) {
                 MH_CreateHook(pNtQueryVolumeInformationFile, &Detour_NtQueryVolumeInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryVolumeInformationFile));
@@ -5871,6 +6216,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
+        // [新增] 资源加载 Hook
+        if (hNtdll) {
+            void* pLdrResSearchResource = (void*)GetProcAddress(hNtdll, "LdrResSearchResource");
+            if (pLdrResSearchResource) {
+                MH_CreateHook(pLdrResSearchResource, &Detour_LdrResSearchResource, reinterpret_cast<LPVOID*>(&fpLdrResSearchResource));
+            }
+        }
+
         // [新增] 字体枚举 Hook
         if (hGdi32) {
             void* pEnumFontFamiliesExW = (void*)GetProcAddress(hGdi32, "EnumFontFamiliesExW");
@@ -5970,6 +6323,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (fpNtQuerySystemInformation == NULL) {
                  MH_CreateHook(GetProcAddress(hNtdll, "NtQuerySystemInformation"), &Detour_NtQuerySystemInformation, reinterpret_cast<LPVOID*>(&fpNtQuerySystemInformation));
             }
+        }
+    }
+
+    // --- [新增] 组 J: NLS 代码页信息 Hook ---
+    if (g_FakeACP != 0) {
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            // 拦截代码页属性查询 确保返回 Shift-JIS (932) 的特征
+            // 例如：MaxCharSize=2, LeadByte 范围等
+            MH_CreateHook(GetProcAddress(hKernel32, "GetCPInfo"), &Detour_GetCPInfo, reinterpret_cast<LPVOID*>(&fpGetCPInfo));
+            MH_CreateHook(GetProcAddress(hKernel32, "GetCPInfoExW"), &Detour_GetCPInfoExW, reinterpret_cast<LPVOID*>(&fpGetCPInfoExW));
+            MH_CreateHook(GetProcAddress(hKernel32, "IsValidCodePage"), &Detour_IsValidCodePage, reinterpret_cast<LPVOID*>(&fpIsValidCodePage));
         }
     }
 
