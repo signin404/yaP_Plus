@@ -177,7 +177,7 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-typedef struct _SYSTEM_TIMEOFDAY_INFORMATION {
+typedef struct _YAP_SYSTEM_TIMEOFDAY_INFORMATION {
     LARGE_INTEGER BootTime;
     LARGE_INTEGER CurrentTime;
     LARGE_INTEGER TimeZoneBias;
@@ -185,7 +185,7 @@ typedef struct _SYSTEM_TIMEOFDAY_INFORMATION {
     ULONG Reserved;
     ULONGLONG BootTimeBias;
     ULONGLONG SleepTimeBias;
-} SYSTEM_TIMEOFDAY_INFORMATION, *PSYSTEM_TIMEOFDAY_INFORMATION;
+} YAP_SYSTEM_TIMEOFDAY_INFORMATION, *PYAP_SYSTEM_TIMEOFDAY_INFORMATION;
 
 // [新增] 设备信息结构体 (用于伪装光驱)
 typedef struct _FILE_FS_DEVICE_INFORMATION {
@@ -4658,8 +4658,8 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
 
     // 3. 处理时间伪造 (SystemTimeOfDayInformation = 3)
     if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
-        if (SystemInformationLength >= sizeof(SYSTEM_TIMEOFDAY_INFORMATION)) {
-            PSYSTEM_TIMEOFDAY_INFORMATION pInfo = (PSYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
+        if (SystemInformationLength >= sizeof(YAP_SYSTEM_TIMEOFDAY_INFORMATION)) {
+            PYAP_SYSTEM_TIMEOFDAY_INFORMATION pInfo = (PYAP_SYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
             pInfo->CurrentTime.QuadPart += g_TimeOffset;
             pInfo->BootTime.QuadPart += g_TimeOffset; // 视情况启用
         }
@@ -4779,8 +4779,8 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation_Time(
 
     // SystemTimeOfDayInformation = 3
     if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
-        if (SystemInformationLength >= sizeof(SYSTEM_TIMEOFDAY_INFORMATION)) {
-            PSYSTEM_TIMEOFDAY_INFORMATION pInfo = (PSYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
+        if (SystemInformationLength >= sizeof(YAP_SYSTEM_TIMEOFDAY_INFORMATION)) {
+            PYAP_SYSTEM_TIMEOFDAY_INFORMATION pInfo = (PYAP_SYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
 
             // 修改当前时间
             pInfo->CurrentTime.QuadPart += g_TimeOffset;
