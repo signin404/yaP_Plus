@@ -1010,6 +1010,7 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
