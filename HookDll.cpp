@@ -4666,7 +4666,7 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
     NTSTATUS status = fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
 
     // 3. 处理时间伪造 (SystemTimeOfDayInformation = 3)
-    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3 && !g_InTimeHook) {
         if (SystemInformationLength >= sizeof(YAP_SYSTEM_TIMEOFDAY_INFORMATION)) {
             PYAP_SYSTEM_TIMEOFDAY_INFORMATION pInfo = (PYAP_SYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
             pInfo->CurrentTime.QuadPart += g_TimeOffset;
@@ -4735,12 +4735,20 @@ void FileTimeToSystemTimeHelper(const FILETIME* ft, SYSTEMTIME* st) {
     FileTimeToSystemTime(ft, st);
 }
 
+// --- Kernel32 Detour 函数 ---
+
 VOID WINAPI Detour_GetSystemTime(LPSYSTEMTIME lpSystemTime) {
+    // [关键修复] 如果已经在 Hook 链中（例如被其他 API 调用） 直接透传 不重复修改
+    if (g_InTimeHook) {
+        fpGetSystemTime(lpSystemTime);
+        return;
+    }
+
     {
-        TimeRecursionGuard guard; // 设置标志 告诉底层不要改时间
+        TimeRecursionGuard guard;
         fpGetSystemTime(lpSystemTime);
     }
-    // 此时拿到的是真实时间 我们在这里统一修改
+
     if (g_EnableTimeHook && lpSystemTime) {
         FILETIME ft;
         SystemTimeToFileTimeHelper(lpSystemTime, &ft);
@@ -4750,10 +4758,16 @@ VOID WINAPI Detour_GetSystemTime(LPSYSTEMTIME lpSystemTime) {
 }
 
 VOID WINAPI Detour_GetLocalTime(LPSYSTEMTIME lpSystemTime) {
+    if (g_InTimeHook) {
+        fpGetLocalTime(lpSystemTime);
+        return;
+    }
+
     {
         TimeRecursionGuard guard;
         fpGetLocalTime(lpSystemTime);
     }
+
     if (g_EnableTimeHook && lpSystemTime) {
         FILETIME ft;
         SystemTimeToFileTimeHelper(lpSystemTime, &ft);
@@ -4763,6 +4777,11 @@ VOID WINAPI Detour_GetLocalTime(LPSYSTEMTIME lpSystemTime) {
 }
 
 VOID WINAPI Detour_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
+    if (g_InTimeHook) {
+        fpGetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
+        return;
+    }
+
     {
         TimeRecursionGuard guard;
         fpGetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
@@ -4771,59 +4790,33 @@ VOID WINAPI Detour_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
 }
 
 VOID WINAPI Detour_GetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
-    if (fpGetSystemTimePreciseAsFileTime) {
-        {
-            TimeRecursionGuard guard;
-            fpGetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
-        }
-        AddTimeOffset(lpSystemTimeAsFileTime);
-    }
-}
+    if (!fpGetSystemTimePreciseAsFileTime) return;
 
-// 拦截底层系统调用 NtQuerySystemTime
-NTSTATUS NTAPI Detour_NtQuerySystemTime(PLARGE_INTEGER SystemTime) {
-    NTSTATUS status = fpNtQuerySystemTime(SystemTime);
-
-    // [修改] 增加 !g_InTimeHook 检查
-    // 只有当不是由高层 Hook 调用时 才在这里修改时间
-    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemTime && !g_InTimeHook) {
-        SystemTime->QuadPart += g_TimeOffset;
-    }
-    return status;
-}
-
-NTSTATUS NTAPI Detour_NtQuerySystemInformation_Time(
-    SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID SystemInformation,
-    ULONG SystemInformationLength,
-    PULONG ReturnLength
-) {
-    // 调用原始函数
-    NTSTATUS status = fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
-
-    // SystemTimeOfDayInformation = 3
-    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3 && !g_InTimeHook) {
-        if (SystemInformationLength >= sizeof(YAP_SYSTEM_TIMEOFDAY_INFORMATION)) {
-            PYAP_SYSTEM_TIMEOFDAY_INFORMATION pInfo = (PYAP_SYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
-
-            // 修改当前时间
-            pInfo->CurrentTime.QuadPart += g_TimeOffset;
-
-            // 可选：修改启动时间 (BootTime)
-            // 如果程序通过 BootTime + TickCount 计算时间 也需要偏移 BootTime
-            pInfo->BootTime.QuadPart += g_TimeOffset;
-        }
+    if (g_InTimeHook) {
+        fpGetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
+        return;
     }
 
-    return status;
+    {
+        TimeRecursionGuard guard;
+        fpGetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
+    }
+    AddTimeOffset(lpSystemTimeAsFileTime);
 }
 
 // --- KernelBase 专用 Detour 函数 ---
+
 VOID WINAPI Detour_GetSystemTime_KB(LPSYSTEMTIME lpSystemTime) {
+    if (g_InTimeHook) {
+        fpGetSystemTime_KB(lpSystemTime);
+        return;
+    }
+
     {
         TimeRecursionGuard guard;
         fpGetSystemTime_KB(lpSystemTime);
     }
+
     if (g_EnableTimeHook && lpSystemTime) {
         FILETIME ft;
         SystemTimeToFileTimeHelper(lpSystemTime, &ft);
@@ -4833,10 +4826,16 @@ VOID WINAPI Detour_GetSystemTime_KB(LPSYSTEMTIME lpSystemTime) {
 }
 
 VOID WINAPI Detour_GetLocalTime_KB(LPSYSTEMTIME lpSystemTime) {
+    if (g_InTimeHook) {
+        fpGetLocalTime_KB(lpSystemTime);
+        return;
+    }
+
     {
         TimeRecursionGuard guard;
         fpGetLocalTime_KB(lpSystemTime);
     }
+
     if (g_EnableTimeHook && lpSystemTime) {
         FILETIME ft;
         SystemTimeToFileTimeHelper(lpSystemTime, &ft);
@@ -4846,6 +4845,11 @@ VOID WINAPI Detour_GetLocalTime_KB(LPSYSTEMTIME lpSystemTime) {
 }
 
 VOID WINAPI Detour_GetSystemTimeAsFileTime_KB(LPFILETIME lpSystemTimeAsFileTime) {
+    if (g_InTimeHook) {
+        fpGetSystemTimeAsFileTime_KB(lpSystemTimeAsFileTime);
+        return;
+    }
+
     {
         TimeRecursionGuard guard;
         fpGetSystemTimeAsFileTime_KB(lpSystemTimeAsFileTime);
@@ -4854,13 +4858,18 @@ VOID WINAPI Detour_GetSystemTimeAsFileTime_KB(LPFILETIME lpSystemTimeAsFileTime)
 }
 
 VOID WINAPI Detour_GetSystemTimePreciseAsFileTime_KB(LPFILETIME lpSystemTimeAsFileTime) {
-    if (fpGetSystemTimePreciseAsFileTime_KB) {
-        {
-            TimeRecursionGuard guard;
-            fpGetSystemTimePreciseAsFileTime_KB(lpSystemTimeAsFileTime);
-        }
-        AddTimeOffset(lpSystemTimeAsFileTime);
+    if (!fpGetSystemTimePreciseAsFileTime_KB) return;
+
+    if (g_InTimeHook) {
+        fpGetSystemTimePreciseAsFileTime_KB(lpSystemTimeAsFileTime);
+        return;
     }
+
+    {
+        TimeRecursionGuard guard;
+        fpGetSystemTimePreciseAsFileTime_KB(lpSystemTimeAsFileTime);
+    }
+    AddTimeOffset(lpSystemTimeAsFileTime);
 }
 
 // --- [新增] 底层退出 Hook (解决进程残留) ---
