@@ -794,6 +794,16 @@ P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
 typedef VOID(WINAPI* P_GetSystemTimePreciseAsFileTime)(LPFILETIME);
 P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 
+// --- [新增] NtQuerySystemTime 及 KernelBase 函数指针 ---
+typedef NTSTATUS(NTAPI* P_NtQuerySystemTime)(PLARGE_INTEGER);
+P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
+
+// KernelBase 专用指针 (避免与 Kernel32 指针冲突)
+P_GetSystemTime fpGetSystemTime_KB = NULL;
+P_GetLocalTime fpGetLocalTime_KB = NULL;
+P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
+P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -4720,9 +4730,51 @@ VOID WINAPI Detour_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
 }
 
 VOID WINAPI Detour_GetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime) {
-    // 精确时间函数在 Win8+ 才存在，如果原始指针为空则不处理
+    // 精确时间函数在 Win8+ 才存在 如果原始指针为空则不处理
     if (fpGetSystemTimePreciseAsFileTime) {
         fpGetSystemTimePreciseAsFileTime(lpSystemTimeAsFileTime);
+        AddTimeOffset(lpSystemTimeAsFileTime);
+    }
+}
+
+// 拦截底层系统调用 NtQuerySystemTime
+NTSTATUS NTAPI Detour_NtQuerySystemTime(PLARGE_INTEGER SystemTime) {
+    NTSTATUS status = fpNtQuerySystemTime(SystemTime);
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemTime) {
+        SystemTime->QuadPart += g_TimeOffset;
+    }
+    return status;
+}
+
+// --- KernelBase 专用 Detour 函数 ---
+VOID WINAPI Detour_GetSystemTime_KB(LPSYSTEMTIME lpSystemTime) {
+    fpGetSystemTime_KB(lpSystemTime);
+    if (g_EnableTimeHook && lpSystemTime) {
+        FILETIME ft;
+        SystemTimeToFileTimeHelper(lpSystemTime, &ft);
+        AddTimeOffset(&ft);
+        FileTimeToSystemTimeHelper(&ft, lpSystemTime);
+    }
+}
+
+VOID WINAPI Detour_GetLocalTime_KB(LPSYSTEMTIME lpSystemTime) {
+    fpGetLocalTime_KB(lpSystemTime);
+    if (g_EnableTimeHook && lpSystemTime) {
+        FILETIME ft;
+        SystemTimeToFileTimeHelper(lpSystemTime, &ft);
+        AddTimeOffset(&ft);
+        FileTimeToSystemTimeHelper(&ft, lpSystemTime);
+    }
+}
+
+VOID WINAPI Detour_GetSystemTimeAsFileTime_KB(LPFILETIME lpSystemTimeAsFileTime) {
+    fpGetSystemTimeAsFileTime_KB(lpSystemTimeAsFileTime);
+    AddTimeOffset(lpSystemTimeAsFileTime);
+}
+
+VOID WINAPI Detour_GetSystemTimePreciseAsFileTime_KB(LPFILETIME lpSystemTimeAsFileTime) {
+    if (fpGetSystemTimePreciseAsFileTime_KB) {
+        fpGetSystemTimePreciseAsFileTime_KB(lpSystemTimeAsFileTime);
         AddTimeOffset(lpSystemTimeAsFileTime);
     }
 }
@@ -5978,7 +6030,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             targetLocalSt.wMonth = (WORD)month;
             targetLocalSt.wDay = (WORD)day;
 
-            // 如果指定了具体时间，则覆盖
+            // 如果指定了具体时间 则覆盖
             if (fields >= 5 && hour >= 0 && minute >= 0) {
                 targetLocalSt.wHour = (WORD)hour;
                 targetLocalSt.wMinute = (WORD)minute;
@@ -6472,6 +6524,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- [新增] 组 K: 时间 Hook ---
     if (g_EnableTimeHook) {
+        // 1. Hook Kernel32 (标准路径)
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         if (hKernel32) {
             MH_CreateHook(GetProcAddress(hKernel32, "GetSystemTime"), &Detour_GetSystemTime, reinterpret_cast<LPVOID*>(&fpGetSystemTime));
@@ -6481,6 +6534,30 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pGetPrecise = (void*)GetProcAddress(hKernel32, "GetSystemTimePreciseAsFileTime");
             if (pGetPrecise) {
                 MH_CreateHook(pGetPrecise, &Detour_GetSystemTimePreciseAsFileTime, reinterpret_cast<LPVOID*>(&fpGetSystemTimePreciseAsFileTime));
+            }
+        }
+
+        // 2. Hook KernelBase (底层路径 防止绕过 Kernel32)
+        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+        if (hKernelBase) {
+            // 注意：使用 _KB 后缀的函数指针和 Detour 函数 防止与 Kernel32 冲突
+            MH_CreateHook(GetProcAddress(hKernelBase, "GetSystemTime"), &Detour_GetSystemTime_KB, reinterpret_cast<LPVOID*>(&fpGetSystemTime_KB));
+            MH_CreateHook(GetProcAddress(hKernelBase, "GetLocalTime"), &Detour_GetLocalTime_KB, reinterpret_cast<LPVOID*>(&fpGetLocalTime_KB));
+            MH_CreateHook(GetProcAddress(hKernelBase, "GetSystemTimeAsFileTime"), &Detour_GetSystemTimeAsFileTime_KB, reinterpret_cast<LPVOID*>(&fpGetSystemTimeAsFileTime_KB));
+
+            void* pGetPreciseKB = (void*)GetProcAddress(hKernelBase, "GetSystemTimePreciseAsFileTime");
+            if (pGetPreciseKB) {
+                MH_CreateHook(pGetPreciseKB, &Detour_GetSystemTimePreciseAsFileTime_KB, reinterpret_cast<LPVOID*>(&fpGetSystemTimePreciseAsFileTime_KB));
+            }
+        }
+
+        // 3. Hook Ntdll (NtQuerySystemTime - 最底层系统调用)
+        // 很多 CRT 时间函数(如 time, _ftime) 和 GetSystemTime 最终都会调用它
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            void* pNtQuerySystemTime = (void*)GetProcAddress(hNtdll, "NtQuerySystemTime");
+            if (pNtQuerySystemTime) {
+                MH_CreateHook(pNtQuerySystemTime, &Detour_NtQuerySystemTime, reinterpret_cast<LPVOID*>(&fpNtQuerySystemTime));
             }
         }
     }
