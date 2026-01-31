@@ -5955,44 +5955,58 @@ DWORD WINAPI InitHookThread(LPVOID) {
         int year = 0, month = 0, day = 0, hour = -1, minute = -1;
 
         // 尝试解析 "YYYY/MM/DD :: HH:MM"
-        if (swscanf_s(timeBuffer, L"%d/%d/%d :: %d:%d", &year, &month, &day, &hour, &minute) >= 3) {
+        // swscanf_s 返回成功匹配的字段数量
+        int fields = swscanf_s(timeBuffer, L"%d/%d/%d :: %d:%d", &year, &month, &day, &hour, &minute);
 
-            // 获取当前真实系统时间 (UTC)
-            SYSTEMTIME realSt;
-            GetSystemTime(&realSt);
-            FILETIME realFt;
-            SystemTimeToFileTime(&realSt, &realFt);
-            ULARGE_INTEGER realUli;
-            realUli.LowPart = realFt.dwLowDateTime;
-            realUli.HighPart = realFt.dwHighDateTime;
+        if (fields >= 3) {
+            // 1. 获取当前真实 UTC 时间 (用于计算基准)
+            SYSTEMTIME realUtcSt;
+            GetSystemTime(&realUtcSt);
+            FILETIME realUtcFt;
+            SystemTimeToFileTime(&realUtcSt, &realUtcFt);
+            ULARGE_INTEGER realUtcUli;
+            realUtcUli.LowPart = realUtcFt.dwLowDateTime;
+            realUtcUli.HighPart = realUtcFt.dwHighDateTime;
 
-            // 构造目标伪造时间
-            SYSTEMTIME fakeSt = realSt; // 继承当前的秒和毫秒
-            fakeSt.wYear = (WORD)year;
-            fakeSt.wMonth = (WORD)month;
-            fakeSt.wDay = (WORD)day;
+            // 2. 获取当前真实 Local 时间 (用于填充未指定的时间部分)
+            SYSTEMTIME realLocalSt;
+            GetLocalTime(&realLocalSt);
 
-            // 如果指定了时间，则覆盖
-            if (hour >= 0 && minute >= 0) {
-                fakeSt.wHour = (WORD)hour;
-                fakeSt.wMinute = (WORD)minute;
-                fakeSt.wSecond = 0;
-                fakeSt.wMilliseconds = 0;
+            // 3. 构造目标 Local 时间
+            SYSTEMTIME targetLocalSt = realLocalSt; // 默认继承当前的 Local 时/分/秒/毫秒
+            targetLocalSt.wYear = (WORD)year;
+            targetLocalSt.wMonth = (WORD)month;
+            targetLocalSt.wDay = (WORD)day;
+
+            // 如果指定了具体时间，则覆盖
+            if (fields >= 5 && hour >= 0 && minute >= 0) {
+                targetLocalSt.wHour = (WORD)hour;
+                targetLocalSt.wMinute = (WORD)minute;
+                targetLocalSt.wSecond = 0;
+                targetLocalSt.wMilliseconds = 0;
             }
-            // 如果未指定时间 (hour == -1)，则保留 realSt 的时间部分 (仅修改日期)
 
-            FILETIME fakeFt;
-            if (SystemTimeToFileTime(&fakeSt, &fakeFt)) {
-                ULARGE_INTEGER fakeUli;
-                fakeUli.LowPart = fakeFt.dwLowDateTime;
-                fakeUli.HighPart = fakeFt.dwHighDateTime;
+            // 4. 将目标 Local 时间转换为目标 UTC 时间
+            // 关键修正：使用 TzSpecificLocalTimeToSystemTime 将用户配置的本地时间转为 UTC
+            SYSTEMTIME targetUtcSt;
+            if (TzSpecificLocalTimeToSystemTime(NULL, &targetLocalSt, &targetUtcSt)) {
+                FILETIME targetUtcFt;
+                SystemTimeToFileTime(&targetUtcSt, &targetUtcFt);
+                ULARGE_INTEGER targetUtcUli;
+                targetUtcUli.LowPart = targetUtcFt.dwLowDateTime;
+                targetUtcUli.HighPart = targetUtcFt.dwHighDateTime;
 
-                // 计算偏移量：目标时间 - 真实时间
-                // 这样后续调用 GetSystemTime 时，加上这个偏移量，时间就会从伪造点开始流逝
-                g_TimeOffset = (long long)(fakeUli.QuadPart - realUli.QuadPart);
+                // 5. 计算偏移量：目标 UTC - 真实 UTC
+                // 这样 Hook 后的 GetSystemTime 返回的是正确的伪造 UTC 时间
+                // 应用程序再通过 GetLocalTime (+8小时) 就能得到正确的本地时间
+                g_TimeOffset = (long long)(targetUtcUli.QuadPart - realUtcUli.QuadPart);
                 g_EnableTimeHook = true;
 
-                DebugLog(L"TimeHook: Enabled. Target: %s, Offset: %lld", timeBuffer, g_TimeOffset);
+                DebugLog(L"TimeHook: Enabled. Target Local: %04d/%02d/%02d %02d:%02d, Offset: %lld",
+                    targetLocalSt.wYear, targetLocalSt.wMonth, targetLocalSt.wDay,
+                    targetLocalSt.wHour, targetLocalSt.wMinute, g_TimeOffset);
+            } else {
+                DebugLog(L"TimeHook: TzSpecificLocalTimeToSystemTime failed.");
             }
         }
     }
