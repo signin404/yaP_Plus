@@ -52,9 +52,11 @@ Just copy and paste to create portable software.
 - [x] Check the parent process or path and terminate the process
 - [x] Traverse subdirectories and delete files/directories
 - [x] (Experimental) Hook Redirect File Operations
+- [x] (Experimental) Hook Falsifying system language
 - [x] (Experimental) Hook Forged volume serial number
-- [x] (Experimental) Hook to prevent network connection
-- [x] (Experimental) Hook to replace font
+- [x] (Experimental) Hook virtual optical drive
+- [x] (Experimental) Hook prevent network connection
+- [x] (Experimental) Hook replace font
 - [x] (Experimental) Injecting a third-party DLL
 
 ## Unported Features
