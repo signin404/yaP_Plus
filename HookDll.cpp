@@ -177,6 +177,16 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef struct _SYSTEM_TIMEOFDAY_INFORMATION {
+    LARGE_INTEGER BootTime;
+    LARGE_INTEGER CurrentTime;
+    LARGE_INTEGER TimeZoneBias;
+    ULONG TimeZoneId;
+    ULONG Reserved;
+    ULONGLONG BootTimeBias;
+    ULONGLONG SleepTimeBias;
+} SYSTEM_TIMEOFDAY_INFORMATION, *PSYSTEM_TIMEOFDAY_INFORMATION;
+
 // [新增] 设备信息结构体 (用于伪装光驱)
 typedef struct _FILE_FS_DEVICE_INFORMATION {
     ULONG DeviceType;
@@ -4624,7 +4634,7 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
     ULONG SystemInformationLength,
     PULONG ReturnLength
 ) {
-    // SystemCurrentTimeZoneInformation = 44
+    // 1. 处理时区伪造 (SystemCurrentTimeZoneInformation = 44)
     if (g_EnableTimeZoneHook && (int)SystemInformationClass == 44) {
         if (SystemInformation && SystemInformationLength >= sizeof(RTL_TIME_ZONE_INFORMATION)) {
             // RTL_TIME_ZONE_INFORMATION 结构与 TIME_ZONE_INFORMATION 几乎一致
@@ -4640,6 +4650,18 @@ NTSTATUS NTAPI Detour_NtQuerySystemInformation(
 
             if (ReturnLength) *ReturnLength = sizeof(RTL_TIME_ZONE_INFORMATION);
             return STATUS_SUCCESS;
+        }
+    }
+
+    // 2. 调用原始函数获取其他信息
+    NTSTATUS status = fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+
+    // 3. 处理时间伪造 (SystemTimeOfDayInformation = 3)
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
+        if (SystemInformationLength >= sizeof(SYSTEM_TIMEOFDAY_INFORMATION)) {
+            PSYSTEM_TIMEOFDAY_INFORMATION pInfo = (PSYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
+            pInfo->CurrentTime.QuadPart += g_TimeOffset;
+            pInfo->BootTime.QuadPart += g_TimeOffset; // 视情况启用
         }
     }
 
@@ -4743,6 +4765,32 @@ NTSTATUS NTAPI Detour_NtQuerySystemTime(PLARGE_INTEGER SystemTime) {
     if (NT_SUCCESS(status) && g_EnableTimeHook && SystemTime) {
         SystemTime->QuadPart += g_TimeOffset;
     }
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtQuerySystemInformation_Time(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+) {
+    // 调用原始函数
+    NTSTATUS status = fpNtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
+
+    // SystemTimeOfDayInformation = 3
+    if (NT_SUCCESS(status) && g_EnableTimeHook && SystemInformation && (int)SystemInformationClass == 3) {
+        if (SystemInformationLength >= sizeof(SYSTEM_TIMEOFDAY_INFORMATION)) {
+            PSYSTEM_TIMEOFDAY_INFORMATION pInfo = (PSYSTEM_TIMEOFDAY_INFORMATION)SystemInformation;
+
+            // 修改当前时间
+            pInfo->CurrentTime.QuadPart += g_TimeOffset;
+
+            // 可选：修改启动时间 (BootTime)
+            // 如果程序通过 BootTime + TickCount 计算时间，也需要偏移 BootTime
+            pInfo->BootTime.QuadPart += g_TimeOffset;
+        }
+    }
+
     return status;
 }
 
