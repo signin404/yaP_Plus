@@ -4404,8 +4404,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
     }
 
+    // --- [新增] 解析 hooklocale (语言区域伪造) ---
+    std::wstring hookLocaleVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooklocale");
+    if (!hookLocaleVal.empty()) {
+        SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", hookLocaleVal.c_str());
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookFontVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
