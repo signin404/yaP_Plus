@@ -53,6 +53,7 @@ Just copy and paste to create portable software.
 - [x] Traverse subdirectories and delete files/directories
 - [x] (Experimental) Hook Redirect File Operations
 - [x] (Experimental) Hook Falsifying system language
+- [x] (Experimental) Hook Falsifying system time
 - [x] (Experimental) Hook Forged volume serial number
 - [x] (Experimental) Hook virtual optical drive
 - [x] (Experimental) Hook prevent network connection
