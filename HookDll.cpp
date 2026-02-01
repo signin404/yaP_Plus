@@ -1288,6 +1288,20 @@ std::wstring g_ProgramDataNtShort;
 std::wstring g_PublicNt;
 
 thread_local bool g_IsInHook = false;
+// [新增] 旁路开关：当为 true 时 所有的 GetACP/GetLocale 等 Hook 返回真实值
+thread_local bool g_BypassHooks = false;
+
+// 辅助类：自动管理旁路开关
+struct BypassGuard {
+    bool wasBypassed;
+    BypassGuard() {
+        wasBypassed = g_BypassHooks;
+        g_BypassHooks = true;
+    }
+    ~BypassGuard() {
+        g_BypassHooks = wasBypassed;
+    }
+};
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -4065,11 +4079,15 @@ GpStatus WINAPI Detour_GdipCreateFontFamilyFromName(const WCHAR* name, GpFontCol
 // --- [新增] 区域伪造 Hook 实现 ---
 
 UINT WINAPI Detour_GetACP(void) {
+    // [修改] 如果开启了旁路 返回真实 ACP
+    if (g_BypassHooks) return fpGetACP();
     return g_FakeACP ? g_FakeACP : fpGetACP();
 }
 
 UINT WINAPI Detour_GetOEMCP(void) {
-    return g_FakeACP ? g_FakeACP : fpGetOEMCP(); // 通常 OEMCP 与 ACP 保持一致以避免兼容性问题
+    // [修改] 同上
+    if (g_BypassHooks) return fpGetOEMCP();
+    return g_FakeACP ? g_FakeACP : fpGetOEMCP();
 }
 
 LCID WINAPI Detour_GetUserDefaultLCID(void) {
@@ -4113,7 +4131,9 @@ int WINAPI Detour_GetLocaleInfoW(LCID Locale, LCTYPE LCType, LPWSTR lpLCData, in
 
 // 拦截 ANSI -> Unicode 转换
 int WINAPI Detour_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar) {
-    // 如果程序请求使用系统默认 ANSI 代码页 强制替换为我们伪造的代码页
+    // [新增] 如果旁路开启 直接透传
+    if (g_BypassHooks) return fpMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+
     if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
         CodePage = g_FakeACP;
     }
@@ -4122,6 +4142,9 @@ int WINAPI Detour_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMult
 
 // 拦截 Unicode -> ANSI 转换
 int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr, int cchWideChar, LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar) {
+    // [新增] 如果旁路开启 直接透传
+    if (g_BypassHooks) return fpWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
+
     if (g_FakeACP && (CodePage == CP_ACP || CodePage == CP_THREAD_ACP || CodePage == CP_OEMCP)) {
         CodePage = g_FakeACP;
     }
@@ -4131,13 +4154,15 @@ int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWid
 // --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
 // 很多程序内部使用这个函数而不是 MultiByteToWideChar
 NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
-    // [修正] 防止无限递归：如果 MultiByteToWideChar 内部再次调用了本函数 直接放行
     if (g_IsInHook) return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
 
-    // 设置递归锁
     RecursionGuard guard;
 
     if (g_FakeACP != 0) {
+        // [新增] 开启旁路：告诉下层 API 不要相信我们伪造的 ACP
+        // 这样 MultiByteToWideChar 就不会回调 RtlMultiByteToUnicodeN
+        BypassGuard bypass;
+
         int wLen = 0;
         int maxChars = MaxBytesInUnicodeString / sizeof(WCHAR);
 
@@ -4157,13 +4182,14 @@ NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesI
 }
 
 NTSTATUS NTAPI Detour_RtlUnicodeToMultiByteN(PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString, PCWSTR UnicodeString, ULONG BytesInUnicodeString) {
-    // [修正] 防止无限递归
     if (g_IsInHook) return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
 
-    // 设置递归锁
     RecursionGuard guard;
 
     if (g_FakeACP != 0) {
+        // [新增] 开启旁路
+        BypassGuard bypass;
+
         int aLen = 0;
         int charsInUnicode = BytesInUnicodeString / sizeof(WCHAR);
 
