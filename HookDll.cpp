@@ -814,6 +814,10 @@ P_GetLocalTime fpGetLocalTime_KB = NULL;
 P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
 P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
 
+// --- [新增] 进程状态检测函数 ---
+typedef BOOLEAN (NTAPI *P_RtlDllShutdownInProgress)(VOID);
+P_RtlDllShutdownInProgress fpRtlDllShutdownInProgress = NULL;
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -1003,6 +1007,9 @@ DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
+
+// 全局退出标志
+std::atomic<bool> g_IsTerminating = false;
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -4151,16 +4158,31 @@ int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWid
     return fpWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar, lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
 }
 
+// 辅助检查：是否安全执行 Hook 逻辑
+bool IsSafeToHook() {
+    // 1. 如果我们已经标记了全局退出
+    if (g_IsTerminating) return false;
+
+    // 2. 如果系统处于 DLL 卸载或进程终止阶段 (Loader Lock 被持有)
+    // 此时调用 Kernel32 API (如 MultiByteToWideChar) 极易导致死锁或崩溃
+    if (fpRtlDllShutdownInProgress && fpRtlDllShutdownInProgress()) return false;
+
+    return true;
+}
+
 // --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
 // 很多程序内部使用这个函数而不是 MultiByteToWideChar
 NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
+    // [修正] 增加安全检查：如果处于退出阶段，直接透传，不做任何处理
+    if (!IsSafeToHook()) {
+        return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
+    }
+
     if (g_IsInHook) return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
 
     RecursionGuard guard;
 
     if (g_FakeACP != 0) {
-        // [新增] 开启旁路：告诉下层 API 不要相信我们伪造的 ACP
-        // 这样 MultiByteToWideChar 就不会回调 RtlMultiByteToUnicodeN
         BypassGuard bypass;
 
         int wLen = 0;
@@ -4182,12 +4204,16 @@ NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesI
 }
 
 NTSTATUS NTAPI Detour_RtlUnicodeToMultiByteN(PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString, PCWSTR UnicodeString, ULONG BytesInUnicodeString) {
+    // [修正] 增加安全检查
+    if (!IsSafeToHook()) {
+        return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
+    }
+
     if (g_IsInHook) return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
 
     RecursionGuard guard;
 
     if (g_FakeACP != 0) {
-        // [新增] 开启旁路
         BypassGuard bypass;
 
         int aLen = 0;
@@ -4523,9 +4549,7 @@ LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lP
 // --- [新增] 强制退出 Hook (解决进程残留) ---
 
 void WINAPI Detour_ExitProcess(UINT uExitCode) {
-    // 这里的关键是使用 TerminateProcess 而不是 ExitProcess
-    // ExitProcess 会尝试通知所有 DLL (DLL_PROCESS_DETACH) 并等待线程结束 容易导致死锁
-    // TerminateProcess 是内核级强制查杀 瞬间结束 不留后患
+    g_IsTerminating = true; // [新增] 标记退出
     TerminateProcess(GetCurrentProcess(), uExitCode);
 }
 
@@ -4942,7 +4966,7 @@ VOID WINAPI Detour_GetSystemTimePreciseAsFileTime_KB(LPFILETIME lpSystemTimeAsFi
 
 // Ntdll 级别的退出函数 比 ExitProcess 更底层
 void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
-    // 强制终止当前进程 不等待任何线程清理
+    g_IsTerminating = true; // [新增] 标记退出
     TerminateProcess(GetCurrentProcess(), Status);
 }
 
@@ -5948,6 +5972,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+        g_NtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+        g_RtlCreateUserThread = (pfnRtlCreateUserThread)GetProcAddress(hNtdll, "RtlCreateUserThread");
+        fpRtlDllShutdownInProgress = (P_RtlDllShutdownInProgress)GetProcAddress(hNtdll, "RtlDllShutdownInProgress");
     }
 
     wchar_t buffer[MAX_PATH] = { 0 };
@@ -6741,6 +6768,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinst);
         CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
+        g_IsTerminating = true; // [新增] DLL 卸载时标记退出
         MH_Uninitialize();
     }
     return TRUE;
