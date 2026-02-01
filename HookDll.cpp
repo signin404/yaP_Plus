@@ -4131,23 +4131,22 @@ int WINAPI Detour_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWid
 // --- [新增] Ntdll 字符串转换 Hook (底层核心) ---
 // 很多程序内部使用这个函数而不是 MultiByteToWideChar
 NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString, PULONG BytesInUnicodeString, PCSTR MultiByteString, ULONG BytesInMultiByteString) {
-    // 这里的逻辑稍微复杂 因为 Rtl 函数不接受 CodePage 参数 它默认使用系统当前 ANSI 代码页
-    // 我们必须手动实现转换 强制使用 g_FakeACP
+    // [修正] 防止无限递归：如果 MultiByteToWideChar 内部再次调用了本函数 直接放行
+    if (g_IsInHook) return fpRtlMultiByteToUnicodeN(UnicodeString, MaxBytesInUnicodeString, BytesInUnicodeString, MultiByteString, BytesInMultiByteString);
+
+    // 设置递归锁
+    RecursionGuard guard;
 
     if (g_FakeACP != 0) {
         int wLen = 0;
-        // 计算所需长度
-        // 注意：MaxBytesInUnicodeString 是字节数 不是字符数
         int maxChars = MaxBytesInUnicodeString / sizeof(WCHAR);
 
-        // 如果只查询长度 (UnicodeString == NULL)
         if (!UnicodeString) {
             wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, NULL, 0);
             if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
             return STATUS_SUCCESS;
         }
 
-        // 执行转换
         wLen = MultiByteToWideChar(g_FakeACP, 0, MultiByteString, BytesInMultiByteString, UnicodeString, maxChars);
 
         if (BytesInUnicodeString) *BytesInUnicodeString = wLen * sizeof(WCHAR);
@@ -4158,6 +4157,12 @@ NTSTATUS NTAPI Detour_RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesI
 }
 
 NTSTATUS NTAPI Detour_RtlUnicodeToMultiByteN(PCHAR MultiByteString, ULONG MaxBytesInMultiByteString, PULONG BytesInMultiByteString, PCWSTR UnicodeString, ULONG BytesInUnicodeString) {
+    // [修正] 防止无限递归
+    if (g_IsInHook) return fpRtlUnicodeToMultiByteN(MultiByteString, MaxBytesInMultiByteString, BytesInMultiByteString, UnicodeString, BytesInUnicodeString);
+
+    // 设置递归锁
+    RecursionGuard guard;
+
     if (g_FakeACP != 0) {
         int aLen = 0;
         int charsInUnicode = BytesInUnicodeString / sizeof(WCHAR);
