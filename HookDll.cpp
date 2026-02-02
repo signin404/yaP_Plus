@@ -4465,27 +4465,234 @@ LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
     return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
+// --- [新增] SendMessageA 专用处理逻辑 (移植自 Locale Remulator) ---
+
+// 处理输入字符串的消息 (如 WM_SETTEXT, LB_ADDSTRING)
+// 将 ANSI(Shift-JIS) 转为 Unicode 后转发给 SendMessageW
+LRESULT Handle_AnsiInString(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (lParam == 0) return SendMessageW(hWnd, Msg, wParam, 0);
+
+    std::wstring wStr = SpoofAnsiToWide((LPCSTR)lParam);
+    return SendMessageW(hWnd, Msg, wParam, (LPARAM)wStr.c_str());
+}
+
+// 处理输出字符串的消息 (如 WM_GETTEXT)
+// 调用 W 版获取 Unicode 再转回 ANSI(Shift-JIS) 写入缓冲区
+LRESULT Handle_AnsiOutString(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (lParam == 0 || wParam == 0) return 0;
+
+    // 1. 准备 Unicode 缓冲区
+    // wParam 通常是缓冲区大小 (字符数)
+    std::vector<wchar_t> wBuf(wParam + 1, 0);
+
+    // 2. 调用 W 版 API
+    LRESULT wResult = SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+    // 3. 转回 ANSI
+    std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+    // 4. 写入用户缓冲区 (注意截断)
+    size_t copyLen = min((size_t)wParam - 1, aStr.length());
+    if (copyLen > 0) {
+        memcpy((void*)lParam, aStr.c_str(), copyLen);
+    }
+    ((char*)lParam)[copyLen] = 0; // 确保 NULL 结尾
+
+    return copyLen;
+}
+
+// 处理 ListBox/ComboBox 获取文本 (LB_GETTEXT, CB_GETLBTEXT)
+// 这些消息的 wParam 是索引 lParam 是缓冲区 且不传递缓冲区大小(危险!)
+// 需要先获取长度 分配 Unicode 缓冲区 获取内容 再转码
+LRESULT Handle_ListGetText(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (lParam == 0) return 0;
+
+    // 确定对应的获取长度消息
+    UINT msgGetLen = (Msg == LB_GETTEXT) ? LB_GETTEXTLEN : CB_GETLBTEXTLEN;
+
+    // 1. 获取 Unicode 长度
+    LRESULT wLen = SendMessageW(hWnd, msgGetLen, wParam, 0);
+    if (wLen == LB_ERR || wLen == CB_ERR) return wLen;
+
+    // 2. 分配 Unicode 缓冲区
+    std::vector<wchar_t> wBuf(wLen + 1, 0);
+
+    // 3. 获取 Unicode 文本
+    SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+    // 4. 转回 ANSI
+    std::string aStr = SpoofWideToAnsi(wBuf.data());
+
+    // 5. 写入用户缓冲区 (假设用户已分配足够空间 这是 Win32 API 的约定)
+    strcpy((char*)lParam, aStr.c_str());
+
+    return aStr.length();
+}
+
+// 处理获取文本长度的消息 (WM_GETTEXTLENGTH, LB_GETTEXTLEN)
+// 获取 Unicode 长度 -> 转为 ANSI 后的字节数
+LRESULT Handle_GetTextLength(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    // 1. 获取 Unicode 长度
+    LRESULT wLen = SendMessageW(hWnd, Msg, wParam, lParam);
+    if (wLen <= 0) return wLen;
+
+    // 2. 获取实际内容以计算 ANSI 长度
+    // 注意：对于 LB/CB wParam 是索引；对于 WM wParam 通常忽略
+    UINT msgGetText = 0;
+    if (Msg == LB_GETTEXTLEN) msgGetText = LB_GETTEXT;
+    else if (Msg == CB_GETLBTEXTLEN) msgGetText = CB_GETLBTEXT;
+    else msgGetText = WM_GETTEXT;
+
+    std::vector<wchar_t> wBuf(wLen + 1, 0);
+
+    if (msgGetText == WM_GETTEXT) {
+        SendMessageW(hWnd, msgGetText, wLen + 1, (LPARAM)wBuf.data());
+    } else {
+        SendMessageW(hWnd, msgGetText, wParam, (LPARAM)wBuf.data());
+    }
+
+    // 3. 计算转码后的长度
+    int aLen = WideCharToMultiByte(g_FakeACP ? g_FakeACP : CP_ACP, 0, wBuf.data(), -1, NULL, 0, NULL, NULL);
+    return (aLen > 0) ? aLen - 1 : 0;
+}
+
+// 处理窗口创建消息 (WM_CREATE, WM_NCCREATE)
+// 需要转换 CREATESTRUCTA 结构体中的类名和窗口名
+LRESULT Handle_CreateStruct(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (lParam == 0) return SendMessageW(hWnd, Msg, wParam, lParam);
+
+    LPCREATESTRUCTA pCsA = (LPCREATESTRUCTA)lParam;
+
+    // 构造 W 版结构体
+    CREATESTRUCTW csW = { 0 };
+    // 复制基本成员
+    csW.lpCreateParams = pCsA->lpCreateParams;
+    csW.hInstance = pCsA->hInstance;
+    csW.hMenu = pCsA->hMenu;
+    csW.hwndParent = pCsA->hwndParent;
+    csW.cy = pCsA->cy;
+    csW.cx = pCsA->cx;
+    csW.y = pCsA->y;
+    csW.x = pCsA->x;
+    csW.style = pCsA->style;
+    csW.dwExStyle = pCsA->dwExStyle;
+
+    // 转换字符串 (注意类名可能是 ATOM)
+    std::wstring wName, wClass;
+
+    if (pCsA->lpszName) {
+        wName = SpoofAnsiToWide(pCsA->lpszName);
+        csW.lpszName = wName.c_str();
+    }
+
+    if (IS_ATOM(pCsA->lpszClass)) {
+        csW.lpszClass = (LPCWSTR)pCsA->lpszClass;
+    } else if (pCsA->lpszClass) {
+        wClass = SpoofAnsiToWide(pCsA->lpszClass);
+        csW.lpszClass = wClass.c_str();
+    }
+
+    return SendMessageW(hWnd, Msg, wParam, (LPARAM)&csW);
+}
+
+// 处理 MDI 子窗口创建 (WM_MDICREATE)
+LRESULT Handle_MdiCreateStruct(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+    if (lParam == 0) return SendMessageW(hWnd, Msg, wParam, lParam);
+
+    LPMDICREATESTRUCTA pMdiA = (LPMDICREATESTRUCTA)lParam;
+    MDICREATESTRUCTW mdiW = { 0 };
+
+    mdiW.hOwner = pMdiA->hOwner;
+    mdiW.x = pMdiA->x;
+    mdiW.y = pMdiA->y;
+    mdiW.cx = pMdiA->cx;
+    mdiW.cy = pMdiA->cy;
+    mdiW.style = pMdiA->style;
+    mdiW.lParam = pMdiA->lParam;
+
+    std::wstring wClass, wTitle;
+
+    if (IS_ATOM(pMdiA->szClass)) {
+        mdiW.szClass = (LPCWSTR)pMdiA->szClass;
+    } else if (pMdiA->szClass) {
+        wClass = SpoofAnsiToWide(pMdiA->szClass);
+        mdiW.szClass = wClass.c_str();
+    }
+
+    if (pMdiA->szTitle) {
+        wTitle = SpoofAnsiToWide(pMdiA->szTitle);
+        mdiW.szTitle = wTitle.c_str();
+    }
+
+    return SendMessageW(hWnd, Msg, wParam, (LPARAM)&mdiW);
+}
+
 // --- [新增] SendMessageA Hook (解决标题栏/控件乱码) ---
 LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
-    if (g_FakeACP != 0) {
-        // [修正] 移除 WM_SETTEXT 的拦截 防止系统错误的二次转换
+    // 如果没有启用区域伪造 直接调用原始函数
+    if (g_FakeACP == 0) {
+        return fpSendMessageA(hWnd, Msg, wParam, lParam);
+    }
 
-        // 保持 WM_GETTEXT 的拦截 (因为我们需要把 Unicode 转回 Shift-JIS 给游戏)
-        if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
-            std::vector<wchar_t> wBuf(wParam + 1);
-            // 调用 W 版获取正确的 Unicode 标题
-            LRESULT wResult = SendMessageW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+    switch (Msg) {
+        // --- 1. 输入字符串类消息 (ANSI -> Unicode) ---
+        case WM_SETTEXT:
+        case WM_SETTINGCHANGE:
+        case WM_DEVMODECHANGE:
+        case EM_REPLACESEL:
+        // ListBox
+        case LB_ADDSTRING:
+        case LB_INSERTSTRING:
+        case LB_SELECTSTRING:
+        case LB_FINDSTRING:
+        case LB_FINDSTRINGEXACT:
+        case LB_DIR:
+        // ComboBox
+        case CB_ADDSTRING:
+        case CB_INSERTSTRING:
+        case CB_SELECTSTRING:
+        case CB_FINDSTRING:
+        case CB_FINDSTRINGEXACT:
+        case CB_DIR:
+        {
+            return Handle_AnsiInString(hWnd, Msg, wParam, lParam);
+        }
 
-            // 转回 Shift-JIS 欺骗游戏
-            std::string aStr = SpoofWideToAnsi(wBuf.data());
+        // --- 2. 输出字符串类消息 (Unicode -> ANSI) ---
+        case WM_GETTEXT:
+        case WM_ASKCBFORMATNAME:
+        {
+            return Handle_AnsiOutString(hWnd, Msg, wParam, lParam);
+        }
 
-            size_t copyLen = min((size_t)wParam - 1, aStr.length());
-            memcpy((void*)lParam, aStr.c_str(), copyLen);
-            ((char*)lParam)[copyLen] = 0;
+        // --- 3. 列表框获取文本 (特殊处理) ---
+        case LB_GETTEXT:
+        case CB_GETLBTEXT:
+        {
+            return Handle_ListGetText(hWnd, Msg, wParam, lParam);
+        }
 
-            return copyLen;
+        // --- 4. 获取长度类消息 ---
+        case WM_GETTEXTLENGTH:
+        case LB_GETTEXTLEN:
+        case CB_GETLBTEXTLEN:
+        {
+            return Handle_GetTextLength(hWnd, Msg, wParam, lParam);
+        }
+
+        // --- 5. 窗口创建类消息 ---
+        case WM_CREATE:
+        case WM_NCCREATE:
+        {
+            return Handle_CreateStruct(hWnd, Msg, wParam, lParam);
+        }
+        case WM_MDICREATE:
+        {
+            return Handle_MdiCreateStruct(hWnd, Msg, wParam, lParam);
         }
     }
+
+    // 其他消息直接透传
     return fpSendMessageA(hWnd, Msg, wParam, lParam);
 }
 
