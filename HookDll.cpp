@@ -5030,6 +5030,20 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
 
 // --- CreateProcess Hooks ---
 
+// 声明伪变量 用于获取当前模块(DLL)的句柄 这是 MSVC 的标准用法
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+// 获取当前 DLL 所在的目录 (不含文件名)
+std::wstring GetCurrentDllDir() {
+    wchar_t path[MAX_PATH];
+    // 使用 &__ImageBase 获取当前 DLL 的句柄 而不是 NULL (EXE)
+    if (GetModuleFileNameW((HINSTANCE)&__ImageBase, path, MAX_PATH) == 0) {
+        return L"";
+    }
+    PathRemoveFileSpecW(path);
+    return std::wstring(path);
+}
+
 // 检查 PE 文件架构 (32/64)
 int GetPeArchitecture(const std::wstring& path) {
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -5229,54 +5243,55 @@ BOOL CreateProcessInternal(
         // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
 
-            // [新增] 获取当前进程和目标进程的架构
-            BOOL isWow64Current = FALSE;
-            IsWow64Process(GetCurrentProcess(), &isWow64Current);
-
-            // 获取目标 EXE 架构
-            int targetArch = GetPeArchitecture(targetExe);
-
-            // 判断当前进程架构 (HookDll 所在的进程)
-            // 如果是 32位构建 arch=32如果是 64位构建 arch=64
+            // [修正] 获取当前进程架构
             #ifdef _WIN64
             int currentArch = 64;
             #else
             int currentArch = 32;
             #endif
 
-            // 获取要注入的 DLL 路径
-            // 假设 HookDll 知道自己的路径 对应的 32/64 DLL 在同一目录下
-            wchar_t thisDllPath[MAX_PATH];
-            GetModuleFileNameW(GetModuleHandleW(L"YapHook64.dll"), thisDllPath, MAX_PATH);
-            // 注意：这里需要根据当前编译的是 32 还是 64 来动态获取
-            // 简单起见 我们可以从环境变量读取 或者假设命名规则
+            // 获取目标 EXE 架构
+            int targetArch = GetPeArchitecture(targetExe);
 
+            // 如果无法读取目标架构(例如权限问题) 默认为同架构尝试注入
+            if (targetArch == 0) targetArch = currentArch;
+
+            // [修正] 动态构建正确的 DLL 路径
+            std::wstring dllDir = GetCurrentDllDir();
             std::wstring targetDllPath;
-            // 获取当前 DLL 目录
-            std::wstring dllDir = thisDllPath;
-            PathRemoveFileSpecW(&dllDir[0]);
-            dllDir.resize(wcslen(dllDir.c_str()));
 
-            if (targetArch == 64) targetDllPath = dllDir + L"\\YapHook64.dll";
-            else if (targetArch == 32) targetDllPath = dllDir + L"\\YapHook32.dll";
+            if (!dllDir.empty()) {
+                if (targetArch == 64) {
+                    targetDllPath = dllDir + L"\\YapHook64.dll";
+                } else {
+                    targetDllPath = dllDir + L"\\YapHook32.dll";
+                }
+            }
 
             bool injected = false;
 
             // --- 策略 A: 同架构直接注入 (极速) ---
-            if (currentArch == targetArch) {
-                DebugLog(L"ChildHook: Direct Injection (Same Arch) -> PID %d", pPI->dwProcessId);
-                if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
-                    injected = true;
+            // 32->32 或 64->64：直接在父进程内存中操作 无需 IPC
+            if (currentArch == targetArch && !targetDllPath.empty()) {
+                // 检查文件是否存在 避免无效注入
+                if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
+                        injected = true;
+                        DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
+                    } else {
+                        DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
+                    }
                 }
             }
 
-            // --- 策略 B: 异架构 (64->32) 使用 IPC (回退) ---
+            // --- 策略 B: 异架构 (64->32) 或 直接注入失败 -> 使用 IPC (回退) ---
             if (!injected) {
-                DebugLog(L"ChildHook: IPC Injection (Diff Arch) -> PID %d", pPI->dwProcessId);
+                DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
                 RequestInjectionFromLauncher(pPI->dwProcessId);
             }
 
         } else {
+            // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
         }
 
         if (!callerWantedSuspended) {
