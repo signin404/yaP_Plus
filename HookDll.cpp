@@ -4445,48 +4445,26 @@ int WINAPI Detour_GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) {
 
 // 拦截默认窗口过程 处理 WM_SETTEXT 消息
 LRESULT WINAPI Detour_DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
-    // 如果没有启用转区 直接放行
-    if (g_FakeACP == 0) return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
-
-    // 核心逻辑：只有当窗口本质是 Unicode 但程序却调用了 ANSI API 时 我们才介入转换
-    // 这通常发生在我们 Hook 了 CreateWindowExA 之后
-    if (IsWindowUnicode(hWnd)) {
-        switch (Msg) {
-            case WM_SETTEXT: {
-                // 游戏试图设置 ANSI 标题 -> 我们转成 Unicode 设进去
-                if (lParam != 0) {
-                    std::wstring wStr = SpoofAnsiToWide((LPCSTR)lParam);
-                    return DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wStr.c_str());
-                }
-                break;
-            }
-            case WM_GETTEXT: {
-                // 游戏试图获取 ANSI 标题 -> 我们取回 Unicode 标题 -> 转成 ANSI 给游戏
-                if (lParam != 0 && wParam > 0) {
-                    std::vector<wchar_t> wBuf(wParam + 1, 0);
-                    // 调用 W 版获取真正的 Unicode 内容
-                    LRESULT res = DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
-
-                    // 转回游戏认识的 ANSI (Shift-JIS)
-                    std::string aStr = SpoofWideToAnsi(wBuf.data());
-
-                    size_t copyLen = min((size_t)wParam - 1, aStr.length());
-                    if (copyLen > 0) {
-                        memcpy((void*)lParam, aStr.c_str(), copyLen);
-                    }
-                    ((char*)lParam)[copyLen] = 0;
-                    return copyLen; // 返回拷贝的字节数
-                }
-                break;
-            }
-            // 这里可以扩展处理其他涉及字符串的消息 如 WM_NCCREATE 等
+    if (g_FakeACP != 0) {
+        // 当消息到达这里时 lParam 依然是 Shift-JIS 编码
+        // 我们在这里将其转为 Unicode 并交给 Unicode 版的 DefWindowProc 进行绘制
+        if (Msg == WM_SETTEXT && lParam != 0) {
+            std::wstring wText = SpoofAnsiToWide((LPCSTR)lParam);
+            return DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wText.c_str());
         }
-        // 对于其他不涉及字符串的消息 虽然它是 Unicode 窗口
-        // 但 DefWindowProcA 内部会自动处理非字符串消息的转发 通常是安全的
-        // 但为了绝对稳妥 有些实现会选择全部转发给 DefWindowProcW
-        // 不过仅处理 SETTEXT/GETTEXT 通常已足够解决标题栏乱码
-    }
 
+        // 处理获取标题
+        if (Msg == WM_GETTEXT && lParam != 0 && wParam > 0) {
+            std::vector<wchar_t> wBuf(wParam + 1);
+            LRESULT wResult = DefWindowProcW(hWnd, Msg, wParam, (LPARAM)wBuf.data());
+
+            std::string aStr = SpoofWideToAnsi(wBuf.data());
+            size_t copyLen = min((size_t)wParam - 1, aStr.length());
+            memcpy((void*)lParam, aStr.c_str(), copyLen);
+            ((char*)lParam)[copyLen] = 0;
+            return copyLen;
+        }
+    }
     return fpDefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
