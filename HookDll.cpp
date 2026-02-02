@@ -814,6 +814,7 @@ P_GetLocalTime fpGetLocalTime_KB = NULL;
 P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
 P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
 
+// --- WinExec 函数指针 ---
 typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
 P_WinExec fpWinExec = NULL;
 
@@ -5793,26 +5794,27 @@ BOOL WINAPI Detour_ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     return result;
 }
 
-// Detour 实现
+// --- [新增] WinExec Hook (兼容老旧启动器) ---
 UINT WINAPI Detour_WinExec(LPCSTR lpCmdLine, UINT uCmdShow) {
-    if (g_FakeACP == 0) return fpWinExec(lpCmdLine, uCmdShow);
-
-    // 将 WinExec 转换为 CreateProcessA 调用
-    // 这样就能复用我们在 CreateProcessA 中写的注入/挂起逻辑
+    // 构造 STARTUPINFO 模拟 WinExec 的行为
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     PROCESS_INFORMATION pi = { 0 };
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = (WORD)uCmdShow;
 
-    // WinExec 的 lpCmdLine 是可写的 我们需要复制一份
+    // WinExec 的 lpCmdLine 可能是只读的 但 CreateProcess 需要可写的
+    // 所以我们复制一份
     std::string cmdLine = lpCmdLine ? lpCmdLine : "";
 
-    // 调用我们已经 Hook 过的 CreateProcessA
+    // 关键点：调用 CreateProcessA
+    // 如果 g_HookChild 开启 这会触发 Detour_CreateProcessA 从而实现注入和转区
+    // 如果 g_HookChild 关闭 这会调用系统 API 行为与原 WinExec 一致
     if (CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        return 33; // >31 表示成功
+        return 33; // WinExec 成功时返回 > 31 的值
     }
+
     return 0; // 失败
 }
 
@@ -6713,6 +6715,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (g_HookChild) {
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+
+        // [新增] 挂钩 WinExec
+        // 很多老程序(VB6/Delphi)使用此 API 启动子进程
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* pWinExec = (void*)GetProcAddress(hKernel32, "WinExec");
+            if (pWinExec) {
+                MH_CreateHook(pWinExec, &Detour_WinExec, reinterpret_cast<LPVOID*>(&fpWinExec));
+            }
+        }
 
         // [新增] 挂钩 ShellExecuteExW
         HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
