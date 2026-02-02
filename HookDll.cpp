@@ -5030,6 +5030,80 @@ bool RequestInjectionFromLauncher(DWORD targetPid) {
 
 // --- CreateProcess Hooks ---
 
+// 声明伪变量 用于获取当前模块(DLL)的句柄 这是 MSVC 的标准用法
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+// 获取当前 DLL 所在的目录 (不含文件名)
+std::wstring GetCurrentDllDir() {
+    wchar_t path[MAX_PATH];
+    // 使用 &__ImageBase 获取当前 DLL 的句柄 而不是 NULL (EXE)
+    if (GetModuleFileNameW((HINSTANCE)&__ImageBase, path, MAX_PATH) == 0) {
+        return L"";
+    }
+    PathRemoveFileSpecW(path);
+    return std::wstring(path);
+}
+
+// 检查 PE 文件架构 (32/64)
+int GetPeArchitecture(const std::wstring& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return 0;
+
+    int arch = 0;
+    DWORD bytesRead;
+    IMAGE_DOS_HEADER dosHeader;
+    IMAGE_NT_HEADERS32 ntHeaders32;
+
+    if (ReadFile(hFile, &dosHeader, sizeof(dosHeader), &bytesRead, NULL) && bytesRead == sizeof(dosHeader)) {
+        if (dosHeader.e_magic == IMAGE_DOS_SIGNATURE) {
+            if (SetFilePointer(hFile, dosHeader.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+                if (ReadFile(hFile, &ntHeaders32, sizeof(ntHeaders32), &bytesRead, NULL) && bytesRead == sizeof(ntHeaders32)) {
+                    if (ntHeaders32.Signature == IMAGE_NT_SIGNATURE) {
+                        if (ntHeaders32.FileHeader.Machine == IMAGE_FILE_MACHINE_I386) arch = 32;
+                        else if (ntHeaders32.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) arch = 64;
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(hFile);
+    return arch;
+}
+
+// 直接在当前线程执行注入 (无 IPC 无外部进程)
+bool InjectDllDirectly(HANDLE hProcess, const std::wstring& dllPath) {
+    if (dllPath.empty()) return false;
+
+    // 获取 LoadLibraryW 地址 (Kernel32 在所有进程中的基址通常相同)
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel32) return false;
+    LPVOID pLoadLibrary = (LPVOID)GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!pLoadLibrary) return false;
+
+    // 在目标进程分配内存
+    size_t size = (dllPath.length() + 1) * sizeof(wchar_t);
+    LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!pRemoteMem) return false;
+
+    // 写入 DLL 路径
+    if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), size, NULL)) {
+        VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 创建远程线程
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
+    if (hThread) {
+        WaitForSingleObject(hThread, INFINITE); // 等待注入完成
+        CloseHandle(hThread);
+        VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+        return true;
+    }
+
+    VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+    return false;
+}
+
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -5168,8 +5242,56 @@ BOOL CreateProcessInternal(
     if (result) {
         // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
+
+            // [修正] 获取当前进程架构
+            #ifdef _WIN64
+            int currentArch = 64;
+            #else
+            int currentArch = 32;
+            #endif
+
+            // 获取目标 EXE 架构
+            int targetArch = GetPeArchitecture(targetExe);
+
+            // 如果无法读取目标架构(例如权限问题) 默认为同架构尝试注入
+            if (targetArch == 0) targetArch = currentArch;
+
+            // [修正] 动态构建正确的 DLL 路径
+            std::wstring dllDir = GetCurrentDllDir();
+            std::wstring targetDllPath;
+
+            if (!dllDir.empty()) {
+                if (targetArch == 64) {
+                    targetDllPath = dllDir + L"\\YapHook64.dll";
+                } else {
+                    targetDllPath = dllDir + L"\\YapHook32.dll";
+                }
+            }
+
+            bool injected = false;
+
+            // --- 策略 A: 同架构直接注入 (极速) ---
+            // 32->32 或 64->64：直接在父进程内存中操作 无需 IPC
+            if (currentArch == targetArch && !targetDllPath.empty()) {
+                // 检查文件是否存在 避免无效注入
+                if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
+                        injected = true;
+                        DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
+                    } else {
+                        DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
+                    }
+                }
+            }
+
+            // --- 策略 B: 异架构 (64->32) 或 直接注入失败 -> 使用 IPC (回退) ---
+            if (!injected) {
+                DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
+                RequestInjectionFromLauncher(pPI->dwProcessId);
+            }
+
         } else {
+            // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
         }
 
         if (!callerWantedSuspended) {
