@@ -4481,7 +4481,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_NET", std::to_wstring(netBlockMode).c_str());
 
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
-        SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
+        if (!childHookNamesVar.empty()) {
+            SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
+        } else {
+            SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", NULL); // 不设置或清除
+        }
 
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
@@ -5180,14 +5184,38 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
-            SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", hookLocaleVal.c_str());
-            SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
-            SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.empty() ? NULL : finalHookPath.c_str());
-            SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.empty() ? NULL : hookCopySizeVal.c_str());
 
             if (!hookVolumeIdVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
+
+            // 条件设置：hookchildname
+            if (!childHookNamesVar.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", NULL);
+            }
+
+            // 条件设置：hookcopysize (必须 hookfile > 0 且配置不为空)
+            if (_wtoi(hookFileVal.c_str()) > 0 && !hookCopySizeVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", NULL);
+            }
+
+            // 条件设置：hooklocale
+            if (!hookLocaleVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", hookLocaleVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", NULL);
+            }
+
+            // 条件设置：hooktime
+            if (!hookTimeVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_TIME", NULL);
+            }
 
             // 处理字体路径 (必须像第一实例那样解析成绝对路径)
             if (!hookFontVal.empty()) {
