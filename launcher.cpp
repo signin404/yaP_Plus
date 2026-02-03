@@ -5098,29 +5098,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     } else {
         // --- [修改] 第二个实例的处理逻辑 ---
-        CloseHandle(hMutex); // 释放互斥体句柄 因为我们不是所有者
+        CloseHandle(hMutex);
 
-        // 检查是否允许运行多实例
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
 
-            // 1. 解析 Hook 和 Net 配置
+            // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
-            int hookMode = _wtoi(hookFileVal.c_str());
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
-            int netBlockMode = _wtoi(netBlockVal.c_str());
-
-            // [新增] 解析 hookvolumeid
             std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
-            // [新增] 解析 hookcd
             std::wstring hookCdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcd");
-            // [新增] 解析 hooklocale
             std::wstring hookLocaleVal = GetValueFromIniContent(iniContent, L"Hook", L"hooklocale");
-            // [新增] 解析 hookfont
             std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
-            // [新增] 解析 hooktime
             std::wstring hookTimeVal = GetValueFromIniContent(iniContent, L"Hook", L"hooktime");
+            std::wstring hookChildVal = GetValueFromIniContent(iniContent, L"Hook", L"hookchild");
+            if (hookChildVal.empty()) hookChildVal = L"1";
 
-            // 2. [新增] 解析 Injector 配置 (检查是否有第三方DLL)
+            // [新增] 解析 hookchildname 和 Injector (用于判断是否需要注入)
+            std::wstring childHookNamesVar;
             bool hasThirdPartyDlls = false;
             {
                 std::wstringstream stream(iniContent);
@@ -5137,17 +5131,48 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                         size_t delimiterPos = line.find(L'=');
                         if (delimiterPos != std::wstring::npos) {
                             std::wstring key = trim(line.substr(0, delimiterPos));
-                            if (_wcsicmp(key.c_str(), L"Injector") == 0) {
-                                hasThirdPartyDlls = true;
-                                break; // 只要发现一个 就知道需要注入流程了
-                            }
+                            std::wstring val = trim(line.substr(delimiterPos + 1));
+                            if (_wcsicmp(key.c_str(), L"Injector") == 0) hasThirdPartyDlls = true;
+                            else if (_wcsicmp(key.c_str(), L"hookchildname") == 0) childHookNamesVar += val + L";";
                         }
                     }
                 }
             }
 
-            // 3. [修改] 判断条件：如果 Hook关 且 Net关 且 无第三方DLL -> 直接启动
-            if (hookMode == 0 && netBlockMode == 0 && hookVolumeIdVal.empty() && hookCdVal.empty() && hookLocaleVal.empty() && hookFontVal.empty() && hookTimeVal.empty() && !hasThirdPartyDlls) {
+            // 2. [关键修复] 为后续实例设置完整环境变量，确保子进程继承
+            SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_LOCALE", hookLocaleVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
+
+            if (!hookVolumeIdVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
+
+            // 处理字体路径 (必须像第一实例那样解析成绝对路径)
+            if (!hookFontVal.empty()) {
+                std::wstring resolvedFontPath = ResolveToAbsolutePath(ExpandVariables(hookFontVal, variables), variables);
+                if (PathFileExistsW(resolvedFontPath.c_str())) {
+                    SetEnvironmentVariableW(L"YAP_HOOK_FONT", resolvedFontPath.c_str());
+                } else {
+                    SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
+                }
+            }
+
+            // 处理光驱伪装路径
+            if (!hookCdVal.empty()) {
+                std::wstring finalCdPath = ResolveToAbsolutePath(ExpandVariables(hookCdVal, variables), variables);
+                SetEnvironmentVariableW(L"YAP_HOOK_CD", finalCdPath.c_str());
+            }
+
+            // 3. 判断是否需要 Hook 流程
+            bool needHook = (_wtoi(hookFileVal.c_str()) > 0 || _wtoi(netBlockVal.c_str()) > 0 ||
+                             !hookVolumeIdVal.empty() || !hookCdVal.empty() ||
+                             !hookLocaleVal.empty() || !hookFontVal.empty() ||
+                             !hookTimeVal.empty() || hasThirdPartyDlls);
+
+            if (!needHook) {
                 LaunchApplication(iniContent, variables);
             }
             else {
@@ -5170,12 +5195,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 wchar_t commandLineBuffer[4096];
                 wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
 
-                STARTUPINFOW si = { 0 };
-                si.cb = sizeof(si);
+                STARTUPINFOW si = { sizeof(si) };
                 PROCESS_INFORMATION pi = { 0 };
-
-                // 2. 设置环境变量 让新进程知道 IPC 管道名称 (以便子进程 Hook 能连接)
-                SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
 
                 // 3. 挂起启动
                 if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, finalWorkDir.c_str(), &si, &pi)) {
@@ -5187,29 +5208,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
                         IpcMessage msg;
                         msg.targetPid = pi.dwProcessId;
-
                         IpcResponse resp;
                         DWORD bytesRead;
 
                         // 发送注入请求
                         if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
-                            if (resp.success) {
-                                injected = true;
-                            }
+                            if (resp.success) injected = true;
                         }
                     }
 
                     // 5. 恢复进程
                     ResumeThread(pi.hThread);
-
-                    if (!injected) {
-                    }
-
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
                 }
             }
         }
     }
-    return 0;
-}
