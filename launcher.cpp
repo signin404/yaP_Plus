@@ -5184,10 +5184,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
-
-            // [补全] 设置沙盒路径和写时复制限制
-            if (!finalHookPath.empty()) SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
-            if (!hookCopySizeVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.empty() ? NULL : finalHookPath.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_COPY_SIZE", hookCopySizeVal.empty() ? NULL : hookCopySizeVal.c_str());
 
             if (!hookVolumeIdVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
 
