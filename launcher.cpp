@@ -4483,8 +4483,6 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD_NAME", childHookNamesVar.c_str());
 
-        SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
-
         // E. 启动 IPC 服务端线程
         hIpcThread = CreateThread(NULL, 0, IpcServerThread, &ipcParam, 0, NULL);
     }
