@@ -5112,6 +5112,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
 
+            std::wstring hookCopySizeVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcopysize");
             std::wstring hookVolumeIdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookvolumeid");
             std::wstring hookCdVal = GetValueFromIniContent(iniContent, L"Hook", L"hookcd");
             std::wstring hookLocaleVal = GetValueFromIniContent(iniContent, L"Hook", L"hooklocale");
