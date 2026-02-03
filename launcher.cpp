@@ -4409,7 +4409,15 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // [新增] 解析 hookfont 配置
     std::wstring hookFontVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfont");
     if (!hookFontVal.empty()) {
-        SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
+        // 尝试作为路径展开 (支持变量如 {YAPROOT})
+        std::wstring resolvedFontPath = ResolveToAbsolutePath(ExpandVariables(hookFontVal, data->variables), data->variables);
+        
+        // 如果展开后文件存在，则传递绝对路径；否则传递原始值(可能是系统字体名)
+        if (PathFileExistsW(resolvedFontPath.c_str())) {
+            SetEnvironmentVariableW(L"YAP_HOOK_FONT", resolvedFontPath.c_str());
+        } else {
+            SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
+        }
     }
 
     // --- [新增] 解析 hooklocale (语言区域伪造) ---

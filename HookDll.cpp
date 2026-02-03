@@ -1314,6 +1314,140 @@ P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
 
 // --- 辅助工具 ---
 
+// --- [新增] 字体文件解析与加载工具 ---
+
+// 字节序转换 (Big Endian -> Little Endian)
+#define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
+#define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
+
+// TTF/OTF 表头结构
+#pragma pack(push, 1)
+struct TT_OFFSET_TABLE {
+    USHORT uMajorVersion;
+    USHORT uMinorVersion;
+    USHORT uNumOfTables;
+    USHORT uSearchRange;
+    USHORT uEntrySelector;
+    USHORT uRangeShift;
+};
+
+struct TT_TABLE_DIRECTORY {
+    char   szTag[4]; // table name
+    ULONG  uCheckSum;
+    ULONG  uOffset;
+    ULONG  uLength;
+};
+
+struct TT_NAME_TABLE_HEADER {
+    USHORT uFSelector;
+    USHORT uNRCount;
+    USHORT uStorageOffset;
+};
+
+struct TT_NAME_RECORD {
+    USHORT uPlatformID;
+    USHORT uEncodingID;
+    USHORT uLanguageID;
+    USHORT uNameID;
+    USHORT uStringLength;
+    USHORT uStringOffset;
+};
+#pragma pack(pop)
+
+// 从内存数据中解析字体名称 (NameID = 1, Font Family)
+std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
+    if (fontData.size() < sizeof(TT_OFFSET_TABLE)) return L"";
+
+    const BYTE* pData = fontData.data();
+    const TT_OFFSET_TABLE* pOffsetTable = (const TT_OFFSET_TABLE*)pData;
+    
+    USHORT numTables = SWAPWORD(pOffsetTable->uNumOfTables);
+    ULONG nameTableOffset = 0;
+
+    // 1. 查找 'name' 表
+    const TT_TABLE_DIRECTORY* pTableDir = (const TT_TABLE_DIRECTORY*)(pData + sizeof(TT_OFFSET_TABLE));
+    for (int i = 0; i < numTables; ++i) {
+        if (memcmp(pTableDir[i].szTag, "name", 4) == 0) {
+            nameTableOffset = SWAPLONG(pTableDir[i].uOffset);
+            break;
+        }
+    }
+
+    if (nameTableOffset == 0 || nameTableOffset + sizeof(TT_NAME_TABLE_HEADER) > fontData.size()) return L"";
+
+    // 2. 解析 'name' 表头
+    const TT_NAME_TABLE_HEADER* pNameHeader = (const TT_NAME_TABLE_HEADER*)(pData + nameTableOffset);
+    USHORT count = SWAPWORD(pNameHeader->uNRCount);
+    USHORT stringOffset = SWAPWORD(pNameHeader->uStorageOffset);
+
+    const TT_NAME_RECORD* pRecord = (const TT_NAME_RECORD*)(pData + nameTableOffset + sizeof(TT_NAME_TABLE_HEADER));
+
+    // 3. 遍历名称记录，寻找 Windows Platform (3), Font Family (1)
+    for (int i = 0; i < count; ++i) {
+        USHORT platformID = SWAPWORD(pRecord[i].uPlatformID);
+        USHORT nameID = SWAPWORD(pRecord[i].uNameID);
+        // USHORT languageID = SWAPWORD(pRecord[i].uLanguageID); // 0x0409 = English, 也可以做多语言匹配
+
+        if (platformID == 3 && nameID == 1) {
+            USHORT length = SWAPWORD(pRecord[i].uStringLength);
+            USHORT offset = SWAPWORD(pRecord[i].uStringOffset);
+            
+            ULONG finalOffset = nameTableOffset + stringOffset + offset;
+            if (finalOffset + length <= fontData.size()) {
+                // 提取字符串 (UTF-16BE)
+                std::wstring name;
+                const char* pStrData = (const char*)(pData + finalOffset);
+                
+                // 转换 Big-Endian Unicode 到 Little-Endian
+                for (int j = 0; j < length; j += 2) {
+                    wchar_t wc = (pStrData[j] << 8) | (unsigned char)pStrData[j + 1];
+                    if (wc == 0) break;
+                    name += wc;
+                }
+                return name;
+            }
+        }
+    }
+    return L"";
+}
+
+// 加载字体文件并返回名称
+std::wstring LoadCustomFontFile(const std::wstring& filePath) {
+    // 1. 读取文件到内存
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == 0) { CloseHandle(hFile); return L""; }
+
+    std::vector<BYTE> buffer(fileSize);
+    DWORD bytesRead;
+    if (!ReadFile(hFile, buffer.data(), fileSize, &bytesRead, NULL)) {
+        CloseHandle(hFile);
+        return L"";
+    }
+    CloseHandle(hFile);
+
+    // 2. 解析字体名称
+    std::wstring fontName = GetFontNameFromMemory(buffer);
+    if (fontName.empty()) {
+        DebugLog(L"FontHook: Failed to parse font name from %s", filePath.c_str());
+        return L"";
+    }
+
+    // 3. 加载到系统字体资源 (私有内存字体)
+    DWORD numFonts = 0;
+    HANDLE hFontRes = AddFontMemResourceEx(buffer.data(), fileSize, NULL, &numFonts);
+    
+    if (hFontRes) {
+        DebugLog(L"FontHook: Loaded file '%s' as '%s'", filePath.c_str(), fontName.c_str());
+        return fontName;
+    } else {
+        DebugLog(L"FontHook: AddFontMemResourceEx failed for %s", filePath.c_str());
+        return L"";
+    }
+}
+
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
     if (!text) return L"";
@@ -6398,10 +6532,33 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // [新增] 读取 hookfont 配置
-    wchar_t fontBuffer[64];
-    if (GetEnvironmentVariableW(L"YAP_HOOK_FONT", fontBuffer, 64) > 0) {
-        g_OverrideFontName = fontBuffer;
-        DebugLog(L"FontHook: Override font set to '%s'", g_OverrideFontName.c_str());
+    wchar_t fontBuffer[MAX_PATH];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_FONT", fontBuffer, MAX_PATH) > 0) {
+        std::wstring fontConfig = fontBuffer;
+        
+        // 检查是否为文件 (简单的判断：包含反斜杠 或 文件存在)
+        bool isFile = (fontConfig.find(L'\\') != std::wstring::npos) || 
+                      (GetFileAttributesW(fontConfig.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+        if (isFile) {
+            // 如果是文件，尝试加载并读取名称
+            std::wstring loadedName = LoadCustomFontFile(fontConfig);
+            if (!loadedName.empty()) {
+                g_OverrideFontName = loadedName;
+            } else {
+                // 加载失败，回退：也许用户输入的只是一个带斜杠的字体名？(极少见)
+                // 或者文件路径错误。保留原值尝试作为名称使用，或者置空。
+                // 这里选择保留原值，万一它就是个名字。
+                g_OverrideFontName = fontConfig; 
+            }
+        } else {
+            // 不是文件，直接作为字体名称
+            g_OverrideFontName = fontConfig;
+        }
+
+        if (!g_OverrideFontName.empty()) {
+            DebugLog(L"FontHook: Override font set to '%s'", g_OverrideFontName.c_str());
+        }
     }
 
     // --- [修改] 读取 hooklocale 配置 ---
