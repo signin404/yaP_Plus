@@ -1400,17 +1400,17 @@ std::wstring ParseSingleFontName(const BYTE* pBase, const BYTE* pFontStart, size
 
         USHORT platformID = SWAPWORD(pRecord[i].uPlatformID);
         USHORT nameID = SWAPWORD(pRecord[i].uNameID);
-        // USHORT languageID = SWAPWORD(pRecord[i].uLanguageID); 
+        // USHORT languageID = SWAPWORD(pRecord[i].uLanguageID);
 
         // Platform ID: 3 (Windows)
         // Name ID: 1 (Font Family Name)
         if (platformID == 3 && nameID == 1) {
             USHORT length = SWAPWORD(pRecord[i].uStringLength);
             USHORT offset = SWAPWORD(pRecord[i].uStringOffset);
-            
+
             // 字符串在 name 表内的绝对偏移
             const BYTE* pStrStart = pNameTable + stringOffset + offset;
-            
+
             if (pStrStart + length <= pBase + totalSize) {
                 std::wstring name;
                 // 转换 Big-Endian Unicode (UTF-16BE)
@@ -1437,11 +1437,11 @@ std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
     if (memcmp(pData, "ttcf", 4) == 0) {
         const TTC_HEADER* pTtcHeader = (const TTC_HEADER*)pData;
         ULONG numFonts = SWAPLONG(pTtcHeader->uNumFonts);
-        
-        // TTC 头部后面紧跟偏移量数组
-        const ULONG* pOffsets = (const ULONG*)(pData + sizeof(TTC_HEADER)); // 简化处理，忽略版本差异带来的细微结构变化
 
-        // 遍历 TTC 中的字体，返回第一个成功解析的名称
+        // TTC 头部后面紧跟偏移量数组
+        const ULONG* pOffsets = (const ULONG*)(pData + sizeof(TTC_HEADER)); // 简化处理 忽略版本差异带来的细微结构变化
+
+        // 遍历 TTC 中的字体 返回第一个成功解析的名称
         for (ULONG i = 0; i < numFonts; ++i) {
             if ((const BYTE*)&pOffsets[i + 1] > pData + dataSize) break;
 
@@ -1455,14 +1455,14 @@ std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
             }
         }
         return L"";
-    } 
+    }
     else {
         // 普通 TTF/OTF
         return ParseSingleFontName(pData, pData, dataSize);
     }
 }
 
-// 加载字体文件并返回名称 (保持不变，只需确保它调用了新的 GetFontNameFromMemory)
+// 加载字体文件并返回名称 (保持不变 只需确保它调用了新的 GetFontNameFromMemory)
 std::wstring LoadCustomFontFile(const std::wstring& filePath) {
     HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return L"";
@@ -1485,10 +1485,10 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
         return L"";
     }
 
-    // 加载资源 (AddFontMemResourceEx 支持 TTC，会加载集合中所有字体)
+    // 加载资源 (AddFontMemResourceEx 支持 TTC 会加载集合中所有字体)
     DWORD numFonts = 0;
     HANDLE hFontRes = AddFontMemResourceEx(buffer.data(), fileSize, NULL, &numFonts);
-    
+
     if (hFontRes) {
         DebugLog(L"FontHook: Loaded file '%s' as '%s'", filePath.c_str(), fontName.c_str());
         return fontName;
@@ -6587,24 +6587,24 @@ DWORD WINAPI InitHookThread(LPVOID) {
     wchar_t fontBuffer[MAX_PATH];
     if (GetEnvironmentVariableW(L"YAP_HOOK_FONT", fontBuffer, MAX_PATH) > 0) {
         std::wstring fontConfig = fontBuffer;
-        
+
         // 检查是否为文件 (简单的判断：包含反斜杠 或 文件存在)
-        bool isFile = (fontConfig.find(L'\\') != std::wstring::npos) || 
+        bool isFile = (fontConfig.find(L'\\') != std::wstring::npos) ||
                       (GetFileAttributesW(fontConfig.c_str()) != INVALID_FILE_ATTRIBUTES);
 
         if (isFile) {
-            // 如果是文件，尝试加载并读取名称
+            // 如果是文件 尝试加载并读取名称
             std::wstring loadedName = LoadCustomFontFile(fontConfig);
             if (!loadedName.empty()) {
                 g_OverrideFontName = loadedName;
             } else {
-                // 加载失败，回退：也许用户输入的只是一个带斜杠的字体名？(极少见)
-                // 或者文件路径错误。保留原值尝试作为名称使用，或者置空。
-                // 这里选择保留原值，万一它就是个名字。
-                g_OverrideFontName = fontConfig; 
+                // 加载失败 回退：也许用户输入的只是一个带斜杠的字体名？(极少见)
+                // 或者文件路径错误保留原值尝试作为名称使用 或者置空
+                // 这里选择保留原值 万一它就是个名字
+                g_OverrideFontName = fontConfig;
             }
         } else {
-            // 不是文件，直接作为字体名称
+            // 不是文件 直接作为字体名称
             g_OverrideFontName = fontConfig;
         }
 
