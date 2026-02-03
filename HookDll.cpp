@@ -1312,16 +1312,24 @@ P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
 P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
 P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
 
-// --- 辅助工具 ---
+// --- [修改] 字体文件解析与加载工具 (支持 TTF/OTF/TTC) ---
 
-// --- [新增] 字体文件解析与加载工具 ---
-
-// 字节序转换 (Big Endian -> Little Endian)
+// 字节序转换
 #define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
 #define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
 
-// TTF/OTF 表头结构
 #pragma pack(push, 1)
+
+// TTC 文件头
+struct TTC_HEADER {
+    char   szTag[4]; // 'ttcf'
+    USHORT uMajorVersion;
+    USHORT uMinorVersion;
+    ULONG  uNumFonts;
+    // 后面紧跟 uNumFonts 个 ULONG 偏移量
+};
+
+// TTF/OTF 表头
 struct TT_OFFSET_TABLE {
     USHORT uMajorVersion;
     USHORT uMinorVersion;
@@ -1332,7 +1340,7 @@ struct TT_OFFSET_TABLE {
 };
 
 struct TT_TABLE_DIRECTORY {
-    char   szTag[4]; // table name
+    char   szTag[4];
     ULONG  uCheckSum;
     ULONG  uOffset;
     ULONG  uLength;
@@ -1354,53 +1362,60 @@ struct TT_NAME_RECORD {
 };
 #pragma pack(pop)
 
-// 从内存数据中解析字体名称 (NameID = 1, Font Family)
-std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
-    if (fontData.size() < sizeof(TT_OFFSET_TABLE)) return L"";
+// 内部辅助：解析单个 TTF/OTF 数据块的名称
+std::wstring ParseSingleFontName(const BYTE* pBase, const BYTE* pFontStart, size_t totalSize) {
+    // 边界检查
+    if (pFontStart < pBase || (size_t)(pFontStart - pBase) + sizeof(TT_OFFSET_TABLE) > totalSize) return L"";
 
-    const BYTE* pData = fontData.data();
-    const TT_OFFSET_TABLE* pOffsetTable = (const TT_OFFSET_TABLE*)pData;
-    
+    const TT_OFFSET_TABLE* pOffsetTable = (const TT_OFFSET_TABLE*)pFontStart;
     USHORT numTables = SWAPWORD(pOffsetTable->uNumOfTables);
     ULONG nameTableOffset = 0;
 
     // 1. 查找 'name' 表
-    const TT_TABLE_DIRECTORY* pTableDir = (const TT_TABLE_DIRECTORY*)(pData + sizeof(TT_OFFSET_TABLE));
+    const TT_TABLE_DIRECTORY* pTableDir = (const TT_TABLE_DIRECTORY*)(pFontStart + sizeof(TT_OFFSET_TABLE));
     for (int i = 0; i < numTables; ++i) {
+        // 边界检查
+        if ((const BYTE*)&pTableDir[i + 1] > pBase + totalSize) return L"";
+
         if (memcmp(pTableDir[i].szTag, "name", 4) == 0) {
             nameTableOffset = SWAPLONG(pTableDir[i].uOffset);
             break;
         }
     }
 
-    if (nameTableOffset == 0 || nameTableOffset + sizeof(TT_NAME_TABLE_HEADER) > fontData.size()) return L"";
+    if (nameTableOffset == 0 || nameTableOffset + sizeof(TT_NAME_TABLE_HEADER) > totalSize) return L"";
 
     // 2. 解析 'name' 表头
-    const TT_NAME_TABLE_HEADER* pNameHeader = (const TT_NAME_TABLE_HEADER*)(pData + nameTableOffset);
+    const BYTE* pNameTable = pBase + nameTableOffset;
+    const TT_NAME_TABLE_HEADER* pNameHeader = (const TT_NAME_TABLE_HEADER*)pNameTable;
     USHORT count = SWAPWORD(pNameHeader->uNRCount);
     USHORT stringOffset = SWAPWORD(pNameHeader->uStorageOffset);
 
-    const TT_NAME_RECORD* pRecord = (const TT_NAME_RECORD*)(pData + nameTableOffset + sizeof(TT_NAME_TABLE_HEADER));
+    const TT_NAME_RECORD* pRecord = (const TT_NAME_RECORD*)(pNameTable + sizeof(TT_NAME_TABLE_HEADER));
 
-    // 3. 遍历名称记录，寻找 Windows Platform (3), Font Family (1)
+    // 3. 遍历名称记录 (优先找 Windows Platform, Font Family)
     for (int i = 0; i < count; ++i) {
+        // 边界检查
+        if ((const BYTE*)&pRecord[i + 1] > pBase + totalSize) break;
+
         USHORT platformID = SWAPWORD(pRecord[i].uPlatformID);
         USHORT nameID = SWAPWORD(pRecord[i].uNameID);
-        // USHORT languageID = SWAPWORD(pRecord[i].uLanguageID); // 0x0409 = English, 也可以做多语言匹配
+        // USHORT languageID = SWAPWORD(pRecord[i].uLanguageID); 
 
+        // Platform ID: 3 (Windows)
+        // Name ID: 1 (Font Family Name)
         if (platformID == 3 && nameID == 1) {
             USHORT length = SWAPWORD(pRecord[i].uStringLength);
             USHORT offset = SWAPWORD(pRecord[i].uStringOffset);
             
-            ULONG finalOffset = nameTableOffset + stringOffset + offset;
-            if (finalOffset + length <= fontData.size()) {
-                // 提取字符串 (UTF-16BE)
+            // 字符串在 name 表内的绝对偏移
+            const BYTE* pStrStart = pNameTable + stringOffset + offset;
+            
+            if (pStrStart + length <= pBase + totalSize) {
                 std::wstring name;
-                const char* pStrData = (const char*)(pData + finalOffset);
-                
-                // 转换 Big-Endian Unicode 到 Little-Endian
+                // 转换 Big-Endian Unicode (UTF-16BE)
                 for (int j = 0; j < length; j += 2) {
-                    wchar_t wc = (pStrData[j] << 8) | (unsigned char)pStrData[j + 1];
+                    wchar_t wc = (pStrStart[j] << 8) | pStrStart[j + 1];
                     if (wc == 0) break;
                     name += wc;
                 }
@@ -1411,9 +1426,44 @@ std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
     return L"";
 }
 
-// 加载字体文件并返回名称
+// 主函数：从内存数据中解析字体名称 (支持 TTC/TTF/OTF)
+std::wstring GetFontNameFromMemory(const std::vector<BYTE>& fontData) {
+    if (fontData.size() < sizeof(TTC_HEADER)) return L"";
+
+    const BYTE* pData = fontData.data();
+    size_t dataSize = fontData.size();
+
+    // 检查是否为 TTC 集合 ('ttcf')
+    if (memcmp(pData, "ttcf", 4) == 0) {
+        const TTC_HEADER* pTtcHeader = (const TTC_HEADER*)pData;
+        ULONG numFonts = SWAPLONG(pTtcHeader->uNumFonts);
+        
+        // TTC 头部后面紧跟偏移量数组
+        const ULONG* pOffsets = (const ULONG*)(pData + sizeof(TTC_HEADER)); // 简化处理，忽略版本差异带来的细微结构变化
+
+        // 遍历 TTC 中的字体，返回第一个成功解析的名称
+        for (ULONG i = 0; i < numFonts; ++i) {
+            if ((const BYTE*)&pOffsets[i + 1] > pData + dataSize) break;
+
+            ULONG offset = SWAPLONG(pOffsets[i]);
+            if (offset >= dataSize) continue;
+
+            std::wstring name = ParseSingleFontName(pData, pData + offset, dataSize);
+            if (!name.empty()) {
+                // DebugLog(L"FontHook: Found TTC font name: %s", name.c_str());
+                return name; // 返回第一个找到的字体名
+            }
+        }
+        return L"";
+    } 
+    else {
+        // 普通 TTF/OTF
+        return ParseSingleFontName(pData, pData, dataSize);
+    }
+}
+
+// 加载字体文件并返回名称 (保持不变，只需确保它调用了新的 GetFontNameFromMemory)
 std::wstring LoadCustomFontFile(const std::wstring& filePath) {
-    // 1. 读取文件到内存
     HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return L"";
 
@@ -1428,14 +1478,14 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
     }
     CloseHandle(hFile);
 
-    // 2. 解析字体名称
+    // 解析名称 (现在支持 TTC)
     std::wstring fontName = GetFontNameFromMemory(buffer);
     if (fontName.empty()) {
         DebugLog(L"FontHook: Failed to parse font name from %s", filePath.c_str());
         return L"";
     }
 
-    // 3. 加载到系统字体资源 (私有内存字体)
+    // 加载资源 (AddFontMemResourceEx 支持 TTC，会加载集合中所有字体)
     DWORD numFonts = 0;
     HANDLE hFontRes = AddFontMemResourceEx(buffer.data(), fileSize, NULL, &numFonts);
     
@@ -1447,6 +1497,8 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
         return L"";
     }
 }
+
+// --- 辅助工具 ---
 
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
