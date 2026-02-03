@@ -4409,19 +4409,23 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // [新增] 解析 hookfont 配置
     std::wstring hookFontVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfont");
     if (!hookFontVal.empty()) {
-        // 1. 展开变量 (如 {YAPROOT})
+        // 1. 强制展开变量 (例如 {YAPROOT} -> Z:\Sandbox)
         std::wstring expandedVal = ExpandVariables(hookFontVal, data->variables);
         
-        // 2. 解析为绝对路径 (相对于启动器目录)
-        std::wstring resolvedFontPath = ResolveToAbsolutePath(expandedVal, data->variables);
+        // 2. 只有包含路径分隔符或后缀名时，才尝试解析为绝对路径
+        bool looksLikePath = (expandedVal.find(L'\\') != std::wstring::npos) || 
+                             (expandedVal.find(L'.') != std::wstring::npos);
         
-        // 3. 检查文件是否存在
-        // 如果作为文件存在，传递绝对路径；否则传递原始值（可能是系统字体名，如 "Arial"）
-        if (PathFileExistsW(resolvedFontPath.c_str())) {
-            SetEnvironmentVariableW(L"YAP_HOOK_FONT", resolvedFontPath.c_str());
+        std::wstring finalFontConfig;
+        if (looksLikePath) {
+            finalFontConfig = ResolveToAbsolutePath(expandedVal, data->variables);
         } else {
-            SetEnvironmentVariableW(L"YAP_HOOK_FONT", hookFontVal.c_str());
+            finalFontConfig = expandedVal;
         }
+
+        // 3. 始终传递展开后的值，不再传递带 { } 的原始值
+        SetEnvironmentVariableW(L"YAP_HOOK_FONT", finalFontConfig.c_str());
+        
     }
 
     // --- [新增] 解析 hooklocale (语言区域伪造) ---
