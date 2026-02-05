@@ -2549,13 +2549,13 @@ void LoadFontsFromDirectory(const std::wstring& dirPath) {
 
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
-            // 跳过目录，只处理文件
+            // 跳过目录 只处理文件
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                 if (IsFontFile(fd.cFileName)) {
                     std::wstring fullPath = dirPath + L"\\" + fd.cFileName;
 
                     // 注册字体：
-                    // 0: 表示系统全局可见，且会出现在 EnumFontFamilies 的枚举列表中（下拉框可见）
+                    // 0: 表示系统全局可见 且会出现在 EnumFontFamilies 的枚举列表中（下拉框可见）
                     if (AddFontResourceExW(fullPath.c_str(), 0, 0) > 0) {
                         g_TemporaryFonts.push_back(fullPath);
                     }
@@ -2598,7 +2598,7 @@ void ProcessLoadFontConfig(const std::wstring& iniContent, std::map<std::wstring
     }
 
     if (!g_TemporaryFonts.empty()) {
-        // 通知系统字体表已更新，这样正在运行的程序（如记事本）能立即看到新字体
+        // 通知系统字体表已更新 这样正在运行的程序（如记事本）能立即看到新字体
         PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
     }
 }
@@ -4522,6 +4522,18 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
     }
 
+    // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
+    std::wstring extraDllsEnv;
+    for (const auto& dll : thirdPartyDlls) {
+        if (!extraDllsEnv.empty()) extraDllsEnv += L"|";
+        extraDllsEnv += dll;
+    }
+    if (!extraDllsEnv.empty()) {
+        SetEnvironmentVariableW(L"YAP_EXTRA_DLL", extraDllsEnv.c_str());
+    } else {
+        SetEnvironmentVariableW(L"YAP_EXTRA_DLL", NULL);
+    }
+
     // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
     bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
@@ -5229,6 +5241,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             // [新增] 多实例环境同步：解析 [Before] 区域的变量
             std::wstring childHookNamesVar;
             bool hasThirdPartyDlls = false;
+            std::wstring extraDllsVar; // [新增] 用于存储拼接后的 DLL 路径
             {
                 std::wstringstream stream(iniContent);
                 std::wstring line;
@@ -5250,7 +5263,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
                     // A. 处理 [Hook] 区域特定逻辑
                     if (_wcsicmp(currentSection.c_str(), L"[Hook]") == 0) {
-                        if (_wcsicmp(key.c_str(), L"Injector") == 0) hasThirdPartyDlls = true;
+                        if (_wcsicmp(key.c_str(), L"Injector") == 0) {
+                            hasThirdPartyDlls = true;
+                            // [新增] 解析并收集路径
+                            std::wstring expanded = ResolveToAbsolutePath(ExpandVariables(val, variables), variables);
+                            if (!expanded.empty()) {
+                                if (!extraDllsVar.empty()) extraDllsVar += L"|";
+                                extraDllsVar += expanded;
+                            }
+                        }
                         else if (_wcsicmp(key.c_str(), L"hookchildname") == 0) childHookNamesVar += val + L";";
                     }
 
@@ -5288,6 +5309,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.empty() ? NULL : finalHookPath.c_str());
 
             if (!hookVolumeIdVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
+
+            // [新增] 设置第三方 DLL 环境变量
+            if (!extraDllsVar.empty()) {
+                SetEnvironmentVariableW(L"YAP_EXTRA_DLL", extraDllsVar.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_EXTRA_DLL", NULL);
+            }
 
             // 条件设置：hookchildname
             if (!childHookNamesVar.empty()) {

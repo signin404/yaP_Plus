@@ -1007,6 +1007,7 @@ DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
+std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -5675,6 +5676,17 @@ BOOL CreateProcessInternal(
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
                         DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
+
+                        // [新增] 顺便注入第三方 DLL
+                        for (const auto& extraDll : g_ExtraDlls) {
+                            // 简单检查文件存在性
+                            if (GetFileAttributesW(extraDll.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                                if (InjectDllDirectly(pPI->hProcess, extraDll)) {
+                                    DebugLog(L"ChildHook: Extra DLL Injected -> %s", extraDll.c_str());
+                                }
+                            }
+                        }
+
                     } else {
                         DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
                     }
@@ -6497,6 +6509,17 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // [新增] 初始化子进程白名单
     InitChildHookWhitelist();
+
+    // [新增] 读取第三方 DLL 列表
+    wchar_t extraDllsBuf[4096];
+    if (GetEnvironmentVariableW(L"YAP_EXTRA_DLL", extraDllsBuf, 4096) > 0) {
+        wchar_t* ctx = NULL;
+        wchar_t* token = wcstok_s(extraDllsBuf, L"|", &ctx);
+        while (token) {
+            g_ExtraDlls.push_back(token);
+            token = wcstok_s(NULL, L"|", &ctx);
+        }
+    }
 
     // [新增] 读取 hookcopysize 配置
     wchar_t copySizeBuf[64];
