@@ -5752,14 +5752,16 @@ BOOL CreateProcessInternal(
 
             // --- 策略 B: 异架构直接调用注入器 (高速 无 IPC) ---
             // 场景：64位父进程 -> 32位子进程 (需要 YapInjector32.exe)
-            if (!injected && currentArch != targetArch && !targetDllPath.empty()) {
+            // [修改] 严格限制仅在 64->32 时执行 避免 32->64 的无效尝试
+            // 32->64 的情况将自动落入下方的策略 C (IPC) 由 64位 Launcher 处理
+            if (!injected && currentArch == 64 && targetArch == 32 && !targetDllPath.empty()) {
                 // 检查注入器是否存在
                 if (GetFileAttributesW(injectorPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
 
                     // 1. 注入主 Hook DLL (带握手等待)
                     if (InjectCrossArchAndWait(pPI->dwProcessId, targetDllPath, injectorPath)) {
                         injected = true;
-                        DebugLog(L"ChildHook: Cross-Arch Injection Success -> PID %d", pPI->dwProcessId);
+                        DebugLog(L"ChildHook: Cross-Arch Injection Success (64->32) -> PID %d", pPI->dwProcessId);
 
                         // 2. 注入第三方 DLL (调用注入器)
                         for (const auto& extraDll : g_ExtraDlls) {
