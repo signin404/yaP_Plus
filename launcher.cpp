@@ -36,6 +36,7 @@
 #pragma comment(lib, "OleAut32.lib")
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
+#pragma comment(lib, "Gdi32.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
@@ -5198,8 +5199,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         UnloadTemporaryFonts();
         CloseHandle(hMutex);
         CoUninitialize();
-
-    } else {
+    }
+    
+    return 0;
+} else {
         // --- [修改] 第二个实例的处理逻辑 ---
         CloseHandle(hMutex);
 
