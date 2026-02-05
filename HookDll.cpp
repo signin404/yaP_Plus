@@ -5677,13 +5677,22 @@ BOOL CreateProcessInternal(
                         injected = true;
                         DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
 
-                        // [新增] 顺便注入第三方 DLL
+                        // [修改] 顺便注入第三方 DLL (增加架构检查)
                         for (const auto& extraDll : g_ExtraDlls) {
-                            // 简单检查文件存在性
-                            if (GetFileAttributesW(extraDll.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                                if (InjectDllDirectly(pPI->hProcess, extraDll)) {
-                                    DebugLog(L"ChildHook: Extra DLL Injected -> %s", extraDll.c_str());
-                                }
+                            // 1. 检查文件是否存在
+                            if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+
+                            // 2. [新增] 检查 DLL 架构是否与目标进程匹配
+                            int dllArch = GetPeArchitecture(extraDll);
+
+                            // 如果无法读取架构(0)或架构不匹配 则跳过
+                            if (dllArch != 0 && dllArch != targetArch) {
+                                continue;
+                            }
+
+                            // 3. 执行注入
+                            if (InjectDllDirectly(pPI->hProcess, extraDll)) {
+                                DebugLog(L"ChildHook: Extra DLL Injected -> %s", extraDll.c_str());
                             }
                         }
 

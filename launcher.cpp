@@ -4377,9 +4377,17 @@ DWORD WINAPI IpcServerThread(LPVOID lpParam) {
                     // 1. 注入主 Hook DLL
                     success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
 
-                    // 2. [新增] 注入第三方 DLL (如果主 Hook 注入成功)
+                    // 2. [修改] 注入第三方 DLL (增加架构检查)
                     if (success) {
+                        int targetArch = targetIs32Bit ? 32 : 64;
+
                         for (const auto& dllPath : param->extraDlls) {
+                            int dllArch = GetPeArchitecture(dllPath);
+
+                            if (dllArch != 0 && dllArch != targetArch) {
+                                continue; // 架构不匹配 跳过
+                            }
+
                             InjectDll(hTarget, NULL, dllPath, param->injectorPath);
                         }
                     }
@@ -4622,15 +4630,35 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName, injectorPath);
             }
 
-            // 2. [新增] 注入第三方 DLL (不带等待)
+            // 2. [修改] 注入第三方 DLL (增加架构检查)
             for (const auto& dllPath : thirdPartyDlls) {
+                // 获取 DLL 架构
+                int dllArch = GetPeArchitecture(dllPath);
+
+                // arch 是之前通过 GetPeArchitecture(data->absoluteAppPath) 获取的主程序架构
+                if (dllArch != 0 && dllArch != arch) {
+                    continue; // 架构不匹配 跳过
+                }
+
                 InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
         // 情况 B: 禁用 Hook (hookfile=0)
         else {
-            // [新增] 仅注入第三方 DLL
+            // [修改] 仅注入第三方 DLL (增加架构检查)
+
+            // 1. 获取主程序架构
+            int arch = GetPeArchitecture(data->absoluteAppPath);
+
             for (const auto& dllPath : thirdPartyDlls) {
+                // 2. 获取 DLL 架构
+                int dllArch = GetPeArchitecture(dllPath);
+
+                // 3. 架构不匹配则跳过
+                if (dllArch != 0 && dllArch != arch) {
+                    continue;
+                }
+
                 InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
