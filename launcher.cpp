@@ -2569,17 +2569,17 @@ void LoadFontsFromDirectory(const std::wstring& dirPath) {
 void ProcessLoadFontConfig(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
     std::wstringstream stream(iniContent);
     std::wstring line;
-    bool inGeneral = false;
+    bool inTargetSection = false;
 
     while (std::getline(stream, line)) {
         line = trim(line);
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
         if (line[0] == L'[' && line.back() == L']') {
-            inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
+            inTargetSection = (_wcsicmp(line.c_str(), L"[Before]") == 0);
             continue;
         }
 
-        if (inGeneral) {
+        if (inTargetSection) {
             size_t delimiterPos = line.find(L'=');
             if (delimiterPos != std::wstring::npos) {
                 std::wstring key = trim(line.substr(0, delimiterPos));
@@ -2598,7 +2598,6 @@ void ProcessLoadFontConfig(const std::wstring& iniContent, std::map<std::wstring
     }
 
     if (!g_TemporaryFonts.empty()) {
-        // 通知系统字体表已更新 这样正在运行的程序（如记事本）能立即看到新字体
         PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
     }
 }

@@ -41,6 +41,7 @@ Just copy and paste to create portable software.
 - [x] Unicode support
 - [x] Wait for process
 - [x] Scheduled backup
+- [x] Load temporary fonts
 - [x] Create hard links
 - [x] Create firewall rules
 - [x] Hide console program window
