@@ -5502,6 +5502,51 @@ bool InjectDllDirectly(HANDLE hProcess, const std::wstring& dllPath) {
     return false;
 }
 
+// [新增] 调用外部注入器 (用于跨架构注入)
+bool RunExternalInjector(DWORD targetPid, const std::wstring& dllPath, const std::wstring& injectorPath) {
+    if (GetFileAttributesW(injectorPath.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+
+    // 构造命令行: "Injector.exe" <PID> "DLLPath"
+    std::wstring cmdLine = L"\"" + injectorPath + L"\" " + std::to_wstring(targetPid) + L" \"" + dllPath + L"\"";
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE; // 隐藏窗口
+
+    if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        // 等待注入器结束 (通常很快)
+        WaitForSingleObject(pi.hProcess, 5000);
+
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        return (exitCode == 0);
+    }
+    return false;
+}
+
+// [新增] 跨架构注入并等待握手
+bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const std::wstring& injectorPath) {
+    // 1. 创建握手事件 (与 Launcher 逻辑一致)
+    std::wstring eventName = GetReadyEventName(targetPid);
+    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+
+    // 2. 执行注入
+    bool success = RunExternalInjector(targetPid, dllPath, injectorPath);
+
+    // 3. 等待 Hook 初始化完成
+    if (success && hEvent) {
+        WaitForSingleObject(hEvent, 3000); // 最多等 3 秒
+    }
+
+    if (hEvent) CloseHandle(hEvent);
+    return success;
+}
+
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -5666,6 +5711,9 @@ BOOL CreateProcessInternal(
                 }
             }
 
+            // [新增] 确定注入器路径
+            std::wstring injectorPath = dllDir + L"\\YapInjector32.exe";
+
             bool injected = false;
 
             // --- 策略 A: 同架构直接注入 (极速) ---
@@ -5702,7 +5750,33 @@ BOOL CreateProcessInternal(
                 }
             }
 
-            // --- 策略 B: 异架构 (64->32) 或 直接注入失败 -> 使用 IPC (回退) ---
+            // --- 策略 B: 异架构直接调用注入器 (高速 无 IPC) ---
+            // 场景：64位父进程 -> 32位子进程 (需要 YapInjector32.exe)
+            if (!injected && currentArch != targetArch && !targetDllPath.empty()) {
+                // 检查注入器是否存在
+                if (GetFileAttributesW(injectorPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+
+                    // 1. 注入主 Hook DLL (带握手等待)
+                    if (InjectCrossArchAndWait(pPI->dwProcessId, targetDllPath, injectorPath)) {
+                        injected = true;
+                        DebugLog(L"ChildHook: Cross-Arch Injection Success -> PID %d", pPI->dwProcessId);
+
+                        // 2. 注入第三方 DLL (调用注入器)
+                        for (const auto& extraDll : g_ExtraDlls) {
+                            if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+                            int dllArch = GetPeArchitecture(extraDll);
+                            // 必须匹配目标进程架构
+                            if (dllArch != 0 && dllArch != targetArch) continue;
+
+                            RunExternalInjector(pPI->dwProcessId, extraDll, injectorPath);
+                        }
+                    } else {
+                        DebugLog(L"ChildHook: Cross-Arch Injection Failed -> PID %d", pPI->dwProcessId);
+                    }
+                }
+            }
+
+            // --- 策略 C: IPC 回退 (仅当上述都失败时) ---
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
                 RequestInjectionFromLauncher(pPI->dwProcessId);
