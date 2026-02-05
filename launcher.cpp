@@ -36,6 +36,7 @@
 #pragma comment(lib, "OleAut32.lib")
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
+#pragma comment(lib, "Gdi32.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
@@ -56,6 +57,7 @@ pfnRtlCreateUserThread g_RtlCreateUserThread = nullptr;
 
 std::wstring g_originalPath;
 std::wstring g_LauncherDir;
+std::vector<std::wstring> g_TemporaryFonts;
 
 // --- Data Structures ---
 
@@ -2529,6 +2531,89 @@ namespace ActionHelpers {
 } // namespace ActionHelpers
 
 
+// --- [新增] 字体批量加载与卸载逻辑 ---
+// 检查文件是否为支持的字体格式
+bool IsFontFile(const std::wstring& fileName) {
+    const wchar_t* ext = PathFindExtensionW(fileName.c_str());
+    if (!ext) return false;
+    return (_wcsicmp(ext, L".ttf") == 0 ||
+            _wcsicmp(ext, L".otf") == 0 ||
+            _wcsicmp(ext, L".ttc") == 0 ||
+            _wcsicmp(ext, L".fon") == 0);
+}
+
+void LoadFontsFromDirectory(const std::wstring& dirPath) {
+    std::wstring searchPath = dirPath + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // 跳过目录 只处理文件
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                if (IsFontFile(fd.cFileName)) {
+                    std::wstring fullPath = dirPath + L"\\" + fd.cFileName;
+
+                    // 注册字体：
+                    // 0: 表示系统全局可见 且会出现在 EnumFontFamilies 的枚举列表中（下拉框可见）
+                    if (AddFontResourceExW(fullPath.c_str(), 0, 0) > 0) {
+                        g_TemporaryFonts.push_back(fullPath);
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+}
+
+void ProcessLoadFontConfig(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
+    std::wstringstream stream(iniContent);
+    std::wstring line;
+    bool inTargetSection = false;
+
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[' && line.back() == L']') {
+            inTargetSection = (_wcsicmp(line.c_str(), L"[Before]") == 0);
+            continue;
+        }
+
+        if (inTargetSection) {
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(line.substr(0, delimiterPos));
+                std::wstring val = trim(line.substr(delimiterPos + 1));
+
+                if (_wcsicmp(key.c_str(), L"loadfont") == 0 && !val.empty()) {
+                    // 展开路径并转为绝对路径
+                    std::wstring fullPath = ResolveToAbsolutePath(ExpandVariables(val, variables), variables);
+
+                    if (PathIsDirectoryW(fullPath.c_str())) {
+                        LoadFontsFromDirectory(fullPath);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!g_TemporaryFonts.empty()) {
+        PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
+    }
+}
+
+void UnloadTemporaryFonts() {
+    if (g_TemporaryFonts.empty()) return;
+
+    for (const auto& fontPath : g_TemporaryFonts) {
+        RemoveFontResourceExW(fontPath.c_str(), 0, 0);
+    }
+    g_TemporaryFonts.clear();
+
+    // 卸载后再次通知系统
+    PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
+}
+
 // --- Process Management Functions ---
 
 // Helper for single-instance wait
@@ -4248,70 +4333,106 @@ struct IpcThreadParam {
     std::wstring injectorPath;
 };
 
-// --- [修改] IPC 服务端线程 ---
+// [新增] IPC 工作线程参数
+struct IpcWorkerParam {
+    HANDLE hPipe;
+    IpcThreadParam* mainParam;
+};
+
+// [新增] 处理单个 IPC 连接的工作线程
+DWORD WINAPI IpcWorkerThread(LPVOID lpParam) {
+    IpcWorkerParam* workerParam = (IpcWorkerParam*)lpParam;
+    HANDLE hPipe = workerParam->hPipe;
+    IpcThreadParam* param = workerParam->mainParam;
+
+    // 释放参数内存
+    delete workerParam;
+
+    IpcMessage msg;
+    DWORD bytesRead;
+    if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
+        // LauncherLog(L"IPC Worker: Processing PID " + std::to_wstring(msg.targetPid));
+
+        bool success = false;
+        HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
+        if (hTarget) {
+            BOOL isWow64 = FALSE;
+            IsWow64Process(hTarget, &isWow64);
+            SYSTEM_INFO si;
+            GetNativeSystemInfo(&si);
+            bool systemIs64 = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64);
+            bool targetIs32Bit = systemIs64 ? (isWow64 == TRUE) : true;
+
+            std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
+
+            // 1. 注入主 Hook DLL
+            success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
+
+            // 2. 注入第三方 DLL
+            if (success) {
+                int targetArch = targetIs32Bit ? 32 : 64;
+                for (const auto& dllPath : param->extraDlls) {
+                    int dllArch = GetPeArchitecture(dllPath);
+                    if (dllArch != 0 && dllArch != targetArch) continue;
+                    InjectDll(hTarget, NULL, dllPath, param->injectorPath);
+                }
+            }
+            CloseHandle(hTarget);
+        }
+
+        IpcResponse resp = { success, 0 };
+        DWORD bytesWritten;
+        WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
+    }
+
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+    return 0;
+}
+
+// [修改] IPC 服务端主线程 (改为并发模式)
 DWORD WINAPI IpcServerThread(LPVOID lpParam) {
     IpcThreadParam* param = (IpcThreadParam*)lpParam;
-    LauncherLog(L"IPC Server started: " + param->pipeName);
+    // LauncherLog(L"IPC Server started: " + param->pipeName);
 
     while (!*(param->shouldStop)) {
+        // 注意：PIPE_UNLIMITED_INSTANCES 允许创建多个管道实例
         HANDLE hPipe = CreateNamedPipeW(
             param->pipeName.c_str(),
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
+            PIPE_UNLIMITED_INSTANCES, // 允许无限实例
             512, 512, 0, NULL
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            LauncherLog(L"IPC CreateNamedPipe failed: " + std::to_wstring(GetLastError()));
-            Sleep(1000);
+            Sleep(100);
             continue;
         }
 
+        // 等待客户端连接
         bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
 
         if (connected) {
-            IpcMessage msg;
-            DWORD bytesRead;
-            if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
-                LauncherLog(L"IPC Received Request: Inject PID " + std::to_wstring(msg.targetPid));
+            // 连接成功 创建一个新线程去处理这个管道实例
+            IpcWorkerParam* workerParam = new IpcWorkerParam;
+            workerParam->hPipe = hPipe;
+            workerParam->mainParam = param;
 
-                bool success = false;
-                HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
-                if (hTarget) {
-                    BOOL isWow64 = FALSE;
-                    IsWow64Process(hTarget, &isWow64);
-                    SYSTEM_INFO si;
-                    GetNativeSystemInfo(&si);
-                    bool systemIs64 = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64);
-                    bool targetIs32Bit = systemIs64 ? (isWow64 == TRUE) : true;
-
-                    std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
-
-                    // 1. 注入主 Hook DLL
-                    success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
-
-                    // 2. [新增] 注入第三方 DLL (如果主 Hook 注入成功)
-                    if (success) {
-                        for (const auto& dllPath : param->extraDlls) {
-                            InjectDll(hTarget, NULL, dllPath, param->injectorPath);
-                        }
-                    }
-
-                    CloseHandle(hTarget);
-                } else {
-                    LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
-                }
-
-                IpcResponse resp = { success, 0 };
-                DWORD bytesWritten;
-                WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
-                LauncherLog(L"IPC Response sent: " + std::wstring(success ? L"OK" : L"FAIL"));
+            HANDLE hThread = CreateThread(NULL, 0, IpcWorkerThread, workerParam, 0, NULL);
+            if (hThread) {
+                CloseHandle(hThread); // 不需要等待它结束
+            } else {
+                // 创建线程失败 清理资源
+                delete workerParam;
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
             }
+        } else {
+            // 连接失败
+            CloseHandle(hPipe);
         }
-
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
     }
     return 0;
 }
@@ -4436,8 +4557,30 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
     }
 
-    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
+    // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
+    std::wstring extraDllsEnv;
+    for (const auto& dll : thirdPartyDlls) {
+        if (!extraDllsEnv.empty()) extraDllsEnv += L"|";
+        extraDllsEnv += dll;
+    }
+    if (!extraDllsEnv.empty()) {
+        SetEnvironmentVariableW(L"YAP_EXTRA_DLL", extraDllsEnv.c_str());
+    } else {
+        SetEnvironmentVariableW(L"YAP_EXTRA_DLL", NULL);
+    }
+
+    // [修改] 启用 Hook 的条件 (针对当前进程)
+    // 只有当需要文件重定向、网络拦截、伪装等核心功能时 才认为当前进程需要 "Hook"
     bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+
+    // [新增] 解析 multiple 配置
+    std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
+    bool allowMultiple = (multipleVal == L"1");
+
+    // [关键修改] 决定是否启动 IPC 服务端
+    // 条件 A: 当前进程需要 Hook (必须启动 IPC 以支持子进程注入)
+    // 条件 B: 允许多实例 且 配置了第三方 DLL (即使当前进程不需要 Hook 也启动 IPC 为后续实例服务)
+    bool startIpcServer = enableHook || (allowMultiple && !thirdPartyDlls.empty());
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -4447,8 +4590,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
-    // [新增] 是否需要释放辅助文件 (Hook开启 或 有第三方DLL注入)
-    bool needHelpers = enableHook || !thirdPartyDlls.empty();
+    // [修改] 是否需要释放辅助文件 (只要启动 IPC 或 有第三方DLL 就需要)
+    bool needHelpers = startIpcServer || !thirdPartyDlls.empty();
 
     // 将 DLL 路径变量移到函数作用域顶部 以便最后删除
     std::wstring dll32Path;
@@ -4472,7 +4615,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ExtractResourceToFile(IDR_INJECTOR32, injectorPath);
     }
 
-    if (enableHook) {
+    // [修改] 使用 startIpcServer 控制 IPC 启动
+    if (startIpcServer) {
         // C. 配置 IPC 参数
         ipcParam.dll32Path = dll32Path;
         ipcParam.dll64Path = dll64Path;
@@ -4480,7 +4624,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ipcParam.shouldStop = &stopIpc;
         ipcParam.pipeName = data->pipeName;
         ipcParam.extraDlls = thirdPartyDlls;
-        ipcParam.injectorPath = injectorPath; // [新增] 传递 injectorPath
+        ipcParam.injectorPath = injectorPath;
 
         // D. 设置环境变量 (供 Hook DLL 读取)
         SetEnvironmentVariableW(L"YAP_IPC_PIPE", ipcParam.pipeName.c_str());
@@ -4524,15 +4668,35 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
                 InjectAndWait(pi.hProcess, pi.hThread, pi.dwProcessId, targetDll, finalHookPath, ipcParam.pipeName, injectorPath);
             }
 
-            // 2. [新增] 注入第三方 DLL (不带等待)
+            // 2. [修改] 注入第三方 DLL (增加架构检查)
             for (const auto& dllPath : thirdPartyDlls) {
+                // 获取 DLL 架构
+                int dllArch = GetPeArchitecture(dllPath);
+
+                // arch 是之前通过 GetPeArchitecture(data->absoluteAppPath) 获取的主程序架构
+                if (dllArch != 0 && dllArch != arch) {
+                    continue; // 架构不匹配 跳过
+                }
+
                 InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
         // 情况 B: 禁用 Hook (hookfile=0)
         else {
-            // [新增] 仅注入第三方 DLL
+            // [修改] 仅注入第三方 DLL (增加架构检查)
+
+            // 1. 获取主程序架构
+            int arch = GetPeArchitecture(data->absoluteAppPath);
+
             for (const auto& dllPath : thirdPartyDlls) {
+                // 2. 获取 DLL 架构
+                int dllArch = GetPeArchitecture(dllPath);
+
+                // 3. 架构不匹配则跳过
+                if (dllArch != 0 && dllArch != arch) {
+                    continue;
+                }
+
                 InjectDll(pi.hProcess, pi.hThread, dllPath, injectorPath);
             }
         }
@@ -4897,6 +5061,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         variables[L"WORKDIR"] = finalWorkDir;
 
+        // [新增] 扫描并加载 loadfont 目录下的所有字体
+        ProcessLoadFontConfig(iniContent, variables);
+
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
         std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
@@ -5107,6 +5274,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hWorkerThread);
         }
 
+        UnloadTemporaryFonts();
         CloseHandle(hMutex);
         CoUninitialize();
 
@@ -5139,6 +5307,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             // [新增] 多实例环境同步：解析 [Before] 区域的变量
             std::wstring childHookNamesVar;
             bool hasThirdPartyDlls = false;
+            std::wstring extraDllsVar; // [新增] 用于存储拼接后的 DLL 路径
             {
                 std::wstringstream stream(iniContent);
                 std::wstring line;
@@ -5160,7 +5329,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
                     // A. 处理 [Hook] 区域特定逻辑
                     if (_wcsicmp(currentSection.c_str(), L"[Hook]") == 0) {
-                        if (_wcsicmp(key.c_str(), L"Injector") == 0) hasThirdPartyDlls = true;
+                        if (_wcsicmp(key.c_str(), L"Injector") == 0) {
+                            hasThirdPartyDlls = true;
+                            // [新增] 解析并收集路径
+                            std::wstring expanded = ResolveToAbsolutePath(ExpandVariables(val, variables), variables);
+                            if (!expanded.empty()) {
+                                if (!extraDllsVar.empty()) extraDllsVar += L"|";
+                                extraDllsVar += expanded;
+                            }
+                        }
                         else if (_wcsicmp(key.c_str(), L"hookchildname") == 0) childHookNamesVar += val + L";";
                     }
 
@@ -5198,6 +5375,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.empty() ? NULL : finalHookPath.c_str());
 
             if (!hookVolumeIdVal.empty()) SetEnvironmentVariableW(L"YAP_HOOK_VOLUME_ID", hookVolumeIdVal.c_str());
+
+            // [新增] 设置第三方 DLL 环境变量
+            if (!extraDllsVar.empty()) {
+                SetEnvironmentVariableW(L"YAP_EXTRA_DLL", extraDllsVar.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_EXTRA_DLL", NULL);
+            }
 
             // 条件设置：hookchildname
             if (!childHookNamesVar.empty()) {
