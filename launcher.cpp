@@ -56,6 +56,7 @@ pfnRtlCreateUserThread g_RtlCreateUserThread = nullptr;
 
 std::wstring g_originalPath;
 std::wstring g_LauncherDir;
+std::vector<std::wstring> g_TemporaryFonts;
 
 // --- Data Structures ---
 
@@ -2529,6 +2530,90 @@ namespace ActionHelpers {
 } // namespace ActionHelpers
 
 
+// --- [新增] 字体批量加载与卸载逻辑 ---
+// 检查文件是否为支持的字体格式
+bool IsFontFile(const std::wstring& fileName) {
+    const wchar_t* ext = PathFindExtensionW(fileName.c_str());
+    if (!ext) return false;
+    return (_wcsicmp(ext, L".ttf") == 0 ||
+            _wcsicmp(ext, L".otf") == 0 ||
+            _wcsicmp(ext, L".ttc") == 0 ||
+            _wcsicmp(ext, L".fon") == 0);
+}
+
+void LoadFontsFromDirectory(const std::wstring& dirPath) {
+    std::wstring searchPath = dirPath + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // 跳过目录，只处理文件
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                if (IsFontFile(fd.cFileName)) {
+                    std::wstring fullPath = dirPath + L"\\" + fd.cFileName;
+
+                    // 注册字体：
+                    // 0: 表示系统全局可见，且会出现在 EnumFontFamilies 的枚举列表中（下拉框可见）
+                    if (AddFontResourceExW(fullPath.c_str(), 0, 0) > 0) {
+                        g_TemporaryFonts.push_back(fullPath);
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+}
+
+void ProcessLoadFontConfig(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
+    std::wstringstream stream(iniContent);
+    std::wstring line;
+    bool inGeneral = false;
+
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[' && line.back() == L']') {
+            inGeneral = (_wcsicmp(line.c_str(), L"[General]") == 0);
+            continue;
+        }
+
+        if (inGeneral) {
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(line.substr(0, delimiterPos));
+                std::wstring val = trim(line.substr(delimiterPos + 1));
+
+                if (_wcsicmp(key.c_str(), L"loadfont") == 0 && !val.empty()) {
+                    // 展开路径并转为绝对路径
+                    std::wstring fullPath = ResolveToAbsolutePath(ExpandVariables(val, variables), variables);
+
+                    if (PathIsDirectoryW(fullPath.c_str())) {
+                        LoadFontsFromDirectory(fullPath);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!g_TemporaryFonts.empty()) {
+        // 通知系统字体表已更新，这样正在运行的程序（如记事本）能立即看到新字体
+        PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
+    }
+}
+
+void UnloadTemporaryFonts() {
+    if (g_TemporaryFonts.empty()) return;
+
+    for (const auto& fontPath : g_TemporaryFonts) {
+        RemoveFontResourceExW(fontPath.c_str(), 0, 0);
+    }
+    g_TemporaryFonts.clear();
+
+    // 卸载后再次通知系统
+    PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
+}
+
 // --- Process Management Functions ---
 
 // Helper for single-instance wait
@@ -4897,6 +4982,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         variables[L"WORKDIR"] = finalWorkDir;
 
+        // [新增] 扫描并加载 loadfont 目录下的所有字体
+        ProcessLoadFontConfig(iniContent, variables);
+
         std::wstring tempFileName = std::wstring(launcherBaseName) + L"Temp.ini";
         std::wstring tempFileDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"tempfile"), variables);
         std::wstring tempFileDir = ResolveToAbsolutePath(tempFileDirRaw, variables);
@@ -5107,6 +5195,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CloseHandle(hWorkerThread);
         }
 
+        UnloadTemporaryFonts();
         CloseHandle(hMutex);
         CoUninitialize();
 
