@@ -4334,78 +4334,106 @@ struct IpcThreadParam {
     std::wstring injectorPath;
 };
 
-// --- [修改] IPC 服务端线程 ---
+// [新增] IPC 工作线程参数
+struct IpcWorkerParam {
+    HANDLE hPipe;
+    IpcThreadParam* mainParam;
+};
+
+// [新增] 处理单个 IPC 连接的工作线程
+DWORD WINAPI IpcWorkerThread(LPVOID lpParam) {
+    IpcWorkerParam* workerParam = (IpcWorkerParam*)lpParam;
+    HANDLE hPipe = workerParam->hPipe;
+    IpcThreadParam* param = workerParam->mainParam;
+
+    // 释放参数内存
+    delete workerParam;
+
+    IpcMessage msg;
+    DWORD bytesRead;
+    if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
+        // LauncherLog(L"IPC Worker: Processing PID " + std::to_wstring(msg.targetPid));
+
+        bool success = false;
+        HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
+        if (hTarget) {
+            BOOL isWow64 = FALSE;
+            IsWow64Process(hTarget, &isWow64);
+            SYSTEM_INFO si;
+            GetNativeSystemInfo(&si);
+            bool systemIs64 = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64);
+            bool targetIs32Bit = systemIs64 ? (isWow64 == TRUE) : true;
+
+            std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
+
+            // 1. 注入主 Hook DLL
+            success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
+
+            // 2. 注入第三方 DLL
+            if (success) {
+                int targetArch = targetIs32Bit ? 32 : 64;
+                for (const auto& dllPath : param->extraDlls) {
+                    int dllArch = GetPeArchitecture(dllPath);
+                    if (dllArch != 0 && dllArch != targetArch) continue;
+                    InjectDll(hTarget, NULL, dllPath, param->injectorPath);
+                }
+            }
+            CloseHandle(hTarget);
+        }
+
+        IpcResponse resp = { success, 0 };
+        DWORD bytesWritten;
+        WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
+    }
+
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
+    return 0;
+}
+
+// [修改] IPC 服务端主线程 (改为并发模式)
 DWORD WINAPI IpcServerThread(LPVOID lpParam) {
     IpcThreadParam* param = (IpcThreadParam*)lpParam;
-    LauncherLog(L"IPC Server started: " + param->pipeName);
+    // LauncherLog(L"IPC Server started: " + param->pipeName);
 
     while (!*(param->shouldStop)) {
+        // 注意：PIPE_UNLIMITED_INSTANCES 允许创建多个管道实例
         HANDLE hPipe = CreateNamedPipeW(
             param->pipeName.c_str(),
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
+            PIPE_UNLIMITED_INSTANCES, // 允许无限实例
             512, 512, 0, NULL
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            LauncherLog(L"IPC CreateNamedPipe failed: " + std::to_wstring(GetLastError()));
-            Sleep(1000);
+            Sleep(100);
             continue;
         }
 
+        // 等待客户端连接
         bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
 
         if (connected) {
-            IpcMessage msg;
-            DWORD bytesRead;
-            if (ReadFile(hPipe, &msg, sizeof(msg), &bytesRead, NULL)) {
-                LauncherLog(L"IPC Received Request: Inject PID " + std::to_wstring(msg.targetPid));
+            // 连接成功 创建一个新线程去处理这个管道实例
+            IpcWorkerParam* workerParam = new IpcWorkerParam;
+            workerParam->hPipe = hPipe;
+            workerParam->mainParam = param;
 
-                bool success = false;
-                HANDLE hTarget = OpenProcess(PROCESS_ALL_ACCESS, FALSE, msg.targetPid);
-                if (hTarget) {
-                    BOOL isWow64 = FALSE;
-                    IsWow64Process(hTarget, &isWow64);
-                    SYSTEM_INFO si;
-                    GetNativeSystemInfo(&si);
-                    bool systemIs64 = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64);
-                    bool targetIs32Bit = systemIs64 ? (isWow64 == TRUE) : true;
-
-                    std::wstring targetDll = targetIs32Bit ? param->dll32Path : param->dll64Path;
-
-                    // 1. 注入主 Hook DLL
-                    success = InjectAndWait(hTarget, NULL, msg.targetPid, targetDll, param->hookPath, param->pipeName, param->injectorPath);
-
-                    // 2. [修改] 注入第三方 DLL (增加架构检查)
-                    if (success) {
-                        int targetArch = targetIs32Bit ? 32 : 64;
-
-                        for (const auto& dllPath : param->extraDlls) {
-                            int dllArch = GetPeArchitecture(dllPath);
-
-                            if (dllArch != 0 && dllArch != targetArch) {
-                                continue; // 架构不匹配 跳过
-                            }
-
-                            InjectDll(hTarget, NULL, dllPath, param->injectorPath);
-                        }
-                    }
-
-                    CloseHandle(hTarget);
-                } else {
-                    LauncherLog(L"IPC OpenProcess failed for PID " + std::to_wstring(msg.targetPid));
-                }
-
-                IpcResponse resp = { success, 0 };
-                DWORD bytesWritten;
-                WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, NULL);
-                LauncherLog(L"IPC Response sent: " + std::wstring(success ? L"OK" : L"FAIL"));
+            HANDLE hThread = CreateThread(NULL, 0, IpcWorkerThread, workerParam, 0, NULL);
+            if (hThread) {
+                CloseHandle(hThread); // 不需要等待它结束
+            } else {
+                // 创建线程失败 清理资源
+                delete workerParam;
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
             }
+        } else {
+            // 连接失败
+            CloseHandle(hPipe);
         }
-
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
     }
     return 0;
 }
