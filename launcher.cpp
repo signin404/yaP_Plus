@@ -4542,8 +4542,18 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_EXTRA_DLL", NULL);
     }
 
-    // [修改] 启用 Hook 的条件：文件 Hook 开启 或 网络 Hook 开启
+    // [修改] 启用 Hook 的条件 (针对当前进程)
+    // 只有当需要文件重定向、网络拦截、伪装等核心功能时 才认为当前进程需要 "Hook"
     bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+
+    // [新增] 解析 multiple 配置
+    std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
+    bool allowMultiple = (multipleVal == L"1");
+
+    // [关键修改] 决定是否启动 IPC 服务端
+    // 条件 A: 当前进程需要 Hook (必须启动 IPC 以支持子进程注入)
+    // 条件 B: 允许多实例 且 配置了第三方 DLL (即使当前进程不需要 Hook 也启动 IPC 为后续实例服务)
+    bool startIpcServer = enableHook || (allowMultiple && !thirdPartyDlls.empty());
 
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
@@ -4553,8 +4563,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     HANDLE hIpcThread = NULL;
     IpcThreadParam ipcParam;
 
-    // [新增] 是否需要释放辅助文件 (Hook开启 或 有第三方DLL注入)
-    bool needHelpers = enableHook || !thirdPartyDlls.empty();
+    // [修改] 是否需要释放辅助文件 (只要启动 IPC 或 有第三方DLL 就需要)
+    bool needHelpers = startIpcServer || !thirdPartyDlls.empty();
 
     // 将 DLL 路径变量移到函数作用域顶部 以便最后删除
     std::wstring dll32Path;
@@ -4578,7 +4588,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ExtractResourceToFile(IDR_INJECTOR32, injectorPath);
     }
 
-    if (enableHook) {
+    // [修改] 使用 startIpcServer 控制 IPC 启动
+    if (startIpcServer) {
         // C. 配置 IPC 参数
         ipcParam.dll32Path = dll32Path;
         ipcParam.dll64Path = dll64Path;
@@ -4586,7 +4597,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         ipcParam.shouldStop = &stopIpc;
         ipcParam.pipeName = data->pipeName;
         ipcParam.extraDlls = thirdPartyDlls;
-        ipcParam.injectorPath = injectorPath; // [新增] 传递 injectorPath
+        ipcParam.injectorPath = injectorPath;
 
         // D. 设置环境变量 (供 Hook DLL 读取)
         SetEnvironmentVariableW(L"YAP_IPC_PIPE", ipcParam.pipeName.c_str());
