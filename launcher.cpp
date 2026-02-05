@@ -5199,10 +5199,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         UnloadTemporaryFonts();
         CloseHandle(hMutex);
         CoUninitialize();
-    }
-    
-    return 0;
-} else {
+
+    } else {
         // --- [修改] 第二个实例的处理逻辑 ---
         CloseHandle(hMutex);
 
