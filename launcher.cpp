@@ -1105,6 +1105,21 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
+    // 辅助函数：强制删除文件 即使它有只读属性
+    void ForceDeleteFile(const std::wstring& path) {
+        // 1. 获取文件属性
+        DWORD attributes = GetFileAttributesW(path.c_str());
+
+        // 2. 检查文件是否存在且为只读
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
+            // 3. 移除只读属性 (保留其他属性)
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        // 4. 现在可以安全地删除文件了
+        DeleteFileW(path.c_str());
+    }
+
     // [新增] 使用 WildcardMatch 筛选并批量传输文件
     void TransferFilesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
         // 1. 确保目标目录存在
@@ -1149,21 +1164,6 @@ namespace ActionHelpers {
             }
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
-    }
-
-    // 辅助函数：强制删除文件 即使它有只读属性
-    void ForceDeleteFile(const std::wstring& path) {
-        // 1. 获取文件属性
-        DWORD attributes = GetFileAttributesW(path.c_str());
-
-        // 2. 检查文件是否存在且为只读
-        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
-            // 3. 移除只读属性 (保留其他属性)
-            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
-        }
-
-        // 4. 现在可以安全地删除文件了
-        DeleteFileW(path.c_str());
     }
 
     // Helper to collect all 'path' values from the INI for a specific scope
