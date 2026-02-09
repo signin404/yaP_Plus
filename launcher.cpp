@@ -1105,6 +1105,138 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
+    // [新增] 目录版：基于通配符批量传输 (Copy 或 Move)
+    void TransferDirectoriesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
+        if (!PathFileExistsW(destDir.c_str())) {
+            SHCreateDirectoryExW(NULL, destDir.c_str(), NULL);
+        }
+
+        std::wstring searchPath = srcDir + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            // [区别1] 只处理目录，跳过文件
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // 跳过备份目录
+            if (EndsWith(fd.cFileName, L"_Backup")) continue;
+
+            if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
+                std::wstring srcPath = srcDir + L"\\" + fd.cFileName;
+                std::wstring destPath = destDir + L"\\" + fd.cFileName;
+
+                if (isMove) {
+                    // 移动模式
+                    if (PathFileExistsW(destPath.c_str())) {
+                        // 如果目标存在，先删除 (使用 SHFileOperation 删除非空目录)
+                        PerformFileSystemOperation(FO_DELETE, destPath);
+                    }
+                    // 尝试原子移动
+                    if (!MoveFileW(srcPath.c_str(), destPath.c_str())) {
+                        // 如果跨分区移动失败，使用 Shell 操作
+                        PerformFileSystemOperation(FO_MOVE, srcPath, destPath);
+                    }
+                } else {
+                    // 复制模式 (目录复制使用 Shell 操作)
+                    // 如果目标存在，SHFileOperation 默认是合并。
+                    // 为了保持一致性，如果需要覆盖，可以先删后拷，或者直接覆盖。
+                    // 这里直接执行复制，Shell 会处理合并
+                    PerformFileSystemOperation(FO_COPY, srcPath, destPath);
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // [新增] 目录版：原地备份
+    void BackupDirectoriesInPlace(const std::wstring& dir, const std::wstring& pattern) {
+        std::wstring searchPath = dir + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (EndsWith(fd.cFileName, L"_Backup")) continue;
+
+            if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
+                std::wstring srcPath = dir + L"\\" + fd.cFileName;
+                std::wstring backupPath = srcPath + L"_Backup";
+
+                if (PathFileExistsW(backupPath.c_str())) {
+                    PerformFileSystemOperation(FO_DELETE, backupPath);
+                }
+                MoveFileW(srcPath.c_str(), backupPath.c_str());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // [新增] 目录版：安全删除 (跳过备份)
+    void DeleteDirectoriesByPatternSafe(const std::wstring& dir, const std::wstring& pattern) {
+        std::wstring searchPath = dir + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // [关键] 跳过备份目录
+            if (EndsWith(fd.cFileName, L"_Backup")) continue;
+
+            if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
+                std::wstring fullPath = dir + L"\\" + fd.cFileName;
+                // 删除非空目录
+                PerformFileSystemOperation(FO_DELETE, fullPath);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // [新增] 目录版：原地恢复
+    void RestoreDirectoryBackupsInPlace(const std::wstring& dir, const std::wstring& pattern) {
+        std::wstring searchPath = dir + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        std::wstring backupSuffix = L"_Backup";
+
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            std::wstring dirName = fd.cFileName;
+
+            if (EndsWith(dirName, backupSuffix)) {
+                std::wstring originalName = dirName.substr(0, dirName.length() - backupSuffix.length());
+
+                if (::WildcardMatch(originalName.c_str(), pattern.c_str())) {
+                    std::wstring backupPath = dir + L"\\" + dirName;
+                    std::wstring restorePath = dir + L"\\" + originalName;
+
+                    if (PathFileExistsW(restorePath.c_str())) {
+                        PerformFileSystemOperation(FO_DELETE, restorePath);
+                    }
+
+                    MoveFileW(backupPath.c_str(), restorePath.c_str());
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+}
+
     // 辅助函数：强制删除文件 即使它有只读属性
     void ForceDeleteFile(const std::wstring& path) {
         // 1. 获取文件属性
@@ -3412,19 +3544,24 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
 
             // [新增] 处理通配符模式
             if (arg.isWildcard) {
-                // 1. 确保目标目录存在
                 SHCreateDirectoryExW(NULL, arg.destPath.c_str(), NULL);
 
-                // 2. 备份：原地重命名目标目录中的匹配文件 (File -> File_Backup)
-                ActionHelpers::BackupWildcardInPlace(arg.destPath, arg.wildcardPattern);
-                arg.destBackupCreated = true;
-
-                // 3. 部署：将源目录中的匹配文件复制到目标目录
-                if (PathFileExistsW(arg.sourcePath.c_str())) {
-                    // [修改] 使用 arg.wasMoved 决定是移动还是复制
-                    // 如果在同一分区 arg.wasMoved 为 true 执行移动
-                    // 如果不同分区 arg.wasMoved 为 false 执行复制
-                    ActionHelpers::TransferFilesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, arg.wasMoved);
+                if (arg.isDirectory) {
+                    // [新增] 目录通配符处理逻辑
+                    // 1. 备份目录
+                    ActionHelpers::BackupDirectoriesInPlace(arg.destPath, arg.wildcardPattern);
+                    arg.destBackupCreated = true;
+                    // 2. 传输目录
+                    if (PathFileExistsW(arg.sourcePath.c_str())) {
+                        ActionHelpers::TransferDirectoriesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, arg.wasMoved);
+                    }
+                } else {
+                    // [原有] 文件通配符处理逻辑
+                    ActionHelpers::BackupWildcardInPlace(arg.destPath, arg.wildcardPattern);
+                    arg.destBackupCreated = true;
+                    if (PathFileExistsW(arg.sourcePath.c_str())) {
+                        ActionHelpers::TransferFilesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, arg.wasMoved);
+                    }
                 }
                 return;
             }
@@ -3561,29 +3698,38 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             // [新增] 处理通配符模式
             if (arg.isWildcard) {
                 if (PathFileExistsW(arg.destPath.c_str())) {
-                    // 确保源目录存在
                     SHCreateDirectoryExW(NULL, arg.sourcePath.c_str(), NULL);
 
-                    // [修改] 根据启动时的操作类型决定恢复逻辑
-                    if (arg.wasMoved) {
-                        // 情况 A: 同分区 (启动时是 Move)
-                        // 退出操作: Move Back (将文件移回源目录)
-                        // Move 操作会自动从 destPath 移除文件 所以不需要额外的 Delete 步骤
-                        ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, true); // true = Move
-                    }
-                    else {
-                        // 情况 B: 不同分区 (启动时是 Copy)
-                        // 退出操作: Copy Back (同步更改) + Delete (清理运行时文件)
-                        ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false); // false = Copy
-
-                        // 显式清理运行时文件 (跳过备份)
-                        ActionHelpers::DeleteFilesByPatternSafe(arg.destPath, arg.wildcardPattern);
+                    if (arg.isDirectory) {
+                        // [新增] 目录通配符恢复逻辑
+                        if (arg.wasMoved) {
+                            // 同分区 Move Back
+                            ActionHelpers::TransferDirectoriesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, true);
+                        } else {
+                            // 异分区 Copy Back + Delete Safe
+                            ActionHelpers::TransferDirectoriesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false);
+                            ActionHelpers::DeleteDirectoriesByPatternSafe(arg.destPath, arg.wildcardPattern);
+                        }
+                    } else {
+                        // [原有] 文件通配符恢复逻辑
+                        if (arg.wasMoved) {
+                            ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, true);
+                        } else {
+                            ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false);
+                            ActionHelpers::DeleteFilesByPatternSafe(arg.destPath, arg.wildcardPattern);
+                        }
                     }
                 }
 
-                // 恢复备份：将 File_Backup 重命名回 File
+                // 恢复备份
                 if (arg.destBackupCreated) {
-                    ActionHelpers::RestoreBackupsInPlace(arg.destPath, arg.wildcardPattern);
+                    if (arg.isDirectory) {
+                        // [新增] 恢复目录备份
+                        ActionHelpers::RestoreDirectoryBackupsInPlace(arg.destPath, arg.wildcardPattern);
+                    } else {
+                        // [原有] 恢复文件备份
+                        ActionHelpers::RestoreBackupsInPlace(arg.destPath, arg.wildcardPattern);
+                    }
                 }
                 return;
             }
@@ -4091,7 +4237,11 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 beforeOp.data = ro_op; op_created = true;
             }
             else if (_wcsicmp(key.c_str(), L"file") == 0 || _wcsicmp(key.c_str(), L"dir") == 0) {
-                FileOp f_op; f_op.isDirectory = (_wcsicmp(key.c_str(), L"dir") == 0);
+                FileOp f_op;
+                // [关键] 记录原始意图：是操作文件还是目录
+                bool isDirOp = (_wcsicmp(key.c_str(), L"dir") == 0);
+                f_op.isDirectory = isDirOp;
+
                 auto parts = split_string(value, delimiter);
                 if (parts.size() == 2) {
                     // [修改] 预先展开变量以检测通配符
@@ -4100,7 +4250,6 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     // 检测是否包含通配符 (* 或 ?)
                     if (rawDest.find(L'*') != std::wstring::npos || rawDest.find(L'?') != std::wstring::npos) {
                         f_op.isWildcard = true;
-                        f_op.isDirectory = false; // 通配符模式下 destPath 视为包含文件的父目录
 
                         // 分离目录和文件名模式
                         // 例如: {LocalLow}\HG_*  ->  Path: ...\LocalLow, Pattern: HG_*
