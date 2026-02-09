@@ -1145,7 +1145,11 @@ namespace ActionHelpers {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
-            // [核心] 使用自定义的 WildcardMatch 进行匹配
+            // [新增] 关键修复：显式跳过以 _Backup 结尾的文件
+            // 防止在回写同步时，将备份文件错误地复制回源目录
+            if (EndsWith(fd.cFileName, L"_Backup")) continue;
+
+            // 使用全局的 WildcardMatch 进行匹配
             if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
                 std::wstring srcFile = srcDir + L"\\" + fd.cFileName;
                 std::wstring destFile = destDir + L"\\" + fd.cFileName;
@@ -1153,7 +1157,7 @@ namespace ActionHelpers {
                 if (isMove) {
                     // 移动模式：如果目标存在先强制删除 (处理只读属性)
                     if (PathFileExistsW(destFile.c_str())) {
-                        ForceDeleteFile(destFile.c_str());
+                        ActionHelpers::ForceDeleteFile(destFile);
                     }
                     MoveFileW(srcFile.c_str(), destFile.c_str());
                 } else {
