@@ -1126,6 +1126,31 @@ namespace ActionHelpers {
         return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
     }
 
+    // [新增] 安全删除匹配文件：显式跳过备份文件
+    void DeleteFilesByPatternSafe(const std::wstring& dir, const std::wstring& pattern) {
+        std::wstring searchPath = dir + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+        
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            // 跳过目录
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // [核心修复] 绝对不要删除备份文件！
+            if (EndsWith(fd.cFileName, L"_Backup")) continue;
+
+            // 再次确认匹配 (防止 FindFirstFile 的 8.3 短文件名误匹配)
+            if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
+                std::wstring fullPath = dir + L"\\" + fd.cFileName;
+                ForceDeleteFile(fullPath.c_str());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
     // [新增] 使用 WildcardMatch 筛选并批量传输文件
     void TransferFilesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
         // 1. 确保目标目录存在
@@ -3538,8 +3563,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false);
 
                     // 2. 清理：删除运行时的文件
-                    std::wstring deletePattern = arg.destPath + L"\\" + arg.wildcardPattern;
-                    ActionHelpers::HandleDeleteFile(deletePattern);
+                    ActionHelpers::DeleteFilesByPatternSafe(arg.destPath, arg.wildcardPattern);
                 }
 
                 // 3. 恢复备份：将 File_Backup 重命名回 File
