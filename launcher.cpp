@@ -1131,7 +1131,7 @@ namespace ActionHelpers {
         std::wstring searchPath = dir + L"\\" + pattern;
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
-        
+
         if (hFind == INVALID_HANDLE_VALUE) return;
 
         do {
@@ -1171,7 +1171,7 @@ namespace ActionHelpers {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
             // [新增] 关键修复：显式跳过以 _Backup 结尾的文件
-            // 防止在回写同步时，将备份文件错误地复制回源目录
+            // 防止在回写同步时 将备份文件错误地复制回源目录
             if (EndsWith(fd.cFileName, L"_Backup")) continue;
 
             // 使用全局的 WildcardMatch 进行匹配
@@ -1218,7 +1218,7 @@ namespace ActionHelpers {
                 std::wstring srcFile = dir + L"\\" + fd.cFileName;
                 std::wstring backupFile = srcFile + L"_Backup";
 
-                // 如果备份文件已存在，先删除，防止重命名失败
+                // 如果备份文件已存在 先删除 防止重命名失败
                 if (PathFileExistsW(backupFile.c_str())) {
                     ForceDeleteFile(backupFile.c_str());
                 }
@@ -1230,9 +1230,9 @@ namespace ActionHelpers {
         FindClose(hFind);
     }
 
-    // [新增] 原地恢复：查找 *_Backup 文件，如果去掉后缀后匹配 pattern，则还原
+    // [新增] 原地恢复：查找 *_Backup 文件 如果去掉后缀后匹配 pattern 则还原
     void RestoreBackupsInPlace(const std::wstring& dir, const std::wstring& pattern) {
-        // 这里必须扫描所有文件，因为我们不知道具体的备份文件名
+        // 这里必须扫描所有文件 因为我们不知道具体的备份文件名
         std::wstring searchPath = dir + L"\\*";
         WIN32_FIND_DATAW fd;
         HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
@@ -1256,7 +1256,7 @@ namespace ActionHelpers {
                     std::wstring backupPath = dir + L"\\" + fileName;
                     std::wstring restorePath = dir + L"\\" + originalName;
 
-                    // 如果当前位置有文件（可能是运行时生成的），先删除
+                    // 如果当前位置有文件（可能是运行时生成的） 先删除
                     if (PathFileExistsW(restorePath.c_str())) {
                         ForceDeleteFile(restorePath.c_str());
                     }
@@ -3421,7 +3421,10 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
 
                 // 3. 部署：将源目录中的匹配文件复制到目标目录
                 if (PathFileExistsW(arg.sourcePath.c_str())) {
-                    ActionHelpers::TransferFilesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, false); // false = Copy
+                    // [修改] 使用 arg.wasMoved 决定是移动还是复制
+                    // 如果在同一分区 arg.wasMoved 为 true 执行移动
+                    // 如果不同分区 arg.wasMoved 为 false 执行复制
+                    ActionHelpers::TransferFilesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, arg.wasMoved);
                 }
                 return;
             }
@@ -3558,15 +3561,27 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             // [新增] 处理通配符模式
             if (arg.isWildcard) {
                 if (PathFileExistsW(arg.destPath.c_str())) {
-                    // 1. 同步回写：将运行时产生/修改的文件复制回源目录
+                    // 确保源目录存在
                     SHCreateDirectoryExW(NULL, arg.sourcePath.c_str(), NULL);
-                    ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false);
 
-                    // 2. 清理：删除运行时的文件
-                    ActionHelpers::DeleteFilesByPatternSafe(arg.destPath, arg.wildcardPattern);
+                    // [修改] 根据启动时的操作类型决定恢复逻辑
+                    if (arg.wasMoved) {
+                        // 情况 A: 同分区 (启动时是 Move)
+                        // 退出操作: Move Back (将文件移回源目录)
+                        // Move 操作会自动从 destPath 移除文件 所以不需要额外的 Delete 步骤
+                        ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, true); // true = Move
+                    }
+                    else {
+                        // 情况 B: 不同分区 (启动时是 Copy)
+                        // 退出操作: Copy Back (同步更改) + Delete (清理运行时文件)
+                        ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false); // false = Copy
+
+                        // 显式清理运行时文件 (跳过备份)
+                        ActionHelpers::DeleteFilesByPatternSafe(arg.destPath, arg.wildcardPattern);
+                    }
                 }
 
-                // 3. 恢复备份：将 File_Backup 重命名回 File
+                // 恢复备份：将 File_Backup 重命名回 File
                 if (arg.destBackupCreated) {
                     ActionHelpers::RestoreBackupsInPlace(arg.destPath, arg.wildcardPattern);
                 }
@@ -4085,7 +4100,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     // 检测是否包含通配符 (* 或 ?)
                     if (rawDest.find(L'*') != std::wstring::npos || rawDest.find(L'?') != std::wstring::npos) {
                         f_op.isWildcard = true;
-                        f_op.isDirectory = false; // 通配符模式下，destPath 视为包含文件的父目录
+                        f_op.isDirectory = false; // 通配符模式下 destPath 视为包含文件的父目录
 
                         // 分离目录和文件名模式
                         // 例如: {LocalLow}\HG_*  ->  Path: ...\LocalLow, Pattern: HG_*
@@ -4094,7 +4109,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                             f_op.destPath = ResolveToAbsolutePath(rawDest.substr(0, lastSlash), variables);
                             f_op.wildcardPattern = rawDest.substr(lastSlash + 1);
                         } else {
-                            // 如果没有反斜杠，假设是当前工作目录
+                            // 如果没有反斜杠 假设是当前工作目录
                             f_op.destPath = ResolveToAbsolutePath(L".", variables);
                             f_op.wildcardPattern = rawDest;
                         }
@@ -4106,6 +4121,9 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
                         // 设置备份路径 (目录)
                         f_op.destBackupPath = f_op.destPath + L"_Backup";
+
+                        // [新增] 关键修改：检测是否在同一分区
+                        f_op.wasMoved = ArePathsOnSameVolume(f_op.sourcePath, f_op.destPath);
                     }
                     else {
                         // --- 原有的常规逻辑 ---
