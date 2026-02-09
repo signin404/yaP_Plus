@@ -210,6 +210,8 @@ struct CopyMoveOp {
     bool isDirectory;
     bool isMove;
     bool overwrite;
+    bool isWildcard = false;
+    std::wstring wildcardPattern;
 };
 
 struct AttributesOp {
@@ -1124,6 +1126,74 @@ namespace ActionHelpers {
 
         // 4. 现在可以安全地删除文件了
         DeleteFileW(path.c_str());
+    }
+
+    // [新增] 处理 CopyMoveOp 的通配符逻辑
+    void ProcessWildcardCopyMove(const CopyMoveOp& op) {
+        // 1. 确保目标父目录存在
+        if (!PathFileExistsW(op.destPath.c_str())) {
+            SHCreateDirectoryExW(NULL, op.destPath.c_str(), NULL);
+        }
+
+        std::wstring searchPath = op.sourcePath + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            // 过滤 . 和 ..
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // [关键] 根据指令类型过滤 文件 vs 目录
+            bool isItemDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+            if (op.isDirectory && !isItemDir) continue; // <-dir 但遇到了文件，跳过
+            if (!op.isDirectory && isItemDir) continue; // <-file 但遇到了目录，跳过
+
+            // 匹配通配符
+            if (::WildcardMatch(fd.cFileName, op.wildcardPattern.c_str())) {
+                std::wstring srcFullPath = op.sourcePath + L"\\" + fd.cFileName;
+                std::wstring destFullPath = op.destPath + L"\\" + fd.cFileName;
+
+                // [关键] 处理 overwrite / no overwrite
+                if (PathFileExistsW(destFullPath.c_str())) {
+                    if (!op.overwrite) {
+                        continue; // 不覆盖，跳过
+                    }
+                    // 如果需要覆盖，且是移动/复制目录，或者目标是只读文件，先尝试删除目标
+                    // 注意：对于文件 CopyFile 有覆盖选项，但 MoveFile 没有，所以 Move 前最好清理
+                    if (isItemDir) {
+                        PerformFileSystemOperation(FO_DELETE, destFullPath);
+                    } else {
+                        ForceDeleteFile(destFullPath.c_str());
+                    }
+                }
+
+                // 执行操作
+                if (isItemDir) {
+                    // --- 目录操作 ---
+                    if (op.isMove) {
+                        // 移动目录
+                        if (!MoveFileW(srcFullPath.c_str(), destFullPath.c_str())) {
+                            PerformFileSystemOperation(FO_MOVE, srcFullPath, destFullPath);
+                        }
+                    } else {
+                        // 复制目录
+                        PerformFileSystemOperation(FO_COPY, srcFullPath, destFullPath);
+                    }
+                } else {
+                    // --- 文件操作 ---
+                    if (op.isMove) {
+                        MoveFileW(srcFullPath.c_str(), destFullPath.c_str());
+                    } else {
+                        // CopyFile 第三个参数: FALSE = 覆盖, TRUE = 不覆盖
+                        // 但我们上面已经处理了 overwrite 逻辑，这里直接覆盖即可
+                        CopyFileW(srcFullPath.c_str(), destFullPath.c_str(), FALSE);
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
     }
 
     // [新增] 目录版：基于通配符批量传输 (Copy 或 Move)
@@ -2297,6 +2367,13 @@ namespace ActionHelpers {
     }
 
     void HandleCopyMove(const CopyMoveOp& op) {
+
+        // [新增] 通配符分支
+        if (op.isWildcard) {
+            ProcessWildcardCopyMove(op);
+            return;
+        }
+
         if (!op.overwrite && PathFileExistsW(op.destPath.c_str())) {
             return;
         }
@@ -3980,8 +4057,43 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 CopyMoveOp op;
                 op.isDirectory = (key.find(L"dir") != std::wstring::npos);
                 bool is_reversed = (key.find(L"->") != std::wstring::npos);
-                op.destPath = is_reversed ? parts[1] : parts[0];
-                op.sourcePath = is_reversed ? parts[0] : parts[1];
+
+                // 原始源路径和目标路径字符串
+                std::wstring rawSrc = is_reversed ? parts[0] : parts[1];
+                std::wstring rawDest = is_reversed ? parts[1] : parts[0];
+
+                // 预先展开变量
+                rawSrc = ExpandVariables(rawSrc, variables);
+                rawDest = ExpandVariables(rawDest, variables);
+
+                // [新增] 检测源路径是否包含通配符
+                if (rawSrc.find(L'*') != std::wstring::npos || rawSrc.find(L'?') != std::wstring::npos) {
+                    op.isWildcard = true;
+
+                    // 分离源路径的目录和模式
+                    // 例如: Other\#New*  ->  Dir: Other, Pattern: #New*
+                    size_t lastSlash = rawSrc.find_last_of(L'\\');
+                    if (lastSlash != std::wstring::npos) {
+                        op.sourcePath = ResolveToAbsolutePath(rawSrc.substr(0, lastSlash), variables);
+                        op.wildcardPattern = rawSrc.substr(lastSlash + 1);
+                    } else {
+                        op.sourcePath = ResolveToAbsolutePath(L".", variables);
+                        op.wildcardPattern = rawSrc;
+                    }
+
+                    // 目标路径处理 (通配符模式下，目标必须是目录)
+                    // 如果 rawDest 是 "Data\"，ResolveToAbsolutePath 会处理好
+                    op.destPath = ResolveToAbsolutePath(rawDest, variables);
+                    // 移除末尾反斜杠以保持一致性
+                    if (!op.destPath.empty() && op.destPath.back() == L'\\') op.destPath.pop_back();
+
+                } else {
+                    // [原有] 常规逻辑
+                    op.isWildcard = false;
+                    op.sourcePath = ResolveToAbsolutePath(rawSrc, variables);
+                    op.destPath = ResolveToAbsolutePath(rawDest, variables);
+                }
+
                 op.overwrite = true;
                 op.isMove = false;
                 for (size_t i = 2; i < parts.size(); ++i) {
