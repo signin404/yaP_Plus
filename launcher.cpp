@@ -1235,7 +1235,6 @@ namespace ActionHelpers {
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
-}
 
     // 辅助函数：强制删除文件 即使它有只读属性
     void ForceDeleteFile(const std::wstring& path) {
