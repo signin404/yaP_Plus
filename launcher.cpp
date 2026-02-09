@@ -1105,6 +1105,12 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 // Deletion and Action Helpers
 namespace ActionHelpers {
 
+    // [新增] 辅助函数：判断字符串是否以指定后缀结尾
+    bool EndsWith(const std::wstring& str, const std::wstring& suffix) {
+        if (str.length() < suffix.length()) return false;
+        return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+    }
+
     // [新增] 目录版：基于通配符批量传输 (Copy 或 Move)
     void TransferDirectoriesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
         if (!PathFileExistsW(destDir.c_str())) {
@@ -1118,7 +1124,7 @@ namespace ActionHelpers {
         if (hFind == INVALID_HANDLE_VALUE) return;
 
         do {
-            // [区别1] 只处理目录，跳过文件
+            // [区别1] 只处理目录 跳过文件
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 
@@ -1132,19 +1138,19 @@ namespace ActionHelpers {
                 if (isMove) {
                     // 移动模式
                     if (PathFileExistsW(destPath.c_str())) {
-                        // 如果目标存在，先删除 (使用 SHFileOperation 删除非空目录)
+                        // 如果目标存在 先删除 (使用 SHFileOperation 删除非空目录)
                         PerformFileSystemOperation(FO_DELETE, destPath);
                     }
                     // 尝试原子移动
                     if (!MoveFileW(srcPath.c_str(), destPath.c_str())) {
-                        // 如果跨分区移动失败，使用 Shell 操作
+                        // 如果跨分区移动失败 使用 Shell 操作
                         PerformFileSystemOperation(FO_MOVE, srcPath, destPath);
                     }
                 } else {
                     // 复制模式 (目录复制使用 Shell 操作)
-                    // 如果目标存在，SHFileOperation 默认是合并。
-                    // 为了保持一致性，如果需要覆盖，可以先删后拷，或者直接覆盖。
-                    // 这里直接执行复制，Shell 会处理合并
+                    // 如果目标存在 SHFileOperation 默认是合并
+                    // 为了保持一致性 如果需要覆盖 可以先删后拷 或者直接覆盖
+                    // 这里直接执行复制 Shell 会处理合并
                     PerformFileSystemOperation(FO_COPY, srcPath, destPath);
                 }
             }
@@ -1249,12 +1255,6 @@ namespace ActionHelpers {
 
         // 4. 现在可以安全地删除文件了
         DeleteFileW(path.c_str());
-    }
-
-    // [新增] 辅助函数：判断字符串是否以指定后缀结尾
-    bool EndsWith(const std::wstring& str, const std::wstring& suffix) {
-        if (str.length() < suffix.length()) return false;
-        return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
     }
 
     // [新增] 安全删除匹配文件：显式跳过备份文件
