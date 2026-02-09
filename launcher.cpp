@@ -103,6 +103,8 @@ struct LinkOp {
     std::vector<std::pair<std::wstring, std::wstring>> backedUpPaths;
     bool performMoveOnCleanup = false;
     std::wstring traversalMode; // "dir", "file", "all", or empty
+    bool isWildcard = false;
+    std::wstring wildcardPattern;
 };
 
 
@@ -1147,8 +1149,8 @@ namespace ActionHelpers {
 
             // [关键] 根据指令类型过滤 文件 vs 目录
             bool isItemDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
-            if (op.isDirectory && !isItemDir) continue; // <-dir 但遇到了文件，跳过
-            if (!op.isDirectory && isItemDir) continue; // <-file 但遇到了目录，跳过
+            if (op.isDirectory && !isItemDir) continue; // <-dir 但遇到了文件 跳过
+            if (!op.isDirectory && isItemDir) continue; // <-file 但遇到了目录 跳过
 
             // 匹配通配符
             if (::WildcardMatch(fd.cFileName, op.wildcardPattern.c_str())) {
@@ -1158,10 +1160,10 @@ namespace ActionHelpers {
                 // [关键] 处理 overwrite / no overwrite
                 if (PathFileExistsW(destFullPath.c_str())) {
                     if (!op.overwrite) {
-                        continue; // 不覆盖，跳过
+                        continue; // 不覆盖 跳过
                     }
-                    // 如果需要覆盖，且是移动/复制目录，或者目标是只读文件，先尝试删除目标
-                    // 注意：对于文件 CopyFile 有覆盖选项，但 MoveFile 没有，所以 Move 前最好清理
+                    // 如果需要覆盖 且是移动/复制目录 或者目标是只读文件 先尝试删除目标
+                    // 注意：对于文件 CopyFile 有覆盖选项 但 MoveFile 没有 所以 Move 前最好清理
                     if (isItemDir) {
                         PerformFileSystemOperation(FO_DELETE, destFullPath);
                     } else {
@@ -1187,7 +1189,7 @@ namespace ActionHelpers {
                         MoveFileW(srcFullPath.c_str(), destFullPath.c_str());
                     } else {
                         // CopyFile 第三个参数: FALSE = 覆盖, TRUE = 不覆盖
-                        // 但我们上面已经处理了 overwrite 逻辑，这里直接覆盖即可
+                        // 但我们上面已经处理了 overwrite 逻辑 这里直接覆盖即可
                         CopyFileW(srcFullPath.c_str(), destFullPath.c_str(), FALSE);
                     }
                 }
@@ -3700,7 +3702,61 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 ImportRegistryFile(arg.filePath);
             }
         } else if constexpr (std::is_same_v<T, LinkOp>) {
-            if (!arg.traversalMode.empty()) {
+
+            if (arg.isWildcard) {
+                // 确保目标目录存在
+                SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
+
+                // 从源目录 (targetPath) 扫描
+                std::wstring searchPath = arg.targetPath + L"\\*";
+                WIN32_FIND_DATAW fd;
+                HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                        bool isItemDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+                        // 如果指定了目录匹配模式 (isDirectory=true)，跳过文件
+                        if (arg.isDirectory && !isItemDir) continue;
+
+                        // 使用通配符匹配文件名
+                        if (::WildcardMatch(fd.cFileName, arg.wildcardPattern.c_str())) {
+                            std::wstring srcFullPath = arg.targetPath + L"\\" + fd.cFileName;
+                            std::wstring destFullPath = arg.linkPath + L"\\" + fd.cFileName;
+
+                            // 备份目标位置已存在的同名项
+                            if (PathFileExistsW(destFullPath.c_str())) {
+                                std::wstring backupDestPath = destFullPath + L"_Backup";
+                                if (PathFileExistsW(backupDestPath.c_str())) {
+                                    if (isItemDir) PerformFileSystemOperation(FO_DELETE, backupDestPath);
+                                    else ActionHelpers::ForceDeleteFile(backupDestPath);
+                                }
+                                if (MoveFileW(destFullPath.c_str(), backupDestPath.c_str())) {
+                                    arg.backedUpPaths.push_back({backupDestPath, destFullPath});
+                                    arg.backupCreated = true;
+                                }
+                            }
+
+                            // 创建链接
+                            if (arg.isHardlink) {
+                                if (!isItemDir) { // 硬链接仅限文件
+                                    if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
+                                        arg.createdLinks.push_back({destFullPath, srcFullPath});
+                                    }
+                                }
+                            } else {
+                                DWORD flags = isItemDir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+                                if (CreateSymbolicLinkW(destFullPath.c_str(), srcFullPath.c_str(), flags)) {
+                                    arg.createdLinks.push_back({destFullPath, srcFullPath});
+                                }
+                            }
+                        }
+                    } while (FindNextFileW(hFind, &fd));
+                    FindClose(hFind);
+                }
+                return;
+            } else if (!arg.traversalMode.empty()) {
                 SHCreateDirectoryExW(NULL, arg.linkPath.c_str(), NULL);
                 WIN32_FIND_DATAW findData;
                 std::wstring searchPath = arg.targetPath + L"\\*";
@@ -3893,7 +3949,7 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
                     }
                     MoveFileW(arg.linkPath.c_str(), arg.targetPath.c_str());
                 }
-            } else if (!arg.traversalMode.empty()) {
+            } else if (!arg.traversalMode.empty() || arg.isWildcard) { // [修改] 增加 arg.isWildcard
                 for (const auto& linkPair : arg.createdLinks) {
                     const std::wstring& pathToDelete = linkPair.first;
                     if (PathIsDirectoryW(pathToDelete.c_str())) {
@@ -3920,10 +3976,14 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (arg.backupCreated) {
                 for (const auto& backupPair : arg.backedUpPaths) {
                     if (PathFileExistsW(backupPair.first.c_str())) {
+                        // 如果恢复目标已存在（理论上链接已被删，但为了保险），先删除
+                        if (PathFileExistsW(backupPair.second.c_str())) {
+                            if (PathIsDirectoryW(backupPair.second.c_str())) PerformFileSystemOperation(FO_DELETE, backupPair.second);
+                            else ActionHelpers::ForceDeleteFile(backupPair.second);
+                        }
                         MoveFileW(backupPair.first.c_str(), backupPair.second.c_str());
                     }
                 }
-            }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             if (arg.ruleCreated) {
                 DeleteFirewallRule(arg.ruleName);
@@ -4081,8 +4141,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                         op.wildcardPattern = rawSrc;
                     }
 
-                    // 目标路径处理 (通配符模式下，目标必须是目录)
-                    // 如果 rawDest 是 "Data\"，ResolveToAbsolutePath 会处理好
+                    // 目标路径处理 (通配符模式下 目标必须是目录)
+                    // 如果 rawDest 是 "Data\" ResolveToAbsolutePath 会处理好
                     op.destPath = ResolveToAbsolutePath(rawDest, variables);
                     // 移除末尾反斜杠以保持一致性
                     if (!op.destPath.empty() && op.destPath.back() == L'\\') op.destPath.pop_back();
@@ -4295,30 +4355,47 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                 l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() >= 2) {
-                    l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
-                    l_op.targetPath = ResolveToAbsolutePath(ExpandVariables(parts[1], variables), variables);
-                    if (parts.size() > 2) {
-                        l_op.traversalMode = trim(parts[2]);
-                    }
-                    if (!l_op.traversalMode.empty()) {
-                        l_op.isDirectory = true;
+                    // [反转逻辑]
+                    // parts[0] = 目标路径+通配符 (例如 App\#New*)
+                    // parts[1] = 源目录 (例如 Data\)
+                    std::wstring rawLinkWithPattern = ExpandVariables(parts[0], variables);
+                    std::wstring rawSourceDir = ExpandVariables(parts[1], variables);
+
+                    if (rawLinkWithPattern.find(L'*') != std::wstring::npos || rawLinkWithPattern.find(L'?') != std::wstring::npos) {
+                        l_op.isWildcard = true;
+
+                        // 1. 处理末尾反斜杠 (例如 #New*\ 表示只匹配目录)
+                        if (rawLinkWithPattern.back() == L'\\') {
+                            l_op.isDirectory = true;
+                            rawLinkWithPattern.pop_back();
+                        }
+
+                        // 2. 从第一部分分离 目标目录 和 通配符模式
+                        size_t lastSlash = rawLinkWithPattern.find_last_of(L'\\');
+                        if (lastSlash != std::wstring::npos) {
+                            l_op.linkPath = ResolveToAbsolutePath(rawLinkWithPattern.substr(0, lastSlash), variables);
+                            l_op.wildcardPattern = rawLinkWithPattern.substr(lastSlash + 1);
+                        } else {
+                            l_op.linkPath = ResolveToAbsolutePath(L".", variables);
+                            l_op.wildcardPattern = rawLinkWithPattern;
+                        }
+
+                        // 3. 第二部分是源目录
+                        l_op.targetPath = ResolveToAbsolutePath(rawSourceDir, variables);
+
                     } else {
-                        l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
+                        // --- 常规无通配符逻辑 (保持 LinkPath :: SourcePath 顺序) ---
+                        l_op.linkPath = ResolveToAbsolutePath(rawLinkWithPattern, variables);
+                        l_op.targetPath = ResolveToAbsolutePath(rawSourceDir, variables);
+                        if (parts.size() > 2) l_op.traversalMode = trim(parts[2]);
+                        l_op.isDirectory = (rawLinkWithPattern.back() == L'\\' || rawSourceDir.back() == L'\\');
                     }
 
-                    if (l_op.isDirectory) {
-                        if (l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
-                        if (l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
-                    }
+                    // 统一清理路径末尾
+                    if (!l_op.linkPath.empty() && l_op.linkPath.back() == L'\\') l_op.linkPath.pop_back();
+                    if (!l_op.targetPath.empty() && l_op.targetPath.back() == L'\\') l_op.targetPath.pop_back();
 
                     l_op.backupPath = l_op.linkPath + L"_Backup";
-
-                    if (l_op.isHardlink && l_op.traversalMode.empty()) {
-                        if (!PathFileExistsW(l_op.targetPath.c_str())) {
-                            l_op.performMoveOnCleanup = true;
-                        }
-                    }
-
                     beforeOp.data = l_op;
                     op_created = true;
                 }
