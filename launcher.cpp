@@ -1120,6 +1120,12 @@ namespace ActionHelpers {
         DeleteFileW(path.c_str());
     }
 
+    // [新增] 辅助函数：判断字符串是否以指定后缀结尾
+    bool EndsWith(const std::wstring& str, const std::wstring& suffix) {
+        if (str.length() < suffix.length()) return false;
+        return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+    }
+
     // [新增] 使用 WildcardMatch 筛选并批量传输文件
     void TransferFilesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
         // 1. 确保目标目录存在
@@ -1160,6 +1166,74 @@ namespace ActionHelpers {
                         }
                     }
                     CopyFileW(srcFile.c_str(), destFile.c_str(), FALSE);
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // [新增] 原地备份：将匹配的文件重命名为 filename_Backup
+    void BackupWildcardInPlace(const std::wstring& dir, const std::wstring& pattern) {
+        std::wstring searchPath = dir + L"\\" + pattern;
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // 严格匹配模式
+            if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
+                std::wstring srcFile = dir + L"\\" + fd.cFileName;
+                std::wstring backupFile = srcFile + L"_Backup";
+
+                // 如果备份文件已存在，先删除，防止重命名失败
+                if (PathFileExistsW(backupFile.c_str())) {
+                    ForceDeleteFile(backupFile.c_str());
+                }
+
+                // 原地重命名
+                MoveFileW(srcFile.c_str(), backupFile.c_str());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // [新增] 原地恢复：查找 *_Backup 文件，如果去掉后缀后匹配 pattern，则还原
+    void RestoreBackupsInPlace(const std::wstring& dir, const std::wstring& pattern) {
+        // 这里必须扫描所有文件，因为我们不知道具体的备份文件名
+        std::wstring searchPath = dir + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+        if (hFind == INVALID_HANDLE_VALUE) return;
+
+        std::wstring backupSuffix = L"_Backup";
+
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+            std::wstring fileName = fd.cFileName;
+
+            // 检查是否以 _Backup 结尾
+            if (EndsWith(fileName, backupSuffix)) {
+                // 还原原始文件名
+                std::wstring originalName = fileName.substr(0, fileName.length() - backupSuffix.length());
+
+                // 检查原始文件名是否匹配我们的通配符模式
+                if (::WildcardMatch(originalName.c_str(), pattern.c_str())) {
+                    std::wstring backupPath = dir + L"\\" + fileName;
+                    std::wstring restorePath = dir + L"\\" + originalName;
+
+                    // 如果当前位置有文件（可能是运行时生成的），先删除
+                    if (PathFileExistsW(restorePath.c_str())) {
+                        ForceDeleteFile(restorePath.c_str());
+                    }
+
+                    // 恢复文件名
+                    MoveFileW(backupPath.c_str(), restorePath.c_str());
                 }
             }
         } while (FindNextFileW(hFind, &fd));
@@ -3309,16 +3383,18 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
 
             // [新增] 处理通配符模式
             if (arg.isWildcard) {
-                // 1. 备份：将目标目录中现有的匹配文件移动到备份目录
-                // 使用 WildcardMatch 筛选
-                ActionHelpers::TransferFilesByPattern(arg.destPath, arg.destBackupPath, arg.wildcardPattern, true); // true = Move
+                // 1. 确保目标目录存在
+                SHCreateDirectoryExW(NULL, arg.destPath.c_str(), NULL);
+
+                // 2. 备份：原地重命名目标目录中的匹配文件 (File -> File_Backup)
+                ActionHelpers::BackupWildcardInPlace(arg.destPath, arg.wildcardPattern);
                 arg.destBackupCreated = true;
 
-                // 2. 部署：将源目录中的匹配文件复制到目标目录
+                // 3. 部署：将源目录中的匹配文件复制到目标目录
                 if (PathFileExistsW(arg.sourcePath.c_str())) {
                     ActionHelpers::TransferFilesByPattern(arg.sourcePath, arg.destPath, arg.wildcardPattern, false); // false = Copy
                 }
-                return; // 结束处理
+                return;
             }
 
             wchar_t dirPath[MAX_PATH];
@@ -3452,27 +3528,21 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
 
             // [新增] 处理通配符模式
             if (arg.isWildcard) {
-                // 1. 保存：将目标目录中的匹配文件复制回源目录 (覆盖)
                 if (PathFileExistsW(arg.destPath.c_str())) {
-                    // 确保源目录存在
+                    // 1. 同步回写：将运行时产生/修改的文件复制回源目录
                     SHCreateDirectoryExW(NULL, arg.sourcePath.c_str(), NULL);
-                    ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false); // false = Copy
+                    ActionHelpers::TransferFilesByPattern(arg.destPath, arg.sourcePath, arg.wildcardPattern, false);
 
-                    // 2. 清理：删除目标目录中的匹配文件
-                    // 直接复用已有的 HandleDeleteFile，它内部已经使用了 WildcardMatch
+                    // 2. 清理：删除运行时的文件
                     std::wstring deletePattern = arg.destPath + L"\\" + arg.wildcardPattern;
                     ActionHelpers::HandleDeleteFile(deletePattern);
                 }
 
-                // 3. 恢复备份：将备份目录中的文件移回目标目录
-                if (arg.destBackupCreated && PathFileExistsW(arg.destBackupPath.c_str())) {
-                    // 备份目录里只有匹配的文件，所以可以直接移动所有匹配 pattern 的文件
-                    ActionHelpers::TransferFilesByPattern(arg.destBackupPath, arg.destPath, arg.wildcardPattern, true); // true = Move
-
-                    // 尝试删除空的备份目录
-                    RemoveDirectoryW(arg.destBackupPath.c_str());
+                // 3. 恢复备份：将 File_Backup 重命名回 File
+                if (arg.destBackupCreated) {
+                    ActionHelpers::RestoreBackupsInPlace(arg.destPath, arg.wildcardPattern);
                 }
-                return; // 结束处理
+                return;
             }
 
             if (arg.wasMoved) {
