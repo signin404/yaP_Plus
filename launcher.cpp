@@ -1111,6 +1111,21 @@ namespace ActionHelpers {
         return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
     }
 
+    // 辅助函数：强制删除文件 即使它有只读属性
+    void ForceDeleteFile(const std::wstring& path) {
+        // 1. 获取文件属性
+        DWORD attributes = GetFileAttributesW(path.c_str());
+
+        // 2. 检查文件是否存在且为只读
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
+            // 3. 移除只读属性 (保留其他属性)
+            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        // 4. 现在可以安全地删除文件了
+        DeleteFileW(path.c_str());
+    }
+
     // [新增] 目录版：基于通配符批量传输 (Copy 或 Move)
     void TransferDirectoriesByPattern(const std::wstring& srcDir, const std::wstring& destDir, const std::wstring& pattern, bool isMove) {
         if (!PathFileExistsW(destDir.c_str())) {
@@ -1124,11 +1139,8 @@ namespace ActionHelpers {
         if (hFind == INVALID_HANDLE_VALUE) return;
 
         do {
-            // [区别1] 只处理目录 跳过文件
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-
-            // 跳过备份目录
             if (EndsWith(fd.cFileName, L"_Backup")) continue;
 
             if (::WildcardMatch(fd.cFileName, pattern.c_str())) {
@@ -1136,22 +1148,42 @@ namespace ActionHelpers {
                 std::wstring destPath = destDir + L"\\" + fd.cFileName;
 
                 if (isMove) {
-                    // 移动模式
+                    // --- 移动模式 (保持不变) ---
                     if (PathFileExistsW(destPath.c_str())) {
-                        // 如果目标存在 先删除 (使用 SHFileOperation 删除非空目录)
                         PerformFileSystemOperation(FO_DELETE, destPath);
                     }
-                    // 尝试原子移动
                     if (!MoveFileW(srcPath.c_str(), destPath.c_str())) {
-                        // 如果跨分区移动失败 使用 Shell 操作
                         PerformFileSystemOperation(FO_MOVE, srcPath, destPath);
                     }
                 } else {
-                    // 复制模式 (目录复制使用 Shell 操作)
-                    // 如果目标存在 SHFileOperation 默认是合并
-                    // 为了保持一致性 如果需要覆盖 可以先删后拷 或者直接覆盖
-                    // 这里直接执行复制 Shell 会处理合并
+                    // --- 复制模式 (修改为：重命名 -> 复制 -> 删除) ---
+
+                    std::wstring tempBackupPath = destPath + L"_Backup";
+                    bool needCleanup = false;
+
+                    // 1. 如果目标已存在 先将其改名为 _Backup
+                    if (PathFileExistsW(destPath.c_str())) {
+                        // 如果之前残留了 _Backup 先删掉它
+                        if (PathFileExistsW(tempBackupPath.c_str())) {
+                            PerformFileSystemOperation(FO_DELETE, tempBackupPath);
+                        }
+
+                        // 尝试重命名 (相当于移动到 _Backup)
+                        if (MoveFileW(destPath.c_str(), tempBackupPath.c_str())) {
+                            needCleanup = true;
+                        } else {
+                            // 如果重命名失败（例如被占用） 则强制删除旧目录
+                            PerformFileSystemOperation(FO_DELETE, destPath);
+                        }
+                    }
+
+                    // 2. 执行复制 (此时 destPath 应该不存在了 或者是空的)
                     PerformFileSystemOperation(FO_COPY, srcPath, destPath);
+
+                    // 3. 如果复制成功且之前进行了备份 删除 _Backup
+                    if (needCleanup && PathFileExistsW(destPath.c_str())) {
+                        PerformFileSystemOperation(FO_DELETE, tempBackupPath);
+                    }
                 }
             }
         } while (FindNextFileW(hFind, &fd));
@@ -1240,21 +1272,6 @@ namespace ActionHelpers {
             }
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
-    }
-
-    // 辅助函数：强制删除文件 即使它有只读属性
-    void ForceDeleteFile(const std::wstring& path) {
-        // 1. 获取文件属性
-        DWORD attributes = GetFileAttributesW(path.c_str());
-
-        // 2. 检查文件是否存在且为只读
-        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
-            // 3. 移除只读属性 (保留其他属性)
-            SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
-        }
-
-        // 4. 现在可以安全地删除文件了
-        DeleteFileW(path.c_str());
     }
 
     // [新增] 安全删除匹配文件：显式跳过备份文件
