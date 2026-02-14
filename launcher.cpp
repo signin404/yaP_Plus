@@ -966,7 +966,9 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     std::wstringstream wss;
     wss << displayName << L"=";
 
-    if (type == REG_SZ && (dataSize % sizeof(wchar_t) == 0)) {
+    // 1. 处理字符串 (REG_SZ)
+    // 检查类型是否为 REG_SZ 且长度是否为偶数
+    if (type == REG_SZ && (size % sizeof(wchar_t) == 0)) {
         std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
         if (!strValue.empty() && strValue.back() == L'\0') {
             strValue.pop_back();
@@ -978,22 +980,30 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
             else escapedStr += c;
         }
         wss << L"\"" << escapedStr << L"\"";
-    } else if (type == REG_DWORD && size == sizeof(DWORD)) {
+    }
+    // 2. 处理 DWORD (REG_DWORD)
+    // 检查类型是否为 REG_DWORD 且长度是否严格为 4 字节
+    else if (type == REG_DWORD && size == sizeof(DWORD)) {
         DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
         wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
-    } else {
+    }
+    // 3. 处理其他所有类型 (Hex 导出)
+    else {
         wss << L"hex";
         if (type == REG_EXPAND_SZ) wss << L"(2)";
         else if (type == REG_MULTI_SZ) wss << L"(7)";
         else if (type == REG_QWORD) wss << L"(b)";
-        else if (type == REG_SZ) wss << L"(1)"; // [新增] 畸形字符串会变成 hex(1):
+        else if (type == REG_SZ) wss << L"(1)"; // 畸形字符串
+        // [修正] 强制使用十六进制输出类型值 (例如 hex(a) 而不是 hex(10))
         else if (type != REG_BINARY) wss << L"(" << std::hex << type << L")";
+
         wss << L":";
 
         // --- [核心修改] ---
         const size_t MAX_LINE_LEN = 80;
         size_t currentLineLength = wss.str().length();
 
+        // [修正] 这里也使用 'size'
         for (DWORD i = 0; i < size; ++i) {
             size_t chars_for_this_byte = (i < size - 1) ? 3 : 2; // "XX," or "XX"
 
