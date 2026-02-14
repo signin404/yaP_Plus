@@ -814,7 +814,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                     else escapedStr += c;
                 }
                 wss << L"\"" << escapedStr << L"\"";
-            } else if (type == REG_DWORD) {
+            } else if (type == REG_DWORD && dataSize == sizeof(DWORD)) {
                 DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
                 wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
             } else {
@@ -977,7 +977,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
             else escapedStr += c;
         }
         wss << L"\"" << escapedStr << L"\"";
-    } else if (type == REG_DWORD) {
+    } else if (type == REG_DWORD && size == sizeof(DWORD)) {
         DWORD dwordValue = *reinterpret_cast<DWORD*>(data.data());
         wss << L"dword:" << std::hex << std::setw(8) << std::setfill(L'0') << dwordValue;
     } else {
