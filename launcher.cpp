@@ -801,7 +801,7 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
             std::wstringstream wss;
             wss << displayName << L"=";
 
-            if (type == REG_SZ) {
+            if (type == REG_SZ && (dataSize % sizeof(wchar_t) == 0)) {
                 std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), dataSize / sizeof(wchar_t));
                 if (!strValue.empty() && strValue.back() == L'\0') {
                     strValue.pop_back();
@@ -822,7 +822,8 @@ void RecursiveRegExport(HKEY hKey, const std::wstring& currentPath, std::ofstrea
                 if (type == REG_EXPAND_SZ) wss << L"(2)";
                 else if (type == REG_MULTI_SZ) wss << L"(7)";
                 else if (type == REG_QWORD) wss << L"(b)";
-                else if (type != REG_BINARY) wss << L"(" << type << L")";
+                else if (type == REG_SZ) wss << L"(1)"; // [新增] 畸形字符串会变成 hex(1):
+                else if (type != REG_BINARY) wss << L"(" << std::hex << type << L")";
                 wss << L":";
 
                 // --- [核心修改] ---
@@ -965,7 +966,7 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
     std::wstringstream wss;
     wss << displayName << L"=";
 
-    if (type == REG_SZ) {
+    if (type == REG_SZ && (dataSize % sizeof(wchar_t) == 0)) {
         std::wstring strValue(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
         if (!strValue.empty() && strValue.back() == L'\0') {
             strValue.pop_back();
@@ -985,7 +986,8 @@ bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::w
         if (type == REG_EXPAND_SZ) wss << L"(2)";
         else if (type == REG_MULTI_SZ) wss << L"(7)";
         else if (type == REG_QWORD) wss << L"(b)";
-        else if (type != REG_BINARY) wss << L"(" << type << L")";
+        else if (type == REG_SZ) wss << L"(1)"; // [新增] 畸形字符串会变成 hex(1):
+        else if (type != REG_BINARY) wss << L"(" << std::hex << type << L")";
         wss << L":";
 
         // --- [核心修改] ---
