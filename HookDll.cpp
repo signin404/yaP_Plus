@@ -2467,53 +2467,102 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
     if (!g_HookReg || g_RegSandboxRoot.empty()) return false;
 
+    // 1. WOW64 修正
     std::wstring fixedPath = FixRegPathWow64(fullNtPath);
 
-    // 如果已经在沙盒路径内，不重定向
+    // 2. 如果已经在沙盒路径内，不重定向 (防止递归)
     if (ContainsCaseInsensitive(fixedPath, g_RegSandboxRoot)) return false;
 
+    // 3. 定义前缀
+    // 注意：HKCU 的 NT 路径是动态的 (\REGISTRY\USER\S-1-5-xx...)
+    // HKLM 的 NT 路径是固定的 (\REGISTRY\MACHINE)
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
-    std::wstring prefixUser = L"\\REGISTRY\\USER";
+    std::wstring prefixUser = L"\\REGISTRY\\USER"; // 这会匹配所有用户，包括当前用户
 
     std::wstring relPath;
+    bool match = false;
+
+    // 检查 HKLM
     if (_wcsnicmp(fixedPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
+        // \REGISTRY\MACHINE\Software -> ...\YapBox_Reg\Machine\Software
         relPath = L"\\Machine" + fixedPath.substr(prefixMachine.length());
-    } else if (_wcsnicmp(fixedPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
-        relPath = L"\\User" + fixedPath.substr(prefixUser.length());
+        match = true;
+    }
+    // 检查 HKCU (以及其他用户的 Hive，如果权限允许)
+    else if (_wcsnicmp(fixedPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
+        // 排除 \REGISTRY\USER\S-1-5-18 (LocalSystem) 等非当前用户情况，
+        // 但为了简单起见，我们把所有 USER 下的访问都重定向到 YapBox_Reg\User 下
+        // 这样 \REGISTRY\USER\S-1-5-21-XXX\Software -> ...\YapBox_Reg\User\S-1-5-21-XXX\Software
+        // 这种结构能保留 SID 信息，避免混淆
+
+        // [优化]：为了让结构更清晰，我们检测是否是当前用户的 SID
+        // g_RegSandboxRoot 包含了当前用户的 SID 前缀
+        // 提取 g_RegSandboxRoot 的前缀部分 (去掉 \Software\YapBox_Reg)
+        std::wstring currentUserPrefix = g_RegSandboxRoot.substr(0, g_RegSandboxRoot.find(L"\\Software\\YapBox_Reg"));
+
+        if (_wcsnicmp(fixedPath.c_str(), currentUserPrefix.c_str(), currentUserPrefix.length()) == 0) {
+            // 是当前用户：映射到 \User\Software\...
+            // 原始: \REGISTRY\USER\S-1-5-xx\Software\123
+            // 截取: \Software\123
+            std::wstring sub = fixedPath.substr(currentUserPrefix.length());
+            relPath = L"\\User" + sub;
+            match = true;
+        } else {
+            // 是其他用户 (如 ClassesRoot 的某些部分)，暂不重定向，或者也映射
+            // 这里选择不重定向其他用户的 Hive，以免权限错误
+            return false;
+        }
     } else {
-        return false; // 其他路径 (如 \Registry\A) 不重定向
+        return false;
     }
 
-    targetPath = g_RegSandboxRoot + relPath;
-    return true;
+    if (match) {
+        targetPath = g_RegSandboxRoot + relPath;
+        return true;
+    }
+    return false;
 }
 
 // 递归创建沙盒注册表键 (类似文件系统的 RecursiveCreatePathWithSync)
 void EnsureRegPathExistsNT(const std::wstring& ntPath) {
-    size_t pos = 0;
-    std::wstring currentPath;
-    while ((pos = ntPath.find(L'\\', pos + 1)) != std::wstring::npos) {
-        currentPath = ntPath.substr(0, pos);
-        if (currentPath.length() < 15) continue; // 跳过基础前缀如 \Registry\User
+    if (ntPath.empty()) return;
 
-        HANDLE hKey;
+    // 找到沙盒根路径的位置
+    if (ntPath.find(g_RegSandboxRoot) != 0) return;
+
+    // 从根路径之后开始逐级检查
+    // g_RegSandboxRoot 例如: \REGISTRY\USER\S-1-5-21...\Software\YapBox_Reg
+    size_t currentPos = g_RegSandboxRoot.length();
+
+    while (true) {
+        // 查找下一个反斜杠
+        size_t nextSlash = ntPath.find(L'\\', currentPos + 1);
+        if (nextSlash == std::wstring::npos) break; // 到达末尾，不需要创建（由 NtCreateKey 创建）
+
+        // 截取当前层级的路径
+        std::wstring subPath = ntPath.substr(0, nextSlash);
+
+        // 尝试打开
+        HANDLE hKey = NULL;
         UNICODE_STRING uStr;
         OBJECT_ATTRIBUTES oa;
-        RtlInitUnicodeString(&uStr, currentPath.c_str());
+        RtlInitUnicodeString(&uStr, subPath.c_str());
         InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
-            fpNtClose(hKey);
+        NTSTATUS status = fpNtOpenKey(&hKey, KEY_READ, &oa);
+
+        // 如果不存在，则创建
+        if (!NT_SUCCESS(status)) {
+            // 注意：创建中间层级时，我们只需要极小的权限，且不需要 Disposition
+            status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, NULL);
+            if (NT_SUCCESS(status)) {
+                // DebugLog(L"RegHook: Auto-created parent key %s", subPath.c_str());
+            }
         }
-    }
-    // 创建最后一个节点
-    HANDLE hKey;
-    UNICODE_STRING uStr;
-    OBJECT_ATTRIBUTES oa;
-    RtlInitUnicodeString(&uStr, ntPath.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
-        fpNtClose(hKey);
+
+        if (hKey) fpNtClose(hKey);
+
+        currentPos = nextSlash;
     }
 }
 
@@ -6867,7 +6916,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     if (g_HookReg) {
-        // 获取当前用户的注册表根路径 (HKEY_CURRENT_USER 的 NT 路径)
+        // 1. 获取当前用户的注册表根路径 (NT 格式)
+        // HKEY_CURRENT_USER 实际上是一个指向 \REGISTRY\USER\<SID> 的句柄
         HKEY hKeyCU = NULL;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, NULL, 0, KEY_READ, &hKeyCU) == ERROR_SUCCESS) {
             ULONG len = 0;
@@ -6881,14 +6931,37 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     std::vector<BYTE> buf(len);
                     if (NT_SUCCESS(fpNtQueryObject(hKeyCU, ObjectNameInformation, buf.data(), len, &len))) {
                         POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buf.data();
-                        g_RegSandboxRoot.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-                        // 设置沙盒注册表根路径 (映射到当前用户的 Software\YapBox_Reg 下)
-                        g_RegSandboxRoot += L"\\Software\\YapBox_Reg";
-                        DebugLog(L"RegHook: Sandbox Root -> %s", g_RegSandboxRoot.c_str());
+                        if (nameInfo->Name.Buffer) {
+                            g_RegSandboxRoot.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                            // 设置沙盒注册表根路径: \REGISTRY\USER\<SID>\Software\YapBox_Reg
+                            g_RegSandboxRoot += L"\\Software\\YapBox_Reg";
+                            DebugLog(L"RegHook: Sandbox Root -> %s", g_RegSandboxRoot.c_str());
+                        }
                     }
                 }
             }
             RegCloseKey(hKeyCU);
+        }
+
+        // 2. [关键修复] 预先创建沙盒根键结构
+        // 如果这些键不存在，后续的重定向写入都会失败
+        if (!g_RegSandboxRoot.empty()) {
+            HKEY hRoot, hSub;
+            // 创建 HKCU\Software\YapBox_Reg
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\YapBox_Reg", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hRoot, NULL) == ERROR_SUCCESS) {
+                // 创建 \Machine (用于存放 HKLM)
+                RegCreateKeyExW(hRoot, L"Machine", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hSub, NULL);
+                if (hSub) RegCloseKey(hSub);
+
+                // 创建 \User (用于存放 HKCU)
+                RegCreateKeyExW(hRoot, L"User", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hSub, NULL);
+                if (hSub) RegCloseKey(hSub);
+
+                RegCloseKey(hRoot);
+                DebugLog(L"RegHook: Initialized Root Keys");
+            } else {
+                DebugLog(L"RegHook: Failed to create root keys. Check permissions.");
+            }
         }
     }
 
