@@ -54,6 +54,15 @@
 // -----------------------------------------------------------
 // 1. 常量和宏补全
 // -----------------------------------------------------------
+
+// --- 注册表重定向相关常量与指针 ---
+#ifndef KEY_WOW64_32KEY
+#define KEY_WOW64_32KEY 0x0200
+#endif
+#ifndef KEY_WOW64_64KEY
+#define KEY_WOW64_64KEY 0x0100
+#endif
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #endif
@@ -176,6 +185,11 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
+typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
 
 typedef struct _YAP_SYSTEM_TIMEOFDAY_INFORMATION {
     LARGE_INTEGER BootTime;
@@ -1008,6 +1022,8 @@ bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
+bool g_HookReg = false;
+std::wstring g_RegSandboxRoot; // 沙盒注册表根路径，例如: \Registry\User\<SID>\Software\YapBox_Reg
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -1058,6 +1074,10 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+P_NtCreateKey fpNtCreateKey = NULL;
+P_NtOpenKey fpNtOpenKey = NULL;
+P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
+P_NtDeleteKey fpNtDeleteKey = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -1500,6 +1520,106 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
 }
 
 // --- 辅助工具 ---
+
+// --- 注册表重定向辅助函数 ---
+// 解析注册表对象属性为完整 NT 路径
+std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
+    std::wstring fullPath;
+    if (attr->RootDirectory) {
+        ULONG len = 0;
+        fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
+        if (len > 0) {
+            std::vector<BYTE> buffer(len);
+            if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
+                POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+                if (nameInfo->Name.Buffer) {
+                    fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                }
+            }
+        }
+        if (!fullPath.empty() && fullPath.back() != L'\\') {
+            fullPath += L'\\';
+        }
+    }
+    if (attr->ObjectName && attr->ObjectName->Buffer) {
+        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    }
+    return fullPath;
+}
+
+// 简单的 WOW64 路径修正 (移植自 key.c: Key_FixNameWow64)
+std::wstring FixRegPathWow64(const std::wstring& path) {
+    BOOL isWow64 = FALSE;
+    IsWow64Process(GetCurrentProcess(), &isWow64);
+    if (!isWow64) return path;
+
+    std::wstring upperPath = path;
+    std::transform(upperPath.begin(), upperPath.end(), upperPath.begin(), towupper);
+
+    std::wstring target = L"\\REGISTRY\\MACHINE\\SOFTWARE";
+    // 如果访问的是 32位 程序的 Software 键，且尚未包含 Wow6432Node，则进行重定向
+    if (upperPath.find(target) == 0 && upperPath.find(L"\\WOW6432NODE") == std::wstring::npos) {
+        // 排除一些系统底层不重定向的键 (如 Classes)
+        if (upperPath.find(L"\\REGISTRY\\MACHINE\\SOFTWARE\\CLASSES") != 0) {
+            return path.substr(0, target.length()) + L"\\Wow6432Node" + path.substr(target.length());
+        }
+    }
+    return path;
+}
+
+// 判断注册表路径是否需要重定向，并输出目标沙盒路径
+bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
+    if (!g_HookReg || g_RegSandboxRoot.empty()) return false;
+
+    std::wstring fixedPath = FixRegPathWow64(fullNtPath);
+
+    // 如果已经在沙盒路径内，不重定向
+    if (ContainsCaseInsensitive(fixedPath, g_RegSandboxRoot)) return false;
+
+    std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
+    std::wstring prefixUser = L"\\REGISTRY\\USER";
+
+    std::wstring relPath;
+    if (_wcsnicmp(fixedPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
+        relPath = L"\\Machine" + fixedPath.substr(prefixMachine.length());
+    } else if (_wcsnicmp(fixedPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
+        relPath = L"\\User" + fixedPath.substr(prefixUser.length());
+    } else {
+        return false; // 其他路径 (如 \Registry\A) 不重定向
+    }
+
+    targetPath = g_RegSandboxRoot + relPath;
+    return true;
+}
+
+// 递归创建沙盒注册表键 (类似文件系统的 RecursiveCreatePathWithSync)
+void EnsureRegPathExistsNT(const std::wstring& ntPath) {
+    size_t pos = 0;
+    std::wstring currentPath;
+    while ((pos = ntPath.find(L'\\', pos + 1)) != std::wstring::npos) {
+        currentPath = ntPath.substr(0, pos);
+        if (currentPath.length() < 15) continue; // 跳过基础前缀如 \Registry\User
+
+        HANDLE hKey;
+        UNICODE_STRING uStr;
+        OBJECT_ATTRIBUTES oa;
+        RtlInitUnicodeString(&uStr, currentPath.c_str());
+        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
+            fpNtClose(hKey);
+        }
+    }
+    // 创建最后一个节点
+    HANDLE hKey;
+    UNICODE_STRING uStr;
+    OBJECT_ATTRIBUTES oa;
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
+        fpNtClose(hKey);
+    }
+}
 
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
@@ -2398,6 +2518,164 @@ struct RecursionGuard {
 };
 
 // --- NTDLL Hooks ---
+
+// --- 注册表 NT API Hook 实现 ---
+NTSTATUS NTAPI Detour_NtCreateKey(
+    PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
+{
+    if (g_IsInHook) return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring targetNtPath;
+
+    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
+        // 判断是否为写操作
+        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+
+        // 检查沙盒中是否已存在该键
+        HANDLE hTest = NULL;
+        OBJECT_ATTRIBUTES oaTest;
+        UNICODE_STRING usTest;
+        RtlInitUnicodeString(&usTest, targetNtPath.c_str());
+        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
+        if (sandboxExists) fpNtClose(hTest);
+
+        // 如果是写操作，或者沙盒中已经存在该键，则重定向到沙盒
+        if (isWrite || sandboxExists) {
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL; // 使用绝对路径
+
+            if (isWrite && !sandboxExists) {
+                EnsureRegPathExistsNT(targetNtPath); // 确保父键存在
+            }
+
+            NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+            return status;
+        }
+    }
+
+    return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+}
+
+NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
+    if (g_IsInHook) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring targetNtPath;
+
+    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
+        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+
+        HANDLE hTest = NULL;
+        OBJECT_ATTRIBUTES oaTest;
+        UNICODE_STRING usTest;
+        RtlInitUnicodeString(&usTest, targetNtPath.c_str());
+        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
+        if (sandboxExists) fpNtClose(hTest);
+
+        if (isWrite || sandboxExists) {
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            if (isWrite && !sandboxExists) {
+                EnsureRegPathExistsNT(targetNtPath);
+            }
+
+            NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+            return status;
+        }
+    }
+
+    return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+}
+
+NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
+    if (g_IsInHook) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring targetNtPath;
+
+    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
+        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+
+        HANDLE hTest = NULL;
+        OBJECT_ATTRIBUTES oaTest;
+        UNICODE_STRING usTest;
+        RtlInitUnicodeString(&usTest, targetNtPath.c_str());
+        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
+        if (sandboxExists) fpNtClose(hTest);
+
+        if (isWrite || sandboxExists) {
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            if (isWrite && !sandboxExists) {
+                EnsureRegPathExistsNT(targetNtPath);
+            }
+
+            NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+            return status;
+        }
+    }
+
+    return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+}
+
+NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
+    if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
+    RecursionGuard guard;
+
+    // NtDeleteKey 接收的是句柄。如果句柄已经被重定向到沙盒，直接删除即可。
+    // 如果句柄是真实的，我们不能删除真实注册表，返回成功欺骗程序。
+    ULONG len = 0;
+    fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
+    if (len > 0) {
+        std::vector<BYTE> buffer(len);
+        if (NT_SUCCESS(fpNtQueryObject(KeyHandle, ObjectNameInformation, buffer.data(), len, &len))) {
+            POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+            if (nameInfo->Name.Buffer) {
+                std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                if (g_HookReg && !g_RegSandboxRoot.empty() && ContainsCaseInsensitive(path, g_RegSandboxRoot)) {
+                    return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
+                } else if (g_HookReg) {
+                    return STATUS_SUCCESS; // 欺骗程序已删除真实键
+                }
+            }
+        }
+    }
+    return fpNtDeleteKey(KeyHandle);
+}
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
@@ -6582,6 +6860,38 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // 注意：这里允许 g_HookMode 为 0
     }
 
+    // 读取 YAP_HOOK_REG 配置
+    wchar_t regBuffer;
+    if (GetEnvironmentVariableW(L"YAP_HOOK_REG", regBuffer, 64) > 0) {
+        g_HookReg = (_wtoi(regBuffer) == 1);
+    }
+
+    if (g_HookReg) {
+        // 获取当前用户的注册表根路径 (HKEY_CURRENT_USER 的 NT 路径)
+        HANDLE hKeyCU;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, NULL, 0, KEY_READ, &hKeyCU) == ERROR_SUCCESS) {
+            ULONG len = 0;
+            // 确保 fpNtQueryObject 已初始化
+            if (fpNtQueryObject == NULL && hNtdll) {
+                fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+            }
+            if (fpNtQueryObject) {
+                fpNtQueryObject(hKeyCU, ObjectNameInformation, NULL, 0, &len);
+                if (len > 0) {
+                    std::vector<BYTE> buf(len);
+                    if (NT_SUCCESS(fpNtQueryObject(hKeyCU, ObjectNameInformation, buf.data(), len, &len))) {
+                        POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buf.data();
+                        g_RegSandboxRoot.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                        // 设置沙盒注册表根路径 (映射到当前用户的 Software\YapBox_Reg 下)
+                        g_RegSandboxRoot += L"\\Software\\YapBox_Reg";
+                        DebugLog(L"RegHook: Sandbox Root -> %s", g_RegSandboxRoot.c_str());
+                    }
+                }
+            }
+            RegCloseKey(hKeyCU);
+        }
+    }
+
     // [新增] 读取子进程挂钩配置
     wchar_t childBuffer[64];
     if (GetEnvironmentVariableW(L"YAP_HOOK_CHILD", childBuffer, 64) > 0) {
@@ -7372,6 +7682,17 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 MH_CreateHook(pNtQuerySystemTime, &Detour_NtQuerySystemTime, reinterpret_cast<LPVOID*>(&fpNtQuerySystemTime));
             }
         }
+    }
+
+    // --- 组 L: 注册表重定向 Hook (仅当 YAP_HOOK_REG=1 时启用) ---
+    if (g_HookReg && hNtdll) {
+        MH_CreateHook(GetProcAddress(hNtdll, "NtCreateKey"), &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
+        MH_CreateHook(GetProcAddress(hNtdll, "NtOpenKey"), &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
+        void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
+        if (pNtOpenKeyEx) {
+            MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
+        }
+        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteKey"), &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
     }
 
     // 9. 启用所有已创建的 Hook
