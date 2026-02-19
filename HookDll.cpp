@@ -1521,110 +1521,6 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
 
 // --- 辅助工具 ---
 
-// --- 注册表重定向辅助函数 ---
-
-// 添加前向声明，解决 C3861 错误
-bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub);
-
-// 解析注册表对象属性为完整 NT 路径
-std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
-    std::wstring fullPath;
-    if (attr->RootDirectory) {
-        ULONG len = 0;
-        fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
-        if (len > 0) {
-            std::vector<BYTE> buffer(len);
-            if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
-                POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-                if (nameInfo->Name.Buffer) {
-                    fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-                }
-            }
-        }
-        if (!fullPath.empty() && fullPath.back() != L'\\') {
-            fullPath += L'\\';
-        }
-    }
-    if (attr->ObjectName && attr->ObjectName->Buffer) {
-        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
-    }
-    return fullPath;
-}
-
-// 简单的 WOW64 路径修正 (移植自 key.c: Key_FixNameWow64)
-std::wstring FixRegPathWow64(const std::wstring& path) {
-    BOOL isWow64 = FALSE;
-    IsWow64Process(GetCurrentProcess(), &isWow64);
-    if (!isWow64) return path;
-
-    std::wstring upperPath = path;
-    std::transform(upperPath.begin(), upperPath.end(), upperPath.begin(), towupper);
-
-    std::wstring target = L"\\REGISTRY\\MACHINE\\SOFTWARE";
-    // 如果访问的是 32位 程序的 Software 键，且尚未包含 Wow6432Node，则进行重定向
-    if (upperPath.find(target) == 0 && upperPath.find(L"\\WOW6432NODE") == std::wstring::npos) {
-        // 排除一些系统底层不重定向的键 (如 Classes)
-        if (upperPath.find(L"\\REGISTRY\\MACHINE\\SOFTWARE\\CLASSES") != 0) {
-            return path.substr(0, target.length()) + L"\\Wow6432Node" + path.substr(target.length());
-        }
-    }
-    return path;
-}
-
-// 判断注册表路径是否需要重定向，并输出目标沙盒路径
-bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
-    if (!g_HookReg || g_RegSandboxRoot.empty()) return false;
-
-    std::wstring fixedPath = FixRegPathWow64(fullNtPath);
-
-    // 如果已经在沙盒路径内，不重定向
-    if (ContainsCaseInsensitive(fixedPath, g_RegSandboxRoot)) return false;
-
-    std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
-    std::wstring prefixUser = L"\\REGISTRY\\USER";
-
-    std::wstring relPath;
-    if (_wcsnicmp(fixedPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
-        relPath = L"\\Machine" + fixedPath.substr(prefixMachine.length());
-    } else if (_wcsnicmp(fixedPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
-        relPath = L"\\User" + fixedPath.substr(prefixUser.length());
-    } else {
-        return false; // 其他路径 (如 \Registry\A) 不重定向
-    }
-
-    targetPath = g_RegSandboxRoot + relPath;
-    return true;
-}
-
-// 递归创建沙盒注册表键 (类似文件系统的 RecursiveCreatePathWithSync)
-void EnsureRegPathExistsNT(const std::wstring& ntPath) {
-    size_t pos = 0;
-    std::wstring currentPath;
-    while ((pos = ntPath.find(L'\\', pos + 1)) != std::wstring::npos) {
-        currentPath = ntPath.substr(0, pos);
-        if (currentPath.length() < 15) continue; // 跳过基础前缀如 \Registry\User
-
-        HANDLE hKey;
-        UNICODE_STRING uStr;
-        OBJECT_ATTRIBUTES oa;
-        RtlInitUnicodeString(&uStr, currentPath.c_str());
-        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-        if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
-            fpNtClose(hKey);
-        }
-    }
-    // 创建最后一个节点
-    HANDLE hKey;
-    UNICODE_STRING uStr;
-    OBJECT_ATTRIBUTES oa;
-    RtlInitUnicodeString(&uStr, ntPath.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
-        fpNtClose(hKey);
-    }
-}
-
 // 辅助：将 ANSI 转换为 Wide
 std::wstring AnsiToWide(LPCSTR text) {
     if (!text) return L"";
@@ -2520,6 +2416,106 @@ struct RecursionGuard {
     RecursionGuard() { g_IsInHook = true; }
     ~RecursionGuard() { g_IsInHook = false; }
 };
+
+// --- 注册表重定向辅助函数 ---
+// 解析注册表对象属性为完整 NT 路径
+std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
+    std::wstring fullPath;
+    if (attr->RootDirectory) {
+        ULONG len = 0;
+        fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
+        if (len > 0) {
+            std::vector<BYTE> buffer(len);
+            if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
+                POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+                if (nameInfo->Name.Buffer) {
+                    fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                }
+            }
+        }
+        if (!fullPath.empty() && fullPath.back() != L'\\') {
+            fullPath += L'\\';
+        }
+    }
+    if (attr->ObjectName && attr->ObjectName->Buffer) {
+        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    }
+    return fullPath;
+}
+
+// 简单的 WOW64 路径修正 (移植自 key.c: Key_FixNameWow64)
+std::wstring FixRegPathWow64(const std::wstring& path) {
+    BOOL isWow64 = FALSE;
+    IsWow64Process(GetCurrentProcess(), &isWow64);
+    if (!isWow64) return path;
+
+    std::wstring upperPath = path;
+    std::transform(upperPath.begin(), upperPath.end(), upperPath.begin(), towupper);
+
+    std::wstring target = L"\\REGISTRY\\MACHINE\\SOFTWARE";
+    // 如果访问的是 32位 程序的 Software 键，且尚未包含 Wow6432Node，则进行重定向
+    if (upperPath.find(target) == 0 && upperPath.find(L"\\WOW6432NODE") == std::wstring::npos) {
+        // 排除一些系统底层不重定向的键 (如 Classes)
+        if (upperPath.find(L"\\REGISTRY\\MACHINE\\SOFTWARE\\CLASSES") != 0) {
+            return path.substr(0, target.length()) + L"\\Wow6432Node" + path.substr(target.length());
+        }
+    }
+    return path;
+}
+
+// 判断注册表路径是否需要重定向，并输出目标沙盒路径
+bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
+    if (!g_HookReg || g_RegSandboxRoot.empty()) return false;
+
+    std::wstring fixedPath = FixRegPathWow64(fullNtPath);
+
+    // 如果已经在沙盒路径内，不重定向
+    if (ContainsCaseInsensitive(fixedPath, g_RegSandboxRoot)) return false;
+
+    std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
+    std::wstring prefixUser = L"\\REGISTRY\\USER";
+
+    std::wstring relPath;
+    if (_wcsnicmp(fixedPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
+        relPath = L"\\Machine" + fixedPath.substr(prefixMachine.length());
+    } else if (_wcsnicmp(fixedPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
+        relPath = L"\\User" + fixedPath.substr(prefixUser.length());
+    } else {
+        return false; // 其他路径 (如 \Registry\A) 不重定向
+    }
+
+    targetPath = g_RegSandboxRoot + relPath;
+    return true;
+}
+
+// 递归创建沙盒注册表键 (类似文件系统的 RecursiveCreatePathWithSync)
+void EnsureRegPathExistsNT(const std::wstring& ntPath) {
+    size_t pos = 0;
+    std::wstring currentPath;
+    while ((pos = ntPath.find(L'\\', pos + 1)) != std::wstring::npos) {
+        currentPath = ntPath.substr(0, pos);
+        if (currentPath.length() < 15) continue; // 跳过基础前缀如 \Registry\User
+
+        HANDLE hKey;
+        UNICODE_STRING uStr;
+        OBJECT_ATTRIBUTES oa;
+        RtlInitUnicodeString(&uStr, currentPath.c_str());
+        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
+            fpNtClose(hKey);
+        }
+    }
+    // 创建最后一个节点
+    HANDLE hKey;
+    UNICODE_STRING uStr;
+    OBJECT_ATTRIBUTES oa;
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (NT_SUCCESS(fpNtCreateKey(&hKey, MAXIMUM_ALLOWED, &oa, 0, NULL, 0, NULL))) {
+        fpNtClose(hKey);
+    }
+}
 
 // --- NTDLL Hooks ---
 
@@ -6865,14 +6861,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // 读取 YAP_HOOK_REG 配置
-    wchar_t regBuffer = { 0 }; // 必须是数组
+    wchar_t regBuffer = { 0 }; // 这里必须声明为数组，指定大小为 64
     if (GetEnvironmentVariableW(L"YAP_HOOK_REG", regBuffer, 64) > 0) {
         g_HookReg = (_wtoi(regBuffer) == 1);
     }
 
     if (g_HookReg) {
         // 获取当前用户的注册表根路径 (HKEY_CURRENT_USER 的 NT 路径)
-        HKEY hKeyCU = NULL; // 类型必须是 HKEY 而不是 HANDLE
+        HKEY hKeyCU = NULL;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, NULL, 0, KEY_READ, &hKeyCU) == ERROR_SUCCESS) {
             ULONG len = 0;
             // 确保 fpNtQueryObject 已初始化
@@ -6892,7 +6888,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     }
                 }
             }
-            RegCloseKey(hKeyCU); // 匹配 HKEY 类型
+            RegCloseKey(hKeyCU);
         }
     }
 
