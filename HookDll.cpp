@@ -6861,7 +6861,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // 读取 YAP_HOOK_REG 配置
-    wchar_t regBuffer = { 0 }; // 这里必须声明为数组，指定大小为 64
+    wchar_t regBuffer[64] = { 0 }; // [修正] 这里必须加上 [64] 定义为数组
     if (GetEnvironmentVariableW(L"YAP_HOOK_REG", regBuffer, 64) > 0) {
         g_HookReg = (_wtoi(regBuffer) == 1);
     }
