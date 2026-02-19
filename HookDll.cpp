@@ -1521,6 +1521,18 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
 
 // --- 辅助工具 ---
 
+// [新增] 不区分大小写的字符串包含检查
+bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
+    auto it = std::search(
+        str.begin(), str.end(),
+        sub.begin(), sub.end(),
+        [](wchar_t ch1, wchar_t ch2) {
+            return towlower(ch1) == towlower(ch2);
+        }
+    );
+    return (it != str.end());
+}
+
 // --- 注册表重定向辅助函数 ---
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
@@ -2257,18 +2269,6 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
     }
 
     return fullPath;
-}
-
-// [新增] 不区分大小写的字符串包含检查
-bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
-    auto it = std::search(
-        str.begin(), str.end(),
-        sub.begin(), sub.end(),
-        [](wchar_t ch1, wchar_t ch2) {
-            return towlower(ch1) == towlower(ch2);
-        }
-    );
-    return (it != str.end());
 }
 
 // [修改] 检查路径是否匹配前缀 并进行映射
@@ -6861,14 +6861,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // 读取 YAP_HOOK_REG 配置
-    wchar_t regBuffer;
+    wchar_t regBuffer = { 0 }; // 必须是数组
     if (GetEnvironmentVariableW(L"YAP_HOOK_REG", regBuffer, 64) > 0) {
         g_HookReg = (_wtoi(regBuffer) == 1);
     }
 
     if (g_HookReg) {
         // 获取当前用户的注册表根路径 (HKEY_CURRENT_USER 的 NT 路径)
-        HANDLE hKeyCU;
+        HKEY hKeyCU = NULL; // 类型必须是 HKEY 而不是 HANDLE
         if (RegOpenKeyExW(HKEY_CURRENT_USER, NULL, 0, KEY_READ, &hKeyCU) == ERROR_SUCCESS) {
             ULONG len = 0;
             // 确保 fpNtQueryObject 已初始化
@@ -6888,7 +6888,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
                     }
                 }
             }
-            RegCloseKey(hKeyCU);
+            RegCloseKey(hKeyCU); // 匹配 HKEY 类型
         }
     }
 
