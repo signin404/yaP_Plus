@@ -1521,19 +1521,11 @@ std::wstring LoadCustomFontFile(const std::wstring& filePath) {
 
 // --- 辅助工具 ---
 
-// [新增] 不区分大小写的字符串包含检查
-bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
-    auto it = std::search(
-        str.begin(), str.end(),
-        sub.begin(), sub.end(),
-        [](wchar_t ch1, wchar_t ch2) {
-            return towlower(ch1) == towlower(ch2);
-        }
-    );
-    return (it != str.end());
-}
-
 // --- 注册表重定向辅助函数 ---
+
+// 添加前向声明，解决 C3861 错误
+bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub);
+
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
@@ -2269,6 +2261,18 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
     }
 
     return fullPath;
+}
+
+// [新增] 不区分大小写的字符串包含检查
+bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
+    auto it = std::search(
+        str.begin(), str.end(),
+        sub.begin(), sub.end(),
+        [](wchar_t ch1, wchar_t ch2) {
+            return towlower(ch1) == towlower(ch2);
+        }
+    );
+    return (it != str.end());
 }
 
 // [修改] 检查路径是否匹配前缀 并进行映射
