@@ -1030,7 +1030,7 @@ std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
 std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
-std::wstring g_RegSandboxRoot = L"\\REGISTRY\\USER\\YapBox_Hive";
+std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 \REGISTRY\USER\YapBoxReg_xxx)
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -2425,28 +2425,6 @@ struct RecursionGuard {
 };
 
 // --- 注册表重定向辅助函数 ---
-bool EnableRegistryPrivileges() {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return false;
-
-    LUID luid;
-    TOKEN_PRIVILEGES tp;
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    LookupPrivilegeValue(NULL, SE_RESTORE_NAME, &luid);
-    tp.Privileges[0].Luid = luid;
-    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-
-    LookupPrivilegeValue(NULL, SE_BACKUP_NAME, &luid);
-    tp.Privileges[0].Luid = luid;
-    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-
-    CloseHandle(hToken);
-    return true;
-}
-
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
@@ -2499,21 +2477,37 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
 }
 
 // 判断注册表路径是否需要重定向，并输出相对于 AppHive 的相对路径
-bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
-    if (!g_HookReg) return false;
-    if (ContainsCaseInsensitive(fullNtPath, L"YapBox_Hive")) return false;
+bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
+    if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
+
+    // [修改] 防止递归：如果路径已经是在私有 Hive 内部，则不重定向
+    // 检查路径是否以挂载点路径开头
+    if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) return false;
 
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
 
+    // --- 匹配 HKLM ---
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
-        targetPath = g_RegSandboxRoot + L"\\Machine" + fullNtPath.substr(prefixMachine.length());
+        std::wstring sub = fullNtPath.substr(prefixMachine.length());
+        if (!sub.empty() && sub[0] == L'\\') {
+            sub = sub.substr(1);
+        }
+
+        relPathOut = L"Machine";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
+    // --- 匹配 HKCU ---
     else if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
-        targetPath = g_RegSandboxRoot + L"\\User" + fullNtPath.substr(prefixUser.length());
+        std::wstring sub = fullNtPath.substr(prefixUser.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+
+        relPathOut = L"User";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
+
     return false;
 }
 
@@ -2684,8 +2678,8 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             if (nameInfo->Name.Buffer) {
                 std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 
-                // AppKey 挂载在 \REGISTRY\A\ 下，如果句柄路径以此开头，说明是沙盒内的键
-                if (g_HookReg && g_hAppHive && path.find(L"\\REGISTRY\\A\\") == 0) {
+                // [修改] 检查句柄路径是否以挂载点开头 (判定是否为沙盒内对象)
+                if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
                     return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
                 } else if (g_HookReg && g_hAppHive) {
                     std::wstring dummy;
@@ -6909,21 +6903,56 @@ DWORD WINAPI InitHookThread(LPVOID) {
         g_HookReg = (_wtoi(regBuffer) == 1);
     }
 
-    if (g_HookReg) {
-        EnableRegistryPrivileges();
+    if (g_HookReg && hNtdll) {
+        // 1. 获取 RtlFormatCurrentUserKeyPath 函数地址
+        fpRtlFormatCurrentUserKeyPath = (P_RtlFormatCurrentUserKeyPath)GetProcAddress(hNtdll, "RtlFormatCurrentUserKeyPath");
 
-        std::wstring hiveFile = std::wstring(g_SandboxRoot) + L"\\YapBoxReg.dat";
+        if (fpRtlFormatCurrentUserKeyPath) {
+            UNICODE_STRING userKeyPath;
+            if (NT_SUCCESS(fpRtlFormatCurrentUserKeyPath(&userKeyPath))) {
+                g_CurrentUserSidPath.assign(userKeyPath.Buffer, userKeyPath.Length / sizeof(WCHAR));
+                DebugLog(L"RegHook: CurrentUser = %s", g_CurrentUserSidPath.c_str());
+            }
+        }
 
-        // 尝试挂载到 HKEY_USERS\YapBox_Hive
-        // 注意：子进程调用此函数会返回 ERROR_ALREADY_EXISTS 或权限错误，直接忽略即可
-        LSTATUS status = RegLoadKeyW(HKEY_USERS, L"YapBox_Hive", hiveFile.c_str());
+        // 2. [修改] 连接到由启动器挂载的注册表键
+        // 不再使用 RegLoadAppKey，而是打开已挂载的键
+        // 启动器会将挂载点名称写入 YAP_REG_MOUNT_POINT 环境变量
+        wchar_t mountPointBuf[256] = { 0 };
+        if (GetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", mountPointBuf, 256) > 0) {
+            // 构造 NT 路径: \REGISTRY\USER\<MountPointName>
+            std::wstring mountPath = L"\\REGISTRY\\USER\\" + std::wstring(mountPointBuf);
 
-        if (status == ERROR_SUCCESS) {
-            DebugLog(L"RegHook: Hive mounted successfully.");
-            // 初始化 Machine/User 结构
-            HKEY hKey;
-            if (RegCreateKeyExW(HKEY_USERS, L"YapBox_Hive\\Machine", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) RegCloseKey(hKey);
-            if (RegCreateKeyExW(HKEY_USERS, L"YapBox_Hive\\User", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) RegCloseKey(hKey);
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, mountPath.c_str());
+
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 使用 NtOpenKey 打开挂载点
+            // 需要 MAXIMUM_ALLOWED 或 KEY_ALL_ACCESS 以便后续创建子键
+            NTSTATUS status = 0;
+            // 尝试获取 NtOpenKey 指针 (如果尚未获取)
+            if (!fpNtOpenKey) fpNtOpenKey = (P_NtOpenKey)GetProcAddress(hNtdll, "NtOpenKey");
+
+            if (fpNtOpenKey) {
+                status = fpNtOpenKey(&g_hAppHive, KEY_ALL_ACCESS, &oa);
+            } else {
+                status = STATUS_NOT_SUPPORTED;
+            }
+
+            if (NT_SUCCESS(status)) {
+                // [新增] 保存挂载点路径供后续判断使用
+                g_RegMountPathNt = mountPath;
+                DebugLog(L"RegHook: Connected to mounted hive at %s", mountPath.c_str());
+                // 注意：Hive 的初始化（创建 Machine/User 子键）现在由启动器在创建 Hive 文件时完成
+            } else {
+                DebugLog(L"RegHook: Failed to open mounted hive %s, status %x", mountPath.c_str(), status);
+                g_hAppHive = NULL;
+            }
+        } else {
+             DebugLog(L"RegHook: YAP_REG_MOUNT_POINT not set, registry redirection disabled.");
+             g_hAppHive = NULL;
         }
     }
 
@@ -7755,7 +7784,5 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     } else if (dwReason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
     }
-    // 卸载配置单元
-    RegUnLoadKeyW(HKEY_USERS, L"YapBox_Hive");
     return TRUE;
 }

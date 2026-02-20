@@ -3002,6 +3002,41 @@ void UnloadTemporaryFonts() {
     PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
 }
 
+// --- [新增] 注册表 Hive 管理辅助函数 ---
+// 计算 Hive 挂载名称 (基于路径哈希，确保唯一性)
+std::wstring GetHiveMountName(const std::wstring& hivePath) {
+    std::hash<std::wstring> hasher;
+    size_t hash = hasher(hivePath);
+    return L"YapBoxReg_" + std::to_wstring(hash);
+}
+
+// 确保 Hive 文件存在且有效 (如果不存在则创建并初始化)
+bool EnsureHiveFileExists(const std::wstring& hivePath) {
+    if (PathFileExistsW(hivePath.c_str())) return true;
+
+    // 创建一个临时 Key 用于构建 Hive 结构
+    HKEY hTempKey;
+    std::wstring tempKeyName = L"YapBoxTempHive_" + std::to_wstring(GetCurrentProcessId());
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, tempKeyName.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hTempKey, NULL) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    // 初始化基础结构 (Machine 和 User 根键)
+    HKEY hSub;
+    if (RegCreateKeyW(hTempKey, L"Machine", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"User", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+
+    // 保存到文件 (需要 SeBackupPrivilege，已在 EnableAllPrivileges 中启用)
+    // 注意：RegSaveKey 要求目标文件不存在
+    LSTATUS status = RegSaveKeyW(hTempKey, hivePath.c_str(), NULL);
+
+    RegCloseKey(hTempKey);
+    RegDeleteKeyW(HKEY_CURRENT_USER, tempKeyName.c_str());
+
+    return (status == ERROR_SUCCESS);
+}
+
 // --- Process Management Functions ---
 
 // Helper for single-instance wait
@@ -5085,11 +5120,60 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // --- [新增] 解析 hookreg 配置 (注册表重定向) ---
+    // 必须在启动进程前完成挂载
     std::wstring hookRegVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookreg");
+    std::wstring regMountName;
+    bool hiveLoadedByMe = false;
+
+    // 预先计算 finalHookPath 以便确定 Hive 位置
+    std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
+    std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
+
     if (!hookRegVal.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+
+        // 1. 计算路径
+        std::wstring hivePath = data->variables[L"YAPROOT"] + L"\\YapBoxReg.dat";
+        // 如果 hookpath 被设置，优先使用 hookpath 下的 dat
+        if (!finalHookPath.empty()) {
+             hivePath = finalHookPath + L"\\YapBoxReg.dat";
+        }
+
+        // 2. 计算挂载名
+        regMountName = GetHiveMountName(hivePath);
+
+        // 3. 确保文件存在 (如果不存在则创建并初始化)
+        // 确保父目录存在
+        wchar_t parentDir[MAX_PATH];
+        wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
+        PathRemoveFileSpecW(parentDir);
+        SHCreateDirectoryExW(NULL, parentDir, NULL);
+
+        if (EnsureHiveFileExists(hivePath)) {
+            // 4. 尝试挂载到 HKEY_USERS
+            // 先检查是否已经挂载 (可能由其他实例挂载)
+            HKEY hTest;
+            LSTATUS status = RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest);
+            if (status == ERROR_SUCCESS) {
+                RegCloseKey(hTest);
+                // 已挂载，直接使用
+            } else {
+                // 未挂载，尝试加载 (需要 SeRestorePrivilege)
+                status = RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
+                if (status == ERROR_SUCCESS) {
+                    hiveLoadedByMe = true;
+                } else {
+                    // 加载失败 (可能是权限不足或文件被其他进程独占锁定)
+                    // 如果失败，子进程将无法进行注册表重定向
+                }
+            }
+
+            // 5. 设置环境变量供 HookDll 使用
+            SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", regMountName.c_str());
+        }
     } else {
         SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+        SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", NULL);
     }
 
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
@@ -5420,6 +5504,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // --- 11. 执行清理 ---
     // 传入 iniContent 以支持智能 Path 变量清理
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid, data->iniContent);
+
+    // [新增] 卸载注册表 Hive
+    if (!regMountName.empty()) {
+        // 尝试卸载 Hive
+        // 注意：如果子进程尚未完全退出或有句柄泄露，RegUnLoadKeyW 可能会失败
+        // 这是正常的系统行为 (Lazy Unload)，系统会在所有句柄关闭后最终卸载它
+        RegUnLoadKeyW(HKEY_USERS, regMountName.c_str());
+    }
 
     DeleteFileW(data->tempFilePath.c_str());
 
