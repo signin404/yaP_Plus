@@ -2427,7 +2427,7 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
 
     // 1. 解析 RootDirectory
     if (attr->RootDirectory) {
-        // 检查是否是预定义的句柄值 (虽然在 NT 层通常是真实句柄，但防万一)
+        // 检查预定义句柄
         if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CURRENT_USER) {
              fullPath = g_CurrentUserSidPath;
         }
@@ -2435,21 +2435,22 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
         else {
-            // 使用 NtQueryObject 获取句柄对应的路径
-            ULONG len = 0;
-            fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
-            if (len > 0) {
-                std::vector<BYTE> buffer(len);
-                if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
-                    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-                    if (nameInfo->Name.Buffer) {
-                        fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+            // [关键修复] 检查函数指针是否为空
+            if (fpNtQueryObject) {
+                ULONG len = 0;
+                fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
+                if (len > 0) {
+                    std::vector<BYTE> buffer(len);
+                    if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
+                        POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+                        if (nameInfo->Name.Buffer) {
+                            fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                        }
                     }
                 }
             }
         }
 
-        // 确保结尾有反斜杠 (如果 Root 不为空)
         if (!fullPath.empty() && fullPath.back() != L'\\') {
             fullPath += L'\\';
         }
@@ -2563,7 +2564,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
 {
-    if (g_IsInHook) return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+    // [关键修复] 如果 SID 路径未初始化，说明 Hook 环境还没准备好，直接透传
+    if (g_IsInHook || g_CurrentUserSidPath.empty()) {
+        return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+    }
+
     RecursionGuard guard;
 
     // 1. 解析原始路径
@@ -2612,7 +2617,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 }
 
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    if (g_IsInHook) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    if (g_IsInHook || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
@@ -2654,7 +2659,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 }
 
 NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
-    if (g_IsInHook) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    if (g_IsInHook || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
@@ -6871,6 +6876,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
+    // [关键修复] 提前获取 ntdll 句柄和所有通用函数指针
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (hNtdll) {
+        fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+        // 无论何种模式，都初始化 NtQueryObject，因为路径解析依赖它
+        fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+    }
+
     // 1. 刷新设备映射
     RefreshDeviceMap();
 
@@ -7749,13 +7762,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- 组 L: 注册表重定向 Hook (仅当 YAP_HOOK_REG=1 时启用) ---
     if (g_HookReg && hNtdll) {
-        MH_CreateHook(GetProcAddress(hNtdll, "NtCreateKey"), &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
-        MH_CreateHook(GetProcAddress(hNtdll, "NtOpenKey"), &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
+        // 确保 fpNtCreateKey 等指针被正确获取
+        void* pNtCreateKey = (void*)GetProcAddress(hNtdll, "NtCreateKey");
+        void* pNtOpenKey = (void*)GetProcAddress(hNtdll, "NtOpenKey");
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
-        if (pNtOpenKeyEx) {
-            MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
-        }
-        MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteKey"), &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        void* pNtDeleteKey = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
+
+        if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
+        if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
+        if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
+        if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
     }
 
     // 9. 启用所有已创建的 Hook
