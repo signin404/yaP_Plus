@@ -2557,6 +2557,25 @@ void EnsureRegPathExistsNT(const std::wstring& ntPath) {
     }
 }
 
+// 辅助函数：确保 SID 路径已初始化
+void EnsureRegInit() {
+    if (!g_HookReg || !g_CurrentUserSidPath.empty()) return;
+
+    // 如果还没初始化，尝试同步获取一次
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return;
+
+    auto fpRtl = (P_RtlFormatCurrentUserKeyPath)GetProcAddress(hNtdll, "RtlFormatCurrentUserKeyPath");
+    if (fpRtl) {
+        UNICODE_STRING userKeyPath;
+        if (NT_SUCCESS(fpRtl(&userKeyPath))) {
+            g_CurrentUserSidPath.assign(userKeyPath.Buffer, userKeyPath.Length / sizeof(WCHAR));
+            g_RegSandboxRoot = g_CurrentUserSidPath + L"\\Software\\YapBox_Reg";
+            // 注意：这里不释放内存以简化逻辑，或者使用 RtlFreeUnicodeString
+        }
+    }
+}
+
 // --- NTDLL Hooks ---
 
 // --- 注册表 NT API Hook 实现 ---
@@ -2617,8 +2636,10 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 }
 
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
+    // [修复] 尝试同步初始化
+    if (g_HookReg && g_CurrentUserSidPath.empty()) EnsureRegInit();
+
     if (g_IsInHook || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
-    RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring targetNtPath;
