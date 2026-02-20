@@ -2491,7 +2491,9 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixMachine.length());
         // 字符串与字符比较的语法错误
-        if (!sub.empty() && sub == L'\\') sub = sub.substr(1);
+        if (!sub.empty() && sub[0] == L'\\') {
+            sub = sub.substr(1);
+        }
 
         relPathOut = L"Machine";
         if (!sub.empty()) relPathOut += L"\\" + sub;
