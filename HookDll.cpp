@@ -6049,7 +6049,14 @@ BOOL CreateProcessInternal(
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-                        DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
+                        // [关键修复] 同架构注入也需要等待就绪事件
+                        std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+                        HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+                        if (hEvent) {
+							// 等待子进程初始化完成，最多等待 5 秒
+							WaitForSingleObject(hEvent, 5000);
+							CloseHandle(hEvent);
+                        }
 
                         // [修改] 顺便注入第三方 DLL (增加架构检查)
                         for (const auto& extraDll : g_ExtraDlls) {
@@ -6108,7 +6115,14 @@ BOOL CreateProcessInternal(
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-            }
+				// [建议] 即使是 IPC 请求，也在这里等一下
+				std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+				HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+				if (hEvent) {
+					WaitForSingleObject(hEvent, 5000);
+					CloseHandle(hEvent);
+				}
+			}
 
         } else {
             // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
