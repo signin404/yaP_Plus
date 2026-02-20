@@ -3026,13 +3026,17 @@ bool EnsureHiveFileExists(const std::wstring& hivePath) {
     HKEY hSub;
     if (RegCreateKeyW(hTempKey, L"Machine", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
     if (RegCreateKeyW(hTempKey, L"User", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    // [新增] 初始化额外的根键映射目录
+    if (RegCreateKeyW(hTempKey, L"Classes", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"Users", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"Config", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
 
     // 保存到文件 (需要 SeBackupPrivilege，已在 EnableAllPrivileges 中启用)
     // 注意：RegSaveKey 要求目标文件不存在
     LSTATUS status = RegSaveKeyW(hTempKey, hivePath.c_str(), NULL);
 
     RegCloseKey(hTempKey);
-    RegDeleteKeyW(HKEY_CURRENT_USER, tempKeyName.c_str());
+    SHDeleteKeyW(HKEY_CURRENT_USER, tempKeyName.c_str());
 
     return (status == ERROR_SUCCESS);
 }
