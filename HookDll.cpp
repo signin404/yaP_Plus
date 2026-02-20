@@ -2423,6 +2423,9 @@ struct RecursionGuard {
 // --- 注册表重定向辅助函数 ---
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
+    // [安全检查] 防止空指针崩溃
+    if (!attr) return L"";
+
     std::wstring fullPath;
 
     // 1. 解析 RootDirectory
@@ -2438,7 +2441,9 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
             // [关键修复] 检查函数指针是否为空
             if (fpNtQueryObject) {
                 ULONG len = 0;
+                // 第一次调用获取长度，忽略返回值(通常是 STATUS_INFO_LENGTH_MISMATCH)
                 fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
+
                 if (len > 0) {
                     std::vector<BYTE> buffer(len);
                     if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
@@ -2523,6 +2528,9 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath)
 void EnsureRegPathExistsNT(const std::wstring& ntPath) {
     if (ntPath.empty()) return;
 
+    // [安全检查] 如果函数指针未初始化，无法创建，直接返回
+    if (!fpNtOpenKey || !fpNtCreateKey) return;
+
     // 必须以沙盒根开头
     if (ntPath.find(g_RegSandboxRoot) != 0) return;
 
@@ -2564,8 +2572,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
 {
-    // [关键修复] 如果 SID 路径未初始化，说明 Hook 环境还没准备好，直接透传
-    if (g_IsInHook || g_CurrentUserSidPath.empty()) {
+    // [安全检查] 确保原始指针有效
+    if (!fpNtCreateKey) return STATUS_NOT_IMPLEMENTED;
+
+    // 如果未初始化完成或参数无效，直接透传
+    if (g_IsInHook || g_CurrentUserSidPath.empty() || !ObjectAttributes) {
         return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     }
 
@@ -6876,12 +6887,22 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
-    // [关键修复] 提前获取 ntdll 句柄和所有通用函数指针
+    // [关键修复] 预先获取所有 NTDLL 函数指针
+    // 防止 Hook 失败或辅助函数调用时因空指针导致崩溃
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
+        // 1. 基础功能
         fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
-        // 无论何种模式，都初始化 NtQueryObject，因为路径解析依赖它
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+        // 2. 注册表功能 (无论是否启用 Hook 都先获取原始地址)
+        fpNtCreateKey = (P_NtCreateKey)GetProcAddress(hNtdll, "NtCreateKey");
+        fpNtOpenKey = (P_NtOpenKey)GetProcAddress(hNtdll, "NtOpenKey");
+        fpNtOpenKeyEx = (P_NtOpenKeyEx)GetProcAddress(hNtdll, "NtOpenKeyEx");
+        fpNtDeleteKey = (P_NtDeleteKey)GetProcAddress(hNtdll, "NtDeleteKey");
+
+        // 3. 辅助功能
+        fpRtlFormatCurrentUserKeyPath = (P_RtlFormatCurrentUserKeyPath)GetProcAddress(hNtdll, "RtlFormatCurrentUserKeyPath");
     }
 
     // 1. 刷新设备映射
@@ -7756,7 +7777,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- 组 L: 注册表重定向 Hook (仅当 YAP_HOOK_REG=1 时启用) ---
     if (g_HookReg && hNtdll) {
-        // 确保 fpNtCreateKey 等指针被正确获取
+        // 注意：这里直接使用开头已经初始化的 fp* 变量作为原始地址
+        // MH_CreateHook 会更新这些变量指向跳板
+
+        // 重新获取原始地址用于 Hook 目标 (虽然 fp* 已经存了，但为了清晰再获取一次目标地址)
         void* pNtCreateKey = (void*)GetProcAddress(hNtdll, "NtCreateKey");
         void* pNtOpenKey = (void*)GetProcAddress(hNtdll, "NtOpenKey");
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
