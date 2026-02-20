@@ -6882,7 +6882,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
         // 无论何种模式，都初始化 NtQueryObject，因为路径解析依赖它
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
--
+
         // [修复] 无论何种模式，都初始化 NtClose
         // 注册表 Hook 中的 EnsureRegPathExistsNT 和 Detour_NtOpenKey 依赖此指针
         // 如果不在此处初始化，当 YAP_HOOK_FILE=0 时 fpNtClose 为空导致崩溃
