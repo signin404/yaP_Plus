@@ -2438,8 +2438,17 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
         else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
+        // [新增] 处理额外的预定义句柄
+        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CLASSES_ROOT) {
+             fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+        }
+        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_USERS) {
+             fullPath = L"\\REGISTRY\\USER";
+        }
+        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CURRENT_CONFIG) {
+             fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
+        }
         else {
-            // [关键修复] 检查函数指针是否为空
             if (fpNtQueryObject) {
                 ULONG len = 0;
                 fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
@@ -2480,30 +2489,59 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
 
-    // [修改] 防止递归：如果路径已经是在私有 Hive 内部，则不重定向
-    // 检查路径是否以挂载点路径开头
     if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) return false;
 
+    // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
+    std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
+    std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
 
-    // --- 匹配 HKLM ---
+    // 1. 匹配 HKCR (优先级高于 HKLM)
+    if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixClasses.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"Classes";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 2. 匹配 HKCC
+    if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixConfig.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"Config";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 3. 匹配 HKCU
+    if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixUser.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"User";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 4. 匹配 HKLM
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixMachine.length());
-        if (!sub.empty() && sub[0] == L'\\') {
-            sub = sub.substr(1);
-        }
-
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
         relPathOut = L"Machine";
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
-    // --- 匹配 HKCU ---
-    else if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
-        std::wstring sub = fullNtPath.substr(prefixUser.length());
+
+    // 5. 匹配 HKU (排除掉已经处理的 HKCU 和沙盒挂载点)
+    if (_wcsnicmp(fullNtPath.c_str(), prefixUsersRoot.c_str(), prefixUsersRoot.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixUsersRoot.length());
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
 
-        relPathOut = L"User";
+        // 如果 sub 为空，说明访问的是 \REGISTRY\USER 根
+        // 如果不为空，且不是当前用户 SID，则映射到 Users
+        relPathOut = L"Users";
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
