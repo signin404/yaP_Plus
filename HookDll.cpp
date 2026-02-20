@@ -2490,6 +2490,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // --- 匹配 HKLM ---
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixMachine.length());
+        // 字符串与字符比较的语法错误
         if (!sub.empty() && sub == L'\\') sub = sub.substr(1);
 
         relPathOut = L"Machine";
@@ -2499,6 +2500,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // --- 匹配 HKCU ---
     else if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixUser.length());
+        // 字符串与字符比较的语法错误
         if (!sub.empty() && sub == L'\\') sub = sub.substr(1);
 
         relPathOut = L"User";
@@ -2509,64 +2511,35 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     return false;
 }
 
-// 递归创建注册表键 (确保父键存在)
-void EnsureRegPathExistsNT(const std::wstring& ntPath) {
-    if (ntPath.empty()) return;
+// 递归创建注册表键 (相对于 AppHive)
+void EnsureRegPathExistsRelative(const std::wstring& relPath) {
+    if (relPath.empty() || !g_hAppHive) return;
 
-    // 必须以沙盒根开头
-    if (ntPath.find(g_RegSandboxRoot) != 0) return;
-
-    // 从根路径之后开始
-    size_t currentPos = g_RegSandboxRoot.length();
-
+    size_t currentPos = 0;
     while (true) {
-        size_t nextSlash = ntPath.find(L'\\', currentPos + 1);
-        if (nextSlash == std::wstring::npos) break;
+        size_t nextSlash = relPath.find(L'\\', currentPos);
+        if (nextSlash == std::wstring::npos) break; // 只创建父级，最后一级由 NtCreateKey 创建
 
-        std::wstring subPath = ntPath.substr(0, nextSlash);
+        std::wstring subPath = relPath.substr(0, nextSlash);
 
         HANDLE hKey = NULL;
         UNICODE_STRING uStr;
         OBJECT_ATTRIBUTES oa;
         RtlInitUnicodeString(&uStr, subPath.c_str());
-        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        // 尝试创建 (如果存在则打开)
-        // 使用 Create 而不是 Open，因为 Create 会自动处理“如果不存在则创建”
+        // 关键：RootDirectory 指向我们的私有 Hive
+        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
         ULONG disposition;
         NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
 
         if (NT_SUCCESS(status)) {
             fpNtClose(hKey);
-        } else {
-            // DebugLog(L"RegHook: Failed to create parent %s (0x%x)", subPath.c_str(), status);
-            // 如果失败，可能是权限问题，或者父级不存在(循环会解决)
         }
 
-        currentPos = nextSlash;
+        currentPos = nextSlash + 1;
     }
 }
-
-// 辅助函数：确保 SID 路径已初始化
-void EnsureRegInit() {
-    if (!g_HookReg || !g_CurrentUserSidPath.empty()) return;
-
-    // 如果还没初始化，尝试同步获取一次
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (!hNtdll) return;
-
-    auto fpRtl = (P_RtlFormatCurrentUserKeyPath)GetProcAddress(hNtdll, "RtlFormatCurrentUserKeyPath");
-    if (fpRtl) {
-        UNICODE_STRING userKeyPath;
-        if (NT_SUCCESS(fpRtl(&userKeyPath))) {
-            g_CurrentUserSidPath.assign(userKeyPath.Buffer, userKeyPath.Length / sizeof(WCHAR));
-            g_RegSandboxRoot = g_CurrentUserSidPath + L"\\Software\\YapBox_Reg";
-            // 注意：这里不释放内存以简化逻辑，或者使用 RtlFreeUnicodeString
-        }
-    }
-}
-
-// --- NTDLL Hooks ---
 
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtCreateKey(
