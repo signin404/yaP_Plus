@@ -18,7 +18,6 @@
 #include <shared_mutex>
 #include <mswsock.h>
 #include <shellapi.h>
-#include <string_view>
 #include <numeric>
 
 #pragma comment(lib, "shell32.lib")
