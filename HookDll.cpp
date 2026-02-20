@@ -6918,7 +6918,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
 
         // 2. 使用 RegLoadAppKey 加载私有配置单元
-        if (g_SandboxRoot != L'\0') {
+        if (g_SandboxRoot[0] != L'\0') {
             // 构造 .dat 文件路径 (例如 Z:\Sandbox\YapBoxReg.dat)
             std::wstring hivePath = std::wstring(g_SandboxRoot) + L"\\YapBoxReg.dat";
 
