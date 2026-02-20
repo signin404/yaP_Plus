@@ -56,6 +56,10 @@
 // -----------------------------------------------------------
 
 // --- 注册表重定向相关常量与指针 ---
+#ifndef REG_PROCESS_APPKEY
+#define REG_PROCESS_APPKEY 0x00000001
+#endif
+
 #ifndef KEY_WOW64_32KEY
 #define KEY_WOW64_32KEY 0x0200
 #endif
@@ -1025,7 +1029,7 @@ std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 bool g_HookReg = false;
-std::wstring g_RegSandboxRoot; // 沙盒注册表根路径，例如: \Registry\User\<SID>\Software\YapBox_Reg
+HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
 std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
 
 // --- 光驱伪装相关全局变量 ---
@@ -2472,47 +2476,33 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
     return path;
 }
 
-// 判断注册表路径是否需要重定向
-bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& targetPath) {
-    if (!g_HookReg || g_CurrentUserSidPath.empty()) return false;
+// 判断注册表路径是否需要重定向，并输出相对于 AppHive 的相对路径
+bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
+    if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
 
-    // 1. 规范化路径 (转大写以便比较，或者使用 _wcsnicmp)
-    // 这里我们直接用 _wcsnicmp
-
-    // 2. 定义前缀
-    // g_CurrentUserSidPath 例如: \REGISTRY\USER\S-1-5-21-XXX
-    // g_RegSandboxRoot     例如: \REGISTRY\USER\S-1-5-21-XXX\Software\YapBox_Reg
-
-    // 防止递归：如果路径已经包含 YapBox_Reg，则不重定向
-    if (ContainsCaseInsensitive(fullNtPath, L"YapBox_Reg")) return false;
+    // AppKey 内部挂载在 \REGISTRY\A\ 之下
+    // 防止递归：如果路径已经是在私有 Hive 内部，则不重定向
+    if (fullNtPath.find(L"\\REGISTRY\\A\\") == 0) return false;
 
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
-    std::wstring prefixUser = g_CurrentUserSidPath; // 动态获取的当前用户 SID 路径
-
-    std::wstring relPath;
-    bool match = false;
+    std::wstring prefixUser = g_CurrentUserSidPath;
 
     // --- 匹配 HKLM ---
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
-        // 提取相对路径: \REGISTRY\MACHINE\Software\Abc -> \Software\Abc
-        relPath = fullNtPath.substr(prefixMachine.length());
+        std::wstring sub = fullNtPath.substr(prefixMachine.length());
+        if (!sub.empty() && sub == L'\\') sub = sub.substr(1);
 
-        // 构造目标: ...\YapBox_Reg\Machine\Software\Abc
-        targetPath = g_RegSandboxRoot + L"\\Machine" + relPath;
-        match = true;
+        relPathOut = L"Machine";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
     }
     // --- 匹配 HKCU ---
     else if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
-        // 提取相对路径: \REGISTRY\USER\S-1-5-xx\Software\Abc -> \Software\Abc
-        relPath = fullNtPath.substr(prefixUser.length());
+        std::wstring sub = fullNtPath.substr(prefixUser.length());
+        if (!sub.empty() && sub == L'\\') sub = sub.substr(1);
 
-        // 构造目标: ...\YapBox_Reg\User\Software\Abc
-        targetPath = g_RegSandboxRoot + L"\\User" + relPath;
-        match = true;
-    }
-
-    if (match) {
-        // DebugLog(L"RegRedirect: %s -> %s", fullNtPath.c_str(), targetPath.c_str());
+        relPathOut = L"User";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
 
@@ -2583,51 +2573,32 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
 {
-    // [关键修复] 如果 SID 路径未初始化，说明 Hook 环境还没准备好，直接透传
-    if (g_IsInHook || g_CurrentUserSidPath.empty()) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
         return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     }
 
     RecursionGuard guard;
-
-    // 1. 解析原始路径
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring relPath;
 
-    // [调试日志] 打印所有尝试创建的键，以便排查
-    // DebugLog(L"NtCreateKey: %s", fullNtPath.c_str());
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
+        // 确保父路径在私有 Hive 中存在
+        EnsureRegPathExistsRelative(relPath);
 
-    std::wstring targetNtPath;
-
-    // 2. 检查是否需要重定向
-    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
-
-        DebugLog(L"RegHook: Redirecting CREATE %s -> %s", fullNtPath.c_str(), targetNtPath.c_str());
-
-        // 3. 确保父路径存在 (递归创建 YapBox_Reg\User\...)
-        EnsureRegPathExistsNT(targetNtPath);
-
-        // 4. 构造新的 ObjectAttributes
         UNICODE_STRING uStr;
-        RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+        RtlInitUnicodeString(&uStr, relPath.c_str());
 
-        // 备份原始值
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 替换为绝对路径 (RootDirectory 置空)
+        // 替换为相对路径，并将 RootDirectory 指向私有 Hive
         ObjectAttributes->ObjectName = &uStr;
-        ObjectAttributes->RootDirectory = NULL;
+        ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
-        // 5. 调用原始函数创建沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 
-        // 还原原始值
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
-
-        if (!NT_SUCCESS(status)) {
-            DebugLog(L"RegHook: Create failed 0x%x", status);
-        }
 
         return status;
     }
@@ -2636,37 +2607,36 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 }
 
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    // [修复] 尝试同步初始化
-    if (g_HookReg && g_CurrentUserSidPath.empty()) EnsureRegInit();
-
-    if (g_IsInHook || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
-    std::wstring targetNtPath;
+    std::wstring relPath;
 
-    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
         bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
 
         HANDLE hTest = NULL;
         OBJECT_ATTRIBUTES oaTest;
         UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, targetNtPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        RtlInitUnicodeString(&usTest, relPath.c_str());
+        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
         bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
         if (sandboxExists) fpNtClose(hTest);
 
         if (isWrite || sandboxExists) {
+            if (isWrite && !sandboxExists) {
+                EnsureRegPathExistsRelative(relPath);
+            }
+
             UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+            RtlInitUnicodeString(&uStr, relPath.c_str());
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
             ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = NULL;
-
-            if (isWrite && !sandboxExists) {
-                EnsureRegPathExistsNT(targetNtPath);
-            }
+            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
             NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 
@@ -2680,35 +2650,36 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 }
 
 NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
-    if (g_IsInHook || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
-    std::wstring targetNtPath;
+    std::wstring relPath;
 
-    if (ShouldRedirectReg(fullNtPath, targetNtPath)) {
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
         bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
 
         HANDLE hTest = NULL;
         OBJECT_ATTRIBUTES oaTest;
         UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, targetNtPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        RtlInitUnicodeString(&usTest, relPath.c_str());
+        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
         bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
         if (sandboxExists) fpNtClose(hTest);
 
         if (isWrite || sandboxExists) {
+            if (isWrite && !sandboxExists) {
+                EnsureRegPathExistsRelative(relPath);
+            }
+
             UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, targetNtPath.c_str());
+            RtlInitUnicodeString(&uStr, relPath.c_str());
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
             ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = NULL;
-
-            if (isWrite && !sandboxExists) {
-                EnsureRegPathExistsNT(targetNtPath);
-            }
+            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
             NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
@@ -2725,8 +2696,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
 
-    // NtDeleteKey 接收的是句柄。如果句柄已经被重定向到沙盒，直接删除即可。
-    // 如果句柄是真实的，我们不能删除真实注册表，返回成功欺骗程序。
     ULONG len = 0;
     fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
     if (len > 0) {
@@ -2735,10 +2704,15 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
             if (nameInfo->Name.Buffer) {
                 std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
-                if (g_HookReg && !g_RegSandboxRoot.empty() && ContainsCaseInsensitive(path, g_RegSandboxRoot)) {
+
+                // AppKey 挂载在 \REGISTRY\A\ 下，如果句柄路径以此开头，说明是沙盒内的键
+                if (g_HookReg && g_hAppHive && path.find(L"\\REGISTRY\\A\\") == 0) {
                     return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
-                } else if (g_HookReg) {
-                    return STATUS_SUCCESS; // 欺骗程序已删除真实键
+                } else if (g_HookReg && g_hAppHive) {
+                    std::wstring dummy;
+                    if (ShouldRedirectReg(path, dummy)) {
+                        return STATUS_SUCCESS; // 欺骗程序已删除真实键
+                    }
                 }
             }
         }
@@ -6962,42 +6936,37 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         if (fpRtlFormatCurrentUserKeyPath) {
             UNICODE_STRING userKeyPath;
-            // 该函数会分配内存，需要我们释放 (RtlFreeUnicodeString)
-            // 但这里我们只调用一次且作为全局变量，不释放也无大碍，或者手动释放 Buffer
             if (NT_SUCCESS(fpRtlFormatCurrentUserKeyPath(&userKeyPath))) {
                 g_CurrentUserSidPath.assign(userKeyPath.Buffer, userKeyPath.Length / sizeof(WCHAR));
-
-                // 设置沙盒根路径: \REGISTRY\USER\S-1-5-xx\Software\YapBox_Reg
-                g_RegSandboxRoot = g_CurrentUserSidPath + L"\\Software\\YapBox_Reg";
-
                 DebugLog(L"RegHook: CurrentUser = %s", g_CurrentUserSidPath.c_str());
-                DebugLog(L"RegHook: SandboxRoot = %s", g_RegSandboxRoot.c_str());
-
-                // 释放系统分配的缓冲区 (可选，避免泄漏)
-                // LocalFree(userKeyPath.Buffer); // 注意：RtlFormatCurrentUserKeyPath 分配的是 PagedPool 还是 ProcessHeap 取决于实现，通常 RtlFreeUnicodeString 对应 RtlFreeHeap
             }
         }
 
-        // 2. 强制创建根键结构 (使用 Win32 API，简单可靠)
-        if (!g_RegSandboxRoot.empty()) {
-            HKEY hKeyRoot;
-            DWORD disp;
-            // 创建 HKCU\Software\YapBox_Reg
-            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\YapBox_Reg", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKeyRoot, &disp) == ERROR_SUCCESS) {
+        // 2. 使用 RegLoadAppKey 加载私有配置单元
+        if (g_SandboxRoot != L'\0') {
+            // 构造 .dat 文件路径 (例如 Z:\Sandbox\YapBoxReg.dat)
+            std::wstring hivePath = std::wstring(g_SandboxRoot) + L"\\YapBoxReg.dat";
 
-                // 创建 Machine 子键
+            // 确保沙盒根目录存在，否则 RegLoadAppKey 会失败
+            RecursiveCreatePathWithSync(g_SandboxRoot);
+
+            // 加载私有 Hive
+            LSTATUS status = RegLoadAppKeyW(hivePath.c_str(), &g_hAppHive, KEY_ALL_ACCESS, REG_PROCESS_APPKEY, 0);
+
+            if (status == ERROR_SUCCESS) {
+                DebugLog(L"RegHook: AppKey loaded successfully from %s", hivePath.c_str());
+
+                // 初始化基础结构 (Machine 和 User 根键)
                 HKEY hKeySub;
-                RegCreateKeyExW(hKeyRoot, L"Machine", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKeySub, NULL);
-                if(hKeySub) RegCloseKey(hKeySub);
-
-                // 创建 User 子键
-                RegCreateKeyExW(hKeyRoot, L"User", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKeySub, NULL);
-                if(hKeySub) RegCloseKey(hKeySub);
-
-                RegCloseKey(hKeyRoot);
-                DebugLog(L"RegHook: Root keys initialized successfully.");
+                if (RegCreateKeyExW(g_hAppHive, L"Machine", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKeySub, NULL) == ERROR_SUCCESS) {
+                    RegCloseKey(hKeySub);
+                }
+                if (RegCreateKeyExW(g_hAppHive, L"User", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKeySub, NULL) == ERROR_SUCCESS) {
+                    RegCloseKey(hKeySub);
+                }
             } else {
-                DebugLog(L"RegHook: Failed to create root keys via Win32 API. Error: %d", GetLastError());
+                DebugLog(L"RegHook: Failed to load AppKey, error %d", status);
+                g_hAppHive = NULL;
             }
         }
     }
