@@ -6936,7 +6936,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (!fpNtOpenKey) fpNtOpenKey = (P_NtOpenKey)GetProcAddress(hNtdll, "NtOpenKey");
 
             if (fpNtOpenKey) {
-                status = fpNtOpenKey(&g_hAppHive, KEY_ALL_ACCESS, &oa);
+                status = fpNtOpenKey(reinterpret_cast<PHANDLE>(&g_hAppHive), KEY_ALL_ACCESS, &oa);
             } else {
                 status = STATUS_NOT_SUPPORTED;
             }
