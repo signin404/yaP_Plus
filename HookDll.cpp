@@ -6887,12 +6887,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 1. 刷新设备映射
     RefreshDeviceMap();
 
-    // [新增] 提前获取 ntdll 句柄和 NtResumeProcess
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (hNtdll) {
-        fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
-    }
-
     wchar_t buffer[MAX_PATH] = { 0 };
 
     // 2. 读取内存映射配置
