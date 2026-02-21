@@ -2693,50 +2693,6 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     }
 }
 
-// [新增] 根据对象属性计算相对于 AppHive 的路径
-// 用于在没有父句柄写权限的情况下创建影子键
-std::wstring GetPathRelativeToAppHive(POBJECT_ATTRIBUTES attr, bool isRedirectedRoot) {
-    // 情况 1: 绝对路径重定向 (attr->ObjectName 已经是相对于 AppHive 的路径)
-    if (isRedirectedRoot && attr->ObjectName) {
-        return std::wstring(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
-    }
-
-    // 情况 2: 相对打开 (需要拼接父路径)
-    if (attr->RootDirectory != NULL) {
-        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-        auto it = g_RegContextMap.find(attr->RootDirectory);
-        if (it != g_RegContextMap.end()) {
-            // 父路径: \REGISTRY\USER\YapBox...\User\Software
-            std::wstring parentFull = it->second->FullPath;
-
-            // 去掉挂载点前缀，得到 User\Software
-            if (parentFull.find(g_RegMountPathNt) == 0) {
-                std::wstring parentRel = parentFull.substr(g_RegMountPathNt.length());
-                if (!parentRel.empty() && parentRel[0] == L'\\') parentRel = parentRel.substr(1);
-
-                std::wstring objName(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
-
-                if (parentRel.empty()) return objName;
-                if (parentRel.back() == L'\\') return parentRel + objName;
-                return parentRel + L"\\" + objName;
-            }
-        }
-    }
-
-    // 情况 3: 已经是沙盒绝对路径
-    // 如果 attr->ObjectName 是 \REGISTRY\USER\YapBox...\User\Software
-    if (attr->RootDirectory == NULL && attr->ObjectName) {
-        std::wstring fullPath(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
-        if (fullPath.find(g_RegMountPathNt) == 0) {
-            std::wstring rel = fullPath.substr(g_RegMountPathNt.length());
-            if (!rel.empty() && rel[0] == L'\\') rel = rel.substr(1);
-            return rel;
-        }
-    }
-
-    return L"";
-}
-
 // [新增] 注册表写入复制 (CoW) 辅助函数
 void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
     if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
@@ -3039,12 +2995,15 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (NT_SUCCESS(status)) {
-            // 尝试缓存真实句柄 (如果真实键存在)
             HANDLE hReal = NULL;
-            // 使用原始 ObjectAttributes 打开真实键
-            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
-                // [修改] 仅当请求了写入权限时，才执行写入复制，避免纯枚举导致沙盒膨胀
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && IS_REG_WRITE_ACCESS(DesiredAccess)) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, fullNtPath.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
+                // [修改] 移除 IS_REG_WRITE_ACCESS 判断。只要在沙盒中新建了键，且真实键存在，就必须复制值，防止产生空影子键
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
 
@@ -3071,8 +3030,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修改] 仅当请求了写入权限时，才执行写入复制，避免纯枚举导致沙盒膨胀
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                // [修改] 移除 IS_REG_WRITE_ACCESS 判断
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
 
@@ -3102,8 +3061,8 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
-    // 1. 绝对路径重定向判断
-    if (ObjectAttributes->RootDirectory == NULL && ShouldRedirectReg(fullNtPath, relPath)) {
+    // 1. 统一转换为沙盒绝对路径重定向 (解决相对句柄引发的路径错乱)
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
@@ -3114,67 +3073,73 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
     // 3. 处理“未找到”情况 (影子键逻辑)
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-        HANDLE hRealParent = NULL;
-        bool hasRealParent = false;
+    std::wstring realPathForCheck;
+    bool canCheckReal = false;
 
-        // 获取真实父句柄 (用于探测真实键是否存在)
-        if (oaModified.RootDirectory != NULL && !isRedirectedRoot) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(oaModified.RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                hRealParent = it->second->hRealKey;
-                hasRealParent = true;
-            }
-        }
+    if (isRedirectedRoot) {
+        realPathForCheck = fullNtPath;
+        canCheckReal = true;
+    } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        canCheckReal = true;
+    }
 
-        // 探测真实子项
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
         HANDLE hRealCheck = NULL;
         bool realExists = false;
 
-        if (hasRealParent) {
-            OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-            oaReal.RootDirectory = hRealParent;
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
-                realExists = true;
-            }
-        } else {
-            // 绝对路径或重定向根，直接尝试打开原始路径
-            // 注意：如果是重定向根，ObjectAttributes 指向的是真实路径，所以可以直接用
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes))) {
-                realExists = true;
-            }
+        OBJECT_ATTRIBUTES oaReal;
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
+            realExists = true;
         }
 
         if (realExists) {
-            // [关键修复] 使用 AppHive 和相对路径创建影子键
-            // 避免因父句柄权限不足导致创建失败
-            std::wstring createRelPath = GetPathRelativeToAppHive(&oaModified, isRedirectedRoot);
+            // [关键修复] 区分读写权限
+            if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                // 写入权限：创建影子键并复制值
+                std::wstring relPathToCreate;
+                if (isRedirectedRoot) {
+                    relPathToCreate = relPath;
+                } else {
+                    relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                    if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
+                }
 
-            if (!createRelPath.empty()) {
-                // 1. 确保父级路径存在
-                EnsureRegPathExistsRelative(createRelPath);
+                EnsureRegPathExistsRelative(relPathToCreate);
 
-                // 2. 创建目标键
                 HANDLE hNewKey = NULL;
                 UNICODE_STRING usCreate;
                 OBJECT_ATTRIBUTES oaCreate;
-                RtlInitUnicodeString(&usCreate, createRelPath.c_str());
+                RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
                 InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
                 ULONG disposition;
-                // 使用 AppHive (拥有完全权限) 创建
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    // [修改] 仅当请求了写入权限时，才执行写入复制
-                    if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                        CopyRegistryValues(hRealCheck, hNewKey);
-                    }
+                    CopyRegistryValues(hRealCheck, hNewKey);
                     fpNtClose(hNewKey);
-                    // 创建成功后，重试原始打开操作
+                    // 重试打开沙盒键
                     status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                 }
+                fpNtClose(hRealCheck);
+            } else {
+                // 纯读取权限：不创建影子键，直接打开真实键并返回
+                fpNtClose(hRealCheck);
+                status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
+
+                if (NT_SUCCESS(status)) {
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
+                        RegContext* ctx = new RegContext();
+                        ctx->hRealKey = NULL; // 已经是真实句柄
+                        ctx->FullPath = realPathForCheck;
+                        g_RegContextMap[*KeyHandle] = ctx;
+                    }
+                }
+                return status; // 直接返回，跳过后续的绑定逻辑
             }
-            fpNtClose(hRealCheck); // 确保复制时句柄有效
         }
     }
 
@@ -3183,18 +3148,13 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         HANDLE hRealTarget = NULL;
         bool foundReal = false;
 
-        if (ObjectAttributes->RootDirectory != NULL) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(ObjectAttributes->RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-                oaReal.RootDirectory = it->second->hRealKey;
-                if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                    foundReal = true;
-                }
-            }
-        } else {
-            if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
                 foundReal = true;
             }
         }
@@ -3204,13 +3164,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                 RegContext* ctx = new RegContext();
                 ctx->hRealKey = hRealTarget;
-                // 记录全路径 (如果是重定向的，需要拼接)
-                if (isRedirectedRoot) {
-                    ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
-                } else {
-                    // 尝试直接获取
-                    ctx->FullPath = GetPathFromHandle(*KeyHandle);
-                }
+                ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
                 g_RegContextMap[*KeyHandle] = ctx;
             } else {
                 fpNtClose(hRealTarget);
@@ -3231,7 +3185,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
-    if (ObjectAttributes->RootDirectory == NULL && ShouldRedirectReg(fullNtPath, relPath)) {
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
@@ -3240,58 +3194,69 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
 
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-        HANDLE hRealParent = NULL;
-        bool hasRealParent = false;
+    std::wstring realPathForCheck;
+    bool canCheckReal = false;
 
-        if (oaModified.RootDirectory != NULL && !isRedirectedRoot) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(oaModified.RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                hRealParent = it->second->hRealKey;
-                hasRealParent = true;
-            }
-        }
+    if (isRedirectedRoot) {
+        realPathForCheck = fullNtPath;
+        canCheckReal = true;
+    } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        canCheckReal = true;
+    }
 
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
         HANDLE hRealCheck = NULL;
         bool realExists = false;
 
-        if (hasRealParent) {
-            OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-            oaReal.RootDirectory = hRealParent;
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
-                realExists = true;
-            }
-        } else {
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes, OpenOptions))) {
-                realExists = true;
-            }
+        OBJECT_ATTRIBUTES oaReal;
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
+            realExists = true;
         }
 
         if (realExists) {
-            // [关键修复] 使用 AppHive 创建影子键
-            std::wstring createRelPath = GetPathRelativeToAppHive(&oaModified, isRedirectedRoot);
+            if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                std::wstring relPathToCreate;
+                if (isRedirectedRoot) {
+                    relPathToCreate = relPath;
+                } else {
+                    relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                    if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
+                }
 
-            if (!createRelPath.empty()) {
-                EnsureRegPathExistsRelative(createRelPath);
+                EnsureRegPathExistsRelative(relPathToCreate);
 
                 HANDLE hNewKey = NULL;
                 UNICODE_STRING usCreate;
                 OBJECT_ATTRIBUTES oaCreate;
-                RtlInitUnicodeString(&usCreate, createRelPath.c_str());
+                RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
                 InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
                 ULONG disposition;
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    // [修改] 仅当请求了写入权限时，才执行写入复制
-                    if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                        CopyRegistryValues(hRealCheck, hNewKey);
-                    }
+                    CopyRegistryValues(hRealCheck, hNewKey);
                     fpNtClose(hNewKey);
                     status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
                 }
+                fpNtClose(hRealCheck);
+            } else {
+                fpNtClose(hRealCheck);
+                status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaReal, OpenOptions);
+
+                if (NT_SUCCESS(status)) {
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
+                        RegContext* ctx = new RegContext();
+                        ctx->hRealKey = NULL;
+                        ctx->FullPath = realPathForCheck;
+                        g_RegContextMap[*KeyHandle] = ctx;
+                    }
+                }
+                return status;
             }
-            fpNtClose(hRealCheck); // 确保复制时句柄有效
         }
     }
 
@@ -3299,18 +3264,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         HANDLE hRealTarget = NULL;
         bool foundReal = false;
 
-        if (ObjectAttributes->RootDirectory != NULL) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(ObjectAttributes->RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-                oaReal.RootDirectory = it->second->hRealKey;
-                if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
-                    foundReal = true;
-                }
-            }
-        } else {
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes, OpenOptions))) {
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
                 foundReal = true;
             }
         }
@@ -3320,11 +3280,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
             if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                 RegContext* ctx = new RegContext();
                 ctx->hRealKey = hRealTarget;
-                if (isRedirectedRoot) {
-                    ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
-                } else {
-                    ctx->FullPath = GetPathFromHandle(*KeyHandle);
-                }
+                ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
                 g_RegContextMap[*KeyHandle] = ctx;
             } else {
                 fpNtClose(hRealTarget);
