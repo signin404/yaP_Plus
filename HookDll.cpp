@@ -2762,35 +2762,43 @@ void EnumerateRegKeysNt(const std::wstring& ntPath, std::map<std::wstring, Cache
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
         ULONG resultLen;
-        // 使用 KeyNodeInformation (包含名称、时间、TitleIndex、ClassOffset 等)
-        // 缓冲区设大一点
-        std::vector<BYTE> buffer(4096);
+        // [修改] 增大缓冲区并初始化
+        std::vector<BYTE> buffer(65536, 0);
 
         while (true) {
+            // [修改] 确保每次调用前 ResultLen 清零
+            resultLen = 0;
             NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buffer.data(), (ULONG)buffer.size(), &resultLen);
 
             if (status == STATUS_NO_MORE_ENTRIES) break;
+
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-                buffer.resize(resultLen);
+                if (resultLen > buffer.size()) {
+                    buffer.resize(resultLen + 1024, 0);
+                } else {
+                    buffer.resize(buffer.size() * 2, 0);
+                }
                 continue; // 重试当前索引
             }
+
             if (!NT_SUCCESS(status)) break;
 
             PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buffer.data();
-            std::wstring keyName(info->Name, info->NameLength / sizeof(WCHAR));
 
-            // 存入 Map (自动去重)
-            // 键名统一转小写用于比较
-            std::wstring sortKey = keyName;
-            std::transform(sortKey.begin(), sortKey.end(), sortKey.begin(), towlower);
+            // [修改] 增加边界检查
+            if (info->NameLength > 0 && (info->NameLength % 2 == 0)) {
+                std::wstring keyName(info->Name, info->NameLength / sizeof(WCHAR));
 
-            CachedRegEntry entry;
-            entry.Name = keyName;
-            entry.LastWriteTime = info->LastWriteTime;
-            entry.TitleIndex = info->TitleIndex;
-            // entry.Type = info->Type; // KeyNodeInformation 没有 Type 字段 通常也不需要
+                std::wstring sortKey = keyName;
+                std::transform(sortKey.begin(), sortKey.end(), sortKey.begin(), towlower);
 
-            outMap[sortKey] = entry;
+                CachedRegEntry entry;
+                entry.Name = keyName;
+                entry.LastWriteTime = info->LastWriteTime;
+                entry.TitleIndex = info->TitleIndex;
+
+                outMap[sortKey] = entry;
+            }
 
             index++;
         }
@@ -3021,87 +3029,75 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 }
 
+// [修改] Detour_NtOpenKey - 增加回退机制 (解决 "能看到但无法进入" 和 "无限循环" 问题)
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    if (g_IsInHook || !g_hAppHive || g_RegMountPathNt.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+        // 1. 尝试打开沙盒路径
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, relPath.c_str());
 
-        HANDLE hTest = NULL;
-        OBJECT_ATTRIBUTES oaTest;
-        UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, relPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+        // 备份原始属性
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
-        if (sandboxExists) fpNtClose(hTest);
+        // 指向沙盒
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
-        if (isWrite || sandboxExists) {
-            if (isWrite && !sandboxExists) {
-                EnsureRegPathExistsRelative(relPath);
-            }
+        NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 
-            UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, relPath.c_str());
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+        // 还原属性
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
 
-            ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
-            NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
-
-            ObjectAttributes->ObjectName = oldName;
-            ObjectAttributes->RootDirectory = oldRoot;
-            return status;
+        // 2. [关键修复] 如果沙盒中不存在，尝试打开真实路径
+        // 只有当状态为 "对象未找到" 时才回退
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            // 直接调用原始函数打开真实路径
+            return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
         }
+
+        return status;
     }
 
     return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 }
 
+// [修改] Detour_NtOpenKeyEx - 增加回退机制
 NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    if (g_IsInHook || !g_hAppHive || g_RegMountPathNt.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, relPath.c_str());
 
-        HANDLE hTest = NULL;
-        OBJECT_ATTRIBUTES oaTest;
-        UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, relPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
-        if (sandboxExists) fpNtClose(hTest);
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
-        if (isWrite || sandboxExists) {
-            if (isWrite && !sandboxExists) {
-                EnsureRegPathExistsRelative(relPath);
-            }
+        NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
-            UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, relPath.c_str());
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
 
-            ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
-            NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
-
-            ObjectAttributes->ObjectName = oldName;
-            ObjectAttributes->RootDirectory = oldRoot;
-            return status;
+        // [关键修复] 回退到真实路径
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
         }
+
+        return status;
     }
 
     return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
