@@ -189,6 +189,13 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// [新增] 注册表枚举相关定义
+typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+P_NtEnumerateKey fpNtEnumerateKey = NULL;
+
+typedef NTSTATUS(NTAPI* P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+P_NtQueryKey fpNtQueryKey = NULL; // 需要在 Init 中获取
+
 typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
@@ -1005,6 +1012,20 @@ namespace CmdUtils {
     }
 }
 
+// [新增] 注册表缓存条目结构
+struct CachedRegEntry {
+    std::wstring Name;
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG Type; // 用于 KeyNodeInformation
+};
+
+// [新增] 注册表上下文结构
+struct RegContext {
+    std::vector<CachedRegEntry> SubKeys;
+    bool IsInitialized = false;
+};
+
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
@@ -1031,6 +1052,10 @@ bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
 std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
 std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 \REGISTRY\USER\YapBoxReg_xxx)
+
+// [新增] 全局注册表上下文映射
+std::map<HANDLE, RegContext*> g_RegContextMap;
+std::shared_mutex g_RegContextMutex;
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -2479,13 +2504,13 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
 
 // 简单的 WOW64 路径修正
 std::wstring FixRegPathWow64(const std::wstring& path) {
-    // 简单判断：如果包含 \Software\ 且不包含 Wow6432Node，且当前是 32 位进程在 64 位系统上
-    // 这里为了简化，暂时不做复杂的 WOW64 模拟，直接返回原路径
-    // 大多数情况下，系统会在 NtCreateKey 之前处理好重定向，或者我们拦截到的已经是重定向后的路径
+    // 简单判断：如果包含 \Software\ 且不包含 Wow6432Node 且当前是 32 位进程在 64 位系统上
+    // 这里为了简化 暂时不做复杂的 WOW64 模拟 直接返回原路径
+    // 大多数情况下 系统会在 NtCreateKey 之前处理好重定向 或者我们拦截到的已经是重定向后的路径
     return path;
 }
 
-// 判断注册表路径是否需要重定向，并输出相对于 AppHive 的相对路径
+// 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
 
@@ -2539,8 +2564,8 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
         std::wstring sub = fullNtPath.substr(prefixUsersRoot.length());
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
 
-        // 如果 sub 为空，说明访问的是 \REGISTRY\USER 根
-        // 如果不为空，且不是当前用户 SID，则映射到 Users
+        // 如果 sub 为空 说明访问的是 \REGISTRY\USER 根
+        // 如果不为空 且不是当前用户 SID 则映射到 Users
         relPathOut = L"Users";
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
@@ -2556,7 +2581,7 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     size_t currentPos = 0;
     while (true) {
         size_t nextSlash = relPath.find(L'\\', currentPos);
-        if (nextSlash == std::wstring::npos) break; // 只创建父级，最后一级由 NtCreateKey 创建
+        if (nextSlash == std::wstring::npos) break; // 只创建父级 最后一级由 NtCreateKey 创建
 
         std::wstring subPath = relPath.substr(0, nextSlash);
 
@@ -2579,7 +2604,318 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     }
 }
 
+// [新增] 注册表反向路径解析：从沙盒句柄路径推导真实路径
+// 输入: \REGISTRY\USER\YapBoxReg_...\Machine\Software
+// 输出 Real: \REGISTRY\MACHINE\Software
+// 输出 Sandbox: 输入本身
+bool GetRealAndSandboxRegPaths(HANDLE hKey, std::wstring& outRealNt, std::wstring& outSandboxNt) {
+    if (!g_HookReg || !g_hAppHive || g_RegMountPathNt.empty()) return false;
+
+    // 1. 获取句柄的完整路径
+    ULONG len = 0;
+    fpNtQueryObject(hKey, ObjectNameInformation, NULL, 0, &len);
+    if (len == 0) return false;
+
+    std::vector<BYTE> buffer(len);
+    if (!NT_SUCCESS(fpNtQueryObject(hKey, ObjectNameInformation, buffer.data(), len, &len))) return false;
+
+    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+    if (!nameInfo->Name.Buffer) return false;
+
+    std::wstring handlePath(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+
+    // 2. 检查是否在挂载点内部
+    if (handlePath.find(g_RegMountPathNt) != 0) {
+        // 句柄指向真实路径 (说明此时还没有重定向 或者不需要重定向)
+        // 但如果在 Mode 3 或其他情况 可能需要反向检查 这里暂时假设只有重定向后的句柄才需要合并
+        // 如果句柄本身就是真实的 NtEnumerateKey 会返回真实内容 不需要我们介入(除非要合并沙盒内容到真实句柄)
+        // 这是一个策略选择：通常我们拦截的是已经重定向到沙盒的句柄 去补全真实内容
+        return false;
+    }
+
+    outSandboxNt = handlePath;
+
+    // 3. 提取相对路径
+    // g_RegMountPathNt: \REGISTRY\USER\YapBoxReg_xxx
+    // handlePath:       \REGISTRY\USER\YapBoxReg_xxx\Machine\Software
+    // relPath:          \Machine\Software
+
+    if (handlePath.length() <= g_RegMountPathNt.length()) return false; // 刚好是根
+
+    std::wstring relPath = handlePath.substr(g_RegMountPathNt.length());
+    if (relPath.empty() || relPath[0] != L'\\') return false;
+
+    // 4. 根据前缀映射回真实根
+    // relPath: \Machine\Software
+
+    // 移除第一个斜杠便于比较
+    std::wstring relSub = relPath.substr(1); // Machine\Software
+
+    if (relSub.find(L"Machine") == 0) {
+        // \Machine -> \REGISTRY\MACHINE
+        if (relSub.length() == 7) outRealNt = L"\\REGISTRY\\MACHINE";
+        else if (relSub[7] == L'\\') outRealNt = L"\\REGISTRY\\MACHINE" + relSub.substr(7);
+    }
+    else if (relSub.find(L"User") == 0) {
+        // \User -> CurrentUserSidPath
+        if (relSub.length() == 4) outRealNt = g_CurrentUserSidPath;
+        else if (relSub[4] == L'\\') outRealNt = g_CurrentUserSidPath + relSub.substr(4);
+    }
+    else if (relSub.find(L"Classes") == 0) {
+        // \Classes -> \REGISTRY\MACHINE\SOFTWARE\Classes
+        if (relSub.length() == 7) outRealNt = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+        else if (relSub[7] == L'\\') outRealNt = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + relSub.substr(7);
+    }
+    else if (relSub.find(L"Users") == 0) {
+        // \Users -> \REGISTRY\USER
+        if (relSub.length() == 5) outRealNt = L"\\REGISTRY\\USER";
+        else if (relSub[5] == L'\\') outRealNt = L"\\REGISTRY\\USER" + relSub.substr(5);
+    }
+    else if (relSub.find(L"Config") == 0) {
+        // \Config -> \REGISTRY\MACHINE\SYSTEM\CurrentControlSet\Hardware Profiles\Current
+        if (relSub.length() == 6) outRealNt = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
+        else if (relSub[6] == L'\\') outRealNt = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + relSub.substr(6);
+    }
+    else {
+        return false; // 未知映射
+    }
+
+    return true;
+}
+
+// [新增] 内部枚举辅助函数
+void EnumerateRegKeysNt(const std::wstring& ntPath, std::map<std::wstring, CachedRegEntry>& outMap) {
+    HANDLE hKey;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
+        ULONG index = 0;
+        ULONG resultLen;
+        // 使用 KeyNodeInformation (包含名称、时间、TitleIndex、ClassOffset 等)
+        // 缓冲区设大一点
+        std::vector<BYTE> buffer(4096);
+
+        while (true) {
+            NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buffer.data(), (ULONG)buffer.size(), &resultLen);
+
+            if (status == STATUS_NO_MORE_ENTRIES) break;
+            if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+                buffer.resize(resultLen);
+                continue; // 重试当前索引
+            }
+            if (!NT_SUCCESS(status)) break;
+
+            PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buffer.data();
+            std::wstring keyName(info->Name, info->NameLength / sizeof(WCHAR));
+
+            // 存入 Map (自动去重)
+            // 键名统一转小写用于比较
+            std::wstring sortKey = keyName;
+            std::transform(sortKey.begin(), sortKey.end(), sortKey.begin(), towlower);
+
+            CachedRegEntry entry;
+            entry.Name = keyName;
+            entry.LastWriteTime = info->LastWriteTime;
+            entry.TitleIndex = info->TitleIndex;
+            // entry.Type = info->Type; // KeyNodeInformation 没有 Type 字段 通常也不需要
+
+            outMap[sortKey] = entry;
+
+            index++;
+        }
+        fpNtClose(hKey);
+    }
+}
+
+// [新增] 构建合并后的注册表键列表
+void BuildMergedKeyList(const std::wstring& realNtPath, const std::wstring& sandboxNtPath, std::vector<CachedRegEntry>& outList) {
+    std::map<std::wstring, CachedRegEntry> mergedMap;
+
+    // 1. 先读真实路径
+    if (!realNtPath.empty()) {
+        EnumerateRegKeysNt(realNtPath, mergedMap);
+    }
+
+    // 2. 再读沙盒路径 (覆盖同名项)
+    if (!sandboxNtPath.empty()) {
+        EnumerateRegKeysNt(sandboxNtPath, mergedMap);
+    }
+
+    // 3. 转为 Vector
+    for (const auto& pair : mergedMap) {
+        outList.push_back(pair.second);
+    }
+}
+
 // --- 注册表 NT API Hook 实现 ---
+
+NTSTATUS NTAPI Detour_NtEnumerateKey(
+    HANDLE KeyHandle,
+    ULONG Index,
+    KEY_INFORMATION_CLASS KeyInformationClass,
+    PVOID KeyInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    RecursionGuard guard;
+
+    // 仅支持基础信息查询 其他类型直接透传（为了简化）
+    if (KeyInformationClass != KeyBasicInformation &&
+        KeyInformationClass != KeyNodeInformation &&
+        KeyInformationClass != KeyFullInformation) { // 通常枚举不怎么用 Full 但为了兼容加上
+        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    // 1. 检查上下文
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            ctx = it->second;
+        } else {
+            // 如果是 Index 0 尝试构建如果是中间 Index 且没 Context 说明可能错过了 直接透传？
+            // 稳妥起见 只要没 Context 都尝试构建
+            needsBuild = true;
+        }
+    }
+
+    // 2. 如果需要构建
+    if (needsBuild) {
+        std::wstring realNt, sandboxNt;
+        // 尝试解析路径 只有成功解析出“真实+沙盒”对的句柄才进行合并
+        if (GetRealAndSandboxRegPaths(KeyHandle, realNt, sandboxNt)) {
+            // 需要合并
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            // 双重检查
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it == g_RegContextMap.end()) {
+                ctx = new RegContext();
+                BuildMergedKeyList(realNt, sandboxNt, ctx->SubKeys);
+                ctx->IsInitialized = true;
+                g_RegContextMap[KeyHandle] = ctx;
+            } else {
+                ctx = it->second;
+            }
+        }
+    }
+
+    // 3. 如果没有 Context (不需要合并) 直接调用原始函数
+    if (!ctx) {
+        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+
+    // 4. 从 Cache 返回数据
+    std::shared_lock<std::shared_mutex> readLock(g_RegContextMutex);
+
+    if (Index >= ctx->SubKeys.size()) {
+        return STATUS_NO_MORE_ENTRIES;
+    }
+
+    const CachedRegEntry& entry = ctx->SubKeys[Index];
+    ULONG requiredSize = 0;
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+
+    // 计算所需大小并填充
+    if (KeyInformationClass == KeyBasicInformation) {
+        requiredSize = FIELD_OFFSET(KEY_BASIC_INFORMATION, Name) + nameBytes;
+        if (Length < requiredSize) {
+            if (ResultLength) *ResultLength = requiredSize;
+            return STATUS_BUFFER_OVERFLOW; // 或 STATUS_BUFFER_TOO_SMALL
+        }
+        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+    else if (KeyInformationClass == KeyNodeInformation) {
+        requiredSize = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes;
+        if (Length < requiredSize) {
+            if (ResultLength) *ResultLength = requiredSize;
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->ClassOffset = 0; // 简化
+        info->ClassLength = 0;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+
+    if (ResultLength) *ResultLength = requiredSize;
+    return STATUS_SUCCESS;
+}
+
+// [修改] Detour_NtQueryKey - 修复子键计数
+// 很多程序会先 QueryKey 获取 SubKeyCount 然后 for 循环 Enum
+// 如果我们不 Hook 这个 程序获取到的只是沙盒内的数量 会导致 Enum 提前终止
+NTSTATUS NTAPI Detour_NtQueryKey(
+    HANDLE KeyHandle,
+    KEY_INFORMATION_CLASS KeyInformationClass,
+    PVOID KeyInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
+    // 先调用原始函数获取其他信息
+    NTSTATUS status = fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+
+    if (g_IsInHook || !g_HookReg || !NT_SUCCESS(status)) return status;
+
+    // 我们只关心 KeyFullInformation 因为它包含 SubKeys (数量)
+    if (KeyInformationClass != KeyFullInformation) return status;
+
+    RecursionGuard guard;
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    // 检查缓存
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            ctx = it->second;
+        } else {
+            needsBuild = true;
+        }
+    }
+
+    if (needsBuild) {
+        std::wstring realNt, sandboxNt;
+        if (GetRealAndSandboxRegPaths(KeyHandle, realNt, sandboxNt)) {
+            // 需要合并 构建缓存
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it == g_RegContextMap.end()) {
+                ctx = new RegContext();
+                BuildMergedKeyList(realNt, sandboxNt, ctx->SubKeys);
+                ctx->IsInitialized = true;
+                g_RegContextMap[KeyHandle] = ctx;
+            } else {
+                ctx = it->second;
+            }
+        }
+    }
+
+    if (ctx) {
+        // 如果有缓存 修正返回的 SubKeys 数量
+        PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
+        // 只有缓冲区足够容纳头部时才修改
+        if (Length >= FIELD_OFFSET(KEY_FULL_INFORMATION, Class)) {
+            info->SubKeys = (ULONG)ctx->SubKeys.size();
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
@@ -2602,7 +2938,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 替换为相对路径，并将 RootDirectory 指向私有 Hive
+        // 替换为相对路径 并将 RootDirectory 指向私有 Hive
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
@@ -4488,8 +4824,19 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
     return status;
 }
 
+// [修改] Detour_NtClose - 清理注册表缓存
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 清理 Context
+    // 清理 RegContext
+    if (g_HookReg) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(Handle);
+        if (it != g_RegContextMap.end()) {
+            delete it->second;
+            g_RegContextMap.erase(it);
+        }
+    }
+
+    // 清理 DirContext (原有)
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
@@ -4499,7 +4846,6 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 调用原始 NtClose
     return fpNtClose(Handle);
 }
 
@@ -6059,7 +6405,7 @@ BOOL CreateProcessInternal(
                         std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
                         HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
                         if (hEvent) {
-							// 等待子进程初始化完成，最多等待 5 秒
+							// 等待子进程初始化完成 最多等待 5 秒
 							WaitForSingleObject(hEvent, 5000);
 							CloseHandle(hEvent);
                         }
@@ -6121,7 +6467,7 @@ BOOL CreateProcessInternal(
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-				// [建议] 即使是 IPC 请求，也在这里等一下
+				// [建议] 即使是 IPC 请求 也在这里等一下
 				std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
 				HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
 				if (hEvent) {
@@ -6900,13 +7246,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
-        // 无论何种模式，都初始化 NtQueryObject，因为路径解析依赖它
+        // 无论何种模式 都初始化 NtQueryObject 因为路径解析依赖它
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
-        // [修复] 无论何种模式，都初始化 NtClose
+        // [修复] 无论何种模式 都初始化 NtClose
         // 注册表 Hook 中的 EnsureRegPathExistsNT 和 Detour_NtOpenKey 依赖此指针
-        // 如果不在此处初始化，当 YAP_HOOK_FILE=0 时 fpNtClose 为空导致崩溃
+        // 如果不在此处初始化 当 YAP_HOOK_FILE=0 时 fpNtClose 为空导致崩溃
         fpNtClose = (P_NtClose)GetProcAddress(hNtdll, "NtClose");
+        // [新增] 获取 NtEnumerateKey 和 NtQueryKey
+        fpNtEnumerateKey = (P_NtEnumerateKey)GetProcAddress(hNtdll, "NtEnumerateKey");
+        fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
     }
 
     // 1. 刷新设备映射
@@ -6954,7 +7303,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
 
         // 2. [修改] 连接到由启动器挂载的注册表键
-        // 不再使用 RegLoadAppKey，而是打开已挂载的键
+        // 不再使用 RegLoadAppKey 而是打开已挂载的键
         // 启动器会将挂载点名称写入 YAP_REG_MOUNT_POINT 环境变量
         wchar_t mountPointBuf[256] = { 0 };
         if (GetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", mountPointBuf, 256) > 0) {
@@ -7798,6 +8147,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        // [新增] Hook 枚举和查询
+        if (fpNtEnumerateKey) MH_CreateHook(fpNtEnumerateKey, &Detour_NtEnumerateKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateKey));
+        if (fpNtQueryKey) MH_CreateHook(fpNtQueryKey, &Detour_NtQueryKey, reinterpret_cast<LPVOID*>(&fpNtQueryKey));
     }
 
     // 9. 启用所有已创建的 Hook
