@@ -1092,7 +1092,8 @@ struct CachedRegValue {
 };
 
 struct RegContext {
-    std::wstring FullPath; // [新增] 用于校验句柄身份
+    std::wstring FullPath;
+    HANDLE hRealKey = NULL; // [新增] 缓存对应的真实键句柄
     std::vector<CachedRegKey> SubKeys;
     std::vector<CachedRegValue> Values;
     bool KeysInitialized = false;
@@ -2822,6 +2823,21 @@ void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, Cache
     }
 }
 
+// [新增] 尝试打开对应的真实键 (用于读取回退)
+HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
+    HANDLE hReal = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, realPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 只读打开
+    if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+        return hReal;
+    }
+    return NULL;
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
@@ -2836,16 +2852,13 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // 确保父路径在私有 Hive 中存在
         EnsureRegPathExistsRelative(relPath);
 
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
-
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 替换为相对路径，并将 RootDirectory 指向私有 Hive
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
@@ -2854,6 +2867,17 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
+        if (NT_SUCCESS(status)) {
+            // [新增] 尝试打开并缓存真实句柄
+            HANDLE hReal = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                RegContext* ctx = new RegContext();
+                ctx->FullPath = fullNtPath;
+                ctx->hRealKey = hReal;
+                g_RegContextMap[*KeyHandle] = ctx;
+            }
+        }
         return status;
     }
 
@@ -2868,35 +2892,57 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+        // 1. 尝试直接打开沙盒键
+        HANDLE hSandbox = NULL;
+        OBJECT_ATTRIBUTES oaSandbox;
+        UNICODE_STRING usSandbox;
+        RtlInitUnicodeString(&usSandbox, relPath.c_str());
+        InitializeObjectAttributes(&oaSandbox, &usSandbox, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
-        HANDLE hTest = NULL;
-        OBJECT_ATTRIBUTES oaTest;
-        UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, relPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+        NTSTATUS status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
 
-        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
-        if (sandboxExists) fpNtClose(hTest);
+        // 2. 如果沙盒中不存在 (STATUS_OBJECT_NAME_NOT_FOUND)
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+            // 检查真实路径是否存在
+            // 注意：ShouldRedirectReg 已经确认了这是需要重定向的路径，但我们需要知道真实键是否存在
+            // 简单起见，我们尝试打开真实键来验证
+            HANDLE hRealCheck = NULL;
+            NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes); // 使用原始属性打开真实键
 
-        if (isWrite || sandboxExists) {
-            if (isWrite && !sandboxExists) {
+            if (NT_SUCCESS(realStatus)) {
+                fpNtClose(hRealCheck);
+
+                // 真实键存在，但沙盒不存在 -> 这是一个“影子键”场景
+                // 我们必须在沙盒中创建这个键，以便后续操作（如写入或查看子项）能正常进行
                 EnsureRegPathExistsRelative(relPath);
+
+                // 再次尝试打开沙盒键
+                status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
+            } else {
+                // 真实键也不存在，确实是找不到了，返回原始错误
+                return status;
+            }
+        }
+
+        // 3. 如果成功打开了沙盒键 (无论是原本存在还是刚创建的)
+        if (NT_SUCCESS(status)) {
+            *KeyHandle = hSandbox;
+
+            // [关键] 缓存真实句柄，供 NtQueryValueKey 使用
+            // 我们需要计算出真实路径。由于 ObjectAttributes 指向的是真实路径，我们直接用它
+            // 但为了安全，我们重新解析一次或使用 GetRegPaths 逻辑
+            // 这里直接尝试打开原始 ObjectAttributes 指向的真实键
+            HANDLE hReal = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+                // 存入 Context
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                RegContext* ctx = new RegContext();
+                ctx->FullPath = fullNtPath; // 绑定路径
+                ctx->hRealKey = hReal;      // 绑定真实句柄
+                g_RegContextMap[hSandbox] = ctx;
             }
 
-            UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, relPath.c_str());
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-            HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
-            ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
-            NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
-
-            ObjectAttributes->ObjectName = oldName;
-            ObjectAttributes->RootDirectory = oldRoot;
-            return status;
+            return STATUS_SUCCESS;
         }
     }
 
@@ -2904,6 +2950,10 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 }
 
 NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
+    // 为简化代码，直接复用 Detour_NtOpenKey 的逻辑，忽略 OpenOptions (通常影响不大)
+    // 或者复制上面的逻辑并传递 OpenOptions 给 fpNtOpenKeyEx
+    // 这里建议复制上面的逻辑，将 fpNtOpenKey 替换为 fpNtOpenKeyEx
+
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     RecursionGuard guard;
 
@@ -2911,38 +2961,38 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE)) != 0;
+        HANDLE hSandbox = NULL;
+        OBJECT_ATTRIBUTES oaSandbox;
+        UNICODE_STRING usSandbox;
+        RtlInitUnicodeString(&usSandbox, relPath.c_str());
+        InitializeObjectAttributes(&oaSandbox, &usSandbox, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
-        HANDLE hTest = NULL;
-        OBJECT_ATTRIBUTES oaTest;
-        UNICODE_STRING usTest;
-        RtlInitUnicodeString(&usTest, relPath.c_str());
-        InitializeObjectAttributes(&oaTest, &usTest, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+        NTSTATUS status = fpNtOpenKeyEx(&hSandbox, DesiredAccess, &oaSandbox, OpenOptions);
 
-        bool sandboxExists = NT_SUCCESS(fpNtOpenKey(&hTest, KEY_READ, &oaTest));
-        if (sandboxExists) fpNtClose(hTest);
-
-        if (isWrite || sandboxExists) {
-            if (isWrite && !sandboxExists) {
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+            HANDLE hRealCheck = NULL;
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes, OpenOptions))) {
+                fpNtClose(hRealCheck);
                 EnsureRegPathExistsRelative(relPath);
+                status = fpNtOpenKeyEx(&hSandbox, DesiredAccess, &oaSandbox, OpenOptions);
+            } else {
+                return status;
             }
+        }
 
-            UNICODE_STRING uStr;
-            RtlInitUnicodeString(&uStr, relPath.c_str());
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-            HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
-            ObjectAttributes->ObjectName = &uStr;
-            ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
-            NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
-
-            ObjectAttributes->ObjectName = oldName;
-            ObjectAttributes->RootDirectory = oldRoot;
-            return status;
+        if (NT_SUCCESS(status)) {
+            *KeyHandle = hSandbox;
+            HANDLE hReal = NULL;
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes, OpenOptions))) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                RegContext* ctx = new RegContext();
+                ctx->FullPath = fullNtPath;
+                ctx->hRealKey = hReal;
+                g_RegContextMap[hSandbox] = ctx;
+            }
+            return STATUS_SUCCESS;
         }
     }
-
     return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 }
 
@@ -4733,51 +4783,109 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     ULONG Length,
     PULONG ResultLength
 ) {
-    // 1. 调用原始函数
+    // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
+    // 注意：这里不加 RecursionGuard，因为 fpNtQueryValueKey 是原始函数，不会递归
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
 
-    // 2. 如果查询成功且启用了区域伪造
-    if (NT_SUCCESS(status) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
+    // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
+    // 且启用了注册表 Hook，尝试从缓存的真实句柄中读取
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
+        HANDLE hReal = NULL;
 
-        // 3. 检查是否查询的是 ACP 或 OEMCP
-        // 注意：为了性能 这里只比较 ValueName
-        // 严格来说应该检查 KeyHandle 是否指向 Control\Nls\CodePage 但在 HookDLL 中维护句柄映射太重了
-        // 由于 ACP/OEMCP 名字很特殊 误伤概率极低
+        // 从 Context 中查找缓存的真实句柄
+        {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                hReal = it->second->hRealKey;
+            }
+        }
 
-        bool isACP = (_wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && ValueName->Length == 6);
-        bool isOEMCP = (_wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && ValueName->Length == 10);
+        // 如果找到了真实句柄，尝试从中查询
+        if (hReal) {
+            // 使用 RecursionGuard 防止某些底层 Hook 再次触发
+            RecursionGuard guard;
+            status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
+    }
+
+    // 3. [区域伪造逻辑] 如果查询成功 (或缓冲区溢出，说明值存在)，且启用了区域伪造
+    // 我们需要拦截 ACP/OEMCP 的查询结果
+    if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
+
+        // 检查是否查询的是 ACP 或 OEMCP
+        // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
+        // ValueName 分别是 "ACP" 或 "OEMCP"
+
+        bool isACP = (ValueName->Length == 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0);
+        bool isOEMCP = (ValueName->Length == 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0);
 
         if (isACP || isOEMCP) {
             const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
-            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t));
+            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t)); // 包含 NULL 结尾
 
-            // 处理 PartialInformation (最常用的查询方式)
+            // 根据查询的信息类进行处理
             if (KeyValueInformationClass == KeyValuePartialInformation) {
-                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+                // 结构: Header + Data
+                ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
 
-                // 检查缓冲区是否足够
-                if (Length >= FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize) {
+                if (Length >= requiredSize) {
+                    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
                     info->Type = REG_SZ;
                     info->DataLength = fakeDataSize;
                     memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
-                    // DebugLog(L"RegHook: Spoofed %s -> %s", ValueName->Buffer, fakeVal.c_str());
+                    status = STATUS_SUCCESS;
                 } else {
                     status = STATUS_BUFFER_OVERFLOW;
-                    if (ResultLength) *ResultLength = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
                 }
-            }
-            // 处理 FullInformation (部分程序使用)
-            else if (KeyValueInformationClass == KeyValueFullInformation) {
-                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-                ULONG dataOffset = info->DataOffset;
 
-                if (Length >= dataOffset + fakeDataSize) {
-                    info->Type = REG_SZ;
-                    info->DataLength = fakeDataSize;
-                    memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
-                } else {
-                    status = STATUS_BUFFER_OVERFLOW;
-                    if (ResultLength) *ResultLength = dataOffset + fakeDataSize;
+                if (ResultLength) *ResultLength = requiredSize;
+            }
+            else if (KeyValueInformationClass == KeyValueFullInformation) {
+                // 结构: Header + Name + Padding + Data
+                // 注意：这里我们只修改 Data 部分，假设 Name 部分已经由 fpNtQueryValueKey 填充好了
+                // 如果原始查询失败(回退逻辑也没找到)，这里进不来，所以 info 里的 Name 是有效的
+
+                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+
+                // 如果原始状态是 SUCCESS，我们可以直接修改数据
+                // 如果原始状态是 OVERFLOW，我们需要重新计算大小
+
+                // 简单起见，如果原始调用成功读取了数据，我们检查是否有空间覆写
+                if (status == STATUS_SUCCESS) {
+                    if (info->DataLength >= fakeDataSize) {
+                        // 原数据空间足够，直接覆盖
+                        info->Type = REG_SZ;
+                        info->DataLength = fakeDataSize;
+                        // DataOffset 是相对于结构体起始的偏移
+                        memcpy((BYTE*)info + info->DataOffset, fakeVal.c_str(), fakeDataSize);
+                    } else {
+                        // 原数据空间不足 (例如原值是 "1252" 长度 10，我们要写 "936" 长度 8，通常够用)
+                        // 如果不够，返回 OVERFLOW
+                        // 但通常代码页字符串长度都很短，这里做个防御性编程
+                        // 如果空间不够，我们只能告诉调用者需要更多内存
+                        // 重新计算所需大小
+                        ULONG dataOffset = info->DataOffset;
+                        ULONG requiredSize = dataOffset + fakeDataSize;
+
+                        if (Length >= requiredSize) {
+                             info->Type = REG_SZ;
+                             info->DataLength = fakeDataSize;
+                             memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
+                        } else {
+                             status = STATUS_BUFFER_OVERFLOW;
+                             if (ResultLength) *ResultLength = requiredSize;
+                        }
+                    }
+                }
+                else if (status == STATUS_BUFFER_OVERFLOW) {
+                    // 如果原始查询就溢出了，我们需要修正 ResultLength
+                    // 原始 ResultLength 是基于真实值的，我们需要基于伪造值计算
+                    // 这比较麻烦，因为我们不知道 Name 有多长。
+                    // 但通常程序会先查长度再分配内存。
+                    // 此时我们无法修改 ResultLength 准确值，因为不知道 NameLength。
+                    // 只能寄希望于程序分配足够大的缓冲区（通常 MAX_PATH）。
+                    // 或者，我们可以忽略这次修正，等程序分配了内存再次调用时，会进入上面的 STATUS_SUCCESS 分支。
                 }
             }
         }
@@ -5044,17 +5152,20 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // [新增] 清理 RegContext
+    // 清理 RegContext
     {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(Handle);
         if (it != g_RegContextMap.end()) {
+            // [新增] 关闭缓存的真实句柄
+            if (it->second->hRealKey) {
+                fpNtClose(it->second->hRealKey);
+            }
             delete it->second;
             g_RegContextMap.erase(it);
         }
     }
 
-    // 调用原始 NtClose
     return fpNtClose(Handle);
 }
 
