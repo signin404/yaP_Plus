@@ -255,24 +255,6 @@ typedef enum _KEY_INFORMATION_CLASS {
     MaxKeyInfoClass
 } KEY_INFORMATION_CLASS;
 
-// KEY_BASIC_INFORMATION 结构体
-typedef struct _KEY_BASIC_INFORMATION {
-    LARGE_INTEGER LastWriteTime;
-    ULONG TitleIndex;
-    ULONG NameLength;
-    WCHAR Name[1];
-} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
-
-// KEY_NODE_INFORMATION 结构体
-typedef struct _KEY_NODE_INFORMATION {
-    LARGE_INTEGER LastWriteTime;
-    ULONG TitleIndex;
-    ULONG ClassOffset;
-    ULONG ClassLength;
-    ULONG NameLength;
-    WCHAR Name[1];
-} KEY_NODE_INFORMATION, *PKEY_NODE_INFORMATION;
-
 typedef struct _YAP_SYSTEM_TIMEOFDAY_INFORMATION {
     LARGE_INTEGER BootTime;
     LARGE_INTEGER CurrentTime;
