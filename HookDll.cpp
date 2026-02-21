@@ -201,6 +201,19 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+// RegEdit 常用的一种查询结构
+typedef struct _KEY_CACHED_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG SubKeys;
+    ULONG MaxNameLen;
+    ULONG Values;
+    ULONG MaxValueNameLen;
+    ULONG MaxValueDataLen;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_CACHED_INFORMATION, *PKEY_CACHED_INFORMATION;
+
 // 1. 基础信息 (包含名称)
 typedef struct _KEY_BASIC_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -656,6 +669,8 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef NTSTATUS(NTAPI* P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+P_NtQueryKey fpNtQueryKey = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
@@ -2965,6 +2980,71 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
 }
 
 // --- 注册表 NT API Hook 实现 ---
+
+NTSTATUS NTAPI Detour_NtQueryKey(HANDLE KeyHandle, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
+    // 1. 先调用原始函数
+    NTSTATUS status = fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+
+    // 2. 仅处理成功或溢出的情况，且仅处理统计信息类
+    if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) &&
+        (KeyInformationClass == KeyFullInformation || KeyInformationClass == KeyCachedInformation)) {
+
+        if (g_HookReg && !g_IsInHook) {
+            RecursionGuard guard;
+            RegContext* ctx = nullptr;
+
+            // 检查该句柄是否在我们的合并映射中
+            {
+                std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+                auto it = g_RegContextMap.find(KeyHandle);
+                if (it != g_RegContextMap.end()) {
+                    ctx = it->second;
+                }
+            }
+
+            // 如果不在映射中，尝试判断是否需要重定向并建立缓存
+            if (!ctx) {
+                std::wstring path = GetPathFromHandle(KeyHandle);
+                std::wstring realPath, sandboxPath;
+                if (!path.empty() && GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+                    // 这是一个需要合并的路径，立即触发一次合并以获取准确数量
+                    std::map<std::wstring, CachedRegKey> mergedKeys;
+                    std::map<std::wstring, CachedRegValue> mergedValues;
+                    EnumerateKeysToMap(realPath, mergedKeys);
+                    EnumerateKeysToMap(sandboxPath, mergedKeys);
+                    EnumerateValuesToMap(realPath, mergedValues);
+                    EnumerateValuesToMap(sandboxPath, mergedValues);
+
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    ctx = new RegContext();
+                    ctx->FullPath = path;
+                    for (auto& p : mergedKeys) ctx->SubKeys.push_back(p.second);
+                    for (auto& p : mergedValues) ctx->Values.push_back(p.second);
+                    ctx->KeysInitialized = true;
+                    ctx->ValuesInitialized = true;
+                    g_RegContextMap[KeyHandle] = ctx;
+                }
+            }
+
+            // 3. 覆写统计数量
+            if (ctx && ctx->KeysInitialized) {
+                if (KeyInformationClass == KeyFullInformation && Length >= sizeof(KEY_FULL_INFORMATION)) {
+                    PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
+                    info->SubKeys = (ULONG)ctx->SubKeys.size();
+                    info->Values = (ULONG)ctx->Values.size();
+                }
+                else if (KeyInformationClass == KeyCachedInformation && Length >= sizeof(KEY_CACHED_INFORMATION)) {
+                    PKEY_CACHED_INFORMATION info = (PKEY_CACHED_INFORMATION)KeyInformation;
+                    info->SubKeys = (ULONG)ctx->SubKeys.size();
+                    info->Values = (ULONG)ctx->Values.size();
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
@@ -3147,13 +3227,12 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                 RegContext* ctx = new RegContext();
                 ctx->hRealKey = hRealTarget;
-                // 记录全路径 (如果是重定向的，需要拼接)
-                if (isRedirectedRoot) {
-                    ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
-                } else {
-                    // 尝试直接获取
-                    ctx->FullPath = GetPathFromHandle(*KeyHandle);
-                }
+                ctx->FullPath = (isRedirectedRoot) ? (g_RegMountPathNt + L"\\" + relPath) : GetPathFromHandle(*KeyHandle);
+
+                // [新增] 立即标记为未初始化，强制下一次 QueryKey 或 Enumerate 触发合并
+                ctx->KeysInitialized = false;
+                ctx->ValuesInitialized = false;
+
                 g_RegContextMap[*KeyHandle] = ctx;
             } else {
                 fpNtClose(hRealTarget);
@@ -3314,10 +3393,10 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
     {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
-
         if (it != g_RegContextMap.end()) {
-            // [关键修复] 如果 Index 为 0，说明是新一轮枚举，强制标记为需要重新构建
             if (Index == 0) {
+                // 彻底清空，强制重新扫描真实注册表
+                it->second->SubKeys.clear();
                 it->second->KeysInitialized = false;
                 needsBuild = true;
             } else {
@@ -8662,11 +8741,13 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKey = (void*)GetProcAddress(hNtdll, "NtOpenKey");
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
+        void* pNtQueryKey = (void*)GetProcAddress(hNtdll, "NtQueryKey");
 
         if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        if (pNtQueryKey) MH_CreateHook(pNtQueryKey, &Detour_NtQueryKey, reinterpret_cast<LPVOID*>(&fpNtQueryKey));
 
         // 获取枚举函数地址并创建 Hook
         // 注意：这里使用的是 fpNtEnumerateKey (函数指针变量)
