@@ -54,6 +54,10 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+
 // --- [新增] 补充注册表枚举相关的状态码 ---
 #ifndef STATUS_NO_MORE_ENTRIES
 #define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
@@ -1172,6 +1176,8 @@ P_NtCreateKey fpNtCreateKey = NULL;
 P_NtOpenKey fpNtOpenKey = NULL;
 P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
 P_NtDeleteKey fpNtDeleteKey = NULL;
+P_NtEnumerateKey fpNtEnumerateKey = NULL;
+P_NtQueryKey fpNtQueryKey = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
