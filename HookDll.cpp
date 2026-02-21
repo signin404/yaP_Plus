@@ -2642,32 +2642,41 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     return false;
 }
 
-// 递归创建注册表键 (相对于 AppHive)
+// [新增] 递归创建注册表键 (相对于 AppHive)
+// 输入: Machine\Software\Microsoft (不包含要创建的最后一级，或者包含均可，视调用场景)
+// 这里的逻辑是确保路径中的每一级都存在
 void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     if (relPath.empty() || !g_hAppHive) return;
 
+    // 移除开头可能的斜杠
+    std::wstring path = (relPath[0] == L'\\') ? relPath.substr(1) : relPath;
+
     size_t currentPos = 0;
     while (true) {
-        size_t nextSlash = relPath.find(L'\\', currentPos);
-        if (nextSlash == std::wstring::npos) break; // 只创建父级 最后一级由 NtCreateKey 创建
+        size_t nextSlash = path.find(L'\\', currentPos);
 
-        std::wstring subPath = relPath.substr(0, nextSlash);
+        // 获取当前层级的路径 (例如 "Machine", 然后 "Machine\Software")
+        std::wstring subPath = (nextSlash == std::wstring::npos) ? path : path.substr(0, nextSlash);
 
-        HANDLE hKey = NULL;
-        UNICODE_STRING uStr;
-        OBJECT_ATTRIBUTES oa;
-        RtlInitUnicodeString(&uStr, subPath.c_str());
+        if (!subPath.empty()) {
+            HANDLE hKey = NULL;
+            UNICODE_STRING uStr;
+            OBJECT_ATTRIBUTES oa;
+            RtlInitUnicodeString(&uStr, subPath.c_str());
 
-        // 关键：RootDirectory 指向我们的私有 Hive
-        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+            // RootDirectory 指向私有 Hive
+            InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
-        ULONG disposition;
-        NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+            // 尝试创建 (如果已存在则打开)
+            ULONG disposition;
+            NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
 
-        if (NT_SUCCESS(status)) {
-            fpNtClose(hKey);
+            if (NT_SUCCESS(status)) {
+                fpNtClose(hKey);
+            }
         }
 
+        if (nextSlash == std::wstring::npos) break;
         currentPos = nextSlash + 1;
     }
 }
@@ -2992,11 +3001,12 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     return status;
 }
 
+// [修改] Detour_NtCreateKey - 增加父路径自动创建逻辑
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
 {
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
+    if (g_IsInHook || !g_hAppHive || g_RegMountPathNt.empty()) {
         return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     }
 
@@ -3005,16 +3015,23 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // 确保父路径在私有 Hive 中存在
-        EnsureRegPathExistsRelative(relPath);
+        // relPath 例如: "User\Software\MyApp"
 
+        // 1. [关键修复] 确保父路径在沙盒中存在
+        // NtCreateKey 只能创建最后一级，如果中间路径不存在会失败
+        size_t lastSlash = relPath.find_last_of(L'\\');
+        if (lastSlash != std::wstring::npos) {
+            std::wstring parentPath = relPath.substr(0, lastSlash);
+            EnsureRegPathExistsRelative(parentPath);
+        }
+
+        // 2. 重定向参数
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 替换为相对路径 并将 RootDirectory 指向私有 Hive
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
@@ -3029,7 +3046,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 }
 
-// [修改] Detour_NtOpenKey - 增加回退机制 (解决 "能看到但无法进入" 和 "无限循环" 问题)
+// [修改] Detour_NtOpenKey - 增加写入时自动迁移 (CoW) 逻辑
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
     if (g_IsInHook || !g_hAppHive || g_RegMountPathNt.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
@@ -3042,25 +3059,64 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
-        // 备份原始属性
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
 
-        // 指向沙盒
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
 
         NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 
-        // 还原属性
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // 2. [关键修复] 如果沙盒中不存在，尝试打开真实路径
-        // 只有当状态为 "对象未找到" 时才回退
+        // 2. 如果沙盒中存在，直接返回
+        if (NT_SUCCESS(status)) return status;
+
+        // 3. 沙盒中不存在
         if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
-            // 直接调用原始函数打开真实路径
-            return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+
+            // 检查是否请求了写入权限
+            bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_WRITE));
+
+            // 如果是只读访问，回退到真实路径 (透传)
+            if (!isWrite) {
+                return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+            }
+
+            // 如果是写入访问，我们不能返回真实句柄（否则会污染系统）
+            // 我们需要检查真实路径是否存在，如果存在，则在沙盒中“克隆”这个键（Copy-on-Write）
+
+            // 3.1 检查真实路径是否存在
+            HANDLE hReal = NULL;
+            NTSTATUS realStatus = fpNtOpenKey(&hReal, KEY_READ, ObjectAttributes);
+            if (NT_SUCCESS(realStatus)) {
+                fpNtClose(hReal);
+
+                // 3.2 真实存在 -> 在沙盒中创建该键 (Migrate)
+                // 确保父级存在
+                size_t lastSlash = relPath.find_last_of(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    EnsureRegPathExistsRelative(relPath.substr(0, lastSlash));
+                }
+
+                // 创建键 (使用 CreateKey 替代 OpenKey)
+                HANDLE hSandboxKey = NULL;
+                ULONG disposition;
+
+                ObjectAttributes->ObjectName = &uStr;
+                ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
+
+                status = fpNtCreateKey(&hSandboxKey, DesiredAccess, ObjectAttributes, 0, NULL, 0, &disposition);
+
+                ObjectAttributes->ObjectName = oldName;
+                ObjectAttributes->RootDirectory = oldRoot;
+
+                if (NT_SUCCESS(status)) {
+                    *KeyHandle = hSandboxKey;
+                    return STATUS_SUCCESS;
+                }
+            }
         }
 
         return status;
@@ -3092,11 +3148,43 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // [关键修复] 回退到真实路径
-        if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
-            return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
-        }
+        if (NT_SUCCESS(status)) return status;
 
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_WRITE));
+
+            if (!isWrite) {
+                return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+            }
+
+            // Copy-on-Write Logic
+            HANDLE hReal = NULL;
+            NTSTATUS realStatus = fpNtOpenKeyEx(&hReal, KEY_READ, ObjectAttributes, OpenOptions);
+            if (NT_SUCCESS(realStatus)) {
+                fpNtClose(hReal);
+
+                size_t lastSlash = relPath.find_last_of(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    EnsureRegPathExistsRelative(relPath.substr(0, lastSlash));
+                }
+
+                HANDLE hSandboxKey = NULL;
+                ULONG disposition;
+
+                ObjectAttributes->ObjectName = &uStr;
+                ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
+
+                status = fpNtCreateKey(&hSandboxKey, DesiredAccess, ObjectAttributes, 0, NULL, 0, &disposition);
+
+                ObjectAttributes->ObjectName = oldName;
+                ObjectAttributes->RootDirectory = oldRoot;
+
+                if (NT_SUCCESS(status)) {
+                    *KeyHandle = hSandboxKey;
+                    return STATUS_SUCCESS;
+                }
+            }
+        }
         return status;
     }
 
