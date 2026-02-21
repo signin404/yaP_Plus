@@ -683,6 +683,9 @@ extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
 typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
 
+typedef NTSTATUS(NTAPI* P_NtFlushKey)(HANDLE);
+P_NtFlushKey fpNtFlushKey = NULL;
+
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 P_NtQueryValueKey fpNtQueryValueKey = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
@@ -6169,18 +6172,50 @@ LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lP
 
 // --- [新增] 强制退出 Hook (解决进程残留) ---
 
+// [新增] 进程退出前的清理工作
+void CleanupRegistryHook() {
+    // 1. 清理注册表上下文缓存 (关闭所有打开的真实句柄)
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        for (auto& pair : g_RegContextMap) {
+            if (pair.second) {
+                if (pair.second->hRealKey) {
+                    fpNtClose(pair.second->hRealKey);
+                }
+                delete pair.second;
+            }
+        }
+        g_RegContextMap.clear();
+    }
+
+    // 2. 刷新并关闭私有 Hive
+    if (g_hAppHive) {
+        // 关键：如果写入过数据，强制刷新到磁盘
+        // 这能避免进程结束后 Hive 文件仍被系统占用导致无法卸载
+        if (fpNtFlushKey) {
+            fpNtFlushKey(g_hAppHive);
+        }
+
+        // 显式关闭根句柄
+        fpNtClose(g_hAppHive);
+        g_hAppHive = NULL;
+    }
+}
+
 void WINAPI Detour_ExitProcess(UINT uExitCode) {
-    // 这里的关键是使用 TerminateProcess 而不是 ExitProcess
-    // ExitProcess 会尝试通知所有 DLL (DLL_PROCESS_DETACH) 并等待线程结束 容易导致死锁
-    // TerminateProcess 是内核级强制查杀 瞬间结束 不留后患
+    // 先清理，再退出
+    CleanupRegistryHook();
+
+    // 使用 TerminateProcess 瞬间结束
     TerminateProcess(GetCurrentProcess(), uExitCode);
 }
 
 NTSTATUS NTAPI Detour_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
     // 如果程序尝试结束自己
     if (!ProcessHandle || ProcessHandle == GetCurrentProcess()) {
-        TerminateProcess(GetCurrentProcess(), 0); // 强制退出
-        return STATUS_SUCCESS; // 实际上永远不会执行到这里
+        CleanupRegistryHook();
+        TerminateProcess(GetCurrentProcess(), 0);
+        return STATUS_SUCCESS;
     }
     return fpNtTerminateProcess(ProcessHandle, ExitStatus);
 }
@@ -6589,6 +6624,7 @@ VOID WINAPI Detour_GetSystemTimePreciseAsFileTime_KB(LPFILETIME lpSystemTimeAsFi
 
 // Ntdll 级别的退出函数 比 ExitProcess 更底层
 void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
+    CleanupRegistryHook();
     // 强制终止当前进程 不等待任何线程清理
     TerminateProcess(GetCurrentProcess(), Status);
 }
@@ -6596,6 +6632,7 @@ void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
 // 看门狗线程：防止 PostQuitMessage 后主循环卡死
 DWORD WINAPI SuicideWatchdog(LPVOID) {
     Sleep(2000); // 给主程序 2 秒时间正常退出
+    CleanupRegistryHook(); // 强杀前也要清理
     TerminateProcess(GetCurrentProcess(), 0); // 2秒后强制杀进程
     return 0;
 }
@@ -8742,12 +8779,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
         void* pNtQueryKey = (void*)GetProcAddress(hNtdll, "NtQueryKey");
+        void* pNtFlushKey = (void*)GetProcAddress(hNtdll, "NtFlushKey");
 
         if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
         if (pNtQueryKey) MH_CreateHook(pNtQueryKey, &Detour_NtQueryKey, reinterpret_cast<LPVOID*>(&fpNtQueryKey));
+        if (pNtFlushKey) fpNtFlushKey = (P_NtFlushKey)pNtFlushKey;
 
         // 获取枚举函数地址并创建 Hook
         // 注意：这里使用的是 fpNtEnumerateKey (函数指针变量)
@@ -8783,7 +8822,12 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinst);
         CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
-        MH_Uninitialize();
+        // 只有在非强制终止的情况下才执行清理
+        // reserved == NULL 表示 FreeLibrary 调用，reserved != NULL 表示进程终止
+        if (reserved == NULL) {
+            MH_Uninitialize();
+            CleanupRegistryHook();
+        }
     }
     return TRUE;
 }
