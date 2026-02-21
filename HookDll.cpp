@@ -54,6 +54,14 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
+#endif
+
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+
 // --- 注册表重定向相关常量与指针 ---
 #ifndef REG_PROCESS_APPKEY
 #define REG_PROCESS_APPKEY 0x00000001
@@ -195,10 +203,44 @@ typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
 typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
 typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
 P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
+
 typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtEnumerateKey fpNtEnumerateKey = NULL;
+extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
 typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtEnumerateValueKey fpNtEnumerateValueKey = NULL;
+extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
+
+// 注册表信息类枚举
+typedef enum _KEY_INFORMATION_CLASS {
+    KeyBasicInformation = 0,
+    KeyNodeInformation,
+    KeyFullInformation,
+    KeyNameInformation,
+    KeyCachedInformation,
+    KeyFlagsInformation,
+    KeyVirtualizationInformation,
+    KeyHandleTagsInformation,
+    KeyTrustInformation,
+    KeyLayerInformation,
+    MaxKeyInfoClass
+} KEY_INFORMATION_CLASS;
+
+// KEY_BASIC_INFORMATION 结构体
+typedef struct _KEY_BASIC_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
+
+// KEY_NODE_INFORMATION 结构体
+typedef struct _KEY_NODE_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG ClassOffset;
+    ULONG ClassLength;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_NODE_INFORMATION, *PKEY_NODE_INFORMATION;
 
 typedef struct _YAP_SYSTEM_TIMEOFDAY_INFORMATION {
     LARGE_INTEGER BootTime;
@@ -1113,6 +1155,8 @@ P_NtCreateKey fpNtCreateKey = NULL;
 P_NtOpenKey fpNtOpenKey = NULL;
 P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
 P_NtDeleteKey fpNtDeleteKey = NULL;
+P_NtEnumerateKey fpNtEnumerateKey = NULL;
+P_NtEnumerateValueKey fpNtEnumerateValueKey = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -2894,7 +2938,14 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     return fpNtDeleteKey(KeyHandle);
 }
 
-NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
+NTSTATUS NTAPI Detour_NtEnumerateKey(
+    HANDLE KeyHandle,
+    ULONG Index,
+    KEY_INFORMATION_CLASS KeyInformationClass,
+    PVOID KeyInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
 
@@ -8179,9 +8230,19 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
-        // [新增] 创建枚举 Hook
-        if (pNtEnumerateKey) MH_CreateHook(pNtEnumerateKey, &Detour_NtEnumerateKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateKey));
-        if (pNtEnumerateValueKey) MH_CreateHook(pNtEnumerateValueKey, &Detour_NtEnumerateValueKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateValueKey));
+
+        // 获取枚举函数地址并创建 Hook
+        // 注意：这里使用的是 fpNtEnumerateKey (函数指针变量)
+        // GetProcAddress 里的字符串必须是 "NtEnumerateKey"
+        void* pNtEnumerateKey = (void*)GetProcAddress(hNtdll, "NtEnumerateKey");
+        if (pNtEnumerateKey) {
+            MH_CreateHook(pNtEnumerateKey, &Detour_NtEnumerateKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateKey));
+        }
+
+        void* pNtEnumerateValueKey = (void*)GetProcAddress(hNtdll, "NtEnumerateValueKey");
+        if (pNtEnumerateValueKey) {
+            MH_CreateHook(pNtEnumerateValueKey, &Detour_NtEnumerateValueKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateValueKey));
+        }
     }
 
     // 9. 启用所有已创建的 Hook
