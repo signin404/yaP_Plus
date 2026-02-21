@@ -54,6 +54,11 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// [新增] 补充注册表创建状态宏
+#ifndef REG_CREATED_NEW_KEY
+#define REG_CREATED_NEW_KEY (0x00000001L)
+#endif
+
 #ifndef _KEY_INFORMATION_CLASS_DEFINED
 #define _KEY_INFORMATION_CLASS_DEFINED
 #endif
@@ -668,8 +673,12 @@ extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
 typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
 
+typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+P_NtSetValueKey fpNtSetValueKey = NULL;
+
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 P_NtQueryValueKey fpNtQueryValueKey = NULL;
+
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 typedef NTSTATUS(NTAPI* P_NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PFILE_BASIC_INFORMATION);
@@ -2739,7 +2748,6 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     if (!NT_SUCCESS(status)) {
         return false;
     }
-    fpNtClose(hRealChild);
 
     // 2. 真实存在，在沙盒中创建影子结构
     HANDLE hNewKey = NULL;
@@ -2750,9 +2758,13 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
 
     if (NT_SUCCESS(status)) {
+        // [新增] 执行注册表写入复制 (CoW)
+        CopyRegistryValues(hRealChild, hNewKey);
         fpNtClose(hNewKey);
+        fpNtClose(hRealChild);
         return true;
     }
+    fpNtClose(hRealChild);
     return false;
 }
 
@@ -2964,6 +2976,36 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     }
 }
 
+// [新增] 注册表写入复制 (CoW) 辅助函数
+void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
+    if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
+
+    ULONG index = 0;
+    ULONG len;
+    std::vector<BYTE> buf(4096);
+
+    while (true) {
+        NTSTATUS status = fpNtEnumerateValueKey(hRealKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
+
+        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+            buf.resize(len);
+            continue;
+        }
+
+        if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
+
+        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
+        UNICODE_STRING valueName;
+        valueName.Buffer = info->Name;
+        valueName.Length = (USHORT)info->NameLength;
+        valueName.MaximumLength = (USHORT)info->NameLength;
+
+        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, (BYTE*)info + info->DataOffset, info->DataLength);
+
+        index++;
+    }
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
@@ -2999,6 +3041,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             HANDLE hReal = NULL;
             // 使用原始 ObjectAttributes 打开真实键
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+                // [新增] 如果是新创建的沙盒键，且真实键存在，执行写入复制
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    CopyRegistryValues(hReal, *KeyHandle);
+                }
+
                 std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                 RegContext* ctx = new RegContext();
                 ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
@@ -3022,6 +3069,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
+                // [新增] 如果是新创建的沙盒键，且真实键存在，执行写入复制
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    CopyRegistryValues(hReal, *KeyHandle);
+                }
+
                 std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                 if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                     RegContext* ctx = new RegContext();
@@ -3093,8 +3145,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         }
 
         if (realExists) {
-            fpNtClose(hRealCheck);
-
             // [关键修复] 使用 AppHive 和相对路径创建影子键
             // 避免因父句柄权限不足导致创建失败
             std::wstring createRelPath = GetPathRelativeToAppHive(&oaModified, isRedirectedRoot);
@@ -3113,11 +3163,14 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                 ULONG disposition;
                 // 使用 AppHive (拥有完全权限) 创建
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
+                    // [新增] 执行注册表写入复制 (CoW)
+                    CopyRegistryValues(hRealCheck, hNewKey);
                     fpNtClose(hNewKey);
                     // 创建成功后，重试原始打开操作
                     status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                 }
             }
+            fpNtClose(hRealCheck); // [修改] 移至此处，确保复制时句柄有效
         }
     }
 
@@ -3212,8 +3265,6 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         }
 
         if (realExists) {
-            fpNtClose(hRealCheck);
-
             // [关键修复] 使用 AppHive 创建影子键
             std::wstring createRelPath = GetPathRelativeToAppHive(&oaModified, isRedirectedRoot);
 
@@ -3228,10 +3279,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
                 ULONG disposition;
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
+                    // [新增] 执行注册表写入复制 (CoW)
+                    CopyRegistryValues(hRealCheck, hNewKey);
                     fpNtClose(hNewKey);
                     status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
                 }
             }
+            fpNtClose(hRealCheck); // [修改] 移至此处，确保复制时句柄有效
         }
     }
 
@@ -8739,6 +8793,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
 
+        // [新增] 获取 NtSetValueKey 指针用于写入复制
+        fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
+
+        if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
