@@ -3307,31 +3307,18 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
 
-    // 1. 获取当前句柄的真实 NT 路径 (这是唯一真理)
     std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) {
-        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
-    }
-
-    // 2. 解析出用于合并的 Real/Sandbox 路径
-    std::wstring realPath, sandboxPath;
-    // 注意：这里传入 currentNtPath 避免 GetRegPaths 内部再次调用 GetPathFromHandle
-    // 我们需要稍微修改 GetRegPaths 或者在这里手动处理，为了性能，建议复用 currentNtPath
-    // 这里为了代码改动最小化，我们假设 GetRegPaths 会再次获取路径，或者我们手动实现路径判断逻辑
-    // 为了稳妥，我们先用 currentNtPath 进行缓存校验
+    if (currentNtPath.empty()) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
 
     RegContext* ctx = nullptr;
     bool needsBuild = false;
 
-    // 3. 检查缓存并校验身份
     {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex); // 使用写锁，因为可能需要删除过期缓存
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
-
         if (it != g_RegContextMap.end()) {
-            // [关键修复] 检查缓存的路径与当前句柄路径是否一致
             if (it->second->FullPath != currentNtPath) {
-                // 句柄被复用了！旧缓存是脏数据，必须清除
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey); // 确保关闭旧句柄
                 delete it->second;
                 g_RegContextMap.erase(it);
                 needsBuild = true;
@@ -3343,17 +3330,15 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             needsBuild = true;
         }
 
-        // 如果需要构建，先占位
         if (needsBuild && ctx == nullptr) {
             ctx = new RegContext();
-            ctx->FullPath = currentNtPath; // [关键] 绑定当前路径
+            ctx->FullPath = currentNtPath;
             g_RegContextMap[KeyHandle] = ctx;
         }
     }
 
-    // 4. 构建合并列表 (无锁操作)
     if (needsBuild) {
-        // 解析路径用于枚举
+        std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegKey> mergedKeys;
 
@@ -5421,7 +5406,7 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 清理 DirContext
+    // 1. 清理 DirContext (文件系统枚举缓存)
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
@@ -5431,20 +5416,24 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 清理 RegContext
+    // 2. 清理 RegContext (注册表重定向上下文)
     {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(Handle);
         if (it != g_RegContextMap.end()) {
-            // [新增] 关闭缓存的真实句柄
+            // 必须先关闭缓存的真实键句柄，否则会造成系统资源泄露
             if (it->second->hRealKey) {
                 fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = NULL;
             }
             delete it->second;
+            // 【修复】之前错误地写成了 g_DirContextMap.erase(it)
             g_RegContextMap.erase(it);
         }
     }
 
+    // 3. 调用原始函数关闭实际句柄
+    // 如果上面的逻辑因为 Map 擦除错误崩溃，这一行将永远不会执行，导致 Hive 无法卸载
     return fpNtClose(Handle);
 }
 
