@@ -198,9 +198,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
-
 // --- [新增] 补充 KEY_INFORMATION_CLASS 枚举 ---
 typedef enum _KEY_INFORMATION_CLASS {
     KeyBasicInformation = 0,
@@ -379,6 +376,25 @@ typedef struct _KEY_VALUE_PARTIAL_INFORMATION_ALIGN64 {
     ULONG DataLength;
     UCHAR Data[1];
 } KEY_VALUE_PARTIAL_INFORMATION_ALIGN64, *PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64;
+
+// --- [修正] 统一函数指针定义 ---
+typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(
+    HANDLE KeyHandle,
+    ULONG Index,
+    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    PVOID KeyValueInformation,
+    ULONG Length,
+    PULONG ResultLength
+);
+
+typedef NTSTATUS(NTAPI* P_NtSetValueKey)(
+    HANDLE KeyHandle,
+    PUNICODE_STRING ValueName,
+    ULONG TitleIndex,
+    ULONG Type,
+    PVOID Data,
+    ULONG DataLength
+);
 
 // [新增] 文件系统信息类枚举
 typedef enum _FSINFOCLASS {
@@ -1181,6 +1197,8 @@ P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
 P_NtDeleteKey fpNtDeleteKey = NULL;
 P_NtEnumerateKey fpNtEnumerateKey = NULL;
 P_NtQueryKey fpNtQueryKey = NULL;
+P_NtEnumerateValueKey fpNtEnumerateValueKey = NULL;
+P_NtSetValueKey fpNtSetValueKey = NULL;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -2840,38 +2858,50 @@ void BuildMergedKeyList(const std::wstring& realNtPath, const std::wstring& sand
 
 // [新增] 辅助函数：将源键的所有值复制到目标键
 void CopyRegistryValues(HANDLE hSrcKey, HANDLE hDestKey) {
-    ULONG index = 0;
-    ULONG resultLen;
-    // 缓冲区大一点以容纳长字符串数据
-    std::vector<BYTE> buffer(16384);
-
-    static P_NtEnumerateValueKey fpNtEnumerateValueKey = (P_NtEnumerateValueKey)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtEnumerateValueKey");
-    static P_NtSetValueKey fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetValueKey");
-
     if (!fpNtEnumerateValueKey || !fpNtSetValueKey) return;
 
-    while (true) {
-        // 使用 KeyValueFullInformation
-        NTSTATUS status = fpNtEnumerateValueKey(hSrcKey, index, KeyValueFullInformation, buffer.data(), (ULONG)buffer.size(), &resultLen);
+    ULONG index = 0;
+    ULONG resultLen = 0;
+    std::vector<BYTE> buffer(16384); 
 
+    while (true) {
+        resultLen = 0;
+        // 调用全局指针
+        NTSTATUS status = fpNtEnumerateValueKey(
+            hSrcKey, 
+            index, 
+            KeyValueFullInformation, 
+            buffer.data(), 
+            (ULONG)buffer.size(), 
+            &resultLen
+        );
+        
         if (status == STATUS_NO_MORE_ENTRIES) break;
+        
         if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
             buffer.resize(resultLen + 1024);
-            continue;
+            continue; // 重新尝试当前索引
         }
+        
         if (!NT_SUCCESS(status)) break;
 
         PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buffer.data();
-
+        
         UNICODE_STRING valName;
         valName.Buffer = info->Name;
         valName.Length = (USHORT)info->NameLength;
         valName.MaximumLength = (USHORT)info->NameLength;
 
         // 写入目标键
-        // DataOffset 是相对于结构体起始位置的偏移
         PVOID dataPtr = (PBYTE)info + info->DataOffset;
-        fpNtSetValueKey(hDestKey, &valName, info->TitleIndex, info->Type, dataPtr, info->DataLength);
+        fpNtSetValueKey(
+            hDestKey, 
+            &valName, 
+            info->TitleIndex, 
+            info->Type, 
+            dataPtr, 
+            info->DataLength
+        );
 
         index++;
     }
@@ -7474,6 +7504,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // [新增] 获取 NtEnumerateKey 和 NtQueryKey
         fpNtEnumerateKey = (P_NtEnumerateKey)GetProcAddress(hNtdll, "NtEnumerateKey");
         fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
+        fpNtEnumerateValueKey = (P_NtEnumerateValueKey)GetProcAddress(hNtdll, "NtEnumerateValueKey");
+        fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
     }
 
     // 1. 刷新设备映射
