@@ -201,6 +201,42 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef struct _KEY_FULL_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG   TitleIndex;
+    ULONG   ClassOffset;
+    ULONG   ClassLength;
+    ULONG   SubKeys;
+    ULONG   MaxNameLen;
+    ULONG   MaxClassLen;
+    ULONG   Values;
+    ULONG   MaxValueNameLen;
+    ULONG   MaxValueDataLen;
+    WCHAR   Class[1]; // Variable length
+    // WCHAR Name[1]; // Variable length located at ClassOffset
+} KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
+
+// 重新定义以匹配通用用法：
+typedef struct _KEY_FULL_INFORMATION_FIXED {
+    LARGE_INTEGER LastWriteTime;
+    ULONG   TitleIndex;
+    ULONG   ClassOffset;
+    ULONG   ClassLength;
+    ULONG   SubKeys;
+    ULONG   MaxNameLen;
+    ULONG   MaxClassLen;
+    ULONG   Values;
+    ULONG   MaxValueNameLen;
+    ULONG   MaxValueDataLen;
+    ULONG   NameLength;
+    WCHAR   Name[1];
+} KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
+
+typedef struct _KEY_NAME_INFORMATION {
+    ULONG   NameLength;
+    WCHAR   Name[1];
+} KEY_NAME_INFORMATION, *PKEY_NAME_INFORMATION;
+
 // 注册表信息类枚举
 typedef enum _KEY_INFORMATION_CLASS {
     KeyBasicInformation = 0,
@@ -2662,14 +2698,11 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
 
     // 检查是否在沙盒内
     if (g_HookReg && !g_RegMountPathNt.empty() && keyPath.find(g_RegMountPathNt) == 0) {
-        // 句柄指向沙盒路径
+        // ... (沙盒路径反向映射逻辑保持不变) ...
         outSandbox = keyPath;
-
-        // 反向映射到真实路径
         std::wstring relPath = keyPath.substr(g_RegMountPathNt.length());
         if (relPath.empty() || relPath[0] != L'\\') return false;
-
-        std::wstring sub = relPath.substr(1); // 去掉开头的斜杠
+        std::wstring sub = relPath.substr(1);
 
         if (sub.find(L"Machine") == 0) {
             outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
@@ -2687,7 +2720,7 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
             outReal = L"\\REGISTRY\\USER" + sub.substr(5);
         }
         else {
-            return false; // 未知根节点
+            return false;
         }
         return true;
     }
@@ -2695,6 +2728,11 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
         // 句柄指向真实路径
         outReal = keyPath;
         std::wstring relPath;
+
+        // [新增] 针对 HKCR 的特殊检查
+        // 如果路径是 \REGISTRY\MACHINE\SOFTWARE\Classes，它可能被视为 HKLM，但我们需要确保它被正确重定向到 Classes 挂载点
+        // ShouldRedirectReg 已经处理了 Classes 前缀，所以这里通常没问题。
+
         if (ShouldRedirectReg(outReal, relPath)) {
             outSandbox = g_RegMountPathNt + L"\\" + relPath;
             return true;
@@ -2711,18 +2749,22 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
     RtlInitUnicodeString(&uStr, path.c_str());
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+    // 尝试打开键
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
         ULONG len;
         std::vector<BYTE> buf(4096);
 
         while (true) {
-            NTSTATUS status = fpNtEnumerateKey(hKey, index, (KEY_INFORMATION_CLASS)KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
-            if (status == STATUS_NO_MORE_ENTRIES) break;
+            NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
+
+            // 处理缓冲区不足的情况 (虽然预分配了4k，但仍可能不足)
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-                buf.resize(len);
-                continue;
+                if (len > buf.size()) buf.resize(len);
+                continue; // 重试
             }
+
+            if (status == STATUS_NO_MORE_ENTRIES) break;
             if (!NT_SUCCESS(status)) break;
 
             PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf.data();
@@ -2733,7 +2775,10 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
             entry.LastWriteTime = info->LastWriteTime;
             entry.TitleIndex = info->TitleIndex;
             if (info->ClassLength > 0 && info->ClassOffset > 0) {
-                entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
+                // 边界检查
+                if (info->ClassOffset + info->ClassLength <= buf.size()) {
+                    entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
+                }
             }
 
             std::wstring keyName = name;
@@ -2942,18 +2987,11 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     return fpNtDeleteKey(KeyHandle);
 }
 
-NTSTATUS NTAPI Detour_NtEnumerateKey(
-    HANDLE KeyHandle,
-    ULONG Index,
-    KEY_INFORMATION_CLASS KeyInformationClass,
-    PVOID KeyInformation,
-    ULONG Length,
-    PULONG ResultLength
-) {
+NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
 
-    // 1. 获取路径并检查是否需要合并
+    // 1. 获取路径
     std::wstring realPath, sandboxPath;
     if (!GetRegPaths(KeyHandle, realPath, sandboxPath)) {
         return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
@@ -2962,7 +3000,7 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(
     RegContext* ctx = nullptr;
     bool needsBuild = false;
 
-    // 2. 检查缓存
+    // 2. 检查缓存状态
     {
         std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
@@ -2974,14 +3012,34 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(
         }
     }
 
-    // 3. 构建合并列表 (如果需要)
+    // 3. 构建合并列表
     if (needsBuild) {
         std::map<std::wstring, CachedRegKey> mergedKeys;
-        // 先枚举真实路径
+
+        // A. 枚举真实路径
         EnumerateKeysToMap(realPath, mergedKeys);
-        // 再枚举沙盒路径 (覆盖同名键)
+
+        // [新增] 特殊处理 HKCR (HKLM\Software\Classes)
+        // 如果我们正在枚举 HKLM Classes，必须同时枚举 HKCU Classes 并合并，否则会丢失用户注册的类
+        // 导致 HKCR 视图不完整
+        if (realPath.find(L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes") != std::wstring::npos) {
+            // 构造对应的 HKCU Classes 路径
+            // 假设 realPath 就是 Classes 根，或者其子键
+            // 简单起见，我们只在枚举 Classes 根时做这个合并
+            if (realPath.length() >= 34 && // len(\REGISTRY\MACHINE\SOFTWARE\Classes)
+                _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
+
+                std::wstring subPath = realPath.substr(34); // 获取相对路径
+                std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
+
+                EnumerateKeysToMap(userClassesPath, mergedKeys);
+            }
+        }
+
+        // B. 枚举沙盒路径 (覆盖同名键)
         EnumerateKeysToMap(sandboxPath, mergedKeys);
 
+        // C. 更新缓存
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
         if (it == g_RegContextMap.end()) {
@@ -3017,39 +3075,90 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(
         case KeyNodeInformation:
             requiredSize = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes + classBytes;
             break;
+        case KeyFullInformation:
+            requiredSize = FIELD_OFFSET(KEY_FULL_INFORMATION, Name) + nameBytes + classBytes;
+            break;
+        case KeyNameInformation:
+            requiredSize = FIELD_OFFSET(KEY_NAME_INFORMATION, Name) + nameBytes;
+            break;
         default:
-            // 其他类型暂不支持合并，回退到原始调用 (可能会漏掉部分键)
+            // 对于不支持的类型，为了避免数据不一致，最好返回错误而不是回退到原始函数
+            // 或者只返回沙盒数据？回退到原始函数会导致索引错乱。
+            // 这里选择返回 STATUS_NOT_IMPLEMENTED 或尝试回退（风险自负）
+            // 鉴于 RegEdit 主要用上述几种，这里暂不处理其他
             return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
 
+    // [关键修复] 处理缓冲区溢出
+    // 即使返回 OVERFLOW，也必须填充 ResultLength 和固定头部信息
+    NTSTATUS status = STATUS_SUCCESS;
     if (Length < requiredSize) {
-        if (ResultLength) *ResultLength = requiredSize;
-        return STATUS_BUFFER_OVERFLOW;
-    }
-
-    // 填充缓冲区
-    memset(KeyInformation, 0, requiredSize);
-    if (KeyInformationClass == KeyBasicInformation) {
-        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime;
-        info->TitleIndex = entry.TitleIndex;
-        info->NameLength = nameBytes;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    } else if (KeyInformationClass == KeyNodeInformation) {
-        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime;
-        info->TitleIndex = entry.TitleIndex;
-        info->NameLength = nameBytes;
-        info->ClassLength = classBytes;
-        info->ClassOffset = (classBytes > 0) ? (FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes) : 0;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-        if (classBytes > 0) {
-            memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
-        }
+        status = STATUS_BUFFER_OVERFLOW;
+        // 注意：不要立即返回，继续填充头部信息，让调用者知道需要多少内存
     }
 
     if (ResultLength) *ResultLength = requiredSize;
-    return STATUS_SUCCESS;
+
+    // 填充数据 (注意检查 Length 是否足够容纳头部)
+    if (KeyInformationClass == KeyBasicInformation) {
+        if (Length >= FIELD_OFFSET(KEY_BASIC_INFORMATION, Name)) {
+            PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
+            info->LastWriteTime = entry.LastWriteTime;
+            info->TitleIndex = entry.TitleIndex;
+            info->NameLength = nameBytes;
+            if (status == STATUS_SUCCESS) memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        }
+    }
+    else if (KeyInformationClass == KeyNodeInformation) {
+        if (Length >= FIELD_OFFSET(KEY_NODE_INFORMATION, Name)) {
+            PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
+            info->LastWriteTime = entry.LastWriteTime;
+            info->TitleIndex = entry.TitleIndex;
+            info->NameLength = nameBytes;
+            info->ClassLength = classBytes;
+            info->ClassOffset = (classBytes > 0) ? (FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes) : 0;
+            // 只有当缓冲区足够时才复制名称和类名
+            if (status == STATUS_SUCCESS) {
+                memcpy(info->Name, entry.Name.c_str(), nameBytes);
+                if (classBytes > 0 && Length >= info->ClassOffset + classBytes) {
+                    memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
+                }
+            }
+        }
+    }
+    else if (KeyInformationClass == KeyFullInformation) {
+        if (Length >= FIELD_OFFSET(KEY_FULL_INFORMATION, Name)) {
+            PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
+            info->LastWriteTime = entry.LastWriteTime;
+            info->TitleIndex = entry.TitleIndex;
+            info->NameLength = nameBytes;
+            info->ClassLength = classBytes;
+            info->ClassOffset = (classBytes > 0) ? (FIELD_OFFSET(KEY_FULL_INFORMATION, Name) + nameBytes) : 0;
+            // KeyFullInformation 还有 SubKeys 等字段，这里暂不填充或填0
+            info->SubKeys = 0;
+            info->MaxNameLen = 0;
+            info->MaxClassLen = 0;
+            info->Values = 0;
+            info->MaxValueNameLen = 0;
+            info->MaxValueDataLen = 0;
+
+            if (status == STATUS_SUCCESS) {
+                memcpy(info->Name, entry.Name.c_str(), nameBytes);
+                if (classBytes > 0 && Length >= info->ClassOffset + classBytes) {
+                    memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
+                }
+            }
+        }
+    }
+    else if (KeyInformationClass == KeyNameInformation) {
+        if (Length >= FIELD_OFFSET(KEY_NAME_INFORMATION, Name)) {
+            PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation;
+            info->NameLength = nameBytes;
+            if (status == STATUS_SUCCESS) memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        }
+    }
+
+    return status;
 }
 
 NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass, PVOID KeyValueInformation, ULONG Length, PULONG ResultLength) {
