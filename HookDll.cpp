@@ -201,18 +201,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
-typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
-typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
-typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
-P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
-
-typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
-typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
-
 // 注册表信息类枚举
 typedef enum _KEY_INFORMATION_CLASS {
     KeyBasicInformation = 0,
@@ -646,6 +634,18 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
+
+typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
+typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
+typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
+P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
+
+typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
+typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
 
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 P_NtQueryValueKey fpNtQueryValueKey = NULL;
