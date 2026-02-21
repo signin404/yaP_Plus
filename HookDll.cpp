@@ -3121,129 +3121,84 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     return status;
 }
 
+// 辅助宏：判断是否包含写权限
+#define IS_WRITE_ACCESS(access) (access & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_WRITE | DELETE | WRITE_DAC | WRITE_OWNER))
+
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    if (g_IsInHook || !g_hAppHive) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
 
-    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
-    UNICODE_STRING usRedirected;
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
-    // 1. 绝对路径重定向判断
+    // 1. 路径重定向判断
     if (ObjectAttributes->RootDirectory == NULL && ShouldRedirectReg(fullNtPath, relPath)) {
-        RtlInitUnicodeString(&usRedirected, relPath.c_str());
-        oaModified.ObjectName = &usRedirected;
-        oaModified.RootDirectory = (HANDLE)g_hAppHive;
         isRedirectedRoot = true;
+    } else {
+        // 如果是相对路径，检查父句柄是否在沙盒内
+        std::wstring realPath;
+        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
+            // 已经是沙盒路径，提取相对路径部分
+            relPath = fullNtPath.substr(g_RegMountPathNt.length());
+            if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
+        }
     }
 
-    // 2. 尝试打开 (沙盒优先)
-    NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+    if (!relPath.empty()) {
+        // 2. 尝试打开沙盒键
+        HANDLE hSandbox = NULL;
+        OBJECT_ATTRIBUTES oaSandbox;
+        UNICODE_STRING usSandbox;
+        RtlInitUnicodeString(&usSandbox, relPath.c_str());
+        InitializeObjectAttributes(&oaSandbox, &usSandbox, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
-    // 3. 处理“未找到”情况 (影子键逻辑)
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-        HANDLE hRealParent = NULL;
-        bool hasRealParent = false;
+        NTSTATUS status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
 
-        // 获取真实父句柄 (用于探测真实键是否存在)
-        if (oaModified.RootDirectory != NULL && !isRedirectedRoot) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(oaModified.RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                hRealParent = it->second->hRealKey;
-                hasRealParent = true;
-            }
-        }
-
-        // 探测真实子项
-        HANDLE hRealCheck = NULL;
-        bool realExists = false;
-
-        if (hasRealParent) {
-            OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-            oaReal.RootDirectory = hRealParent;
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
-                realExists = true;
-            }
-        } else {
-            // 绝对路径或重定向根，直接尝试打开原始路径
-            // 注意：如果是重定向根，ObjectAttributes 指向的是真实路径，所以可以直接用
+        // 3. 如果沙盒不存在
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+            // 探测真实键是否存在
+            HANDLE hRealCheck = NULL;
+            // 注意：这里必须用原始的 ObjectAttributes 探测真实注册表
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes))) {
-                realExists = true;
-            }
-        }
+                fpNtClose(hRealCheck);
 
-        if (realExists) {
-            fpNtClose(hRealCheck);
-
-            // [关键修复] 使用 AppHive 和相对路径创建影子键
-            // 避免因父句柄权限不足导致创建失败
-            std::wstring createRelPath = GetPathRelativeToAppHive(&oaModified, isRedirectedRoot);
-
-            if (!createRelPath.empty()) {
-                // 1. 确保父级路径存在
-                EnsureRegPathExistsRelative(createRelPath);
-
-                // 2. 创建目标键
-                HANDLE hNewKey = NULL;
-                UNICODE_STRING usCreate;
-                OBJECT_ATTRIBUTES oaCreate;
-                RtlInitUnicodeString(&usCreate, createRelPath.c_str());
-                InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-
-                ULONG disposition;
-                // 使用 AppHive (拥有完全权限) 创建
-                if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    fpNtClose(hNewKey);
-                    // 创建成功后，重试原始打开操作
-                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+                // [核心优化] 延迟影子化
+                if (IS_WRITE_ACCESS(DesiredAccess)) {
+                    // 只有写请求才创建影子键 (会导致 Hive 变脏)
+                    EnsureRegPathExistsRelative(relPath);
+                    status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
+                } else {
+                    // 只读请求：直接返回真实注册表的句柄！
+                    // 这样完全不触碰沙盒 Hive，不会导致锁定或变脏
+                    return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
                 }
             }
         }
-    }
 
-    // 4. 成功后绑定真实句柄 (供 NtQueryValueKey 回退使用)
-    if (NT_SUCCESS(status)) {
-        HANDLE hRealTarget = NULL;
-        bool foundReal = false;
-
-        if (ObjectAttributes->RootDirectory != NULL) {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(ObjectAttributes->RootDirectory);
-            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
-                OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
-                oaReal.RootDirectory = it->second->hRealKey;
-                if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                    foundReal = true;
+        if (NT_SUCCESS(status)) {
+            *KeyHandle = hSandbox;
+            // 缓存真实句柄供合并使用
+            HANDLE hReal = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                // 句柄复用处理：如果已存在，先清理旧的
+                auto it = g_RegContextMap.find(hSandbox);
+                if (it != g_RegContextMap.end()) {
+                    if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                    delete it->second;
                 }
-            }
-        } else {
-            if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
-                foundReal = true;
-            }
-        }
-
-        if (foundReal) {
-            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-            if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                 RegContext* ctx = new RegContext();
-                ctx->hRealKey = hRealTarget;
-                ctx->FullPath = (isRedirectedRoot) ? (g_RegMountPathNt + L"\\" + relPath) : GetPathFromHandle(*KeyHandle);
-
-                // [新增] 立即标记为未初始化，强制下一次 QueryKey 或 Enumerate 触发合并
-                ctx->KeysInitialized = false;
-                ctx->ValuesInitialized = false;
-
-                g_RegContextMap[*KeyHandle] = ctx;
-            } else {
-                fpNtClose(hRealTarget);
+                ctx->hRealKey = hReal;
+                ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
+                g_RegContextMap[hSandbox] = ctx;
             }
+            return STATUS_SUCCESS;
         }
+        return status;
     }
 
-    return status;
+    return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 }
 
 NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
@@ -5427,6 +5382,19 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
+    if (g_HookReg) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(Handle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->hRealKey) {
+                fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = NULL;
+            }
+            delete it->second;
+            g_RegContextMap.erase(it);
+        }
+    }
+
     // 清理 DirContext
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
@@ -6174,31 +6142,39 @@ LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lP
 
 // [新增] 进程退出前的清理工作
 void CleanupRegistryHook() {
-    // 1. 清理注册表上下文缓存 (关闭所有打开的真实句柄)
+    // 1. 彻底清理上下文映射
     {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        for (auto& pair : g_RegContextMap) {
-            if (pair.second) {
-                if (pair.second->hRealKey) {
-                    fpNtClose(pair.second->hRealKey);
+        for (auto it = g_RegContextMap.begin(); it != g_RegContextMap.end(); ++it) {
+            if (it->second) {
+                if (it->second->hRealKey) {
+                    fpNtClose(it->second->hRealKey);
+                    it->second->hRealKey = NULL;
                 }
-                delete pair.second;
+                delete it->second;
             }
         }
         g_RegContextMap.clear();
     }
 
-    // 2. 刷新并关闭私有 Hive
+    // 2. 刷新并关闭沙盒根句柄
     if (g_hAppHive) {
-        // 关键：如果写入过数据，强制刷新到磁盘
-        // 这能避免进程结束后 Hive 文件仍被系统占用导致无法卸载
+        // 强制内核将所有挂起的写入刷新到磁盘
         if (fpNtFlushKey) {
             fpNtFlushKey(g_hAppHive);
         }
-
-        // 显式关闭根句柄
+        // 显式关闭句柄，减少引用计数
         fpNtClose(g_hAppHive);
         g_hAppHive = NULL;
+    }
+
+    // 3. 额外保险：清理文件上下文 (如果有)
+    {
+        std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
+        for (auto& pair : g_DirContextMap) {
+            if (pair.second) delete pair.second;
+        }
+        g_DirContextMap.clear();
     }
 }
 
@@ -7965,6 +7941,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
 
             if (NT_SUCCESS(status)) {
+                // 禁止句柄被子进程继承，防止 Hive 被子进程锁定
+                SetHandleInformation((HANDLE)g_hAppHive, HANDLE_FLAG_INHERIT, 0);
                 // [新增] 保存挂载点路径供后续判断使用
                 g_RegMountPathNt = mountPath;
                 DebugLog(L"RegHook: Connected to mounted hive at %s", mountPath.c_str());
