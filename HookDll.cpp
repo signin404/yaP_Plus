@@ -54,6 +54,10 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+#ifndef _KEY_INFORMATION_CLASS_DEFINED
+#define _KEY_INFORMATION_CLASS_DEFINED
+#endif
+
 #ifndef STATUS_NO_MORE_ENTRIES
 #define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
 #endif
