@@ -2679,6 +2679,43 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     }
 }
 
+// [新增] 检查真实键是否存在，如果存在则在沙盒中创建结构 (影子键)
+// 参数:
+//   ParentDirectory: 沙盒中的父句柄 (可以为 NULL)
+//   ObjectName: 要打开的子项名称
+//   RealParent: 真实注册表中的父句柄 (用于探测)
+// 返回: true 表示已确保沙盒中存在该键
+bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent) {
+    // 1. 尝试在真实环境中打开，确认是否存在
+    HANDLE hRealChild = NULL;
+    OBJECT_ATTRIBUTES oaReal;
+    InitializeObjectAttributes(&oaReal, ObjectName, OBJ_CASE_INSENSITIVE, RealParent, NULL);
+
+    NTSTATUS status = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal);
+    if (!NT_SUCCESS(status)) {
+        return false; // 真实环境中也不存在
+    }
+    fpNtClose(hRealCheck);
+
+    // 2. 真实存在，需要在沙盒中创建
+    // 我们需要构造沙盒中的完整路径来调用 NtCreateKey
+    // 或者直接利用 SandboxParent 进行相对创建
+
+    HANDLE hNewKey = NULL;
+    OBJECT_ATTRIBUTES oaNew;
+    InitializeObjectAttributes(&oaNew, ObjectName, OBJ_CASE_INSENSITIVE, SandboxParent, NULL);
+
+    ULONG disposition;
+    status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
+
+    if (NT_SUCCESS(status)) {
+        fpNtClose(hNewKey);
+        return true;
+    }
+
+    return false;
+}
+
 // [新增] 获取句柄对应的真实路径和沙盒路径
 bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
     std::wstring keyPath = GetPathFromHandle(hKey);
@@ -2965,108 +3002,131 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
 
-    // 1. 解析请求的完整路径 (解析 RootDirectory + ObjectName)
+    // --- 阶段 1: 尝试直接打开 (沙盒优先) ---
+    // 这里的逻辑会处理：
+    // 1. 绝对路径重定向 (ShouldRedirectReg)
+    // 2. 相对路径直接打开 (如果 RootDirectory 是沙盒句柄，系统会自动在沙盒内查找)
+
+    // 我们需要先拦截 ObjectAttributes，如果是绝对路径且需要重定向，修改它
+    // 如果是相对路径，且 RootDirectory 是沙盒句柄，保持原样
+
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
+    bool isRedirectedRoot = false;
 
-    // 2. 判断是否需要重定向 (Standard Redirection)
-    // 如果是 HKCU\Software... 这种原始路径，这里会返回 true
-    if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // 构造沙盒路径并尝试打开
-        HANDLE hSandbox = NULL;
-        OBJECT_ATTRIBUTES oaSandbox;
-        UNICODE_STRING usSandbox;
-        RtlInitUnicodeString(&usSandbox, relPath.c_str());
-        InitializeObjectAttributes(&oaSandbox, &usSandbox, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-
-        NTSTATUS status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
-
-        // 如果沙盒中不存在，检查真实键并创建影子键
-        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-            HANDLE hRealCheck = NULL;
-            // 使用原始属性尝试打开真实键
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes))) {
-                fpNtClose(hRealCheck);
-                // 真实存在 -> 创建影子键
-                EnsureRegPathExistsRelative(relPath);
-                // 重试打开
-                status = fpNtOpenKey(&hSandbox, DesiredAccess, &oaSandbox);
-            }
-        }
-
-        if (NT_SUCCESS(status)) {
-            *KeyHandle = hSandbox;
-
-            // [关键] 成功打开沙盒键后，必须缓存对应的真实句柄
-            // 此时 fullNtPath 是真实路径
-            HANDLE hReal = NULL;
-            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
-                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                RegContext* ctx = new RegContext();
-                ctx->FullPath = g_RegMountPathNt + L"\\" + relPath; // 记录沙盒全路径
-                ctx->hRealKey = hReal;
-                g_RegContextMap[hSandbox] = ctx;
-            }
-            return STATUS_SUCCESS;
-        }
-        return status;
+    // 检查是否是绝对路径重定向
+    if (ObjectAttributes->RootDirectory == NULL && ShouldRedirectReg(fullNtPath, relPath)) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+        isRedirectedRoot = true;
     }
 
-    // 3. [关键修复] 处理已经是沙盒路径的情况
-    // 如果 fullNtPath 已经是 \REGISTRY\USER\YapBoxReg_...\User\Software\Rime\Weasel
-    // ShouldRedirectReg 返回 false，代码走到这里。
+    // 尝试打开
+    NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
-    NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
-
-    // 如果打开失败，且这是一个沙盒路径，我们需要检查是否是因为缺少影子键
+    // --- 阶段 2: 处理 "未找到" (影子键逻辑) ---
     if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-        std::wstring realPath;
-        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
-            // 检查真实路径是否存在
-            HANDLE hRealCheck = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        HANDLE hRealParent = NULL;
+        bool hasRealParent = false;
 
+        // 情况 A: 相对打开 (RootDirectory != NULL)
+        if (oaModified.RootDirectory != NULL) {
+            // 查找父句柄的 Context
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(oaModified.RootDirectory);
+            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
+                hRealParent = it->second->hRealKey;
+                hasRealParent = true;
+            }
+        }
+        // 情况 B: 绝对路径重定向 (RootDirectory == AppHive)
+        else if (isRedirectedRoot) {
+            // 这种情况下，我们需要手动打开对应的真实根键
+            // 但为了简单，我们直接用原始 ObjectAttributes 尝试打开真实键
+            // 这里的逻辑在下面的通用处理中覆盖
+        }
+
+        // 尝试在真实环境中查找
+        HANDLE hRealCheck = NULL;
+        bool realExists = false;
+
+        if (hasRealParent) {
+            // 相对查找
+            OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+            oaReal.RootDirectory = hRealParent; // 替换为真实父句柄
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
-                fpNtClose(hRealCheck);
+                realExists = true;
+            }
+        } else {
+            // 绝对查找 (使用原始参数)
+            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes))) {
+                realExists = true;
+            }
+        }
 
-                // 真实存在 -> 创建影子键
-                EnsureSandboxPathExists(fullNtPath);
+        if (realExists) {
+            fpNtClose(hRealCheck);
 
-                // 重试原始调用
-                status = fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+            // 真实存在 -> 在沙盒中创建影子键
+            // 注意：此时 oaModified 已经指向了正确的沙盒位置 (无论是相对还是绝对重定向后)
+            HANDLE hNewKey = NULL;
+            ULONG disposition;
+            // 临时创建，需要写权限
+            NTSTATUS createStatus = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaModified, 0, NULL, 0, &disposition);
+
+            if (NT_SUCCESS(createStatus)) {
+                fpNtClose(hNewKey);
+                // 创建成功后，重试打开
+                status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
             }
         }
     }
 
-    // 4. [关键修复] 成功打开后，如果指向沙盒，必须缓存真实句柄
-    // 无论是通过重定向打开的，还是直接打开的沙盒路径
+    // --- 阶段 3: 成功后的上下文绑定 (缓存真实句柄) ---
     if (NT_SUCCESS(status)) {
-        std::wstring realPath;
-        // 检查当前打开的句柄是否指向沙盒
-        // 注意：这里不能用 fullNtPath，因为如果是相对打开，fullNtPath 是解析后的。
-        // 我们再次检查 fullNtPath 是否在沙盒内
-        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
-            // 尝试打开真实句柄
-            HANDLE hReal = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        // 我们需要找到这个新打开的沙盒句柄对应的真实句柄
+        HANDLE hRealTarget = NULL;
+        bool foundReal = false;
 
-            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                // 检查是否已存在 (避免重复创建)
-                if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                    RegContext* ctx = new RegContext();
-                    ctx->FullPath = fullNtPath;
-                    ctx->hRealKey = hReal;
-                    g_RegContextMap[*KeyHandle] = ctx;
-                } else {
-                    fpNtClose(hReal); // 已存在，关闭多余的
+        // 再次利用之前的逻辑查找真实句柄
+        if (ObjectAttributes->RootDirectory != NULL) {
+            // 相对打开
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(ObjectAttributes->RootDirectory);
+            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
+                OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+                oaReal.RootDirectory = it->second->hRealKey;
+                if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
+                    foundReal = true;
                 }
+            }
+        } else {
+            // 绝对打开
+            if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
+                foundReal = true;
+            }
+        }
+
+        if (foundReal) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            // 检查是否已存在
+            if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
+                RegContext* ctx = new RegContext();
+                // 记录全路径用于校验 (如果是相对打开，这里计算全路径比较麻烦，可以先存空，
+                // 或者通过 GetPathFromHandle 获取。为了性能，这里建议调用 GetPathFromHandle)
+                // 但为了避免死锁或递归，我们可以在 Enumerate 时再懒加载 FullPath
+                // 这里最重要的是 hRealKey
+                ctx->hRealKey = hRealTarget;
+
+                // 尝试获取全路径用于后续校验
+                ctx->FullPath = GetPathFromHandle(*KeyHandle);
+
+                g_RegContextMap[*KeyHandle] = ctx;
+            } else {
+                fpNtClose(hRealTarget); // 应该不会发生，但以防万一
             }
         }
     }
@@ -3078,83 +3138,90 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     RecursionGuard guard;
 
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
+    bool isRedirectedRoot = false;
 
-    // 1. 重定向逻辑
-    if (ShouldRedirectReg(fullNtPath, relPath)) {
-        HANDLE hSandbox = NULL;
-        OBJECT_ATTRIBUTES oaSandbox;
-        UNICODE_STRING usSandbox;
-        RtlInitUnicodeString(&usSandbox, relPath.c_str());
-        InitializeObjectAttributes(&oaSandbox, &usSandbox, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-
-        NTSTATUS status = fpNtOpenKeyEx(&hSandbox, DesiredAccess, &oaSandbox, OpenOptions);
-
-        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-            HANDLE hRealCheck = NULL;
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes, OpenOptions))) {
-                fpNtClose(hRealCheck);
-                EnsureRegPathExistsRelative(relPath);
-                status = fpNtOpenKeyEx(&hSandbox, DesiredAccess, &oaSandbox, OpenOptions);
-            }
-        }
-
-        if (NT_SUCCESS(status)) {
-            *KeyHandle = hSandbox;
-            HANDLE hReal = NULL;
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes, OpenOptions))) {
-                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                RegContext* ctx = new RegContext();
-                ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
-                ctx->hRealKey = hReal;
-                g_RegContextMap[hSandbox] = ctx;
-            }
-            return STATUS_SUCCESS;
-        }
-        return status;
+    if (ObjectAttributes->RootDirectory == NULL && ShouldRedirectReg(fullNtPath, relPath)) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+        isRedirectedRoot = true;
     }
 
-    // 2. 直接打开逻辑
-    NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
-        std::wstring realPath;
-        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
-            HANDLE hRealCheck = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        HANDLE hRealParent = NULL;
+        bool hasRealParent = false;
 
+        if (oaModified.RootDirectory != NULL && !isRedirectedRoot) {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(oaModified.RootDirectory);
+            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
+                hRealParent = it->second->hRealKey;
+                hasRealParent = true;
+            }
+        }
+
+        HANDLE hRealCheck = NULL;
+        bool realExists = false;
+
+        if (hasRealParent) {
+            OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+            oaReal.RootDirectory = hRealParent;
             if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
-                fpNtClose(hRealCheck);
-                EnsureSandboxPathExists(fullNtPath);
-                status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+                realExists = true;
+            }
+        } else {
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, ObjectAttributes, OpenOptions))) {
+                realExists = true;
+            }
+        }
+
+        if (realExists) {
+            fpNtClose(hRealCheck);
+            HANDLE hNewKey = NULL;
+            ULONG disposition;
+            NTSTATUS createStatus = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaModified, 0, NULL, 0, &disposition);
+            if (NT_SUCCESS(createStatus)) {
+                fpNtClose(hNewKey);
+                status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
             }
         }
     }
 
-    // 3. 缓存真实句柄
     if (NT_SUCCESS(status)) {
-        std::wstring realPath;
-        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
-            HANDLE hReal = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        HANDLE hRealTarget = NULL;
+        bool foundReal = false;
 
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
-                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                    RegContext* ctx = new RegContext();
-                    ctx->FullPath = fullNtPath;
-                    ctx->hRealKey = hReal;
-                    g_RegContextMap[*KeyHandle] = ctx;
-                } else {
-                    fpNtClose(hReal);
+        if (ObjectAttributes->RootDirectory != NULL) {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(ObjectAttributes->RootDirectory);
+            if (it != g_RegContextMap.end() && it->second->hRealKey != NULL) {
+                OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+                oaReal.RootDirectory = it->second->hRealKey;
+                if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
+                    foundReal = true;
                 }
+            }
+        } else {
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes, OpenOptions))) {
+                foundReal = true;
+            }
+        }
+
+        if (foundReal) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
+                RegContext* ctx = new RegContext();
+                ctx->hRealKey = hRealTarget;
+                ctx->FullPath = GetPathFromHandle(*KeyHandle);
+                g_RegContextMap[*KeyHandle] = ctx;
+            } else {
+                fpNtClose(hRealTarget);
             }
         }
     }
