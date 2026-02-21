@@ -198,6 +198,9 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
+
 // --- [新增] 补充 KEY_INFORMATION_CLASS 枚举 ---
 typedef enum _KEY_INFORMATION_CLASS {
     KeyBasicInformation = 0,
@@ -2835,6 +2838,45 @@ void BuildMergedKeyList(const std::wstring& realNtPath, const std::wstring& sand
     }
 }
 
+// [新增] 辅助函数：将源键的所有值复制到目标键
+void CopyRegistryValues(HANDLE hSrcKey, HANDLE hDestKey) {
+    ULONG index = 0;
+    ULONG resultLen;
+    // 缓冲区大一点以容纳长字符串数据
+    std::vector<BYTE> buffer(16384);
+
+    static P_NtEnumerateValueKey fpNtEnumerateValueKey = (P_NtEnumerateValueKey)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtEnumerateValueKey");
+    static P_NtSetValueKey fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetValueKey");
+
+    if (!fpNtEnumerateValueKey || !fpNtSetValueKey) return;
+
+    while (true) {
+        // 使用 KeyValueFullInformation
+        NTSTATUS status = fpNtEnumerateValueKey(hSrcKey, index, KeyValueFullInformation, buffer.data(), (ULONG)buffer.size(), &resultLen);
+
+        if (status == STATUS_NO_MORE_ENTRIES) break;
+        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+            buffer.resize(resultLen + 1024);
+            continue;
+        }
+        if (!NT_SUCCESS(status)) break;
+
+        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buffer.data();
+
+        UNICODE_STRING valName;
+        valName.Buffer = info->Name;
+        valName.Length = (USHORT)info->NameLength;
+        valName.MaximumLength = (USHORT)info->NameLength;
+
+        // 写入目标键
+        // DataOffset 是相对于结构体起始位置的偏移
+        PVOID dataPtr = (PBYTE)info + info->DataOffset;
+        fpNtSetValueKey(hDestKey, &valName, info->TitleIndex, info->Type, dataPtr, info->DataLength);
+
+        index++;
+    }
+}
+
 // --- 注册表 NT API Hook 实现 ---
 
 NTSTATUS NTAPI Detour_NtEnumerateKey(
@@ -2949,19 +2991,15 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     ULONG Length,
     PULONG ResultLength
 ) {
-    // 先调用原始函数获取其他信息
     NTSTATUS status = fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
 
     if (g_IsInHook || !g_HookReg || !NT_SUCCESS(status)) return status;
-
-    // 我们只关心 KeyFullInformation 因为它包含 SubKeys (数量)
     if (KeyInformationClass != KeyFullInformation) return status;
 
     RecursionGuard guard;
     RegContext* ctx = nullptr;
     bool needsBuild = false;
 
-    // 检查缓存
     {
         std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
@@ -2975,7 +3013,6 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     if (needsBuild) {
         std::wstring realNt, sandboxNt;
         if (GetRealAndSandboxRegPaths(KeyHandle, realNt, sandboxNt)) {
-            // 需要合并 构建缓存
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it == g_RegContextMap.end()) {
@@ -2990,18 +3027,29 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     }
 
     if (ctx) {
-        // 如果有缓存 修正返回的 SubKeys 数量
         PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
-        // 只有缓冲区足够容纳头部时才修改
-        if (Length >= FIELD_OFFSET(KEY_FULL_INFORMATION, Class)) {
+        if (Length >= sizeof(KEY_FULL_INFORMATION)) { // 确保缓冲区足够
             info->SubKeys = (ULONG)ctx->SubKeys.size();
+
+            // [新增] 重新计算 MaxNameLen 等统计信息
+            // 如果不更新这些，资源管理器可能会因为缓冲区分配不足而无法显示子项
+            ULONG maxNameLen = 0;
+            ULONG maxClassLen = 0;
+
+            for (const auto& entry : ctx->SubKeys) {
+                ULONG nameLen = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+                if (nameLen > maxNameLen) maxNameLen = nameLen;
+            }
+
+            info->MaxSubKeyLen = maxNameLen;
+            // info->MaxClassLen = ...; // 类名通常不重要，保持原样或设为0
         }
     }
 
     return status;
 }
 
-// [修改] Detour_NtCreateKey - 增加父路径自动创建逻辑
+// [修改] Detour_NtCreateKey - 增加句柄清理
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
@@ -3015,17 +3063,12 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // relPath 例如: "User\Software\MyApp"
-
-        // 1. [关键修复] 确保父路径在沙盒中存在
-        // NtCreateKey 只能创建最后一级，如果中间路径不存在会失败
         size_t lastSlash = relPath.find_last_of(L'\\');
         if (lastSlash != std::wstring::npos) {
             std::wstring parentPath = relPath.substr(0, lastSlash);
             EnsureRegPathExistsRelative(parentPath);
         }
 
-        // 2. 重定向参数
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
@@ -3040,13 +3083,19 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
+        // [关键修复] 成功创建新句柄时，必须清除该句柄值可能残留的旧缓存
+        if (NT_SUCCESS(status) && KeyHandle && *KeyHandle) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            g_RegContextMap.erase(*KeyHandle);
+        }
+
         return status;
     }
 
     return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 }
 
-// [修改] Detour_NtOpenKey - 增加写入时自动迁移 (CoW) 逻辑
+// [修改] Detour_NtOpenKey - 增加值复制和句柄清理
 NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
     if (g_IsInHook || !g_hAppHive || g_RegMountPathNt.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
@@ -3055,7 +3104,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // 1. 尝试打开沙盒路径
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
@@ -3070,37 +3118,32 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // 2. 如果沙盒中存在，直接返回
-        if (NT_SUCCESS(status)) return status;
+        if (NT_SUCCESS(status)) {
+            // [关键修复] 清理旧缓存
+            if (KeyHandle && *KeyHandle) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                g_RegContextMap.erase(*KeyHandle);
+            }
+            return status;
+        }
 
-        // 3. 沙盒中不存在
         if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
-
-            // 检查是否请求了写入权限
             bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_WRITE));
 
-            // 如果是只读访问，回退到真实路径 (透传)
             if (!isWrite) {
                 return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
             }
 
-            // 如果是写入访问，我们不能返回真实句柄（否则会污染系统）
-            // 我们需要检查真实路径是否存在，如果存在，则在沙盒中“克隆”这个键（Copy-on-Write）
-
-            // 3.1 检查真实路径是否存在
             HANDLE hReal = NULL;
-            NTSTATUS realStatus = fpNtOpenKey(&hReal, KEY_READ, ObjectAttributes);
+            NTSTATUS realStatus = fpNtOpenKey(&hReal, KEY_READ, ObjectAttributes); // 只读打开真实键
             if (NT_SUCCESS(realStatus)) {
-                fpNtClose(hReal);
 
-                // 3.2 真实存在 -> 在沙盒中创建该键 (Migrate)
-                // 确保父级存在
+                // 确保父路径存在
                 size_t lastSlash = relPath.find_last_of(L'\\');
                 if (lastSlash != std::wstring::npos) {
                     EnsureRegPathExistsRelative(relPath.substr(0, lastSlash));
                 }
 
-                // 创建键 (使用 CreateKey 替代 OpenKey)
                 HANDLE hSandboxKey = NULL;
                 ULONG disposition;
 
@@ -3113,12 +3156,22 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                 ObjectAttributes->RootDirectory = oldRoot;
 
                 if (NT_SUCCESS(status)) {
+                    // [关键修复] 迁移：将真实键的值复制到新创建的沙盒键中
+                    CopyRegistryValues(hReal, hSandboxKey);
+
+                    fpNtClose(hReal);
                     *KeyHandle = hSandboxKey;
+
+                    // [关键修复] 清理旧缓存
+                    {
+                        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                        g_RegContextMap.erase(hSandboxKey);
+                    }
                     return STATUS_SUCCESS;
                 }
+                fpNtClose(hReal);
             }
         }
-
         return status;
     }
 
@@ -3148,7 +3201,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        if (NT_SUCCESS(status)) return status;
+        if (NT_SUCCESS(status)) {
+            if (KeyHandle && *KeyHandle) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                g_RegContextMap.erase(*KeyHandle);
+            }
+            return status;
+        }
 
         if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) {
             bool isWrite = (DesiredAccess & (KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | MAXIMUM_ALLOWED | GENERIC_ALL | GENERIC_WRITE));
@@ -3157,11 +3216,9 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
                 return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
             }
 
-            // Copy-on-Write Logic
             HANDLE hReal = NULL;
             NTSTATUS realStatus = fpNtOpenKeyEx(&hReal, KEY_READ, ObjectAttributes, OpenOptions);
             if (NT_SUCCESS(realStatus)) {
-                fpNtClose(hReal);
 
                 size_t lastSlash = relPath.find_last_of(L'\\');
                 if (lastSlash != std::wstring::npos) {
@@ -3180,9 +3237,18 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
                 ObjectAttributes->RootDirectory = oldRoot;
 
                 if (NT_SUCCESS(status)) {
+                    CopyRegistryValues(hReal, hSandboxKey);
+
+                    fpNtClose(hReal);
                     *KeyHandle = hSandboxKey;
+
+                    {
+                        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                        g_RegContextMap.erase(hSandboxKey);
+                    }
                     return STATUS_SUCCESS;
                 }
+                fpNtClose(hReal);
             }
         }
         return status;
