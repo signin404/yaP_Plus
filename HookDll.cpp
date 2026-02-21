@@ -2686,33 +2686,29 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
 //   RealParent: 真实注册表中的父句柄 (用于探测)
 // 返回: true 表示已确保沙盒中存在该键
 bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent) {
-    // 1. 尝试在真实环境中打开，确认是否存在
-    HANDLE hRealChild = NULL;
+    HANDLE hRealChild = NULL; 
     OBJECT_ATTRIBUTES oaReal;
     InitializeObjectAttributes(&oaReal, ObjectName, OBJ_CASE_INSENSITIVE, RealParent, NULL);
 
-    NTSTATUS status = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal);
+    // 1. 探测真实键是否存在
+    NTSTATUS status = fpNtOpenKey(&hRealChild, KEY_QUERY_VALUE, &oaReal);
     if (!NT_SUCCESS(status)) {
-        return false; // 真实环境中也不存在
+        return false; 
     }
-    fpNtClose(hRealCheck);
+    fpNtClose(hRealChild);
 
-    // 2. 真实存在，需要在沙盒中创建
-    // 我们需要构造沙盒中的完整路径来调用 NtCreateKey
-    // 或者直接利用 SandboxParent 进行相对创建
-
+    // 2. 真实存在，在沙盒中创建影子结构
     HANDLE hNewKey = NULL;
     OBJECT_ATTRIBUTES oaNew;
     InitializeObjectAttributes(&oaNew, ObjectName, OBJ_CASE_INSENSITIVE, SandboxParent, NULL);
-
+    
     ULONG disposition;
     status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
-
+    
     if (NT_SUCCESS(status)) {
         fpNtClose(hNewKey);
         return true;
     }
-
     return false;
 }
 
