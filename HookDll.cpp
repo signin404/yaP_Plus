@@ -54,6 +54,11 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// --- [新增] 补充注册表枚举相关的状态码 ---
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
+#endif
+
 // --- 注册表重定向相关常量与指针 ---
 #ifndef REG_PROCESS_APPKEY
 #define REG_PROCESS_APPKEY 0x00000001
@@ -189,12 +194,69 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-// [新增] 注册表枚举相关定义
-typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtEnumerateKey fpNtEnumerateKey = NULL;
+// --- [新增] 补充 KEY_INFORMATION_CLASS 枚举 ---
+typedef enum _KEY_INFORMATION_CLASS {
+    KeyBasicInformation = 0,
+    KeyNodeInformation,
+    KeyFullInformation,
+    KeyNameInformation,
+    KeyCachedInformation,
+    KeyFlagsInformation,
+    KeyVirtualizationInformation,
+    KeyHandleTagsInformation,
+    KeyTrustInformation,
+    KeyLayerInformation,
+    MaxKeyInfoClass
+} KEY_INFORMATION_CLASS;
 
-typedef NTSTATUS(NTAPI* P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtQueryKey fpNtQueryKey = NULL; // 需要在 Init 中获取
+// --- [新增] 补充注册表枚举结构体 ---
+typedef struct _KEY_BASIC_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         NameLength;
+    WCHAR         Name[1];
+} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
+
+typedef struct _KEY_NODE_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         ClassOffset;
+    ULONG         ClassLength;
+    ULONG         NameLength;
+    WCHAR         Name[1];
+} KEY_NODE_INFORMATION, *PKEY_NODE_INFORMATION;
+
+typedef struct _KEY_FULL_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         ClassOffset;
+    ULONG         ClassLength;
+    ULONG         SubKeys;
+    ULONG         MaxSubKeyLen;
+    ULONG         MaxClassLen;
+    ULONG         Values;
+    ULONG         MaxValueNameLen;
+    ULONG         MaxValueDataLen;
+    WCHAR         Class[1];
+} KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
+
+// --- [新增] 补充 NtEnumerateKey 函数指针定义 ---
+typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(
+    HANDLE KeyHandle,
+    ULONG Index,
+    KEY_INFORMATION_CLASS KeyInformationClass,
+    PVOID KeyInformation,
+    ULONG Length,
+    PULONG ResultLength
+);
+
+typedef NTSTATUS(NTAPI* P_NtQueryKey)(
+    HANDLE KeyHandle,
+    KEY_INFORMATION_CLASS KeyInformationClass,
+    PVOID KeyInformation,
+    ULONG Length,
+    PULONG ResultLength
+);
 
 typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
