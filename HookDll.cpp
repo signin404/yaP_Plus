@@ -3154,7 +3154,6 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
         if (it != g_RegContextMap.end()) {
-            // [关键修复] 校验路径
             if (it->second->FullPath != currentNtPath) {
                 delete it->second;
                 g_RegContextMap.erase(it);
@@ -3169,7 +3168,7 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
 
         if (needsBuild && ctx == nullptr) {
             ctx = new RegContext();
-            ctx->FullPath = currentNtPath; // 绑定路径
+            ctx->FullPath = currentNtPath;
             g_RegContextMap[KeyHandle] = ctx;
         }
     }
@@ -3190,7 +3189,6 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
                 ctx->ValuesInitialized = true;
             }
         } else {
-            // 不需要 Hook，清理并返回原始
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end()) {
@@ -3210,39 +3208,64 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
 
     if (Index >= ctx->Values.size()) return STATUS_NO_MORE_ENTRIES;
 
-    // ... (后续填充逻辑保持不变) ...
     const CachedRegValue& entry = ctx->Values[Index];
     ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
     ULONG dataBytes = (ULONG)entry.Data.size();
     ULONG requiredSize = 0;
 
+    // [关键修改] 计算对齐后的 DataOffset
+    ULONG dataOffset = 0;
+
     switch (KeyValueInformationClass) {
-        case KeyValueBasicInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes; break;
-        case KeyValueFullInformation:  requiredSize = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes + dataBytes; break;
-        case KeyValuePartialInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes; break;
-        default: return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        case KeyValueBasicInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes;
+            break;
+        case KeyValueFullInformation:
+            // 计算 Name 结束后的偏移
+            dataOffset = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes;
+            // [修复] 强制 4 字节对齐 (DataOffset 必须是 4 的倍数)
+            dataOffset = (dataOffset + 3) & ~3;
+            // 总大小 = 对齐后的偏移 + 数据大小
+            requiredSize = dataOffset + dataBytes;
+            break;
+        case KeyValuePartialInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes;
+            break;
+        default:
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     }
 
     if (ResultLength) *ResultLength = requiredSize;
     if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
 
     memset(KeyValueInformation, 0, Length);
+
     if (KeyValueInformationClass == KeyValueBasicInformation) {
         PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation;
         info->TitleIndex = entry.TitleIndex;
         info->Type = entry.Type;
         info->NameLength = nameBytes;
         memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    } else if (KeyValueInformationClass == KeyValueFullInformation) {
+    }
+    else if (KeyValueInformationClass == KeyValueFullInformation) {
         PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
         info->TitleIndex = entry.TitleIndex;
         info->Type = entry.Type;
         info->NameLength = nameBytes;
         info->DataLength = dataBytes;
-        info->DataOffset = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes;
+        // 使用对齐后的偏移
+        info->DataOffset = dataOffset;
+
         memcpy(info->Name, entry.Name.c_str(), nameBytes);
-        if (dataBytes > 0) memcpy((BYTE*)info + info->DataOffset, entry.Data.data(), dataBytes);
-    } else if (KeyValueInformationClass == KeyValuePartialInformation) {
+
+        if (dataBytes > 0) {
+            // 确保写入位置在缓冲区范围内
+            if (Length >= dataOffset + dataBytes) {
+                memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
+            }
+        }
+    }
+    else if (KeyValueInformationClass == KeyValuePartialInformation) {
         PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
         info->TitleIndex = entry.TitleIndex;
         info->Type = entry.Type;
