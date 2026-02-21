@@ -2732,6 +2732,36 @@ std::wstring GetPathRelativeToAppHive(POBJECT_ATTRIBUTES attr, bool isRedirected
     return L"";
 }
 
+// [新增] 注册表写入复制 (CoW) 辅助函数
+void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
+    if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
+
+    ULONG index = 0;
+    ULONG len;
+    std::vector<BYTE> buf(4096);
+
+    while (true) {
+        NTSTATUS status = fpNtEnumerateValueKey(hRealKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
+
+        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+            buf.resize(len);
+            continue;
+        }
+
+        if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
+
+        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
+        UNICODE_STRING valueName;
+        valueName.Buffer = info->Name;
+        valueName.Length = (USHORT)info->NameLength;
+        valueName.MaximumLength = (USHORT)info->NameLength;
+
+        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, (BYTE*)info + info->DataOffset, info->DataLength);
+
+        index++;
+    }
+}
+
 // [新增] 检查真实键是否存在，如果存在则在沙盒中创建结构 (影子键)
 // 参数:
 //   ParentDirectory: 沙盒中的父句柄 (可以为 NULL)
@@ -2973,36 +3003,6 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
         std::wstring relPath = fullSandboxPath.substr(g_RegMountPathNt.length());
         if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
         EnsureRegPathExistsRelative(relPath);
-    }
-}
-
-// [新增] 注册表写入复制 (CoW) 辅助函数
-void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
-    if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
-
-    ULONG index = 0;
-    ULONG len;
-    std::vector<BYTE> buf(4096);
-
-    while (true) {
-        NTSTATUS status = fpNtEnumerateValueKey(hRealKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
-
-        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-            buf.resize(len);
-            continue;
-        }
-
-        if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
-
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
-        UNICODE_STRING valueName;
-        valueName.Buffer = info->Name;
-        valueName.Length = (USHORT)info->NameLength;
-        valueName.MaximumLength = (USHORT)info->NameLength;
-
-        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, (BYTE*)info + info->DataOffset, info->DataLength);
-
-        index++;
     }
 }
 
