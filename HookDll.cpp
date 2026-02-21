@@ -54,6 +54,11 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// [新增] 判断是否包含注册表写入/修改权限
+#ifndef IS_REG_WRITE_ACCESS
+#define IS_REG_WRITE_ACCESS(access) (((access) & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER | MAXIMUM_ALLOWED | GENERIC_WRITE | GENERIC_ALL)) != 0)
+#endif
+
 // [新增] 补充注册表创建状态宏
 #ifndef REG_CREATED_NEW_KEY
 #define REG_CREATED_NEW_KEY (0x00000001L)
@@ -2763,12 +2768,7 @@ void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
 }
 
 // [新增] 检查真实键是否存在，如果存在则在沙盒中创建结构 (影子键)
-// 参数:
-//   ParentDirectory: 沙盒中的父句柄 (可以为 NULL)
-//   ObjectName: 要打开的子项名称
-//   RealParent: 真实注册表中的父句柄 (用于探测)
-// 返回: true 表示已确保沙盒中存在该键
-bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent) {
+bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent, ACCESS_MASK DesiredAccess = KEY_WRITE) {
     HANDLE hRealChild = NULL;
     OBJECT_ATTRIBUTES oaReal;
     InitializeObjectAttributes(&oaReal, ObjectName, OBJ_CASE_INSENSITIVE, RealParent, NULL);
@@ -2788,8 +2788,10 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
 
     if (NT_SUCCESS(status)) {
-        // [新增] 执行注册表写入复制 (CoW)
-        CopyRegistryValues(hRealChild, hNewKey);
+        // [修改] 仅当请求了写入权限时，才执行写入复制
+        if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+            CopyRegistryValues(hRealChild, hNewKey);
+        }
         fpNtClose(hNewKey);
         fpNtClose(hRealChild);
         return true;
@@ -3041,8 +3043,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             HANDLE hReal = NULL;
             // 使用原始 ObjectAttributes 打开真实键
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, ObjectAttributes))) {
-                // [新增] 如果是新创建的沙盒键，且真实键存在，执行写入复制
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                // [修改] 仅当请求了写入权限时，才执行写入复制，避免纯枚举导致沙盒膨胀
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
 
@@ -3069,8 +3071,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [新增] 如果是新创建的沙盒键，且真实键存在，执行写入复制
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                // [修改] 仅当请求了写入权限时，才执行写入复制，避免纯枚举导致沙盒膨胀
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
 
@@ -3163,14 +3165,16 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                 ULONG disposition;
                 // 使用 AppHive (拥有完全权限) 创建
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    // [新增] 执行注册表写入复制 (CoW)
-                    CopyRegistryValues(hRealCheck, hNewKey);
+                    // [修改] 仅当请求了写入权限时，才执行写入复制
+                    if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                        CopyRegistryValues(hRealCheck, hNewKey);
+                    }
                     fpNtClose(hNewKey);
                     // 创建成功后，重试原始打开操作
                     status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                 }
             }
-            fpNtClose(hRealCheck); // [修改] 移至此处，确保复制时句柄有效
+            fpNtClose(hRealCheck); // 确保复制时句柄有效
         }
     }
 
@@ -3279,13 +3283,15 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
                 ULONG disposition;
                 if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    // [新增] 执行注册表写入复制 (CoW)
-                    CopyRegistryValues(hRealCheck, hNewKey);
+                    // [修改] 仅当请求了写入权限时，才执行写入复制
+                    if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                        CopyRegistryValues(hRealCheck, hNewKey);
+                    }
                     fpNtClose(hNewKey);
                     status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
                 }
             }
-            fpNtClose(hRealCheck); // [修改] 移至此处，确保复制时句柄有效
+            fpNtClose(hRealCheck); // 确保复制时句柄有效
         }
     }
 
