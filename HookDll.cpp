@@ -2964,6 +2964,29 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     }
 }
 
+// [新增] 彻底释放注册表资源
+void CleanupRegistryResources() {
+    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+
+    // 1. 清理所有打开的子键上下文
+    for (auto& pair : g_RegContextMap) {
+        if (pair.second->hRealKey) {
+            fpNtClose(pair.second->hRealKey);
+        }
+        delete pair.second;
+    }
+    g_RegContextMap.clear();
+
+    // 2. 关键：关闭全局 Hive 根句柄
+    if (g_hAppHive) {
+        // 刷新缓冲区，确保外部写入的数据已落盘
+        RegFlushKey((HKEY)g_hAppHive); 
+        fpNtClose(g_hAppHive);
+        g_hAppHive = NULL;
+        DebugLog(L"RegHook: Global hive handle closed.");
+    }
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
@@ -5406,7 +5429,7 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 1. 清理 DirContext (文件系统枚举缓存)
+    // 1. 清理文件系统上下文
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
@@ -5416,24 +5439,21 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 2. 清理 RegContext (注册表重定向上下文)
+    // 2. 清理注册表上下文
     {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(Handle);
         if (it != g_RegContextMap.end()) {
-            // 必须先关闭缓存的真实键句柄，否则会造成系统资源泄露
+            // 必须关闭缓存的真实键句柄
             if (it->second->hRealKey) {
                 fpNtClose(it->second->hRealKey);
-                it->second->hRealKey = NULL;
             }
             delete it->second;
             // 【修复】之前错误地写成了 g_DirContextMap.erase(it)
-            g_RegContextMap.erase(it);
+            g_RegContextMap.erase(it); 
         }
     }
 
-    // 3. 调用原始函数关闭实际句柄
-    // 如果上面的逻辑因为 Map 擦除错误崩溃，这一行将永远不会执行，导致 Hive 无法卸载
     return fpNtClose(Handle);
 }
 
@@ -6156,17 +6176,16 @@ LRESULT WINAPI Detour_SendMessageA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lP
 // --- [新增] 强制退出 Hook (解决进程残留) ---
 
 void WINAPI Detour_ExitProcess(UINT uExitCode) {
-    // 这里的关键是使用 TerminateProcess 而不是 ExitProcess
-    // ExitProcess 会尝试通知所有 DLL (DLL_PROCESS_DETACH) 并等待线程结束 容易导致死锁
-    // TerminateProcess 是内核级强制查杀 瞬间结束 不留后患
+    // 在进程自杀前，先释放注册表锁
+    CleanupRegistryResources();
     TerminateProcess(GetCurrentProcess(), uExitCode);
 }
 
 NTSTATUS NTAPI Detour_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
-    // 如果程序尝试结束自己
     if (!ProcessHandle || ProcessHandle == GetCurrentProcess()) {
-        TerminateProcess(GetCurrentProcess(), 0); // 强制退出
-        return STATUS_SUCCESS; // 实际上永远不会执行到这里
+        CleanupRegistryResources();
+        TerminateProcess(GetCurrentProcess(), (UINT)ExitStatus);
+        return STATUS_SUCCESS;
     }
     return fpNtTerminateProcess(ProcessHandle, ExitStatus);
 }
@@ -6575,7 +6594,7 @@ VOID WINAPI Detour_GetSystemTimePreciseAsFileTime_KB(LPFILETIME lpSystemTimeAsFi
 
 // Ntdll 级别的退出函数 比 ExitProcess 更底层
 void NTAPI Detour_RtlExitUserProcess(NTSTATUS Status) {
-    // 强制终止当前进程 不等待任何线程清理
+    CleanupRegistryResources();
     TerminateProcess(GetCurrentProcess(), Status);
 }
 
@@ -7908,6 +7927,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (!fpNtOpenKey) fpNtOpenKey = (P_NtOpenKey)GetProcAddress(hNtdll, "NtOpenKey");
 
             if (fpNtOpenKey) {
+                InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
                 status = fpNtOpenKey(reinterpret_cast<PHANDLE>(&g_hAppHive), KEY_ALL_ACCESS, &oa);
             } else {
                 status = STATUS_NOT_SUPPORTED;
@@ -8767,6 +8787,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinst);
         CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
+        // 正常卸载时的清理
+        CleanupRegistryResources();
         MH_Uninitialize();
     }
     return TRUE;
