@@ -3159,7 +3159,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     if (ShouldRedirectReg(fullNtPath, relPath)) {
         EnsureRegPathExistsRelative(relPath);
 
-        // [新增] 目标沙盒键存在且带墓碑时，递归物理删除，避免 CoW 判断错误
+        // [修复] 目标沙盒键存在且带墓碑时，递归物理删除，避免 CoW 判断错误
+        // 必须在调用 NtCreateKey 之前执行，确保返回 REG_CREATED_NEW_KEY
         std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
         {
             HANDLE hCheck = NULL;
@@ -3201,8 +3202,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
             }
             // [修复] 使父键枚举缓存失效
-            std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
-            InvalidateParentRegContext(sandboxFullPath);
+            InvalidateParentRegContext(targetSandboxFull);
 
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
@@ -3235,16 +3235,36 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     }
 
     // 2. 直接创建 (可能是在沙盒路径下创建)
+    // [修复] 在 NtCreateKey 之前检查并处理沙盒内的墓碑键
+    // 场景：父句柄已在沙盒，子键用相对路径创建，ShouldRedirectReg 不会触发，但仍然需要处理"删除后重建"的情况
+    bool isSandboxPath = (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0);
+    bool preDeletedTomb = false;
+
+    if (isSandboxPath) {
+        HANDLE hCheck = NULL;
+        OBJECT_ATTRIBUTES oaCheck;
+        UNICODE_STRING usCheck;
+        RtlInitUnicodeString(&usCheck, fullNtPath.c_str());
+        InitializeObjectAttributes(&oaCheck, &usCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        // 尝试打开检查是否存在墓碑
+        if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
+            bool hasTomb = HasTombstone(hCheck);
+            fpNtClose(hCheck);
+            if (hasTomb) {
+                DeleteSandboxKeyRecursive(fullNtPath);
+                InvalidateParentRegContext(fullNtPath);
+                preDeletedTomb = true;
+            }
+        }
+    }
+
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 
     if (NT_SUCCESS(status)) {
-        // [修复] fullNtPath 在沙盒内且返回 OPENED_EXISTING 时检查墓碑
-        // 场景：父句柄已在沙盒，子键用相对路径创建，ShouldRedirectReg 不会触发
-        if (Disposition && *Disposition == REG_OPENED_EXISTING_KEY &&
-            !g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0 &&
-            HasTombstone(*KeyHandle))
+        // [修复] 如果我们没有在之前删除（例如权限问题），但检测到了打开的是带墓碑的键，则进行补救处理
+        if (!preDeletedTomb && Disposition && *Disposition == REG_OPENED_EXISTING_KEY &&
+            isSandboxPath && HasTombstone(*KeyHandle))
         {
-            // 用新的 KEY_SET_VALUE 句柄删除墓碑值（*KeyHandle 的权限可能不含 KEY_SET_VALUE）
             if (fpNtDeleteValueKey) {
                 HANDLE hWrite = NULL;
                 UNICODE_STRING usWrite;
@@ -3272,6 +3292,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
+                // 只有当确实是新建时才复制值（避免覆盖用户修改）
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
