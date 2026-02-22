@@ -2630,6 +2630,36 @@ bool HasTombstone(HANDLE hKey, bool* accessDenied = nullptr) {
     return NT_SUCCESS(st);
 }
 
+// --- [新增] 清除键的所有值 (用于复活墓碑键时) ---
+void ClearSandboxKeyValues(HANDLE hKey) {
+    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
+    ULONG index = 0;
+    ULONG len;
+    std::vector<BYTE> buf(1024);
+    std::vector<std::wstring> valueNames;
+
+    // 1. 先收集所有值名，防止边删边枚举导致死循环或遗漏
+    while (true) {
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            buf.resize(len);
+            continue;
+        }
+        if (!NT_SUCCESS(st) || st == STATUS_NO_MORE_ENTRIES) break;
+
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf.data();
+        valueNames.push_back(std::wstring(info->Name, info->NameLength / sizeof(WCHAR)));
+        index++;
+    }
+
+    // 2. 统一删除 (这也会一并删掉 __YapBox_Deleted__ 墓碑)
+    for (const auto& name : valueNames) {
+        UNICODE_STRING uName;
+        RtlInitUnicodeString(&uName, name.c_str());
+        fpNtDeleteValueKey(hKey, &uName);
+    }
+}
+
 // 递归物理删除沙盒键（含所有子键）
 void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
     // 先枚举并递归删除所有子键
@@ -3171,7 +3201,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     if (ShouldRedirectReg(fullNtPath, relPath)) {
         EnsureRegPathExistsRelative(relPath);
 
-        // [修复] 目标沙盒键存在且带墓碑时，将其重命名为临时键让路，避免 STATUS_KEY_DELETED 导致创建 "新项 #2"
         std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
         std::wstring tempPathToClean;
         bool wasTombstoned = false; // [新增] 记录是否曾有墓碑
@@ -3184,7 +3213,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             if (NT_SUCCESS(fpNtOpenKey(&hCheck, MAXIMUM_ALLOWED, &oaCheck))) {
                 bool hasTomb = HasTombstone(hCheck);
                 if (hasTomb) {
-                    wasTombstoned = true; // [新增]
+                    wasTombstoned = true;
                     wchar_t tempName[64];
                     swprintf_s(tempName, L"__YBTmp%u_%u__", GetTickCount(), GetCurrentThreadId());
                     UNICODE_STRING usTempName;
@@ -3207,7 +3236,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 bool hasTomb = HasTombstone(hCheck);
                 fpNtClose(hCheck);
                 if (hasTomb) {
-                    wasTombstoned = true; // [新增]
+                    wasTombstoned = true;
                     DeleteSandboxKeyRecursive(targetSandboxFull);
                     InvalidateParentRegContext(targetSandboxFull);
                 }
@@ -3227,18 +3256,16 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        // 清理让路产生的临时键
         if (!tempPathToClean.empty()) {
             DeleteSandboxKeyRecursive(tempPathToClean);
         }
 
         if (NT_SUCCESS(status)) {
-            // [修复] 沙盒键存在但有墓碑（虚拟删除后重建）→ 清除墓碑并改为"新建"语义
+            // [修复] 沙盒键存在但有墓碑（虚拟删除后重建）→ 清空所有旧值并改为"新建"语义
             bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
             if (checkTomb) {
                 bool accessDenied = false;
                 bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
-                // 如果当前句柄没有 KEY_QUERY_VALUE 权限，新开一个句柄去查
                 if (!hasTomb && accessDenied) {
                     HANDLE hCheck = NULL;
                     OBJECT_ATTRIBUTES oaCheck;
@@ -3252,25 +3279,22 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     }
                 }
                 if (hasTomb) {
-                    wasTombstoned = true; // [新增]
-                    if (fpNtDeleteValueKey) {
-                        HANDLE hWrite = NULL;
-                        OBJECT_ATTRIBUTES oaWrite;
-                        UNICODE_STRING usWrite;
-                        std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
-                        RtlInitUnicodeString(&usWrite, sandboxFullPath.c_str());
-                        InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                        if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
-                            UNICODE_STRING markerName;
-                            RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
-                            fpNtDeleteValueKey(hWrite, &markerName);
-                            fpNtClose(hWrite);
-                        }
+                    wasTombstoned = true;
+                    HANDLE hWrite = NULL;
+                    OBJECT_ATTRIBUTES oaWrite;
+                    UNICODE_STRING usWrite;
+                    std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
+                    RtlInitUnicodeString(&usWrite, sandboxFullPath.c_str());
+                    InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    // [修改] 使用 KEY_SET_VALUE | KEY_QUERY_VALUE 权限打开，以清空所有值
+                    if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaWrite))) {
+                        ClearSandboxKeyValues(hWrite);
+                        fpNtClose(hWrite);
                     }
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 }
             }
-            // [修复] 使父键枚举缓存失效
+            
             std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
             InvalidateParentRegContext(sandboxFullPath);
 
@@ -3280,7 +3304,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修复] 如果曾经有墓碑（即被用户删除过），重建时不应从真实注册表复制数据！
+                // [修复] 如果曾经有墓碑，说明是用户主动删除后重建的，绝不能从真实注册表复制旧数据！
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
@@ -3309,8 +3333,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 
     if (NT_SUCCESS(status)) {
-        bool wasTombstoned = false; // [新增]
-        // [修复] fullNtPath 在沙盒内且返回 OPENED_EXISTING 时检查墓碑
+        bool wasTombstoned = false;
         bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
         if (checkTomb && !g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0)
         {
@@ -3328,19 +3351,15 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 }
             }
             if (hasTomb) {
-                wasTombstoned = true; // [新增]
-                if (fpNtDeleteValueKey) {
-                    HANDLE hWrite = NULL;
-                    UNICODE_STRING usWrite;
-                    OBJECT_ATTRIBUTES oaWrite;
-                    RtlInitUnicodeString(&usWrite, fullNtPath.c_str());
-                    InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                    if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
-                        UNICODE_STRING markerName;
-                        RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
-                        fpNtDeleteValueKey(hWrite, &markerName);
-                        fpNtClose(hWrite);
-                    }
+                wasTombstoned = true;
+                HANDLE hWrite = NULL;
+                UNICODE_STRING usWrite;
+                OBJECT_ATTRIBUTES oaWrite;
+                RtlInitUnicodeString(&usWrite, fullNtPath.c_str());
+                InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaWrite))) {
+                    ClearSandboxKeyValues(hWrite);
+                    fpNtClose(hWrite);
                 }
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 InvalidateParentRegContext(fullNtPath);
@@ -3356,7 +3375,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修复] 如果曾经有墓碑，不复制
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
