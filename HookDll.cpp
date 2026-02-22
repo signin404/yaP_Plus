@@ -3273,11 +3273,14 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
-    // [修复] 打开的沙盒键若有墓碑标记，视为不存在
-    if (NT_SUCCESS(status) && isRedirectedRoot && HasTombstone(*KeyHandle)) {
-        fpNtClose(*KeyHandle);
-        *KeyHandle = NULL;
-        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    // [修复] 只要打开的句柄落在沙盒内且有墓碑，无论是否经过重定向，都视为不存在
+    if (NT_SUCCESS(status)) {
+        std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+        if (!openedPath.empty() && openedPath.find(g_RegMountPathNt) == 0 && HasTombstone(*KeyHandle)) {
+            fpNtClose(*KeyHandle);
+            *KeyHandle = NULL;
+            status = STATUS_OBJECT_NAME_NOT_FOUND;
+        }
     }
 
     std::wstring realPathForCheck;
@@ -3407,11 +3410,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
 
-    // [修复] 同 NtOpenKey
-    if (NT_SUCCESS(status) && isRedirectedRoot && HasTombstone(*KeyHandle)) {
-        fpNtClose(*KeyHandle);
-        *KeyHandle = NULL;
-        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    if (NT_SUCCESS(status)) {
+        std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+        if (!openedPath.empty() && openedPath.find(g_RegMountPathNt) == 0 && HasTombstone(*KeyHandle)) {
+            fpNtClose(*KeyHandle);
+            *KeyHandle = NULL;
+            status = STATUS_OBJECT_NAME_NOT_FOUND;
+        }
     }
 
     std::wstring realPathForCheck;
