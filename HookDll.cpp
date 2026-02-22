@@ -3144,7 +3144,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         std::wstring tombstoneName;
         if (oaModified.ObjectName && oaModified.ObjectName->Buffer) {
             tombstoneName.assign(oaModified.ObjectName->Buffer, oaModified.ObjectName->Length / sizeof(WCHAR));
-            tombstoneName += L"__YapDel__";
+            tombstoneName += L"_YapDel";
 
             UNICODE_STRING usTombstone;
             RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
@@ -3288,7 +3288,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         std::wstring tombstoneName;
         if (oaModified.ObjectName && oaModified.ObjectName->Buffer) {
             tombstoneName.assign(oaModified.ObjectName->Buffer, oaModified.ObjectName->Length / sizeof(WCHAR));
-            tombstoneName += L"__YapDel__";
+            tombstoneName += L"_YapDel";
 
             UNICODE_STRING usTombstone;
             RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
@@ -5347,7 +5347,7 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
         if (ValueName && ValueName->Buffer) {
             valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
         }
-        std::wstring tombstoneName = valName + L"__YapDel__";
+        std::wstring tombstoneName = valName + L"_YapDel";
         UNICODE_STRING usTombstone;
         RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
 
