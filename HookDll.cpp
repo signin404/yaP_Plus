@@ -2599,6 +2599,62 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
     return path;
 }
 
+// --- [新增] 沙盒墓碑机制 ---
+// 用于标记"已被虚拟删除"的特殊值名
+static const wchar_t* YAPBOX_TOMBSTONE_VALUE = L"__YapBox_Deleted__";
+
+// 在沙盒键上设置墓碑标记
+void SetSandboxTombstone(HANDLE hSandboxKey) {
+    if (!fpNtSetValueKey) return;
+    UNICODE_STRING markerName;
+    RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+    DWORD val = 1;
+    fpNtSetValueKey(hSandboxKey, &markerName, 0, REG_DWORD, &val, sizeof(val));
+}
+
+// 枚举沙盒路径下带有墓碑标记的子键名 (小写) 写入集合
+void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstring>& tombstones) {
+    if (!fpNtOpenKey || !fpNtEnumerateKey || !fpNtQueryValueKey) return;
+
+    HANDLE hParent = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, sandboxPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(fpNtOpenKey(&hParent, KEY_ENUMERATE_SUB_KEYS, &oa))) return;
+
+    ULONG index = 0, len;
+    std::vector<BYTE> buf(1024);
+    while (true) {
+        NTSTATUS st = fpNtEnumerateKey(hParent, index, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { buf.resize(len); continue; }
+        if (!NT_SUCCESS(st)) break;
+
+        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf.data();
+        std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
+
+        // 打开该子键 检查是否有墓碑值
+        HANDLE hChild = NULL;
+        UNICODE_STRING uChild;
+        OBJECT_ATTRIBUTES oaChild;
+        RtlInitUnicodeString(&uChild, childName.c_str());
+        InitializeObjectAttributes(&oaChild, &uChild, OBJ_CASE_INSENSITIVE, hParent, NULL);
+        if (NT_SUCCESS(fpNtOpenKey(&hChild, KEY_QUERY_VALUE, &oaChild))) {
+            UNICODE_STRING markerName;
+            RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+            BYTE qbuf[64]; ULONG qlen;
+            if (NT_SUCCESS(fpNtQueryValueKey(hChild, &markerName, KeyValuePartialInformation, qbuf, sizeof(qbuf), &qlen))) {
+                std::wstring lower = childName;
+                std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
+                tombstones.insert(lower);
+            }
+            fpNtClose(hChild);
+        }
+        index++;
+    }
+    fpNtClose(hParent);
+}
+
 // 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
@@ -2995,6 +3051,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (NT_SUCCESS(status)) {
+            // [新增] 如果此键之前被设置了墓碑 (虚拟删除后重建) 清除墓碑标记
+            UNICODE_STRING markerName;
+            RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+            fpNtDeleteValueKey(*KeyHandle, &markerName); // 忽略失败 (原本就没有墓碑时会失败)
+
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
@@ -3334,13 +3395,45 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             if (nameInfo->Name.Buffer) {
                 std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 
-                // [修改] 检查句柄路径是否以挂载点开头 (判定是否为沙盒内对象)
                 if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
-                    return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
+                    // --- 沙盒键 ---
+                    std::wstring realPath;
+                    if (IsSandboxPathAndGetReal(path, realPath)) {
+                        // 检查真实键是否存在
+                        HANDLE hRealCheck = NULL;
+                        OBJECT_ATTRIBUTES oaReal;
+                        UNICODE_STRING usReal;
+                        RtlInitUnicodeString(&usReal, realPath.c_str());
+                        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                        bool realExists = NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal));
+                        if (realExists) fpNtClose(hRealCheck);
+
+                        if (realExists) {
+                            // 真实键存在 → 设置墓碑而非物理删除 防止枚举 Hook 持续返回该真实键导致死循环
+                            SetSandboxTombstone(KeyHandle);
+                            return STATUS_SUCCESS;
+                        }
+                    }
+                    // 真实无对应 → 物理删除沙盒键
+                    return fpNtDeleteKey(KeyHandle);
+
                 } else if (g_HookReg && g_hAppHive) {
-                    std::wstring dummy;
-                    if (ShouldRedirectReg(path, dummy)) {
-                        return STATUS_SUCCESS; // 欺骗程序已删除真实键
+                    std::wstring relPath;
+                    if (ShouldRedirectReg(path, relPath)) {
+                        // --- 真实键句柄 → 在沙盒中创建对应键并设置墓碑 ---
+                        EnsureRegPathExistsRelative(relPath);
+
+                        HANDLE hSandbox = NULL;
+                        UNICODE_STRING usRel;
+                        OBJECT_ATTRIBUTES oaSandbox;
+                        RtlInitUnicodeString(&usRel, relPath.c_str());
+                        InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                        ULONG disposition;
+                        if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_SET_VALUE, &oaSandbox, 0, NULL, 0, &disposition))) {
+                            SetSandboxTombstone(hSandbox);
+                            fpNtClose(hSandbox);
+                        }
+                        return STATUS_SUCCESS;
                     }
                 }
             }
@@ -3399,7 +3492,6 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
 
     // 4. 构建合并列表 (无锁操作)
     if (needsBuild) {
-        // 解析路径用于枚举
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegKey> mergedKeys;
 
@@ -3413,29 +3505,27 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
                 EnumerateKeysToMap(userClassesPath, mergedKeys);
             }
 
-            // C. 枚举沙盒路径
+            // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
             EnumerateKeysToMap(sandboxPath, mergedKeys);
 
-            // D. 更新上下文
+            // [新增] D. 过滤带墓碑标记的子键 (已被虚拟删除)
+            std::set<std::wstring> tombstones;
+            CollectTombstonedKeys(sandboxPath, tombstones);
+            for (const auto& t : tombstones) mergedKeys.erase(t);
+
+            // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-            // 再次查找以防多线程竞争
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
                 ctx = it->second;
                 ctx->SubKeys.clear();
-                for (auto& pair : mergedKeys) {
-                    ctx->SubKeys.push_back(pair.second);
-                }
+                for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
                 ctx->KeysInitialized = true;
             }
         } else {
-            // 如果无法解析路径（不应重定向） 则标记为已初始化但为空 或者直接回退
-            // 这里简单处理：如果不需要重定向 其实不应该走到这里 但为了安全：
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end()) {
-                // 移除错误的缓存 让它走原始路径?
-                // 不 如果 GetRegPaths 返回 false 说明不需要 Hook 直接返回原始函数
                 delete it->second;
                 g_RegContextMap.erase(it);
                 return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
