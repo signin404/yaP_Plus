@@ -681,6 +681,8 @@ extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
 
 typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
 P_NtSetValueKey fpNtSetValueKey = NULL;
+typedef NTSTATUS(NTAPI* P_NtDeleteValueKey)(HANDLE, PUNICODE_STRING);
+P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
 
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 P_NtQueryValueKey fpNtQueryValueKey = NULL;
@@ -3011,6 +3013,25 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (NT_SUCCESS(status)) {
+            // [新增] 如果成功创建，尝试移除其墓碑
+            std::wstring tombstoneName;
+            if (ObjectAttributes->ObjectName && ObjectAttributes->ObjectName->Buffer) {
+                tombstoneName.assign(ObjectAttributes->ObjectName->Buffer, ObjectAttributes->ObjectName->Length / sizeof(WCHAR));
+                tombstoneName += L"_YapDel";
+
+                UNICODE_STRING usTombstone;
+                RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                OBJECT_ATTRIBUTES oaTombstone = *ObjectAttributes;
+                oaTombstone.ObjectName = &usTombstone;
+                oaTombstone.RootDirectory = (HANDLE)g_hAppHive;
+
+                HANDLE hTombstone = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hTombstone, DELETE, &oaTombstone))) {
+                    fpNtDeleteKey(hTombstone);
+                    fpNtClose(hTombstone);
+                }
+            }
+
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
@@ -3039,6 +3060,24 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     if (NT_SUCCESS(status)) {
         std::wstring realPath;
         if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
+            // [新增] 如果成功创建，尝试移除其墓碑
+            std::wstring tombstoneName;
+            if (ObjectAttributes->ObjectName && ObjectAttributes->ObjectName->Buffer) {
+                tombstoneName.assign(ObjectAttributes->ObjectName->Buffer, ObjectAttributes->ObjectName->Length / sizeof(WCHAR));
+                tombstoneName += L"_YapDel";
+
+                UNICODE_STRING usTombstone;
+                RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                OBJECT_ATTRIBUTES oaTombstone = *ObjectAttributes;
+                oaTombstone.ObjectName = &usTombstone;
+
+                HANDLE hTombstone = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hTombstone, DELETE, &oaTombstone))) {
+                    fpNtDeleteKey(hTombstone);
+                    fpNtClose(hTombstone);
+                }
+            }
+
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
@@ -3100,20 +3139,26 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     }
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
-        // [新增] 检查是否被虚拟删除
-        bool isDeleted = false;
-        {
-            std::shared_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
-            if (!g_DeletedRegKeys.empty()) {
-                std::wstring lowerPath = realPathForCheck;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-                if (g_DeletedRegKeys.find(lowerPath) != g_DeletedRegKeys.end()) {
-                    isDeleted = true;
-                }
+        // [新增] 检查沙盒中是否存在该项的墓碑
+        bool isTombstoned = false;
+        std::wstring tombstoneName;
+        if (oaModified.ObjectName && oaModified.ObjectName->Buffer) {
+            tombstoneName.assign(oaModified.ObjectName->Buffer, oaModified.ObjectName->Length / sizeof(WCHAR));
+            tombstoneName += L"__YapDel__";
+
+            UNICODE_STRING usTombstone;
+            RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+            OBJECT_ATTRIBUTES oaTombstone = oaModified;
+            oaTombstone.ObjectName = &usTombstone;
+
+            HANDLE hTombstone = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hTombstone, KEY_QUERY_VALUE, &oaTombstone))) {
+                isTombstoned = true;
+                fpNtClose(hTombstone);
             }
         }
 
-        if (isDeleted) {
+        if (isTombstoned) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
 
@@ -3238,20 +3283,26 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     }
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
-        // [新增] 检查是否被虚拟删除
-        bool isDeleted = false;
-        {
-            std::shared_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
-            if (!g_DeletedRegKeys.empty()) {
-                std::wstring lowerPath = realPathForCheck;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-                if (g_DeletedRegKeys.find(lowerPath) != g_DeletedRegKeys.end()) {
-                    isDeleted = true;
-                }
+        // [新增] 检查沙盒中是否存在该项的墓碑
+        bool isTombstoned = false;
+        std::wstring tombstoneName;
+        if (oaModified.ObjectName && oaModified.ObjectName->Buffer) {
+            tombstoneName.assign(oaModified.ObjectName->Buffer, oaModified.ObjectName->Length / sizeof(WCHAR));
+            tombstoneName += L"__YapDel__";
+
+            UNICODE_STRING usTombstone;
+            RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+            OBJECT_ATTRIBUTES oaTombstone = oaModified;
+            oaTombstone.ObjectName = &usTombstone;
+
+            HANDLE hTombstone = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hTombstone, KEY_QUERY_VALUE, &oaTombstone))) {
+                isTombstoned = true;
+                fpNtClose(hTombstone);
             }
         }
 
-        if (isDeleted) {
+        if (isTombstoned) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         }
 
@@ -3354,18 +3405,46 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             if (nameInfo->Name.Buffer) {
                 std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 
+                std::wstring relPath;
+                bool isSandbox = false;
+
                 if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
-                    return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
+                    isSandbox = true;
+                    relPath = path.substr(g_RegMountPathNt.length());
+                    if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
                 } else if (g_HookReg && g_hAppHive) {
-                    std::wstring dummy;
-                    if (ShouldRedirectReg(path, dummy)) {
-                        // [关键修复] 记录虚拟删除，防止递归删除算法死循环
-                        {
-                            std::unique_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
-                            std::wstring lowerPath = path;
-                            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-                            g_DeletedRegKeys.insert(lowerPath);
+                    if (ShouldRedirectReg(path, relPath)) {
+                        isSandbox = false;
+                    }
+                }
+
+                if (!relPath.empty()) {
+                    // [核心] 在沙盒中创建物理墓碑键
+                    std::wstring tombstoneRelPath = relPath + L"_YapDel";
+                    EnsureRegPathExistsRelative(tombstoneRelPath);
+
+                    HANDLE hTombstone = NULL;
+                    UNICODE_STRING usTombstone;
+                    OBJECT_ATTRIBUTES oaTombstone;
+                    RtlInitUnicodeString(&usTombstone, tombstoneRelPath.c_str());
+                    InitializeObjectAttributes(&oaTombstone, &usTombstone, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+                    ULONG disp;
+                    if (NT_SUCCESS(fpNtCreateKey(&hTombstone, KEY_WRITE, &oaTombstone, 0, NULL, 0, &disp))) {
+                        fpNtClose(hTombstone);
+                    }
+
+                    if (isSandbox) {
+                        NTSTATUS status = fpNtDeleteKey(KeyHandle);
+                        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                        auto it = g_RegContextMap.find(KeyHandle);
+                        if (it != g_RegContextMap.end()) {
+                            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                            delete it->second;
+                            g_RegContextMap.erase(it);
                         }
+                        return status;
+                    } else {
                         return STATUS_SUCCESS; // 欺骗程序已删除真实键
                     }
                 }
@@ -3373,6 +3452,94 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         }
     }
     return fpNtDeleteKey(KeyHandle);
+}
+
+// [新增] 拦截值删除，创建值墓碑
+NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName) {
+    if (g_IsInHook || !g_HookReg) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    RecursionGuard guard;
+
+    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) return fpNtDeleteValueKey(KeyHandle, ValueName);
+
+    std::wstring realPath, sandboxPath;
+    if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+        HANDLE hSandboxKey = NULL;
+        bool closeSandboxKey = false;
+
+        if (currentNtPath.find(g_RegMountPathNt) == 0) {
+            hSandboxKey = KeyHandle;
+        } else {
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, sandboxPath.c_str());
+            InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            if (NT_SUCCESS(fpNtOpenKey(&hSandboxKey, KEY_SET_VALUE, &oa))) {
+                closeSandboxKey = true;
+            }
+        }
+
+        if (hSandboxKey) {
+            std::wstring valName;
+            if (ValueName && ValueName->Buffer) {
+                valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
+            }
+            std::wstring tombstoneName = valName + L"_YapDel";
+            UNICODE_STRING usTombstone;
+            RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+
+            DWORD tombstoneData = 1;
+            fpNtSetValueKey(hSandboxKey, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
+
+            if (closeSandboxKey) fpNtClose(hSandboxKey);
+        }
+
+        NTSTATUS status = fpNtDeleteValueKey(KeyHandle, ValueName);
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            it->second->ValuesInitialized = false;
+        }
+
+        if (currentNtPath.find(g_RegMountPathNt) != 0) {
+            return STATUS_SUCCESS;
+        }
+        return status;
+    }
+
+    return fpNtDeleteValueKey(KeyHandle, ValueName);
+}
+
+// [新增] 拦截值设置，如果重新创建了值，则移除其墓碑
+NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex, ULONG Type, PVOID Data, ULONG DataSize) {
+    if (g_IsInHook || !g_HookReg) return fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+    RecursionGuard guard;
+
+    NTSTATUS status = fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+
+    if (NT_SUCCESS(status)) {
+        std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+        std::wstring realPath, sandboxPath;
+        if (!currentNtPath.empty() && GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+            std::wstring valName;
+            if (ValueName && ValueName->Buffer) {
+                valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
+            }
+            std::wstring tombstoneName = valName + L"_YapDel";
+            UNICODE_STRING usTombstone;
+            RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+
+            fpNtDeleteValueKey(KeyHandle, &usTombstone);
+
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                it->second->ValuesInitialized = false;
+            }
+        }
+    }
+    return status;
 }
 
 NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
@@ -3457,6 +3624,18 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
 
             // C. 枚举沙盒路径
             EnumerateKeysToMap(sandboxPath, mergedKeys);
+
+            // [新增] 处理墓碑，剔除被删除的项
+            for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
+                const std::wstring& lowerName = it->first;
+                if (lowerName.length() >= 10 && lowerName.substr(lowerName.length() - 10) == L"_YapDel") {
+                    std::wstring lowerOriginal = lowerName.substr(0, lowerName.length() - 10);
+                    mergedKeys.erase(lowerOriginal); // 移除真实项
+                    it = mergedKeys.erase(it);       // 移除墓碑自身
+                } else {
+                    ++it;
+                }
+            }
 
             // D. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
@@ -3596,6 +3775,18 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             std::map<std::wstring, CachedRegValue> mergedValues;
             EnumerateValuesToMap(realPath, mergedValues);
             EnumerateValuesToMap(sandboxPath, mergedValues);
+
+            // [新增] 处理墓碑，剔除被删除的值
+            for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
+                const std::wstring& lowerName = it->first;
+                if (lowerName.length() >= 10 && lowerName.substr(lowerName.length() - 10) == L"_YapDel") {
+                    std::wstring lowerOriginal = lowerName.substr(0, lowerName.length() - 10);
+                    mergedValues.erase(lowerOriginal); // 移除真实值
+                    it = mergedValues.erase(it);       // 移除墓碑自身
+                } else {
+                    ++it;
+                }
+            }
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
@@ -5150,16 +5341,30 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     ULONG Length,
     PULONG ResultLength
 ) {
-    // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
-    // 注意：这里不加 RecursionGuard，因为 fpNtQueryValueKey 是原始函数，不会递归
+    // 1. [新增] 检查沙盒中是否存在该值的墓碑
+    if (g_HookReg && !g_IsInHook) {
+        std::wstring valName;
+        if (ValueName && ValueName->Buffer) {
+            valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
+        }
+        std::wstring tombstoneName = valName + L"__YapDel__";
+        UNICODE_STRING usTombstone;
+        RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+
+        BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
+        ULONG dummyLen = 0;
+        NTSTATUS tbStatus = fpNtQueryValueKey(KeyHandle, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
+        if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    }
+
+    // 2. 尝试从当前句柄查询
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
 
-    // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
-    // 且启用了注册表 Hook，尝试从缓存的真实句柄中读取
+    // 3. 回退逻辑
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
         HANDLE hReal = NULL;
-
-        // 从 Context 中查找缓存的真实句柄
         {
             std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
@@ -5168,9 +5373,7 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
             }
         }
 
-        // 如果找到了真实句柄，尝试从中查询
         if (hReal) {
-            // 使用 RecursionGuard 防止某些底层 Hook 再次触发
             RecursionGuard guard;
             status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
         }
@@ -8827,14 +9030,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKeyEx = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
 
-        // [新增] 获取 NtSetValueKey 指针用于写入复制
-        fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
+        // [新增] 获取并挂钩值操作函数
+        void* pNtSetValueKey = (void*)GetProcAddress(hNtdll, "NtSetValueKey");
+        void* pNtDeleteValueKey = (void*)GetProcAddress(hNtdll, "NtDeleteValueKey");
+        fpNtSetValueKey = (P_NtSetValueKey)pNtSetValueKey;
+        fpNtDeleteValueKey = (P_NtDeleteValueKey)pNtDeleteValueKey;
 
-        if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtCreateKey) MH_CreateHook(pNtCreateKey, &Detour_NtCreateKey, reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtOpenKey) MH_CreateHook(pNtOpenKey, &Detour_NtOpenKey, reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx) MH_CreateHook(pNtOpenKeyEx, &Detour_NtOpenKeyEx, reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey) MH_CreateHook(pNtDeleteKey, &Detour_NtDeleteKey, reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        if (pNtSetValueKey) MH_CreateHook(pNtSetValueKey, &Detour_NtSetValueKey, reinterpret_cast<LPVOID*>(&fpNtSetValueKey));
+        if (pNtDeleteValueKey) MH_CreateHook(pNtDeleteValueKey, &Detour_NtDeleteValueKey, reinterpret_cast<LPVOID*>(&fpNtDeleteValueKey));
 
         // 获取枚举函数地址并创建 Hook
         // 注意：这里使用的是 fpNtEnumerateKey (函数指针变量)
