@@ -2627,6 +2627,33 @@ bool HasTombstone(HANDLE hKey) {
     return NT_SUCCESS(fpNtQueryValueKey(hKey, &markerName, KeyValuePartialInformation, buf, sizeof(buf), &qlen));
 }
 
+// 递归物理删除沙盒键（含所有子键）
+void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
+    // 先枚举并递归删除所有子键
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, fullPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | DELETE, &oa))) {
+        while (true) {
+            ULONG len;
+            BYTE buf[1024];
+            // 始终枚举 index=0，因为每次删除后列表会缩短
+            NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf, sizeof(buf), &len);
+            if (!NT_SUCCESS(st)) break;
+
+            PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf;
+            std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
+            std::wstring childPath = fullPath + L"\\" + childName;
+            DeleteSandboxKeyRecursive(childPath);
+        }
+        fpNtDeleteKey(hKey);
+        fpNtClose(hKey);
+    }
+}
+
 // 使指定沙盒路径的父键枚举缓存失效
 void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
     size_t pos = sandboxKeyPath.rfind(L'\\');
@@ -3079,14 +3106,10 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
     if (NT_SUCCESS(fpNtOpenKey(&hTarget, KEY_QUERY_VALUE, &oaTarget))) {
         bool hasTomb = HasTombstone(hTarget);
         fpNtClose(hTarget);
-        hTarget = NULL;
 
         if (hasTomb) {
-            // 物理删除墓碑键，给 rename 让路
-            if (NT_SUCCESS(fpNtOpenKey(&hTarget, DELETE, &oaTarget))) {
-                fpNtDeleteKey(hTarget);
-                fpNtClose(hTarget);
-            }
+            // [修复] 递归删除墓碑键（原版单层删除在有子键时会失败）
+            DeleteSandboxKeyRecursive(targetSandboxPath);
         }
     }
 
@@ -3115,6 +3138,24 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     // 1. 重定向创建
     if (ShouldRedirectReg(fullNtPath, relPath)) {
         EnsureRegPathExistsRelative(relPath);
+
+        // [新增] 目标沙盒键存在且带墓碑时，递归物理删除，避免 CoW 判断错误
+        std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
+        {
+            HANDLE hCheck = NULL;
+            OBJECT_ATTRIBUTES oaCheck;
+            UNICODE_STRING usCheck;
+            RtlInitUnicodeString(&usCheck, targetSandboxFull.c_str());
+            InitializeObjectAttributes(&oaCheck, &usCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
+                bool hasTomb = HasTombstone(hCheck);
+                fpNtClose(hCheck);
+                if (hasTomb) {
+                    DeleteSandboxKeyRecursive(targetSandboxFull);
+                    InvalidateParentRegContext(targetSandboxFull);
+                }
+            }
+        }
 
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
