@@ -19,6 +19,7 @@
 #include <mswsock.h>
 #include <shellapi.h>
 #include <numeric>
+#include <set>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -683,6 +684,9 @@ P_NtSetValueKey fpNtSetValueKey = NULL;
 
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 P_NtQueryValueKey fpNtQueryValueKey = NULL;
+
+typedef NTSTATUS (NTAPI *P_NtDeleteValueKey)(HANDLE KeyHandle, PUNICODE_STRING ValueName);
+P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
 
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
@@ -3642,6 +3646,11 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             std::map<std::wstring, CachedRegValue> mergedValues;
             EnumerateValuesToMap(realPath, mergedValues);
             EnumerateValuesToMap(sandboxPath, mergedValues);
+
+            // [新增] 过滤墓碑标记值本身，不暴露给调用者
+            std::wstring tombstoneKeyLower = YAPBOX_TOMBSTONE_VALUE;
+            std::transform(tombstoneKeyLower.begin(), tombstoneKeyLower.end(), tombstoneKeyLower.begin(), towlower);
+            mergedValues.erase(tombstoneKeyLower);
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
@@ -8871,13 +8880,13 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKey        = (void*)GetProcAddress(hNtdll, "NtOpenKey");
         void* pNtOpenKeyEx      = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey      = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
-        void* pNtQueryValueKey  = (void*)GetProcAddress(hNtdll, "NtQueryValueKey"); // [新增]
+        void* pNtQueryValueKey  = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
 
         // 获取 NtSetValueKey 指针用于写入复制（内部调用，不 Hook）
         fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
+        fpNtDeleteValueKey = (P_NtDeleteValueKey)GetProcAddress(hNtdll, "NtDeleteValueKey");
 
         if (pNtCreateKey)     MH_CreateHook(pNtCreateKey,     &Detour_NtCreateKey,     reinterpret_cast<LPVOID*>(&fpNtCreateKey));
-        // 修复：删除重复的 NtCreateKey Hook
         if (pNtOpenKey)       MH_CreateHook(pNtOpenKey,       &Detour_NtOpenKey,       reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx)     MH_CreateHook(pNtOpenKeyEx,     &Detour_NtOpenKeyEx,     reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey)     MH_CreateHook(pNtDeleteKey,     &Detour_NtDeleteKey,     reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
