@@ -3069,24 +3069,27 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-        if (NT_SUCCESS(status)) {
-            // [新增] 如果此键之前被设置了墓碑 (虚拟删除后重建) 清除墓碑标记
-            UNICODE_STRING markerName;
-            RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
-            fpNtDeleteValueKey(*KeyHandle, &markerName); // 忽略失败 (原本就没有墓碑时会失败)
+if (NT_SUCCESS(status)) {
+            // [修复] 清除墓碑标记（复活被虚拟删除的键）
+            if (fpNtDeleteValueKey) {
+                UNICODE_STRING markerName;
+                RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+                fpNtDeleteValueKey(*KeyHandle, &markerName); // 无墓碑时会失败，忽略返回值
+            }
+            // [修复] 使父键枚举缓存失效，让新建的键立刻在枚举中可见
+            std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
+            InvalidateParentRegContext(sandboxFullPath);
 
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
             }
-
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
