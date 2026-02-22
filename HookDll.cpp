@@ -3108,8 +3108,28 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
         fpNtClose(hTarget);
 
         if (hasTomb) {
-            // [修复] 递归删除墓碑键（原版单层删除在有子键时会失败）
-            DeleteSandboxKeyRecursive(targetSandboxPath);
+            // [修复] 不用 NtDeleteKey（可能因权限或句柄残留失败），
+            // 改为将墓碑键先 rename 到临时名让路，再执行真正的 rename，最后删临时键
+            wchar_t tempName[64];
+            swprintf_s(tempName, L"__YBTmp%u__", GetTickCount());
+            UNICODE_STRING usTempName;
+            RtlInitUnicodeString(&usTempName, tempName);
+
+            // 把墓碑键 rename 到临时名（目标名现在空出来了）
+            NTSTATUS mvSt = fpNtRenameKey(hTarget, &usTempName);
+            fpNtClose(hTarget);
+
+            if (!NT_SUCCESS(mvSt)) return fpNtRenameKey(KeyHandle, NewName); // 回退
+
+            // 正式 rename 源键到目标名
+            NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
+
+            // 清理临时键（递归删除）
+            std::wstring tempPath = parentSandboxPath + L"\\" + tempName;
+            DeleteSandboxKeyRecursive(tempPath);
+
+            if (NT_SUCCESS(status)) InvalidateParentRegContext(currentPath);
+            return status;
         }
     }
 
@@ -3218,6 +3238,31 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 
     if (NT_SUCCESS(status)) {
+        // [修复] fullNtPath 在沙盒内且返回 OPENED_EXISTING 时检查墓碑
+        // 场景：父句柄已在沙盒，子键用相对路径创建，ShouldRedirectReg 不会触发
+        if (Disposition && *Disposition == REG_OPENED_EXISTING_KEY &&
+            !g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0 &&
+            HasTombstone(*KeyHandle))
+        {
+            // 用新的 KEY_SET_VALUE 句柄删除墓碑值（*KeyHandle 的权限可能不含 KEY_SET_VALUE）
+            if (fpNtDeleteValueKey) {
+                HANDLE hWrite = NULL;
+                UNICODE_STRING usWrite;
+                OBJECT_ATTRIBUTES oaWrite;
+                RtlInitUnicodeString(&usWrite, fullNtPath.c_str());
+                InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
+                    UNICODE_STRING markerName;
+                    RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+                    fpNtDeleteValueKey(hWrite, &markerName);
+                    fpNtClose(hWrite);
+                }
+            }
+            // 语义变为"新建"，使父键缓存失效
+            *Disposition = REG_CREATED_NEW_KEY;
+            InvalidateParentRegContext(fullNtPath);
+        }
+
         std::wstring realPath;
         HANDLE hReal = NULL;
         if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
