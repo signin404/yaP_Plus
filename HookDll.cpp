@@ -3019,70 +3019,48 @@ void EnumerateKeyTombstonesToSet(const std::wstring& path, std::set<std::wstring
 }
 
 // --- 注册表 NT API Hook 实现 ---
-NTSTATUS NTAPI Detour_NtCreateKey(
-    PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
-    ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
-{
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
-        return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-    }
-
+NTSTATUS NTAPI Detour_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     RecursionGuard guard;
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
 
-    // 1. 重定向创建
     if (ShouldRedirectReg(fullNtPath, relPath)) {
         EnsureRegPathExistsRelative(relPath);
-
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
         PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
         HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
         ObjectAttributes->ObjectName = &uStr;
         ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (NT_SUCCESS(status)) {
-            // [新增] 移除项墓碑
+            // 移除项墓碑
             std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
             size_t lastSlash = sandboxPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentSandboxPath = sandboxPath.substr(0, lastSlash);
+                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
                 std::wstring keyName = sandboxPath.substr(lastSlash + 1);
-
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa;
-                UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
+                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTombstone;
-                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-                    fpNtDeleteValueKey(hParent, &usTombstone);
+                    std::wstring tbName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
+                    fpNtDeleteValueKey(hParent, &usTb);
                     fpNtClose(hParent);
                 }
             }
-
             HANDLE hReal = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
+            OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修改] 移除 IS_REG_WRITE_ACCESS 判断。只要在沙盒中新建了键，且真实键存在，就必须复制值，防止产生空影子键
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                    CopyRegistryValues(hReal, *KeyHandle);
-                }
-
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) CopyRegistryValues(hReal, *KeyHandle);
                 std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                 RegContext* ctx = new RegContext();
                 ctx->FullPath = g_RegMountPathNt + L"\\" + relPath;
@@ -3093,316 +3071,112 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         return status;
     }
 
-    // 2. 直接创建 (可能是在沙盒路径下创建)
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-
     if (NT_SUCCESS(status)) {
         std::wstring realPath;
         if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
-            // [新增] 移除项墓碑
             size_t lastSlash = fullNtPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentSandboxPath = fullNtPath.substr(0, lastSlash);
+                std::wstring parentPath = fullNtPath.substr(0, lastSlash);
                 std::wstring keyName = fullNtPath.substr(lastSlash + 1);
-
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa;
-                UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
+                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTombstone;
-                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-                    fpNtDeleteValueKey(hParent, &usTombstone);
+                    std::wstring tbName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
+                    fpNtDeleteValueKey(hParent, &usTb);
                     fpNtClose(hParent);
                 }
             }
-
             HANDLE hReal = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
+            OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修改] 移除 IS_REG_WRITE_ACCESS 判断
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                    CopyRegistryValues(hReal, *KeyHandle);
-                }
-
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) CopyRegistryValues(hReal, *KeyHandle);
                 std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                 if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                     RegContext* ctx = new RegContext();
-                    ctx->FullPath = fullNtPath;
-                    ctx->hRealKey = hReal;
+                    ctx->FullPath = fullNtPath; ctx->hRealKey = hReal;
                     g_RegContextMap[*KeyHandle] = ctx;
-                } else {
-                    fpNtClose(hReal);
-                }
+                } else { fpNtClose(hReal); }
             }
         }
     }
-
     return status;
 }
 
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
-        // [新增] 检查沙盒中是否存在该项的墓碑
-        bool isTombstoned = false;
-        std::wstring relPathToCheck;
-        if (isRedirectedRoot) {
-            relPathToCheck = relPath;
-        } else {
-            ShouldRedirectReg(fullNtPath, relPathToCheck);
-        }
-
-        if (!relPathToCheck.empty()) {
-            std::wstring sandboxPathToCheck = g_RegMountPathNt + L"\\" + relPathToCheck;
-            size_t lastSlash = sandboxPathToCheck.find_last_of(L'\\');
-            if (lastSlash != std::wstring::npos) {
-                std::wstring parentSandboxPath = sandboxPathToCheck.substr(0, lastSlash);
-                std::wstring keyName = sandboxPathToCheck.substr(lastSlash + 1);
-
-                HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa;
-                UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
-                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-                if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_QUERY_VALUE, &oa))) {
-                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTombstone;
-                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-
-                    BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
-                    ULONG dummyLen = 0;
-                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
-                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
-                        isTombstoned = true;
-                    }
-                    fpNtClose(hParent);
-                }
-            }
-        }
-
-        if (isTombstoned) {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-
-        HANDLE hRealCheck = NULL;
-        bool realExists = false;
-
-        OBJECT_ATTRIBUTES oaReal;
-        UNICODE_STRING usReal;
-        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
-        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
-            realExists = true;
-        }
-
-        if (realExists) {
-            // [关键修复] 区分读写权限
-            if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                // 写入权限：创建影子键并复制值
-                std::wstring relPathToCreate;
-                if (isRedirectedRoot) {
-                    relPathToCreate = relPath;
-                } else {
-                    relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
-                    if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
-                }
-
-                EnsureRegPathExistsRelative(relPathToCreate);
-
-                HANDLE hNewKey = NULL;
-                UNICODE_STRING usCreate;
-                OBJECT_ATTRIBUTES oaCreate;
-                RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
-                InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-
-                ULONG disposition;
-                if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    CopyRegistryValues(hRealCheck, hNewKey);
-                    fpNtClose(hNewKey);
-                    // 重试打开沙盒键
-                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
-                }
-                fpNtClose(hRealCheck);
-            } else {
-                // 纯读取权限：不创建影子键，直接打开真实键并返回
-                fpNtClose(hRealCheck);
-                status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
-
-                if (NT_SUCCESS(status)) {
-                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                    if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                        RegContext* ctx = new RegContext();
-                        ctx->hRealKey = NULL; // 已经是真实句柄
-                        ctx->FullPath = realPathForCheck;
-                        g_RegContextMap[*KeyHandle] = ctx;
-                    }
-                }
-                return status; // 直接返回，跳过后续的绑定逻辑
-            }
-        }
-    }
-
-    // 4. 成功后绑定真实句柄 (供 NtQueryValueKey 回退使用)
-    if (NT_SUCCESS(status)) {
-        HANDLE hRealTarget = NULL;
-        bool foundReal = false;
-
-        if (canCheckReal) {
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                foundReal = true;
-            }
-        }
-
-        if (foundReal) {
-            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-            if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                RegContext* ctx = new RegContext();
-                ctx->hRealKey = hRealTarget;
-                ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
-                g_RegContextMap[*KeyHandle] = ctx;
-            } else {
-                fpNtClose(hRealTarget);
-            }
-        }
-    }
-
-    return status;
-}
-
-NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
-    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
-
     OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
     UNICODE_STRING usRedirected;
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
     std::wstring relPath;
-    bool isRedirectedRoot = false;
-
-    if (ShouldRedirectReg(fullNtPath, relPath)) {
+    bool isRedirectedRoot = ShouldRedirectReg(fullNtPath, relPath);
+    if (isRedirectedRoot) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
-        isRedirectedRoot = true;
     }
 
-    NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+    NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
     std::wstring realPathForCheck;
-    bool canCheckReal = false;
-
-    if (isRedirectedRoot) {
-        realPathForCheck = fullNtPath;
-        canCheckReal = true;
-    } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
-        canCheckReal = true;
-    }
+    bool canCheckReal = isRedirectedRoot ? (realPathForCheck = fullNtPath, true) : IsSandboxPathAndGetReal(fullNtPath, realPathForCheck);
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
-        // [新增] 检查沙盒中是否存在该项的墓碑
         bool isTombstoned = false;
-        std::wstring relPathToCheck;
-        if (isRedirectedRoot) {
-            relPathToCheck = relPath;
-        } else {
-            ShouldRedirectReg(fullNtPath, relPathToCheck);
-        }
-
-        if (!relPathToCheck.empty()) {
-            std::wstring sandboxPathToCheck = g_RegMountPathNt + L"\\" + relPathToCheck;
-            size_t lastSlash = sandboxPathToCheck.find_last_of(L'\\');
+        std::wstring relPathToTb;
+        if (isRedirectedRoot) relPathToTb = relPath; else ShouldRedirectReg(fullNtPath, relPathToTb);
+        if (!relPathToTb.empty()) {
+            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPathToTb;
+            size_t lastSlash = sandboxPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentSandboxPath = sandboxPathToCheck.substr(0, lastSlash);
-                std::wstring keyName = sandboxPathToCheck.substr(lastSlash + 1);
-
+                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
+                std::wstring keyName = sandboxPath.substr(lastSlash + 1);
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa;
-                UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
+                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_QUERY_VALUE, &oa))) {
-                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTombstone;
-                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-
-                    BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
-                    ULONG dummyLen = 0;
-                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
-                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
-                        isTombstoned = true;
-                    }
+                    std::wstring tbName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
+                    BYTE dummy[64]; ULONG dLen;
+                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTb, KeyValuePartialInformation, dummy, sizeof(dummy), &dLen);
+                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW) isTombstoned = true;
                     fpNtClose(hParent);
                 }
             }
         }
-
-        if (isTombstoned) {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
+        if (isTombstoned) return STATUS_OBJECT_NAME_NOT_FOUND;
 
         HANDLE hRealCheck = NULL;
-        bool realExists = false;
-
-        OBJECT_ATTRIBUTES oaReal;
-        UNICODE_STRING usReal;
+        OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
         InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-        if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
-            realExists = true;
-        }
-
-        if (realExists) {
+        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
             if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                std::wstring relPathToCreate;
-                if (isRedirectedRoot) {
-                    relPathToCreate = relPath;
-                } else {
-                    relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
-                    if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
-                }
-
-                EnsureRegPathExistsRelative(relPathToCreate);
-
-                HANDLE hNewKey = NULL;
-                UNICODE_STRING usCreate;
-                OBJECT_ATTRIBUTES oaCreate;
-                RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
-                InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-
-                ULONG disposition;
-                if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                    CopyRegistryValues(hRealCheck, hNewKey);
-                    fpNtClose(hNewKey);
-                    status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+                std::wstring relToCreate = isRedirectedRoot ? relPath : fullNtPath.substr(g_RegMountPathNt.length());
+                if (!relToCreate.empty() && relToCreate[0] == L'\\') relToCreate = relToCreate.substr(1);
+                EnsureRegPathExistsRelative(relToCreate);
+                HANDLE hNewKey = NULL; UNICODE_STRING usCr; OBJECT_ATTRIBUTES oaCr;
+                RtlInitUnicodeString(&usCr, relToCreate.c_str());
+                InitializeObjectAttributes(&oaCr, &usCr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCr, 0, NULL, 0, NULL))) {
+                    CopyRegistryValues(hRealCheck, hNewKey); fpNtClose(hNewKey);
+                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                 }
                 fpNtClose(hRealCheck);
             } else {
                 fpNtClose(hRealCheck);
-                status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaReal, OpenOptions);
-
+                status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
                 if (NT_SUCCESS(status)) {
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                    if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                        RegContext* ctx = new RegContext();
-                        ctx->hRealKey = NULL;
-                        ctx->FullPath = realPathForCheck;
-                        g_RegContextMap[*KeyHandle] = ctx;
-                    }
+                    RegContext* ctx = new RegContext(); ctx->hRealKey = NULL; ctx->FullPath = realPathForCheck;
+                    g_RegContextMap[*KeyHandle] = ctx;
                 }
                 return status;
             }
@@ -3411,98 +3185,151 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     if (NT_SUCCESS(status)) {
         HANDLE hRealTarget = NULL;
-        bool foundReal = false;
-
-        if (canCheckReal) {
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
-                foundReal = true;
-            }
-        }
-
-        if (foundReal) {
+        OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        if (NT_SUCCESS(fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
-                RegContext* ctx = new RegContext();
-                ctx->hRealKey = hRealTarget;
+                RegContext* ctx = new RegContext(); ctx->hRealKey = hRealTarget;
                 ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
                 g_RegContextMap[*KeyHandle] = ctx;
+            } else { fpNtClose(hRealTarget); }
+        }
+    }
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    RecursionGuard guard;
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring relPath;
+    bool isRedirectedRoot = ShouldRedirectReg(fullNtPath, relPath);
+    if (isRedirectedRoot) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+    }
+
+    NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+
+    std::wstring realPathForCheck;
+    bool canCheckReal = isRedirectedRoot ? (realPathForCheck = fullNtPath, true) : IsSandboxPathAndGetReal(fullNtPath, realPathForCheck);
+
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
+        bool isTombstoned = false;
+        std::wstring relPathToTb;
+        if (isRedirectedRoot) relPathToTb = relPath; else ShouldRedirectReg(fullNtPath, relPathToTb);
+        if (!relPathToTb.empty()) {
+            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPathToTb;
+            size_t lastSlash = sandboxPath.find_last_of(L'\\');
+            if (lastSlash != std::wstring::npos) {
+                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
+                std::wstring keyName = sandboxPath.substr(lastSlash + 1);
+                HANDLE hParent = NULL;
+                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentPath.c_str());
+                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                if (NT_SUCCESS(fpNtOpenKeyEx(&hParent, KEY_QUERY_VALUE, &oa, OpenOptions))) {
+                    std::wstring tbName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
+                    BYTE dummy[64]; ULONG dLen;
+                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTb, KeyValuePartialInformation, dummy, sizeof(dummy), &dLen);
+                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW) isTombstoned = true;
+                    fpNtClose(hParent);
+                }
+            }
+        }
+        if (isTombstoned) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+        HANDLE hRealCheck = NULL;
+        OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
+            if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                std::wstring relToCreate = isRedirectedRoot ? relPath : fullNtPath.substr(g_RegMountPathNt.length());
+                if (!relToCreate.empty() && relToCreate[0] == L'\\') relToCreate = relToCreate.substr(1);
+                EnsureRegPathExistsRelative(relToCreate);
+                HANDLE hNewKey = NULL; UNICODE_STRING usCr; OBJECT_ATTRIBUTES oaCr;
+                RtlInitUnicodeString(&usCr, relToCreate.c_str());
+                InitializeObjectAttributes(&oaCr, &usCr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCr, 0, NULL, 0, NULL))) {
+                    CopyRegistryValues(hRealCheck, hNewKey); fpNtClose(hNewKey);
+                    status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+                }
+                fpNtClose(hRealCheck);
             } else {
-                fpNtClose(hRealTarget);
+                fpNtClose(hRealCheck);
+                status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaReal, OpenOptions);
+                if (NT_SUCCESS(status)) {
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    RegContext* ctx = new RegContext(); ctx->hRealKey = NULL; ctx->FullPath = realPathForCheck;
+                    g_RegContextMap[*KeyHandle] = ctx;
+                }
+                return status;
             }
         }
     }
 
+    if (NT_SUCCESS(status)) {
+        HANDLE hRealTarget = NULL;
+        OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        if (NT_SUCCESS(fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions))) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
+                RegContext* ctx = new RegContext(); ctx->hRealKey = hRealTarget;
+                ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+                g_RegContextMap[*KeyHandle] = ctx;
+            } else { fpNtClose(hRealTarget); }
+        }
+    }
     return status;
 }
 
 NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
-
     std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
     if (currentNtPath.empty()) return fpNtDeleteKey(KeyHandle);
-
     std::wstring realPath, sandboxPath;
     if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-        // 找到父路径和当前项名
         size_t lastSlash = sandboxPath.find_last_of(L'\\');
         if (lastSlash != std::wstring::npos) {
-            std::wstring parentSandboxPath = sandboxPath.substr(0, lastSlash);
+            std::wstring parentPath = sandboxPath.substr(0, lastSlash);
             std::wstring keyName = sandboxPath.substr(lastSlash + 1);
-
-            // 打开沙盒中的父项
-            HANDLE hParent = NULL;
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING us;
-            RtlInitUnicodeString(&us, parentSandboxPath.c_str());
+            HANDLE hParent = NULL; OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
+            RtlInitUnicodeString(&us, parentPath.c_str());
             InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                UNICODE_STRING usTombstone;
-                RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-                DWORD tombstoneData = 1;
-                fpNtSetValueKey(hParent, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
-                fpNtClose(hParent);
-            } else {
-                // 如果沙盒中父项不存在，则创建它以存放墓碑
-                std::wstring relParentPath;
-                if (parentSandboxPath.find(g_RegMountPathNt) == 0) {
-                    relParentPath = parentSandboxPath.substr(g_RegMountPathNt.length());
-                    if (!relParentPath.empty() && relParentPath[0] == L'\\') relParentPath = relParentPath.substr(1);
-
-                    EnsureRegPathExistsRelative(relParentPath);
-
-                    if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                        std::wstring tombstoneName = keyName + L"__YapKeyDel__";
-                        UNICODE_STRING usTombstone;
-                        RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-                        DWORD tombstoneData = 1;
-                        fpNtSetValueKey(hParent, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
-                        fpNtClose(hParent);
-                    }
+            if (!NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
+                std::wstring relParent;
+                if (parentPath.find(g_RegMountPathNt) == 0) {
+                    relParent = parentPath.substr(g_RegMountPathNt.length());
+                    if (!relParent.empty() && relParent[0] == L'\\') relParent = relParent.substr(1);
+                    EnsureRegPathExistsRelative(relParent);
                 }
+                fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa);
+            }
+            if (hParent) {
+                std::wstring tbName = keyName + L"__YapKeyDel__";
+                UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
+                DWORD data = 1; fpNtSetValueKey(hParent, &usTb, 0, REG_DWORD, &data, sizeof(data));
+                fpNtClose(hParent);
             }
         }
-
         if (currentNtPath.find(g_RegMountPathNt) == 0) {
             NTSTATUS status = fpNtDeleteKey(KeyHandle);
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                delete it->second;
-                g_RegContextMap.erase(it);
-            }
+            if (it != g_RegContextMap.end()) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); }
             return status;
-        } else {
-            return STATUS_SUCCESS; // 欺骗程序已删除真实键
         }
+        return STATUS_SUCCESS;
     }
     return fpNtDeleteKey(KeyHandle);
 }
