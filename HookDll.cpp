@@ -2616,6 +2616,21 @@ void SetSandboxTombstone(HANDLE hSandboxKey) {
     fpNtSetValueKey(hSandboxKey, &markerName, 0, REG_DWORD, &val, sizeof(val));
 }
 
+// 使指定沙盒路径的父键枚举缓存失效
+void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
+    size_t pos = sandboxKeyPath.rfind(L'\\');
+    if (pos == std::wstring::npos) return;
+    std::wstring parentPath = sandboxKeyPath.substr(0, pos);
+
+    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+    for (auto& pair : g_RegContextMap) {
+        if (_wcsicmp(pair.second->FullPath.c_str(), parentPath.c_str()) == 0) {
+            pair.second->KeysInitialized = false;
+            pair.second->SubKeys.clear();
+        }
+    }
+}
+
 // 枚举沙盒路径下带有墓碑标记的子键名 (小写) 写入集合
 void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstring>& tombstones) {
     if (!fpNtOpenKey || !fpNtEnumerateKey || !fpNtQueryValueKey) return;
@@ -3403,7 +3418,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                     // --- 沙盒键 ---
                     std::wstring realPath;
                     if (IsSandboxPathAndGetReal(path, realPath)) {
-                        // 检查真实键是否存在
                         HANDLE hRealCheck = NULL;
                         OBJECT_ATTRIBUTES oaReal;
                         UNICODE_STRING usReal;
@@ -3413,12 +3427,23 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                         if (realExists) fpNtClose(hRealCheck);
 
                         if (realExists) {
-                            // 真实键存在 → 设置墓碑而非物理删除 防止枚举 Hook 持续返回该真实键导致死循环
-                            SetSandboxTombstone(KeyHandle);
+                            // [修复1] 用新句柄以 KEY_SET_VALUE 权限写墓碑，而非使用 DELETE 权限的 KeyHandle
+                            HANDLE hWrite = NULL;
+                            OBJECT_ATTRIBUTES oaWrite;
+                            UNICODE_STRING usWrite;
+                            RtlInitUnicodeString(&usWrite, path.c_str());
+                            InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
+                                SetSandboxTombstone(hWrite);
+                                fpNtClose(hWrite);
+                            }
+                            // [修复2] 使父键枚举缓存失效，防止死循环
+                            InvalidateParentRegContext(path);
                             return STATUS_SUCCESS;
                         }
                     }
                     // 真实无对应 → 物理删除沙盒键
+                    InvalidateParentRegContext(path);
                     return fpNtDeleteKey(KeyHandle);
 
                 } else if (g_HookReg && g_hAppHive) {
@@ -3437,6 +3462,9 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                             SetSandboxTombstone(hSandbox);
                             fpNtClose(hSandbox);
                         }
+                        // [修复2] 同样需要使父键缓存失效
+                        std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                        InvalidateParentRegContext(sandboxPath);
                         return STATUS_SUCCESS;
                     }
                 }
