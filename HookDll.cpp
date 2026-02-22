@@ -2606,17 +2606,6 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
     return path;
 }
 
-// --- [修改] 增加 accessDenied 参数，用于探测是否因权限不足导致查询失败 ---
-bool HasTombstone(HANDLE hKey, bool* accessDenied = nullptr) {
-    if (!fpNtQueryValueKey) return false;
-    UNICODE_STRING markerName;
-    RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
-    BYTE buf[64]; ULONG qlen;
-    NTSTATUS st = fpNtQueryValueKey(hKey, &markerName, KeyValuePartialInformation, buf, sizeof(buf), &qlen);
-    if (accessDenied) *accessDenied = (st == STATUS_ACCESS_DENIED);
-    return NT_SUCCESS(st);
-}
-
 // --- [新增] 沙盒墓碑机制 ---
 // 用于标记"已被虚拟删除"的特殊值名
 static const wchar_t* YAPBOX_TOMBSTONE_VALUE = L"__YapBox_Deleted__";
@@ -2630,12 +2619,15 @@ void SetSandboxTombstone(HANDLE hSandboxKey) {
     fpNtSetValueKey(hSandboxKey, &markerName, 0, REG_DWORD, &val, sizeof(val));
 }
 
-bool HasTombstone(HANDLE hKey) {
+// --- [修改] 增加 accessDenied 参数，用于探测是否因权限不足导致查询失败 ---
+bool HasTombstone(HANDLE hKey, bool* accessDenied = nullptr) {
     if (!fpNtQueryValueKey) return false;
     UNICODE_STRING markerName;
     RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
     BYTE buf[64]; ULONG qlen;
-    return NT_SUCCESS(fpNtQueryValueKey(hKey, &markerName, KeyValuePartialInformation, buf, sizeof(buf), &qlen));
+    NTSTATUS st = fpNtQueryValueKey(hKey, &markerName, KeyValuePartialInformation, buf, sizeof(buf), &qlen);
+    if (accessDenied) *accessDenied = (st == STATUS_ACCESS_DENIED);
+    return NT_SUCCESS(st);
 }
 
 // 递归物理删除沙盒键（含所有子键）
