@@ -688,6 +688,9 @@ P_NtQueryValueKey fpNtQueryValueKey = NULL;
 typedef NTSTATUS (NTAPI *P_NtDeleteValueKey)(HANDLE KeyHandle, PUNICODE_STRING ValueName);
 P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
 
+typedef NTSTATUS (NTAPI *P_NtRenameKey)(HANDLE KeyHandle, PUNICODE_STRING NewName);
+P_NtRenameKey fpNtRenameKey = NULL;
+
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 typedef NTSTATUS(NTAPI* P_NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PFILE_BASIC_INFORMATION);
@@ -3048,6 +3051,55 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
 }
 
 // --- 注册表 NT API Hook 实现 ---
+NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
+    if (g_IsInHook || !g_HookReg || !g_hAppHive || !NewName || !NewName->Buffer)
+        return fpNtRenameKey(KeyHandle, NewName);
+    RecursionGuard guard;
+
+    // 只处理沙盒内的句柄
+    std::wstring currentPath = GetPathFromHandle(KeyHandle);
+    if (currentPath.empty() || currentPath.find(g_RegMountPathNt) != 0)
+        return fpNtRenameKey(KeyHandle, NewName);
+
+    // 构造目标沙盒路径
+    size_t pos = currentPath.rfind(L'\\');
+    if (pos == std::wstring::npos) return fpNtRenameKey(KeyHandle, NewName);
+
+    std::wstring parentSandboxPath = currentPath.substr(0, pos);
+    std::wstring newName(NewName->Buffer, NewName->Length / sizeof(WCHAR));
+    std::wstring targetSandboxPath = parentSandboxPath + L"\\" + newName;
+
+    // 检查目标路径是否有墓碑键，有则物理删除以让路
+    HANDLE hTarget = NULL;
+    OBJECT_ATTRIBUTES oaTarget;
+    UNICODE_STRING usTarget;
+    RtlInitUnicodeString(&usTarget, targetSandboxPath.c_str());
+    InitializeObjectAttributes(&oaTarget, &usTarget, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hTarget, KEY_QUERY_VALUE, &oaTarget))) {
+        bool hasTomb = HasTombstone(hTarget);
+        fpNtClose(hTarget);
+        hTarget = NULL;
+
+        if (hasTomb) {
+            // 物理删除墓碑键，给 rename 让路
+            if (NT_SUCCESS(fpNtOpenKey(&hTarget, DELETE, &oaTarget))) {
+                fpNtDeleteKey(hTarget);
+                fpNtClose(hTarget);
+            }
+        }
+    }
+
+    NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
+
+    if (NT_SUCCESS(status)) {
+        // 使父键枚举缓存失效
+        InvalidateParentRegContext(currentPath);
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes,
     ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
@@ -8937,6 +8989,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKeyEx      = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey      = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
         void* pNtQueryValueKey  = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
+        void* pNtRenameKey = (void*)GetProcAddress(hNtdll, "NtRenameKey");
 
         // 获取 NtSetValueKey 指针用于写入复制（内部调用，不 Hook）
         fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
@@ -8946,6 +8999,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (pNtOpenKey)       MH_CreateHook(pNtOpenKey,       &Detour_NtOpenKey,       reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx)     MH_CreateHook(pNtOpenKeyEx,     &Detour_NtOpenKeyEx,     reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
         if (pNtDeleteKey)     MH_CreateHook(pNtDeleteKey,     &Detour_NtDeleteKey,     reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        if (pNtRenameKey) MH_CreateHook(pNtRenameKey, &Detour_NtRenameKey, reinterpret_cast<LPVOID*>(&fpNtRenameKey));
 
         // [修复核心] 安装 NtQueryValueKey Hook，使沙盒中不存在的值能回退读取真实注册表
         if (pNtQueryValueKey) MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
