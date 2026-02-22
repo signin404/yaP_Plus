@@ -2616,6 +2616,14 @@ void SetSandboxTombstone(HANDLE hSandboxKey) {
     fpNtSetValueKey(hSandboxKey, &markerName, 0, REG_DWORD, &val, sizeof(val));
 }
 
+bool HasTombstone(HANDLE hKey) {
+    if (!fpNtQueryValueKey) return false;
+    UNICODE_STRING markerName;
+    RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+    BYTE buf[64]; ULONG qlen;
+    return NT_SUCCESS(fpNtQueryValueKey(hKey, &markerName, KeyValuePartialInformation, buf, sizeof(buf), &qlen));
+}
+
 // 使指定沙盒路径的父键枚举缓存失效
 void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
     size_t pos = sandboxKeyPath.rfind(L'\\');
@@ -3069,14 +3077,17 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
 
-if (NT_SUCCESS(status)) {
-            // [修复] 清除墓碑标记（复活被虚拟删除的键）
-            if (fpNtDeleteValueKey) {
-                UNICODE_STRING markerName;
-                RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
-                fpNtDeleteValueKey(*KeyHandle, &markerName); // 无墓碑时会失败，忽略返回值
+        if (NT_SUCCESS(status)) {
+            // [修复] 沙盒键存在但有墓碑（虚拟删除后重建）→ 清除墓碑并改为"新建"语义
+            if (Disposition && *Disposition == REG_OPENED_EXISTING_KEY && HasTombstone(*KeyHandle)) {
+                if (fpNtDeleteValueKey) {
+                    UNICODE_STRING markerName;
+                    RtlInitUnicodeString(&markerName, YAPBOX_TOMBSTONE_VALUE);
+                    fpNtDeleteValueKey(*KeyHandle, &markerName);
+                }
+                if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
             }
-            // [修复] 使父键枚举缓存失效，让新建的键立刻在枚举中可见
+            // [修复] 使父键枚举缓存失效
             std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
             InvalidateParentRegContext(sandboxFullPath);
 
@@ -3168,6 +3179,13 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     }
 
     NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+
+    // [修复] 打开的沙盒键若有墓碑标记，视为不存在
+    if (NT_SUCCESS(status) && isRedirectedRoot && HasTombstone(*KeyHandle)) {
+        fpNtClose(*KeyHandle);
+        *KeyHandle = NULL;
+        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     std::wstring realPathForCheck;
     bool canCheckReal = false;
@@ -3295,6 +3313,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     }
 
     NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+
+    // [修复] 同 NtOpenKey
+    if (NT_SUCCESS(status) && isRedirectedRoot && HasTombstone(*KeyHandle)) {
+        fpNtClose(*KeyHandle);
+        *KeyHandle = NULL;
+        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     std::wstring realPathForCheck;
     bool canCheckReal = false;
