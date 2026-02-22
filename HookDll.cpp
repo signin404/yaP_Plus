@@ -19,6 +19,7 @@
 #include <mswsock.h>
 #include <shellapi.h>
 #include <numeric>
+#include <set>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -1142,6 +1143,10 @@ std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
 std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 \REGISTRY\USER\YapBoxReg_xxx)
 std::map<HANDLE, RegContext*> g_RegContextMap;
 std::shared_mutex g_RegContextMutex;
+
+// [新增] 记录被虚拟删除的真实注册表键，防止递归删除死循环
+std::set<std::wstring> g_DeletedRegKeys;
+std::shared_mutex g_DeletedRegKeysMutex;
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -2698,14 +2703,19 @@ void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
     if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
 
     ULONG index = 0;
-    ULONG len;
+    ULONG len = 0; // 必须初始化
     std::vector<BYTE> buf(4096);
 
     while (true) {
         NTSTATUS status = fpNtEnumerateValueKey(hRealKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
 
         if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-            buf.resize(len);
+            // [关键修复] 防止 len 未被系统更新导致 buf.resize(0) 陷入死循环
+            if (len > buf.size()) {
+                buf.resize(len);
+            } else {
+                buf.resize(buf.size() * 2); // 强制扩大
+            }
             continue;
         }
 
@@ -2814,22 +2824,24 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
     RtlInitUnicodeString(&uStr, path.c_str());
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // 尝试打开键
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
-        ULONG len;
+        ULONG len = 0;
         std::vector<BYTE> buf(4096);
 
         while (true) {
             NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
 
-            // 处理缓冲区不足的情况 (虽然预分配了4k，但仍可能不足)
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-                if (len > buf.size()) buf.resize(len);
-                continue; // 重试
+                if (len > buf.size()) {
+                    buf.resize(len);
+                } else {
+                    buf.resize(buf.size() * 2);
+                }
+                continue;
             }
 
-            if (status == STATUS_NO_MORE_ENTRIES) break;
+            if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
             if (!NT_SUCCESS(status)) break;
 
             PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf.data();
@@ -2866,14 +2878,18 @@ void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, Cache
 
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
-        ULONG len;
+        ULONG len = 0;
         std::vector<BYTE> buf(4096);
 
         while (true) {
             NTSTATUS status = fpNtEnumerateValueKey(hKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
             if (status == STATUS_NO_MORE_ENTRIES) break;
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-                buf.resize(len);
+                if (len > buf.size()) {
+                    buf.resize(len);
+                } else {
+                    buf.resize(buf.size() * 2);
+                }
                 continue;
             }
             if (!NT_SUCCESS(status)) break;
@@ -3084,6 +3100,23 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     }
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
+        // [新增] 检查是否被虚拟删除
+        bool isDeleted = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
+            if (!g_DeletedRegKeys.empty()) {
+                std::wstring lowerPath = realPathForCheck;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+                if (g_DeletedRegKeys.find(lowerPath) != g_DeletedRegKeys.end()) {
+                    isDeleted = true;
+                }
+            }
+        }
+
+        if (isDeleted) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
         HANDLE hRealCheck = NULL;
         bool realExists = false;
 
@@ -3205,6 +3238,23 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     }
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
+        // [新增] 检查是否被虚拟删除
+        bool isDeleted = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
+            if (!g_DeletedRegKeys.empty()) {
+                std::wstring lowerPath = realPathForCheck;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+                if (g_DeletedRegKeys.find(lowerPath) != g_DeletedRegKeys.end()) {
+                    isDeleted = true;
+                }
+            }
+        }
+
+        if (isDeleted) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+
         HANDLE hRealCheck = NULL;
         bool realExists = false;
 
@@ -3304,12 +3354,18 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             if (nameInfo->Name.Buffer) {
                 std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 
-                // [修改] 检查句柄路径是否以挂载点开头 (判定是否为沙盒内对象)
                 if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
                     return fpNtDeleteKey(KeyHandle); // 物理删除沙盒内的键
                 } else if (g_HookReg && g_hAppHive) {
                     std::wstring dummy;
                     if (ShouldRedirectReg(path, dummy)) {
+                        // [关键修复] 记录虚拟删除，防止递归删除算法死循环
+                        {
+                            std::unique_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
+                            std::wstring lowerPath = path;
+                            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+                            g_DeletedRegKeys.insert(lowerPath);
+                        }
                         return STATUS_SUCCESS; // 欺骗程序已删除真实键
                     }
                 }
@@ -3375,6 +3431,22 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
 
             // A. 枚举真实路径
             EnumerateKeysToMap(realPath, mergedKeys);
+
+            // [新增] 过滤被虚拟删除的键
+            {
+                std::shared_lock<std::shared_mutex> lock(g_DeletedRegKeysMutex);
+                if (!g_DeletedRegKeys.empty()) {
+                    for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
+                        std::wstring fullChildPath = realPath + L"\\" + it->second.Name;
+                        std::transform(fullChildPath.begin(), fullChildPath.end(), fullChildPath.begin(), towlower);
+                        if (g_DeletedRegKeys.find(fullChildPath) != g_DeletedRegKeys.end()) {
+                            it = mergedKeys.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
 
             // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
