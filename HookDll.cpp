@@ -1146,10 +1146,6 @@ std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 
 std::map<HANDLE, RegContext*> g_RegContextMap;
 std::shared_mutex g_RegContextMutex;
 
-// [新增] 记录被虚拟删除的真实注册表键，防止递归删除死循环
-std::set<std::wstring> g_DeletedRegKeys;
-std::shared_mutex g_DeletedRegKeysMutex;
-
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
 std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
@@ -2769,53 +2765,68 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
 }
 
 // [新增] 获取句柄对应的真实路径和沙盒路径
-bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
-    std::wstring keyPath = GetPathFromHandle(hKey);
+bool GetRegPaths(const std::wstring& keyPath, std::wstring& outReal, std::wstring& outSandbox) {
     if (keyPath.empty()) return false;
 
-    // 检查是否在沙盒内
     if (g_HookReg && !g_RegMountPathNt.empty() && keyPath.find(g_RegMountPathNt) == 0) {
-        // ... (沙盒路径反向映射逻辑保持不变) ...
         outSandbox = keyPath;
         std::wstring relPath = keyPath.substr(g_RegMountPathNt.length());
         if (relPath.empty() || relPath[0] != L'\\') return false;
         std::wstring sub = relPath.substr(1);
 
-        if (sub.find(L"Machine") == 0) {
-            outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
-        }
-        else if (sub.find(L"User") == 0) {
-            outReal = g_CurrentUserSidPath + sub.substr(4);
-        }
-        else if (sub.find(L"Classes") == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
-        }
-        else if (sub.find(L"Config") == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
-        }
-        else if (sub.find(L"Users") == 0) {
-            outReal = L"\\REGISTRY\\USER" + sub.substr(5);
-        }
-        else {
-            return false;
-        }
+        if (sub.find(L"Machine") == 0) outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
+        else if (sub.find(L"User") == 0) outReal = g_CurrentUserSidPath + sub.substr(4);
+        else if (sub.find(L"Classes") == 0) outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
+        else if (sub.find(L"Config") == 0) outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
+        else if (sub.find(L"Users") == 0) outReal = L"\\REGISTRY\\USER" + sub.substr(5);
+        else return false;
         return true;
-    }
-    else {
-        // 句柄指向真实路径
+    } else {
         outReal = keyPath;
         std::wstring relPath;
-
-        // [新增] 针对 HKCR 的特殊检查
-        // 如果路径是 \REGISTRY\MACHINE\SOFTWARE\Classes，它可能被视为 HKLM，但我们需要确保它被正确重定向到 Classes 挂载点
-        // ShouldRedirectReg 已经处理了 Classes 前缀，所以这里通常没问题。
-
         if (ShouldRedirectReg(outReal, relPath)) {
             outSandbox = g_RegMountPathNt + L"\\" + relPath;
             return true;
         }
     }
     return false;
+}
+
+// [新增] 读取沙盒中的项墓碑 (值为 [项名]__YapKeyDel__)
+void EnumerateKeyTombstonesToSet(const std::wstring& path, std::set<std::wstring>& tombstones) {
+    HANDLE hKey;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, path.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa))) {
+        ULONG index = 0;
+        ULONG len = 0;
+        std::vector<BYTE> buf(4096);
+
+        while (true) {
+            if (!fpNtEnumerateValueKey) break;
+            NTSTATUS status = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+            if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+                buf.resize(len > buf.size() ? len : buf.size() * 2);
+                continue;
+            }
+            if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
+
+            PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf.data();
+            std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
+            
+            std::wstring lowerName = name;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), towlower);
+            
+            if (lowerName.length() >= 13 && lowerName.substr(lowerName.length() - 13) == L"__yapkeydel__") {
+                tombstones.insert(lowerName.substr(0, lowerName.length() - 13));
+            }
+            index++;
+        }
+        fpNtClose(hKey);
+    }
 }
 
 // [新增] 枚举指定路径的子键到 Map (用于去重)
@@ -3038,23 +3049,27 @@ NTSTATUS NTAPI Detour_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         ObjectAttributes->RootDirectory = oldRoot;
 
         if (NT_SUCCESS(status)) {
-            // 移除项墓碑
             std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
             size_t lastSlash = sandboxPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
+                std::wstring parentSandboxPath = sandboxPath.substr(0, lastSlash);
                 std::wstring keyName = sandboxPath.substr(lastSlash + 1);
+                
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentPath.c_str());
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                    std::wstring tbName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
-                    fpNtDeleteValueKey(hParent, &usTb);
+                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTombstone;
+                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                    if (fpNtDeleteValueKey) fpNtDeleteValueKey(hParent, &usTombstone);
                     fpNtClose(hParent);
                 }
             }
+            
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
@@ -3077,19 +3092,24 @@ NTSTATUS NTAPI Detour_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
             size_t lastSlash = fullNtPath.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentPath = fullNtPath.substr(0, lastSlash);
+                std::wstring parentSandboxPath = fullNtPath.substr(0, lastSlash);
                 std::wstring keyName = fullNtPath.substr(lastSlash + 1);
+                
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentPath.c_str());
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                    std::wstring tbName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
-                    fpNtDeleteValueKey(hParent, &usTb);
+                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTombstone;
+                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                    if (fpNtDeleteValueKey) fpNtDeleteValueKey(hParent, &usTombstone);
                     fpNtClose(hParent);
                 }
             }
+
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPath.c_str());
@@ -3129,29 +3149,47 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
         bool isTombstoned = false;
-        std::wstring relPathToTb;
-        if (isRedirectedRoot) relPathToTb = relPath; else ShouldRedirectReg(fullNtPath, relPathToTb);
-        if (!relPathToTb.empty()) {
-            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPathToTb;
-            size_t lastSlash = sandboxPath.find_last_of(L'\\');
+        std::wstring relPathToCheck;
+        if (isRedirectedRoot) {
+            relPathToCheck = relPath;
+        } else {
+            ShouldRedirectReg(fullNtPath, relPathToCheck);
+        }
+        
+        if (!relPathToCheck.empty()) {
+            std::wstring sandboxPathToCheck = g_RegMountPathNt + L"\\" + relPathToCheck;
+            size_t lastSlash = sandboxPathToCheck.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
-                std::wstring keyName = sandboxPath.substr(lastSlash + 1);
+                std::wstring parentSandboxPath = sandboxPathToCheck.substr(0, lastSlash);
+                std::wstring keyName = sandboxPathToCheck.substr(lastSlash + 1);
+                
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentPath.c_str());
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                
                 if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_QUERY_VALUE, &oa))) {
-                    std::wstring tbName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
-                    BYTE dummy[64]; ULONG dLen;
-                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTb, KeyValuePartialInformation, dummy, sizeof(dummy), &dLen);
-                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW) isTombstoned = true;
+                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTombstone;
+                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                    
+                    BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
+                    ULONG dummyLen = 0;
+                    if (fpNtQueryValueKey) {
+                        NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
+                        if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
+                            isTombstoned = true;
+                        }
+                    }
                     fpNtClose(hParent);
                 }
             }
         }
-        if (isTombstoned) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+        if (isTombstoned) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
 
         HANDLE hRealCheck = NULL;
         OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
@@ -3221,29 +3259,47 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal) {
         bool isTombstoned = false;
-        std::wstring relPathToTb;
-        if (isRedirectedRoot) relPathToTb = relPath; else ShouldRedirectReg(fullNtPath, relPathToTb);
-        if (!relPathToTb.empty()) {
-            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPathToTb;
-            size_t lastSlash = sandboxPath.find_last_of(L'\\');
+        std::wstring relPathToCheck;
+        if (isRedirectedRoot) {
+            relPathToCheck = relPath;
+        } else {
+            ShouldRedirectReg(fullNtPath, relPathToCheck);
+        }
+        
+        if (!relPathToCheck.empty()) {
+            std::wstring sandboxPathToCheck = g_RegMountPathNt + L"\\" + relPathToCheck;
+            size_t lastSlash = sandboxPathToCheck.find_last_of(L'\\');
             if (lastSlash != std::wstring::npos) {
-                std::wstring parentPath = sandboxPath.substr(0, lastSlash);
-                std::wstring keyName = sandboxPath.substr(lastSlash + 1);
+                std::wstring parentSandboxPath = sandboxPathToCheck.substr(0, lastSlash);
+                std::wstring keyName = sandboxPathToCheck.substr(lastSlash + 1);
+                
                 HANDLE hParent = NULL;
-                OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
-                RtlInitUnicodeString(&us, parentPath.c_str());
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, parentSandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                if (NT_SUCCESS(fpNtOpenKeyEx(&hParent, KEY_QUERY_VALUE, &oa, OpenOptions))) {
-                    std::wstring tbName = keyName + L"__YapKeyDel__";
-                    UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
-                    BYTE dummy[64]; ULONG dLen;
-                    NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTb, KeyValuePartialInformation, dummy, sizeof(dummy), &dLen);
-                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW) isTombstoned = true;
+                
+                if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_QUERY_VALUE, &oa))) {
+                    std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                    UNICODE_STRING usTombstone;
+                    RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                    
+                    BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
+                    ULONG dummyLen = 0;
+                    if (fpNtQueryValueKey) {
+                        NTSTATUS tbStatus = fpNtQueryValueKey(hParent, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
+                        if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
+                            isTombstoned = true;
+                        }
+                    }
                     fpNtClose(hParent);
                 }
             }
         }
-        if (isTombstoned) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+        if (isTombstoned) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
 
         HANDLE hRealCheck = NULL;
         OBJECT_ATTRIBUTES oaReal; UNICODE_STRING usReal;
@@ -3295,62 +3351,101 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
-    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+
+    std::wstring currentNtPath;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) currentNtPath = it->second->FullPath;
+    }
+    if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
     if (currentNtPath.empty()) return fpNtDeleteKey(KeyHandle);
+
     std::wstring realPath, sandboxPath;
-    if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+    if (GetRegPaths(currentNtPath, realPath, sandboxPath)) {
         size_t lastSlash = sandboxPath.find_last_of(L'\\');
         if (lastSlash != std::wstring::npos) {
-            std::wstring parentPath = sandboxPath.substr(0, lastSlash);
+            std::wstring parentSandboxPath = sandboxPath.substr(0, lastSlash);
             std::wstring keyName = sandboxPath.substr(lastSlash + 1);
-            HANDLE hParent = NULL; OBJECT_ATTRIBUTES oa; UNICODE_STRING us;
-            RtlInitUnicodeString(&us, parentPath.c_str());
+
+            HANDLE hParent = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, parentSandboxPath.c_str());
             InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            if (!NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
-                std::wstring relParent;
-                if (parentPath.find(g_RegMountPathNt) == 0) {
-                    relParent = parentPath.substr(g_RegMountPathNt.length());
-                    if (!relParent.empty() && relParent[0] == L'\\') relParent = relParent.substr(1);
-                    EnsureRegPathExistsRelative(relParent);
-                }
-                fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa);
-            }
-            if (hParent) {
-                std::wstring tbName = keyName + L"__YapKeyDel__";
-                UNICODE_STRING usTb; RtlInitUnicodeString(&usTb, tbName.c_str());
-                DWORD data = 1; fpNtSetValueKey(hParent, &usTb, 0, REG_DWORD, &data, sizeof(data));
+
+            if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
+                std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                UNICODE_STRING usTombstone;
+                RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                DWORD tombstoneData = 1;
+                if (fpNtSetValueKey) fpNtSetValueKey(hParent, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
                 fpNtClose(hParent);
+            } else {
+                std::wstring relParentPath;
+                if (parentSandboxPath.find(g_RegMountPathNt) == 0) {
+                    relParentPath = parentSandboxPath.substr(g_RegMountPathNt.length());
+                    if (!relParentPath.empty() && relParentPath[0] == L'\\') relParentPath = relParentPath.substr(1);
+                    
+                    EnsureRegPathExistsRelative(relParentPath);
+                    
+                    if (NT_SUCCESS(fpNtOpenKey(&hParent, KEY_SET_VALUE, &oa))) {
+                        std::wstring tombstoneName = keyName + L"__YapKeyDel__";
+                        UNICODE_STRING usTombstone;
+                        RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+                        DWORD tombstoneData = 1;
+                        if (fpNtSetValueKey) fpNtSetValueKey(hParent, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
+                        fpNtClose(hParent);
+                    }
+                }
             }
         }
+
         if (currentNtPath.find(g_RegMountPathNt) == 0) {
             NTSTATUS status = fpNtDeleteKey(KeyHandle);
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); }
+            if (it != g_RegContextMap.end()) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                delete it->second;
+                g_RegContextMap.erase(it);
+            }
             return status;
+        } else {
+            return STATUS_SUCCESS;
         }
-        return STATUS_SUCCESS;
     }
     return fpNtDeleteKey(KeyHandle);
 }
 
 // [新增] 拦截值删除，创建值墓碑
 NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName) {
-    if (g_IsInHook || !g_HookReg) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    if (g_IsInHook || !g_HookReg) {
+        if (fpNtDeleteValueKey) return fpNtDeleteValueKey(KeyHandle, ValueName);
+        return STATUS_NOT_SUPPORTED;
+    }
     RecursionGuard guard;
 
-    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    std::wstring currentNtPath;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) currentNtPath = it->second->FullPath;
+    }
+    if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) {
+        if (fpNtDeleteValueKey) return fpNtDeleteValueKey(KeyHandle, ValueName);
+        return STATUS_NOT_SUPPORTED;
+    }
 
     std::wstring realPath, sandboxPath;
-    if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+    if (GetRegPaths(currentNtPath, realPath, sandboxPath)) {
         HANDLE hSandboxKey = NULL;
         bool closeSandboxKey = false;
-
+        
         if (currentNtPath.find(g_RegMountPathNt) == 0) {
             hSandboxKey = KeyHandle;
         } else {
-            // 确保沙盒键存在以存放墓碑
             std::wstring relPath;
             if (sandboxPath.find(g_RegMountPathNt) == 0) {
                 relPath = sandboxPath.substr(g_RegMountPathNt.length());
@@ -3369,55 +3464,59 @@ NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueNa
 
         if (hSandboxKey) {
             std::wstring valName;
-            if (ValueName && ValueName->Buffer) {
-                valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
-            }
+            if (ValueName && ValueName->Buffer) valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
             std::wstring tombstoneName = valName + L"__YapValDel__";
             UNICODE_STRING usTombstone;
             RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-
+            
             DWORD tombstoneData = 1;
-            fpNtSetValueKey(hSandboxKey, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
-
+            if (fpNtSetValueKey) fpNtSetValueKey(hSandboxKey, &usTombstone, 0, REG_DWORD, &tombstoneData, sizeof(tombstoneData));
             if (closeSandboxKey) fpNtClose(hSandboxKey);
         }
 
-        NTSTATUS status = fpNtDeleteValueKey(KeyHandle, ValueName);
-
+        NTSTATUS status = STATUS_SUCCESS;
+        if (fpNtDeleteValueKey) status = fpNtDeleteValueKey(KeyHandle, ValueName);
+        
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
-        if (it != g_RegContextMap.end()) {
-            it->second->ValuesInitialized = false;
-        }
-
-        if (currentNtPath.find(g_RegMountPathNt) != 0) {
-            return STATUS_SUCCESS;
-        }
+        if (it != g_RegContextMap.end()) it->second->ValuesInitialized = false;
+        
+        if (currentNtPath.find(g_RegMountPathNt) != 0) return STATUS_SUCCESS;
         return status;
     }
 
-    return fpNtDeleteValueKey(KeyHandle, ValueName);
+    if (fpNtDeleteValueKey) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    return STATUS_NOT_SUPPORTED;
 }
 
 // [新增] 拦截值设置，如果重新创建了值，则移除其墓碑
 NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex, ULONG Type, PVOID Data, ULONG DataSize) {
-    if (g_IsInHook || !g_HookReg) return fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+    if (g_IsInHook || !g_HookReg) {
+        if (fpNtSetValueKey) return fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+        return STATUS_NOT_SUPPORTED;
+    }
     RecursionGuard guard;
 
-    NTSTATUS status = fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+    NTSTATUS status = STATUS_SUCCESS;
+    if (fpNtSetValueKey) status = fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
 
     if (NT_SUCCESS(status)) {
-        std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+        std::wstring currentNtPath;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) currentNtPath = it->second->FullPath;
+        }
+        if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
+
         std::wstring realPath, sandboxPath;
-        if (!currentNtPath.empty() && GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+        if (!currentNtPath.empty() && GetRegPaths(currentNtPath, realPath, sandboxPath)) {
             std::wstring valName;
-            if (ValueName && ValueName->Buffer) {
-                valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
-            }
+            if (ValueName && ValueName->Buffer) valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
             std::wstring tombstoneName = valName + L"__YapValDel__";
             UNICODE_STRING usTombstone;
             RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
-
+            
             HANDLE hSandboxKey = NULL;
             bool closeSandboxKey = false;
             if (currentNtPath.find(g_RegMountPathNt) == 0) {
@@ -3427,21 +3526,17 @@ NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName,
                 UNICODE_STRING us;
                 RtlInitUnicodeString(&us, sandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                if (NT_SUCCESS(fpNtOpenKey(&hSandboxKey, KEY_SET_VALUE, &oa))) {
-                    closeSandboxKey = true;
-                }
+                if (NT_SUCCESS(fpNtOpenKey(&hSandboxKey, KEY_SET_VALUE, &oa))) closeSandboxKey = true;
             }
 
             if (hSandboxKey) {
-                fpNtDeleteValueKey(hSandboxKey, &usTombstone);
+                if (fpNtDeleteValueKey) fpNtDeleteValueKey(hSandboxKey, &usTombstone);
                 if (closeSandboxKey) fpNtClose(hSandboxKey);
             }
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) {
-                it->second->ValuesInitialized = false;
-            }
+            if (it != g_RegContextMap.end()) it->second->ValuesInitialized = false;
         }
     }
     return status;
@@ -3450,48 +3545,101 @@ NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName,
 NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
-    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
-    RegContext* ctx = nullptr; bool needsBuild = false;
-    { std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-      auto it = g_RegContextMap.find(KeyHandle);
-      if (it != g_RegContextMap.end()) {
-          if (it->second->FullPath != currentNtPath) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); needsBuild = true; }
-          else { ctx = it->second; if (!ctx->KeysInitialized) needsBuild = true; }
-      } else needsBuild = true;
-      if (needsBuild && ctx == nullptr) { ctx = new RegContext(); ctx->FullPath = currentNtPath; g_RegContextMap[KeyHandle] = ctx; }
+
+    std::wstring currentNtPath;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) currentNtPath = it->second->FullPath;
     }
+    if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->FullPath != currentNtPath) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+                needsBuild = true;
+            } else {
+                ctx = it->second;
+                if (!ctx->KeysInitialized) needsBuild = true;
+            }
+        } else {
+            needsBuild = true;
+        }
+
+        if (needsBuild && ctx == nullptr) {
+            ctx = new RegContext();
+            ctx->FullPath = currentNtPath;
+            g_RegContextMap[KeyHandle] = ctx;
+        }
+    }
+
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
-        if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+        if (GetRegPaths(currentNtPath, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegKey> mergedKeys;
+
             EnumerateKeysToMap(realPath, mergedKeys);
+
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
                 std::wstring subPath = realPath.substr(34);
                 std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
                 EnumerateKeysToMap(userClassesPath, mergedKeys);
             }
+
             EnumerateKeysToMap(sandboxPath, mergedKeys);
-            std::set<std::wstring> keyTombstones; EnumerateKeyTombstonesToSet(sandboxPath, keyTombstones);
+
+            std::set<std::wstring> keyTombstones;
+            EnumerateKeyTombstonesToSet(sandboxPath, keyTombstones);
+
             for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
-                if (keyTombstones.find(it->first) != keyTombstones.end()) it = mergedKeys.erase(it); else ++it;
+                if (keyTombstones.find(it->first) != keyTombstones.end()) {
+                    it = mergedKeys.erase(it);
+                } else {
+                    ++it;
+                }
             }
+
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
-                ctx = it->second; ctx->SubKeys.clear();
+                ctx = it->second;
+                ctx->SubKeys.clear();
                 for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
                 ctx->KeysInitialized = true;
             }
-        } else return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+        } else {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+            }
+            return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+        }
     }
+
     std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
     auto it = g_RegContextMap.find(KeyHandle);
-    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) {
+        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
     ctx = it->second;
+
     if (Index >= ctx->SubKeys.size()) return STATUS_NO_MORE_ENTRIES;
+
     const CachedRegKey& entry = ctx->SubKeys[Index];
-    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR)), classBytes = (ULONG)(entry.Class.length() * sizeof(WCHAR)), requiredSize = 0;
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+    ULONG classBytes = (ULONG)(entry.Class.length() * sizeof(WCHAR));
+    ULONG requiredSize = 0;
+
     switch (KeyInformationClass) {
         case KeyBasicInformation: requiredSize = FIELD_OFFSET(KEY_BASIC_INFORMATION, Name) + nameBytes; break;
         case KeyNodeInformation:  requiredSize = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes + classBytes; break;
@@ -3499,90 +3647,189 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
         case KeyNameInformation:  requiredSize = FIELD_OFFSET(KEY_NAME_INFORMATION, Name) + nameBytes; break;
         default: return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
+
     if (ResultLength) *ResultLength = requiredSize;
     if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
+
     memset(KeyInformation, 0, Length);
+
     if (KeyInformationClass == KeyBasicInformation) {
         PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    } else if (KeyInformationClass == KeyNodeInformation) {
-        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->NameLength = nameBytes; info->ClassLength = classBytes;
-        info->ClassOffset = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
-        if (classBytes > 0) memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
-    } else if (KeyInformationClass == KeyFullInformation) {
-        PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->ClassLength = classBytes;
-        info->ClassOffset = FIELD_OFFSET(KEY_FULL_INFORMATION, Class); info->SubKeys = (ULONG)ctx->SubKeys.size(); info->Values = (ULONG)ctx->Values.size();
-        if (classBytes > 0) memcpy(info->Class, entry.Class.c_str(), classBytes);
-    } else if (KeyInformationClass == KeyNameInformation) {
-        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
     }
+    else if (KeyInformationClass == KeyNodeInformation) {
+        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->NameLength = nameBytes;
+        info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        if (classBytes > 0) memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
+    }
+    else if (KeyInformationClass == KeyFullInformation) {
+        PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_FULL_INFORMATION, Class);
+        info->SubKeys = (ULONG)ctx->SubKeys.size();
+        info->Values = (ULONG)ctx->Values.size();
+        if (classBytes > 0) memcpy(info->Class, entry.Class.c_str(), classBytes);
+    }
+    else if (KeyInformationClass == KeyNameInformation) {
+        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+
     return STATUS_SUCCESS;
 }
 
 NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass, PVOID KeyValueInformation, ULONG Length, PULONG ResultLength) {
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     RecursionGuard guard;
-    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-    RegContext* ctx = nullptr; bool needsBuild = false;
-    { std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-      auto it = g_RegContextMap.find(KeyHandle);
-      if (it != g_RegContextMap.end()) {
-          if (it->second->FullPath != currentNtPath) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); needsBuild = true; }
-          else { ctx = it->second; if (!ctx->ValuesInitialized) needsBuild = true; }
-      } else needsBuild = true;
-      if (needsBuild && ctx == nullptr) { ctx = new RegContext(); ctx->FullPath = currentNtPath; g_RegContextMap[KeyHandle] = ctx; }
+
+    std::wstring currentNtPath;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) currentNtPath = it->second->FullPath;
     }
+    if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->FullPath != currentNtPath) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+                needsBuild = true;
+            } else {
+                ctx = it->second;
+                if (!ctx->ValuesInitialized) needsBuild = true;
+            }
+        } else {
+            needsBuild = true;
+        }
+
+        if (needsBuild && ctx == nullptr) {
+            ctx = new RegContext();
+            ctx->FullPath = currentNtPath;
+            g_RegContextMap[KeyHandle] = ctx;
+        }
+    }
+
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
-        if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+        if (GetRegPaths(currentNtPath, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegValue> mergedValues;
-            EnumerateValuesToMap(realPath, mergedValues); EnumerateValuesToMap(sandboxPath, mergedValues);
+            EnumerateValuesToMap(realPath, mergedValues);
+            EnumerateValuesToMap(sandboxPath, mergedValues);
+
             for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
                 const std::wstring& lowerName = it->first;
                 if (lowerName.length() >= 13 && lowerName.substr(lowerName.length() - 13) == L"__yapvaldel__") {
                     std::wstring lowerOriginal = lowerName.substr(0, lowerName.length() - 13);
-                    mergedValues.erase(lowerOriginal); it = mergedValues.erase(it);
-                } else ++it;
+                    mergedValues.erase(lowerOriginal);
+                    it = mergedValues.erase(it);
+                } else if (lowerName.length() >= 13 && lowerName.substr(lowerName.length() - 13) == L"__yapkeydel__") {
+                    it = mergedValues.erase(it); // 隐藏项墓碑值本身
+                } else {
+                    ++it;
+                }
             }
+
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
-                ctx = it->second; ctx->Values.clear();
+                ctx = it->second;
+                ctx->Values.clear();
                 for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
                 ctx->ValuesInitialized = true;
             }
-        } else return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        } else {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+            }
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
     }
+
     std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
     auto it = g_RegContextMap.find(KeyHandle);
-    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-    ctx = it->second;
-    if (Index >= ctx->Values.size()) return STATUS_NO_MORE_ENTRIES;
-    const CachedRegValue& entry = ctx->Values[Index];
-    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR)), dataBytes = (ULONG)entry.Data.size(), requiredSize = 0, dataOffset = 0;
-    switch (KeyValueInformationClass) {
-        case KeyValueBasicInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes; break;
-        case KeyValueFullInformation: dataOffset = (FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes + 3) & ~3; requiredSize = dataOffset + dataBytes; break;
-        case KeyValuePartialInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes; break;
-        default: return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) {
+        return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     }
+    ctx = it->second;
+
+    if (Index >= ctx->Values.size()) return STATUS_NO_MORE_ENTRIES;
+
+    const CachedRegValue& entry = ctx->Values[Index];
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+    ULONG dataBytes = (ULONG)entry.Data.size();
+    ULONG requiredSize = 0;
+    ULONG dataOffset = 0;
+
+    switch (KeyValueInformationClass) {
+        case KeyValueBasicInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes;
+            break;
+        case KeyValueFullInformation:
+            dataOffset = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes;
+            dataOffset = (dataOffset + 3) & ~3;
+            requiredSize = dataOffset + dataBytes;
+            break;
+        case KeyValuePartialInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes;
+            break;
+        default:
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    }
+
     if (ResultLength) *ResultLength = requiredSize;
     if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
+
     memset(KeyValueInformation, 0, Length);
+
     if (KeyValueInformationClass == KeyValueBasicInformation) {
         PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    } else if (KeyValueInformationClass == KeyValueFullInformation) {
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->NameLength = nameBytes; info->DataLength = dataBytes; info->DataOffset = dataOffset;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes); if (dataBytes > 0) memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
-    } else if (KeyValueInformationClass == KeyValuePartialInformation) {
-        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->DataLength = dataBytes; if (dataBytes > 0) memcpy(info->Data, entry.Data.data(), dataBytes);
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
     }
+    else if (KeyValueInformationClass == KeyValueFullInformation) {
+        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->NameLength = nameBytes;
+        info->DataLength = dataBytes;
+        info->DataOffset = dataOffset;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        if (dataBytes > 0 && Length >= dataOffset + dataBytes) {
+            memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
+        }
+    }
+    else if (KeyValueInformationClass == KeyValuePartialInformation) {
+        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->DataLength = dataBytes;
+        if (dataBytes > 0) memcpy(info->Data, entry.Data.data(), dataBytes);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -5043,19 +5290,27 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     ULONG Length,
     PULONG ResultLength
 ) {
-    // 1. 检查沙盒中是否存在该值的墓碑
     if (g_HookReg && !g_IsInHook) {
         std::wstring valName;
-        if (ValueName && ValueName->Buffer) {
-            valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
-        }
+        if (ValueName && ValueName->Buffer) valName.assign(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
         std::wstring tombstoneName = valName + L"__YapValDel__";
         UNICODE_STRING usTombstone;
         RtlInitUnicodeString(&usTombstone, tombstoneName.c_str());
+        
+        std::wstring currentNtPath;
+        HANDLE hReal = NULL;
+        {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                currentNtPath = it->second->FullPath;
+                hReal = it->second->hRealKey;
+            }
+        }
+        if (currentNtPath.empty()) currentNtPath = GetPathFromHandle(KeyHandle);
 
-        std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
         std::wstring realPath, sandboxPath;
-        if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+        if (GetRegPaths(currentNtPath, realPath, sandboxPath)) {
             HANDLE hSandbox = NULL;
             bool closeSandbox = false;
             if (currentNtPath.find(g_RegMountPathNt) == 0) {
@@ -5065,63 +5320,47 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
                 UNICODE_STRING us;
                 RtlInitUnicodeString(&us, sandboxPath.c_str());
                 InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                if (NT_SUCCESS(fpNtOpenKey(&hSandbox, KEY_QUERY_VALUE, &oa))) {
-                    closeSandbox = true;
-                }
+                if (NT_SUCCESS(fpNtOpenKey(&hSandbox, KEY_QUERY_VALUE, &oa))) closeSandbox = true;
             }
 
             if (hSandbox) {
                 BYTE dummyBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 16];
                 ULONG dummyLen = 0;
-                NTSTATUS tbStatus = fpNtQueryValueKey(hSandbox, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
-                if (closeSandbox) fpNtClose(hSandbox);
-                if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
-                    return STATUS_OBJECT_NAME_NOT_FOUND; // 命中墓碑，返回未找到
+                if (fpNtQueryValueKey) {
+                    NTSTATUS tbStatus = fpNtQueryValueKey(hSandbox, &usTombstone, KeyValuePartialInformation, dummyBuf, sizeof(dummyBuf), &dummyLen);
+                    if (NT_SUCCESS(tbStatus) || tbStatus == STATUS_BUFFER_OVERFLOW || tbStatus == STATUS_BUFFER_TOO_SMALL) {
+                        if (closeSandbox) fpNtClose(hSandbox);
+                        return STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
                 }
+                if (closeSandbox) fpNtClose(hSandbox);
             }
         }
     }
 
-    // 2. 尝试从当前句柄查询
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
 
-    // 3. 回退逻辑
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
         HANDLE hReal = NULL;
         {
             std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) {
-                hReal = it->second->hRealKey;
-            }
+            if (it != g_RegContextMap.end()) hReal = it->second->hRealKey;
         }
-
         if (hReal) {
             RecursionGuard guard;
             status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
         }
     }
 
-    // 3. [区域伪造逻辑] 如果查询成功 (或缓冲区溢出，说明值存在)，且启用了区域伪造
-    // 我们需要拦截 ACP/OEMCP 的查询结果
     if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
-
-        // 检查是否查询的是 ACP 或 OEMCP
-        // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
-        // ValueName 分别是 "ACP" 或 "OEMCP"
-
         bool isACP = (ValueName->Length == 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0);
         bool isOEMCP = (ValueName->Length == 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0);
-
         if (isACP || isOEMCP) {
             const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
-            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t)); // 包含 NULL 结尾
-
-            // 根据查询的信息类进行处理
+            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t));
             if (KeyValueInformationClass == KeyValuePartialInformation) {
-                // 结构: Header + Data
                 ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
-
                 if (Length >= requiredSize) {
                     PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
                     info->Type = REG_SZ;
@@ -5131,36 +5370,18 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
                 } else {
                     status = STATUS_BUFFER_OVERFLOW;
                 }
-
                 if (ResultLength) *ResultLength = requiredSize;
             }
             else if (KeyValueInformationClass == KeyValueFullInformation) {
-                // 结构: Header + Name + Padding + Data
-                // 注意：这里我们只修改 Data 部分，假设 Name 部分已经由 fpNtQueryValueKey 填充好了
-                // 如果原始查询失败(回退逻辑也没找到)，这里进不来，所以 info 里的 Name 是有效的
-
                 PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-
-                // 如果原始状态是 SUCCESS，我们可以直接修改数据
-                // 如果原始状态是 OVERFLOW，我们需要重新计算大小
-
-                // 简单起见，如果原始调用成功读取了数据，我们检查是否有空间覆写
                 if (status == STATUS_SUCCESS) {
                     if (info->DataLength >= fakeDataSize) {
-                        // 原数据空间足够，直接覆盖
                         info->Type = REG_SZ;
                         info->DataLength = fakeDataSize;
-                        // DataOffset 是相对于结构体起始的偏移
                         memcpy((BYTE*)info + info->DataOffset, fakeVal.c_str(), fakeDataSize);
                     } else {
-                        // 原数据空间不足 (例如原值是 "1252" 长度 10，我们要写 "936" 长度 8，通常够用)
-                        // 如果不够，返回 OVERFLOW
-                        // 但通常代码页字符串长度都很短，这里做个防御性编程
-                        // 如果空间不够，我们只能告诉调用者需要更多内存
-                        // 重新计算所需大小
                         ULONG dataOffset = info->DataOffset;
                         ULONG requiredSize = dataOffset + fakeDataSize;
-
                         if (Length >= requiredSize) {
                              info->Type = REG_SZ;
                              info->DataLength = fakeDataSize;
@@ -5171,19 +5392,9 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
                         }
                     }
                 }
-                else if (status == STATUS_BUFFER_OVERFLOW) {
-                    // 如果原始查询就溢出了，我们需要修正 ResultLength
-                    // 原始 ResultLength 是基于真实值的，我们需要基于伪造值计算
-                    // 这比较麻烦，因为我们不知道 Name 有多长。
-                    // 但通常程序会先查长度再分配内存。
-                    // 此时我们无法修改 ResultLength 准确值，因为不知道 NameLength。
-                    // 只能寄希望于程序分配足够大的缓冲区（通常 MAX_PATH）。
-                    // 或者，我们可以忽略这次修正，等程序分配了内存再次调用时，会进入上面的 STATUS_SUCCESS 分支。
-                }
             }
         }
     }
-
     return status;
 }
 
