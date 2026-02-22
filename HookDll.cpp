@@ -3447,118 +3447,51 @@ NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName,
     return status;
 }
 
-NTSTATUS NTAPI Detour_NtEnumerateKey(
-    HANDLE KeyHandle,
-    ULONG Index,
-    KEY_INFORMATION_CLASS KeyInformationClass,
-    PVOID KeyInformation,
-    ULONG Length,
-    PULONG ResultLength
-) {
-    if (g_IsInHook || !g_HookReg) {
-        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
-    }
+NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
+    if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
-
-    // 1. 获取当前句柄的真实 NT 路径
     std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) {
-        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    if (currentNtPath.empty()) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    RegContext* ctx = nullptr; bool needsBuild = false;
+    { std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+      auto it = g_RegContextMap.find(KeyHandle);
+      if (it != g_RegContextMap.end()) {
+          if (it->second->FullPath != currentNtPath) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); needsBuild = true; }
+          else { ctx = it->second; if (!ctx->KeysInitialized) needsBuild = true; }
+      } else needsBuild = true;
+      if (needsBuild && ctx == nullptr) { ctx = new RegContext(); ctx->FullPath = currentNtPath; g_RegContextMap[KeyHandle] = ctx; }
     }
-
-    RegContext* ctx = nullptr;
-    bool needsBuild = false;
-
-    // 2. 检查并维护缓存
-    {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        auto it = g_RegContextMap.find(KeyHandle);
-
-        if (it != g_RegContextMap.end()) {
-            if (it->second->FullPath != currentNtPath) {
-                // 句柄被复用，清理旧缓存
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                delete it->second;
-                g_RegContextMap.erase(it);
-                needsBuild = true;
-            } else {
-                ctx = it->second;
-                if (!ctx->KeysInitialized) needsBuild = true;
-            }
-        } else {
-            needsBuild = true;
-        }
-
-        if (needsBuild && ctx == nullptr) {
-            ctx = new RegContext();
-            ctx->FullPath = currentNtPath;
-            g_RegContextMap[KeyHandle] = ctx;
-        }
-    }
-
-    // 3. 构建合并列表 (仅在需要时执行)
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegKey> mergedKeys;
-
-            // A. 枚举真实路径
             EnumerateKeysToMap(realPath, mergedKeys);
-
-            // B. 处理 HKCR 特殊合并
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
                 std::wstring subPath = realPath.substr(34);
                 std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
                 EnumerateKeysToMap(userClassesPath, mergedKeys);
             }
-
-            // C. 枚举沙盒路径
             EnumerateKeysToMap(sandboxPath, mergedKeys);
-
-            // D. 读取并过滤项墓碑 (__YapKeyDel__)
-            std::set<std::wstring> keyTombstones;
-            EnumerateKeyTombstonesToSet(sandboxPath, keyTombstones);
-
+            std::set<std::wstring> keyTombstones; EnumerateKeyTombstonesToSet(sandboxPath, keyTombstones);
             for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
-                if (keyTombstones.find(it->first) != keyTombstones.end()) {
-                    it = mergedKeys.erase(it);
-                } else {
-                    ++it;
-                }
+                if (keyTombstones.find(it->first) != keyTombstones.end()) it = mergedKeys.erase(it); else ++it;
             }
-
-            // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
-                ctx = it->second;
-                ctx->SubKeys.clear();
-                for (auto& pair : mergedKeys) {
-                    ctx->SubKeys.push_back(pair.second);
-                }
+                ctx = it->second; ctx->SubKeys.clear();
+                for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
                 ctx->KeysInitialized = true;
             }
-        } else {
-            // 不需要重定向的路径，直接回退
-            return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
-        }
+        } else return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
-
-    // 4. 从缓存读取数据并填充缓冲区
     std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
     auto it = g_RegContextMap.find(KeyHandle);
-    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) {
-        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
-    }
+    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     ctx = it->second;
-
     if (Index >= ctx->SubKeys.size()) return STATUS_NO_MORE_ENTRIES;
-
     const CachedRegKey& entry = ctx->SubKeys[Index];
-    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
-    ULONG classBytes = (ULONG)(entry.Class.length() * sizeof(WCHAR));
-    ULONG requiredSize = 0;
-
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR)), classBytes = (ULONG)(entry.Class.length() * sizeof(WCHAR)), requiredSize = 0;
     switch (KeyInformationClass) {
         case KeyBasicInformation: requiredSize = FIELD_OFFSET(KEY_BASIC_INFORMATION, Name) + nameBytes; break;
         case KeyNodeInformation:  requiredSize = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes + classBytes; break;
@@ -3566,200 +3499,90 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(
         case KeyNameInformation:  requiredSize = FIELD_OFFSET(KEY_NAME_INFORMATION, Name) + nameBytes; break;
         default: return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
-
     if (ResultLength) *ResultLength = requiredSize;
     if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
-
     memset(KeyInformation, 0, Length);
-
     if (KeyInformationClass == KeyBasicInformation) {
         PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime;
-        info->TitleIndex = entry.TitleIndex;
-        info->NameLength = nameBytes;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    }
-    else if (KeyInformationClass == KeyNodeInformation) {
+        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    } else if (KeyInformationClass == KeyNodeInformation) {
         PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime;
-        info->TitleIndex = entry.TitleIndex;
-        info->NameLength = nameBytes;
-        info->ClassLength = classBytes;
-        info->ClassOffset = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->NameLength = nameBytes; info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
         if (classBytes > 0) memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
-    }
-    else if (KeyInformationClass == KeyFullInformation) {
+    } else if (KeyInformationClass == KeyFullInformation) {
         PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
-        info->LastWriteTime = entry.LastWriteTime;
-        info->TitleIndex = entry.TitleIndex;
-        info->ClassLength = classBytes;
-        info->ClassOffset = FIELD_OFFSET(KEY_FULL_INFORMATION, Class);
-        // 关键：返回合并后的统计信息
-        info->SubKeys = (ULONG)ctx->SubKeys.size();
-        info->Values = (ULONG)ctx->Values.size();
+        info->LastWriteTime = entry.LastWriteTime; info->TitleIndex = entry.TitleIndex; info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_FULL_INFORMATION, Class); info->SubKeys = (ULONG)ctx->SubKeys.size(); info->Values = (ULONG)ctx->Values.size();
         if (classBytes > 0) memcpy(info->Class, entry.Class.c_str(), classBytes);
+    } else if (KeyInformationClass == KeyNameInformation) {
+        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
     }
-    else if (KeyInformationClass == KeyNameInformation) {
-        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation;
-        info->NameLength = nameBytes;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    }
-
     return STATUS_SUCCESS;
 }
 
-NTSTATUS NTAPI Detour_NtEnumerateValueKey(
-    HANDLE KeyHandle,
-    ULONG Index,
-    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    PVOID KeyValueInformation,
-    ULONG Length,
-    PULONG ResultLength
-) {
-    if (g_IsInHook || !g_HookReg) {
-        return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-    }
+NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass, PVOID KeyValueInformation, ULONG Length, PULONG ResultLength) {
+    if (g_IsInHook || !g_HookReg) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     RecursionGuard guard;
-
-    // 1. 获取当前句柄的真实 NT 路径
     std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
-    if (currentNtPath.empty()) {
-        return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    if (currentNtPath.empty()) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    RegContext* ctx = nullptr; bool needsBuild = false;
+    { std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+      auto it = g_RegContextMap.find(KeyHandle);
+      if (it != g_RegContextMap.end()) {
+          if (it->second->FullPath != currentNtPath) { if (it->second->hRealKey) fpNtClose(it->second->hRealKey); delete it->second; g_RegContextMap.erase(it); needsBuild = true; }
+          else { ctx = it->second; if (!ctx->ValuesInitialized) needsBuild = true; }
+      } else needsBuild = true;
+      if (needsBuild && ctx == nullptr) { ctx = new RegContext(); ctx->FullPath = currentNtPath; g_RegContextMap[KeyHandle] = ctx; }
     }
-
-    RegContext* ctx = nullptr;
-    bool needsBuild = false;
-
-    // 2. 检查并维护缓存
-    {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        auto it = g_RegContextMap.find(KeyHandle);
-        if (it != g_RegContextMap.end()) {
-            if (it->second->FullPath != currentNtPath) {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                delete it->second;
-                g_RegContextMap.erase(it);
-                needsBuild = true;
-            } else {
-                ctx = it->second;
-                if (!ctx->ValuesInitialized) needsBuild = true;
-            }
-        } else {
-            needsBuild = true;
-        }
-
-        if (needsBuild && ctx == nullptr) {
-            ctx = new RegContext();
-            ctx->FullPath = currentNtPath;
-            g_RegContextMap[KeyHandle] = ctx;
-        }
-    }
-
-    // 3. 构建合并列表
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegValue> mergedValues;
-
-            // A. 枚举真实和沙盒值
-            EnumerateValuesToMap(realPath, mergedValues);
-            EnumerateValuesToMap(sandboxPath, mergedValues);
-
-            // B. 过滤值墓碑 (__YapValDel__)
+            EnumerateValuesToMap(realPath, mergedValues); EnumerateValuesToMap(sandboxPath, mergedValues);
             for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
                 const std::wstring& lowerName = it->first;
                 if (lowerName.length() >= 13 && lowerName.substr(lowerName.length() - 13) == L"__yapvaldel__") {
                     std::wstring lowerOriginal = lowerName.substr(0, lowerName.length() - 13);
-                    mergedValues.erase(lowerOriginal); // 移除被标记删除的真实值
-                    it = mergedValues.erase(it);       // 移除墓碑自身
-                } else {
-                    ++it;
-                }
+                    mergedValues.erase(lowerOriginal); it = mergedValues.erase(it);
+                } else ++it;
             }
-
-            // C. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
-                ctx = it->second;
-                ctx->Values.clear();
-                for (auto& pair : mergedValues) {
-                    ctx->Values.push_back(pair.second);
-                }
+                ctx = it->second; ctx->Values.clear();
+                for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
                 ctx->ValuesInitialized = true;
             }
-        } else {
-            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-        }
+        } else return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     }
-
-    // 4. 从缓存读取数据并填充缓冲区
     std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
     auto it = g_RegContextMap.find(KeyHandle);
-    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) {
-        return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-    }
+    if (it == g_RegContextMap.end() || it->second->FullPath != currentNtPath) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     ctx = it->second;
-
     if (Index >= ctx->Values.size()) return STATUS_NO_MORE_ENTRIES;
-
     const CachedRegValue& entry = ctx->Values[Index];
-    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
-    ULONG dataBytes = (ULONG)entry.Data.size();
-    ULONG requiredSize = 0;
-    ULONG dataOffset = 0;
-
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR)), dataBytes = (ULONG)entry.Data.size(), requiredSize = 0, dataOffset = 0;
     switch (KeyValueInformationClass) {
-        case KeyValueBasicInformation:
-            requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes;
-            break;
-        case KeyValueFullInformation:
-            dataOffset = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes;
-            dataOffset = (dataOffset + 3) & ~3; // 4字节对齐
-            requiredSize = dataOffset + dataBytes;
-            break;
-        case KeyValuePartialInformation:
-            requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes;
-            break;
-        default:
-            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        case KeyValueBasicInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes; break;
+        case KeyValueFullInformation: dataOffset = (FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes + 3) & ~3; requiredSize = dataOffset + dataBytes; break;
+        case KeyValuePartialInformation: requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes; break;
+        default: return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
     }
-
     if (ResultLength) *ResultLength = requiredSize;
     if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
-
     memset(KeyValueInformation, 0, Length);
-
     if (KeyValueInformationClass == KeyValueBasicInformation) {
         PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex;
-        info->Type = entry.Type;
-        info->NameLength = nameBytes;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-    }
-    else if (KeyValueInformationClass == KeyValueFullInformation) {
+        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->NameLength = nameBytes; memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    } else if (KeyValueInformationClass == KeyValueFullInformation) {
         PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex;
-        info->Type = entry.Type;
-        info->NameLength = nameBytes;
-        info->DataLength = dataBytes;
-        info->DataOffset = dataOffset;
-        memcpy(info->Name, entry.Name.c_str(), nameBytes);
-        if (dataBytes > 0) {
-            memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
-        }
-    }
-    else if (KeyValueInformationClass == KeyValuePartialInformation) {
+        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->NameLength = nameBytes; info->DataLength = dataBytes; info->DataOffset = dataOffset;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes); if (dataBytes > 0) memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
+    } else if (KeyValueInformationClass == KeyValuePartialInformation) {
         PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
-        info->TitleIndex = entry.TitleIndex;
-        info->Type = entry.Type;
-        info->DataLength = dataBytes;
-        if (dataBytes > 0) {
-            memcpy(info->Data, entry.Data.data(), dataBytes);
-        }
+        info->TitleIndex = entry.TitleIndex; info->Type = entry.Type; info->DataLength = dataBytes; if (dataBytes > 0) memcpy(info->Data, entry.Data.data(), dataBytes);
     }
-
     return STATUS_SUCCESS;
 }
 
