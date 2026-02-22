@@ -2993,42 +2993,6 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     }
 }
 
-// [新增] 读取沙盒中的项墓碑 (值为 [项名]__YapKeyDel__)
-void EnumerateKeyTombstonesToSet(const std::wstring& path, std::set<std::wstring>& tombstones) {
-    HANDLE hKey;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uStr;
-    RtlInitUnicodeString(&uStr, path.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa))) {
-        ULONG index = 0;
-        ULONG len = 0;
-        std::vector<BYTE> buf(4096);
-
-        while (true) {
-            NTSTATUS status = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, buf.data(), (ULONG)buf.size(), &len);
-            if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-                buf.resize(len > buf.size() ? len : buf.size() * 2);
-                continue;
-            }
-            if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
-
-            PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf.data();
-            std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
-
-            std::wstring lowerName = name;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), towlower);
-
-            if (lowerName.length() >= 13 && lowerName.substr(lowerName.length() - 13) == L"__YapKeyDel__") {
-                tombstones.insert(lowerName.substr(0, lowerName.length() - 13));
-            }
-            index++;
-        }
-        fpNtClose(hKey);
-    }
-}
-
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition) {
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
