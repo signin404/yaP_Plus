@@ -852,6 +852,9 @@ typedef NTSTATUS(NTAPI* P_NtQuerySystemTime)(PLARGE_INTEGER);
 // --- WinExec 函数指针 ---
 typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
 
+// 原始 NtClose 指针 (需要 Hook 它来清理内存)
+typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
+
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -1074,6 +1077,16 @@ std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 
 std::map<HANDLE, RegContext*> g_RegContextMap;
 std::shared_mutex g_RegContextMutex;
 
+// 缓存的 NT 路径
+std::wstring g_LauncherDirNt;
+std::wstring g_UserProfileNt;
+std::wstring g_UserProfileNtShort;
+std::wstring g_UsersDirNt;      // [新增] Users 根目录 (长路径)
+std::wstring g_UsersDirNtShort; // [新增] Users 根目录 (短路径)
+std::wstring g_ProgramDataNt;
+std::wstring g_ProgramDataNtShort;
+std::wstring g_PublicNt;
+
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
 std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
@@ -1099,6 +1112,8 @@ bool g_EnableTimeHook = false;
 
 // [新增] 防止时间函数递归调用的标志
 thread_local bool g_InTimeHook = false;
+
+thread_local bool g_IsInHook = false;
 
 // 辅助类：自动设置和清除标志
 struct TimeRecursionGuard {
@@ -1198,6 +1213,26 @@ P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
 P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
 P_WinExec fpWinExec = NULL;
+P_NtClose fpNtClose = NULL;
+
+// 原始函数指针
+P_NtCreateFile fpNtCreateFile = NULL;
+P_NtOpenFile fpNtOpenFile = NULL;
+P_NtQueryAttributesFile fpNtQueryAttributesFile = NULL;
+P_NtQueryFullAttributesFile fpNtQueryFullAttributesFile = NULL;
+P_NtSetInformationFile fpNtSetInformationFile = NULL;
+P_NtQueryDirectoryFile fpNtQueryDirectoryFile = NULL;
+P_NtQueryDirectoryFileEx fpNtQueryDirectoryFileEx = NULL;
+P_NtQueryInformationFile fpNtQueryInformationFile = NULL;
+P_NtQueryObject fpNtQueryObject = NULL;
+
+P_CreateProcessW fpCreateProcessW = NULL;
+P_CreateProcessA fpCreateProcessA = NULL;
+P_CreateProcessAsUserW fpCreateProcessAsUserW = NULL;
+P_CreateProcessAsUserA fpCreateProcessAsUserA = NULL;
+P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
+P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
+P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
 
 // KernelBase 专用指针 (避免与 Kernel32 指针冲突)
 P_GetSystemTime fpGetSystemTime_KB = NULL;
@@ -1385,10 +1420,6 @@ struct DirContext {
 std::map<HANDLE, DirContext*> g_DirContextMap;
 std::shared_mutex g_DirContextMutex; // 读写锁
 
-// 原始 NtClose 指针 (需要 Hook 它来清理内存)
-typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
-P_NtClose fpNtClose = NULL;
-
 // --- 设备路径映射缓存 ---
 std::vector<std::pair<std::wstring, std::wstring>> g_DeviceMap;
 
@@ -1431,37 +1462,6 @@ std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
     }
     return devicePath;
 }
-
-// 缓存的 NT 路径
-std::wstring g_LauncherDirNt;
-std::wstring g_UserProfileNt;
-std::wstring g_UserProfileNtShort;
-std::wstring g_UsersDirNt;      // [新增] Users 根目录 (长路径)
-std::wstring g_UsersDirNtShort; // [新增] Users 根目录 (短路径)
-std::wstring g_ProgramDataNt;
-std::wstring g_ProgramDataNtShort;
-std::wstring g_PublicNt;
-
-thread_local bool g_IsInHook = false;
-
-// 原始函数指针
-P_NtCreateFile fpNtCreateFile = NULL;
-P_NtOpenFile fpNtOpenFile = NULL;
-P_NtQueryAttributesFile fpNtQueryAttributesFile = NULL;
-P_NtQueryFullAttributesFile fpNtQueryFullAttributesFile = NULL;
-P_NtSetInformationFile fpNtSetInformationFile = NULL;
-P_NtQueryDirectoryFile fpNtQueryDirectoryFile = NULL;
-P_NtQueryDirectoryFileEx fpNtQueryDirectoryFileEx = NULL;
-P_NtQueryInformationFile fpNtQueryInformationFile = NULL;
-P_NtQueryObject fpNtQueryObject = NULL;
-
-P_CreateProcessW fpCreateProcessW = NULL;
-P_CreateProcessA fpCreateProcessA = NULL;
-P_CreateProcessAsUserW fpCreateProcessAsUserW = NULL;
-P_CreateProcessAsUserA fpCreateProcessAsUserA = NULL;
-P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
-P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
-P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
 
 // --- [修改] 字体文件解析与加载工具 (支持 TTF/OTF/TTC) ---
 
@@ -3784,7 +3784,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            // [修复] 动态计算回退权限：剔除写权限，保留请求的读/枚举权限
+            // [修复] 动态计算回退权限：剔除写权限 保留请求的读/枚举权限
             ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
@@ -4377,20 +4377,20 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     RecursionGuard guard;
 
     // ========================================================================
-    // [核心修复 1] 检查合并视图中是否还有子键。
-    // 如果有，必须返回 STATUS_CANNOT_DELETE (0xC0000121)
-    // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree），导致 0xc0000005 崩溃。
+    // [核心修复 1] 检查合并视图中是否还有子键
+    // 如果有 必须返回 STATUS_CANNOT_DELETE (0xC0000121)
+    // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree） 导致 0xc0000005 崩溃
     // ========================================================================
     bool hasSubkeys = false;
     {
-        g_IsInHook = false; // 临时解除 RecursionGuard，以便调用我们自己的 Detour_NtEnumerateKey
+        g_IsInHook = false; // 临时解除 RecursionGuard 以便调用我们自己的 Detour_NtEnumerateKey
         ULONG resLen = 0;
         BYTE enumBuf[256];
         // 尝试枚举第 0 个子键
         NTSTATUS enumStatus = Detour_NtEnumerateKey(KeyHandle, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
 
         if (enumStatus == STATUS_ACCESS_DENIED) {
-            // 如果当前句柄没有枚举权限，尝试提权重新打开以进行准确检查
+            // 如果当前句柄没有枚举权限 尝试提权重新打开以进行准确检查
             HANDLE hCheck = NULL;
             OBJECT_ATTRIBUTES oa;
             UNICODE_STRING emptyStr;
@@ -4402,7 +4402,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             }
         }
 
-        // 如果成功枚举到子键，或者缓冲区不足（说明确实有数据），则证明存在子键
+        // 如果成功枚举到子键 或者缓冲区不足（说明确实有数据） 则证明存在子键
         if (NT_SUCCESS(enumStatus) || enumStatus == STATUS_BUFFER_OVERFLOW || enumStatus == STATUS_BUFFER_TOO_SMALL) {
             hasSubkeys = true;
         }
@@ -4414,7 +4414,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     }
 
     // ========================================================================
-    // [核心修复 2] 增加缓冲区大小并进行边界检查，防止 NtQueryObject 越界写入导致堆破坏
+    // [核心修复 2] 增加缓冲区大小并进行边界检查 防止 NtQueryObject 越界写入导致堆破坏
     // ========================================================================
     ULONG len = 0;
     fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
@@ -4426,10 +4426,10 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
 
             if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
-                // 安全的字符串构造，防止 Name.Length 异常导致越界读取
+                // 安全的字符串构造 防止 Name.Length 异常导致越界读取
                 ULONG strLen = nameInfo->Name.Length;
                 ULONG maxLen = bufSize - sizeof(OBJECT_NAME_INFORMATION);
-                if (strLen > maxLen) strLen = maxLen; // 强制截断，防止越界
+                if (strLen > maxLen) strLen = maxLen; // 强制截断 防止越界
 
                 std::wstring path(nameInfo->Name.Buffer, strLen / sizeof(WCHAR));
 
