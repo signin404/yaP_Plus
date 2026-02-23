@@ -2558,8 +2558,8 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
         else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
-             // HKCR 是合并视图，但在 NT 路径中通常映射到 Machine Classes
-             // 或者让系统去处理，但这里我们需要一个基准路径
+             // HKCR 是合并视图 但在 NT 路径中通常映射到 Machine Classes
+             // 或者让系统去处理 但这里我们需要一个基准路径
              fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
         }
         else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
@@ -2569,7 +2569,7 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
              fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
         }
         else {
-            // 普通句柄，查询对象名称
+            // 普通句柄 查询对象名称
             if (fpNtQueryObject) {
                 ULONG len = 0;
                 fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
@@ -2769,6 +2769,9 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     if (contains(L"microsoft\\directx")) return true;
     if (contains(L"direct3d")) return true;
     if (contains(L"directdraw")) return true;
+    if (contains(L"directsound")) return true;  // ← 修复 DirectSound Error
+    if (contains(L"directinput")) return true;  // ← 预防
+    if (contains(L"directplay")) return true;   // ← 预防
 
     // 4. 硬件设备类
     if (contains(L"control\\class")) return true;
@@ -3439,25 +3442,25 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
-        oaReal.RootDirectory = NULL; // 丢弃父句柄，使用绝对路径
+        oaReal.RootDirectory = NULL; // 丢弃父句柄 使用绝对路径
 
         // 策略 1: 尝试按请求的权限创建/打开
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaReal, TitleIndex, Class, CreateOptions, Disposition);
 
-        // 策略 2: 如果因权限不足失败 (STATUS_ACCESS_DENIED)，尝试降级为只读打开
+        // 策略 2: 如果因权限不足失败 (STATUS_ACCESS_DENIED) 尝试降级为只读打开
         // 很多游戏请求 KEY_ALL_ACCESS 但实际上只需要读取 CLSID
         if (status == STATUS_ACCESS_DENIED) {
-            // 移除写权限，保留读权限
+            // 移除写权限 保留读权限
             ACCESS_MASK readOnlyAccess = DesiredAccess & (KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY | READ_CONTROL);
 
-            // 如果原始请求就没有读权限，至少给个 KEY_READ
+            // 如果原始请求就没有读权限 至少给个 KEY_READ
             if (readOnlyAccess == 0) readOnlyAccess = KEY_READ;
 
-            // 改用 NtOpenKey (我们不能在真实注册表 CreateKey，只能 Open)
+            // 改用 NtOpenKey (我们不能在真实注册表 CreateKey 只能 Open)
             status = fpNtOpenKey(KeyHandle, readOnlyAccess, &oaReal);
 
             if (NT_SUCCESS(status)) {
-                // 伪造 Disposition，让游戏以为它打开了存在的键
+                // 伪造 Disposition 让游戏以为它打开了存在的键
                 if (Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
                 DebugLog(L"RegHook: Whitelist Downgrade Success: %s", realPathCandidate.c_str());
             }
@@ -3477,7 +3480,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         bool wasTombstoned = false;
 
         // --- 墓碑(Tombstone)处理逻辑 ---
-        // 检查该键是否曾被标记为“已删除”。如果是，我们需要清理旧数据以模拟“新建”。
+        // 检查该键是否曾被标记为“已删除”如果是 我们需要清理旧数据以模拟“新建”
         {
             HANDLE hCheck = NULL;
             OBJECT_ATTRIBUTES oaCheck;
@@ -3489,7 +3492,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             if (NT_SUCCESS(fpNtOpenKey(&hCheck, MAXIMUM_ALLOWED, &oaCheck))) {
                 if (HasTombstone(hCheck)) {
                     wasTombstoned = true;
-                    // 将旧的墓碑键重命名为临时名称，稍后删除
+                    // 将旧的墓碑键重命名为临时名称 稍后删除
                     wchar_t tempName[64];
                     swprintf_s(tempName, L"__YBTmp%u_%u__", GetTickCount(), GetCurrentThreadId());
                     UNICODE_STRING usTempName;
@@ -3501,7 +3504,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             tempPathToClean = targetSandboxFull.substr(0, pos) + L"\\" + tempName;
                         }
                     } else {
-                        // 重命名失败，强制递归删除
+                        // 重命名失败 强制递归删除
                         fpNtClose(hCheck);
                         hCheck = NULL;
                         DeleteSandboxKeyRecursive(targetSandboxFull);
@@ -3549,8 +3552,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
         if (NT_SUCCESS(status)) {
             // --- 写入复制 (Copy-on-Write) 逻辑 ---
-            // 如果是新建的键 (REG_CREATED_NEW_KEY)，且之前没有被标记为删除，
-            // 我们需要从真实注册表复制初始值。
+            // 如果是新建的键 (REG_CREATED_NEW_KEY) 且之前没有被标记为删除
+            // 我们需要从真实注册表复制初始值
 
             bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
 
@@ -3584,7 +3587,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // 仅当确实是新建且非复活时，才复制真实值
+                // 仅当确实是新建且非复活时 才复制真实值
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
@@ -3612,11 +3615,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     }
 
     // 6. 直接创建 (未重定向的情况)
-    // 可能是已经在沙盒路径下，或者是完全无关的路径
+    // 可能是已经在沙盒路径下 或者是完全无关的路径
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
 
     if (NT_SUCCESS(status)) {
-        // 同样需要处理墓碑和缓存，逻辑类似
+        // 同样需要处理墓碑和缓存 逻辑类似
         bool wasTombstoned = false;
         bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
 
@@ -3684,7 +3687,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     // 1. 解析完整路径
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
-    
+
     // 2. 检查是否为沙盒路径并获取真实路径候选
     bool isSandboxPath = false;
     std::wstring realPathCandidate;
@@ -3697,11 +3700,11 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     }
 
     // 3. [核心修复] 白名单检查 (DirectSound/Drivers 等)
-    // 如果是系统关键路径，强制使用绝对路径打开真实键，丢弃可能指向沙盒的 RootDirectory
+    // 如果是系统关键路径 强制使用绝对路径打开真实键 丢弃可能指向沙盒的 RootDirectory
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
-        
+
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
         oaReal.RootDirectory = NULL; // 丢弃父句柄
@@ -3715,7 +3718,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
-    // 如果不是沙盒路径，且符合重定向规则 (例如 HKLM\Software\MyGame)
+    // 如果不是沙盒路径 且符合重定向规则 (例如 HKLM\Software\MyGame)
     if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
@@ -3754,7 +3757,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         }
     }
 
-    // 如果沙盒中未找到，且不是因为墓碑导致的，尝试读取真实注册表 (Copy-on-Read / Fallback)
+    // 如果沙盒中未找到 且不是因为墓碑导致的 尝试读取真实注册表 (Copy-on-Read / Fallback)
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && !isTombstoned) {
         std::wstring realPathForCheck;
         bool canCheckReal = false;
@@ -3802,7 +3805,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                     // 只读请求：直接返回真实句柄
                     *KeyHandle = hRealCheck;
                     status = STATUS_SUCCESS;
-                    
+
                     // 更新上下文映射
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                     auto it = g_RegContextMap.find(*KeyHandle);
@@ -3875,7 +3878,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     // 1. 解析完整路径
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
-    
+
     // 2. 白名单检查
     bool isSandboxPath = false;
     std::wstring realPathCandidate;
@@ -3890,7 +3893,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
-        
+
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
         oaReal.RootDirectory = NULL; // 丢弃父句柄
@@ -3913,7 +3916,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
 
-    // 4. 墓碑与回退 (逻辑同 NtOpenKey，只是调用 Ex 版本)
+    // 4. 墓碑与回退 (逻辑同 NtOpenKey 只是调用 Ex 版本)
     bool isTombstoned = false;
 
     if (NT_SUCCESS(status)) {
@@ -3986,7 +3989,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
                 } else {
                     *KeyHandle = hRealCheck;
                     status = STATUS_SUCCESS;
-                    
+
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                     auto it = g_RegContextMap.find(*KeyHandle);
                     if (it != g_RegContextMap.end()) {
