@@ -3031,7 +3031,7 @@ bool EnsureHiveFileExists(const std::wstring& hivePath) {
     if (RegCreateKeyW(hTempKey, L"Users", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
     if (RegCreateKeyW(hTempKey, L"Config", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
 
-    // 保存到文件 (需要 SeBackupPrivilege，已在 EnableAllPrivileges 中启用)
+    // 保存到文件 (需要 SeBackupPrivilege 已在 EnableAllPrivileges 中启用)
     // 注意：RegSaveKey 要求目标文件不存在
     LSTATUS status = RegSaveKeyW(hTempKey, hivePath.c_str(), NULL);
 
@@ -5458,8 +5458,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // [新增] 卸载注册表 Hive
     if (!data->regMountName.empty()) {
         // 尝试卸载 Hive
-        // 注意：如果子进程尚未完全退出或有句柄泄露，RegUnLoadKeyW 可能会失败
-        // 这是正常的系统行为 (Lazy Unload)，系统会在所有句柄关闭后最终卸载它
+        // 注意：如果子进程尚未完全退出或有句柄泄露 RegUnLoadKeyW 可能会失败
+        // 这是正常的系统行为 (Lazy Unload) 系统会在所有句柄关闭后最终卸载它
         RegUnLoadKeyW(HKEY_USERS, data->regMountName.c_str());
 
         // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)

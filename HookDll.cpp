@@ -9036,16 +9036,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultUILanguage"), &Detour_GetSystemDefaultUILanguage, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultUILanguage));
         }
 
-        // [新增] 注册表 Hook (NtQueryValueKey)
         if (hNtdll) {
-            // 注意：如果之前在文件系统 Hook 中已经获取了 fpNtQueryValueKey 这里直接使用
-            // 如果没有 需要 GetProcAddress
-            void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
-            if (pNtQueryValueKey) {
-                MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
-                MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
-                MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
-            }
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
         }
 
         // [新增] 资源加载 Hook
@@ -9216,7 +9209,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKey        = (void*)GetProcAddress(hNtdll, "NtOpenKey");
         void* pNtOpenKeyEx      = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey      = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
-        void* pNtQueryValueKey  = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
         void* pNtRenameKey = (void*)GetProcAddress(hNtdll, "NtRenameKey");
 
         // 获取 NtSetValueKey 指针用于写入复制（内部调用 不 Hook）
@@ -9229,9 +9221,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (pNtDeleteKey)     MH_CreateHook(pNtDeleteKey,     &Detour_NtDeleteKey,     reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
         if (pNtRenameKey) MH_CreateHook(pNtRenameKey, &Detour_NtRenameKey, reinterpret_cast<LPVOID*>(&fpNtRenameKey));
 
-        // [修复核心] 安装 NtQueryValueKey Hook 使沙盒中不存在的值能回退读取真实注册表
-        if (pNtQueryValueKey) MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
-
         void* pNtEnumerateKey = (void*)GetProcAddress(hNtdll, "NtEnumerateKey");
         if (pNtEnumerateKey) {
             MH_CreateHook(pNtEnumerateKey, &Detour_NtEnumerateKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateKey));
@@ -9240,6 +9229,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtEnumerateValueKey = (void*)GetProcAddress(hNtdll, "NtEnumerateValueKey");
         if (pNtEnumerateValueKey) {
             MH_CreateHook(pNtEnumerateValueKey, &Detour_NtEnumerateValueKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateValueKey));
+        }
+    }
+
+    // --- [新增] 组 M: 共享注册表查询 Hook (统一处理) ---
+    // 只要启用了 区域伪装(FakeACP) 或者 注册表重定向(HookReg) 就需要挂钩 NtQueryValueKey
+    if ((g_FakeACP != 0 || g_HookReg) && hNtdll) {
+        // 防止重复挂钩的防御性检查
+        if (fpNtQueryValueKey == NULL) {
+            void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
+            if (pNtQueryValueKey) {
+                MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
+            }
         }
     }
 
