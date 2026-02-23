@@ -2548,29 +2548,33 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
 
     // 1. 解析 RootDirectory
     if (attr->RootDirectory) {
-        // 检查预定义句柄
-        if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CURRENT_USER) {
+        // 检查预定义句柄 (强制转换为 ULONG_PTR 比较)
+        ULONG_PTR rootHandle = (ULONG_PTR)attr->RootDirectory;
+
+        if (rootHandle == (ULONG_PTR)HKEY_CURRENT_USER) {
              fullPath = g_CurrentUserSidPath;
         }
-        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
+        else if (rootHandle == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
-        // [新增] 处理额外的预定义句柄
-        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CLASSES_ROOT) {
+        else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
+             // HKCR 是合并视图，但在 NT 路径中通常映射到 Machine Classes
+             // 或者让系统去处理，但这里我们需要一个基准路径
              fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
         }
-        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_USERS) {
+        else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
              fullPath = L"\\REGISTRY\\USER";
         }
-        else if ((ULONG_PTR)attr->RootDirectory == (ULONG_PTR)HKEY_CURRENT_CONFIG) {
+        else if (rootHandle == (ULONG_PTR)HKEY_CURRENT_CONFIG) {
              fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
         }
         else {
+            // 普通句柄，查询对象名称
             if (fpNtQueryObject) {
                 ULONG len = 0;
                 fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
                 if (len > 0) {
-                    std::vector<BYTE> buffer(len);
+                    std::vector<BYTE> buffer(len + 2); // +2 防止溢出
                     if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
                         POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
                         if (nameInfo->Name.Buffer) {
@@ -2743,52 +2747,47 @@ void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstrin
 
 // [新增] 检查注册表路径是否在白名单中 (需要直通真实注册表)
 bool IsSystemCriticalRegPath(const std::wstring& path) {
-    // 转换为小写以进行比较
     std::wstring lowerPath = path;
     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
 
-    // 1. 绝对禁止重定向 Classes (COM 组件注册表)
-    // DirectSound, DirectShow, ActiveX 都依赖这里面的 CLSID
-    if (lowerPath.find(L"\\software\\classes") != std::wstring::npos) return true;
+    // 辅助 lambda：检查是否包含关键词
+    auto contains = [&](const wchar_t* sub) {
+        return lowerPath.find(sub) != std::wstring::npos;
+    };
 
-    // 2. 音频与多媒体硬件配置 (MMDevices)
-    if (lowerPath.find(L"mmdevices") != std::wstring::npos) return true;
+    // 1. Classes (COM 组件) - 核心修复
+    // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
+    if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
 
-    // 3. 传统音频驱动映射
-    if (lowerPath.find(L"drivers32") != std::wstring::npos) return true;
-    if (lowerPath.find(L"drivers.desc") != std::wstring::npos) return true;
+    // 2. 音频与多媒体
+    if (contains(L"mmdevices")) return true;
+    if (contains(L"audiocore")) return true;
+    if (contains(L"drivers32")) return true;
+    if (contains(L"drivers.desc")) return true;
 
-    // 4. DirectX 配置
-    if (lowerPath.find(L"microsoft\\directx") != std::wstring::npos) return true;
-    if (lowerPath.find(L"direct3d") != std::wstring::npos) return true;
-    if (lowerPath.find(L"directdraw") != std::wstring::npos) return true;
+    // 3. DirectX
+    if (contains(L"microsoft\\directx")) return true;
+    if (contains(L"direct3d")) return true;
+    if (contains(L"directdraw")) return true;
 
-    // 5. 硬件设备类 (查找声卡/显卡)
-    if (lowerPath.find(L"control\\class") != std::wstring::npos) return true;
+    // 4. 硬件设备类
+    if (contains(L"control\\class")) return true;
+    if (contains(L"control\\deviceclasses")) return true;
 
-    // 6. 密码学与证书 (防止安全校验失败)
-    if (lowerPath.find(L"cryptography") != std::wstring::npos) return true;
+    // 5. 密码学与证书
+    if (contains(L"cryptography")) return true;
+    if (contains(L"systemcertificates")) return true;
 
-    // 7. Windows 防火墙与基础过滤引擎 (BFE)
-    if (lowerPath.find(L"services\\bfe") != std::wstring::npos) return true;
+    // 6. 基础服务
+    if (contains(L"services\\bfe")) return true; // 防火墙
+    if (contains(L"currentversion\\sidebyside")) return true; // WinSxS
+    if (contains(L"\\registry\\machine\\components")) return true; // WinSxS
 
-    // 8. WinSxS 组件与 SideBySide (保证 DLL 正确加载)
-    if (lowerPath.find(L"currentversion\\sidebyside") != std::wstring::npos) return true;
-    if (lowerPath.find(L"\\registry\\machine\\components") != std::wstring::npos) return true;
+    // 7. Office ClickToRun (Sandboxie 源码中提到的)
+    if (contains(L"clicktorun")) return true;
 
-    // 9. Office ClickToRun 虚拟化层
-    if (lowerPath.find(L"microsoft\\office") != std::wstring::npos &&
-        lowerPath.find(L"clicktorun") != std::wstring::npos) return true;
-
-    // 10. 应用程序专用 Hive (App Hives)
-    if (lowerPath.compare(0, 12, L"\\registry\\a\\") == 0) return true;
-
-    // 11. IE 安全区域设置 (Zones)
-    if (lowerPath.find(L"internet settings\\zones") != std::wstring::npos) return true;
-
-    // 12. 系统硬件配置集映射
-    if (lowerPath.find(L"\\system\\controlset") != std::wstring::npos ||
-        lowerPath.find(L"\\system\\currentcontrolset") != std::wstring::npos) return true;
+    // 8. IE Zones
+    if (contains(L"internet settings\\zones")) return true;
 
     return false;
 }
@@ -3414,55 +3413,63 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     ULONG CreateOptions,
     PULONG Disposition)
 {
-    // 1. 基础检查与递归保护
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
         return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     }
     RecursionGuard guard;
 
-    // 2. 解析完整路径 (解析 RootDirectory + ObjectName)
-    // 如果 RootDirectory 指向沙盒内，这里得到的 fullNtPath 也会是沙盒路径
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
-    // 3. 计算用于白名单检查的“真实路径候选”
+    // --- 白名单检查与处理 ---
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
 
     if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
-        // 如果当前路径已经在沙盒内，反推其真实路径
         isSandboxPath = true;
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
-        // 否则它本身就是真实路径
         realPathCandidate = fullNtPath;
     }
 
-    // 4. [核心修复] 白名单检查与沙盒逃逸
-    // 如果目标路径属于系统关键路径 (DirectSound, Drivers, CLSID 等)
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        // === 命中白名单：直通真实注册表 ===
 
-        // 构造一个新的 ObjectAttributes
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
 
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL; // 丢弃父句柄，使用绝对路径
 
-        // [关键] 强制丢弃 RootDirectory
-        // 即使原来的 RootDirectory 指向沙盒内的某个键，我们也必须忽略它，
-        // 改为使用绝对路径直接在真实注册表中操作。
-        oaReal.RootDirectory = NULL;
+        // 策略 1: 尝试按请求的权限创建/打开
+        NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaReal, TitleIndex, Class, CreateOptions, Disposition);
 
-        // 直接调用原始函数，绕过重定向逻辑
-        return fpNtCreateKey(KeyHandle, DesiredAccess, &oaReal, TitleIndex, Class, CreateOptions, Disposition);
+        // 策略 2: 如果因权限不足失败 (STATUS_ACCESS_DENIED)，尝试降级为只读打开
+        // 很多游戏请求 KEY_ALL_ACCESS 但实际上只需要读取 CLSID
+        if (status == STATUS_ACCESS_DENIED) {
+            // 移除写权限，保留读权限
+            ACCESS_MASK readOnlyAccess = DesiredAccess & (KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY | READ_CONTROL);
+
+            // 如果原始请求就没有读权限，至少给个 KEY_READ
+            if (readOnlyAccess == 0) readOnlyAccess = KEY_READ;
+
+            // 改用 NtOpenKey (我们不能在真实注册表 CreateKey，只能 Open)
+            status = fpNtOpenKey(KeyHandle, readOnlyAccess, &oaReal);
+
+            if (NT_SUCCESS(status)) {
+                // 伪造 Disposition，让游戏以为它打开了存在的键
+                if (Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
+                DebugLog(L"RegHook: Whitelist Downgrade Success: %s", realPathCandidate.c_str());
+            }
+        }
+
+        return status;
     }
 
-    // 5. 正常的重定向逻辑
+    // --- 以下是常规重定向逻辑 (保持不变) ---
     std::wstring relPath;
 
-    // 如果不是白名单，且符合重定向规则 (例如 HKLM\Software\MyGame)
     if (ShouldRedirectReg(fullNtPath, relPath)) {
-        // 确保沙盒中的父级路径存在
         EnsureRegPathExistsRelative(relPath);
 
         std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
@@ -3663,7 +3670,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         } else {
             RegContext* ctx = new RegContext();
             ctx->FullPath = fullNtPath;
-            ctx->hRealKey = hReal;
+            ctx->hRealKey = NULL;
             g_RegContextMap[*KeyHandle] = ctx;
         }
     }
@@ -3675,34 +3682,24 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     RecursionGuard guard;
 
-    // 1. 解析当前请求的完整路径 (可能是基于沙盒句柄的相对路径)
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
-    // 2. 检查这是否是一个沙盒路径
-    bool isSandboxPath = false;
     std::wstring realPathCandidate;
-
     if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
-        isSandboxPath = true;
-        // 尝试计算它对应的真实路径
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
         realPathCandidate = fullNtPath;
     }
 
-    // 3. [关键修复] 检查白名单 (使用真实路径检查)
+    // [核心修复] 白名单检查
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
-        // === 命中白名单：强制逃逸出沙盒 ===
-
-        // 构造一个新的 ObjectAttributes，使用绝对路径，不使用 RootDirectory
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
 
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
-        oaReal.RootDirectory = NULL; // [重要] 丢弃可能指向沙盒的父句柄
+        oaReal.RootDirectory = NULL; // 丢弃父句柄
 
-        // 直接打开真实路径
         return fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
     }
 
