@@ -2548,6 +2548,7 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
 
     // 1. 解析 RootDirectory
     if (attr->RootDirectory) {
+        // 检查预定义句柄 (强制转换为 ULONG_PTR 比较)
         ULONG_PTR rootHandle = (ULONG_PTR)attr->RootDirectory;
 
         if (rootHandle == (ULONG_PTR)HKEY_CURRENT_USER) {
@@ -2556,13 +2557,10 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
         else if (rootHandle == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
-        // [修改] 移除 HKEY_CLASSES_ROOT 的手动映射
-        // 让其进入下面的 else 分支，或者直接返回空字符串让它直通
-        // 如果我们返回空字符串，后续逻辑会判定为"无需重定向"，从而直通系统调用
         else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
-             // 不做任何路径构造，直接返回空
-             // 这样 ShouldRedirectReg 会返回 false，请求会直通真实的 HKCR
-             return L""; 
+             // HKCR 是合并视图 但在 NT 路径中通常映射到 Machine Classes
+             // 或者让系统去处理 但这里我们需要一个基准路径
+             fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
         }
         else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
              fullPath = L"\\REGISTRY\\USER";
@@ -2761,6 +2759,11 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
     if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
 
+    // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
+    // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
+    if (contains(L"_classes\\") ||
+		(lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
+
     // 2. 音频与多媒体
     if (contains(L"mmdevices")) return true;
     if (contains(L"audiocore")) return true;
@@ -2839,9 +2842,13 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // 3. 匹配 HKCU
     if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixUser.length());
+
+        // [关键修复] sub 必须为空(精确匹配)或以 \ 开头(子键)
+        // 若以 _ 开头说明是同级配置单元(如 SID_Classes), 不是 HKCU 子键, 不应重定向
+        if (!sub.empty() && sub[0] != L'\\') return false;
+
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
 
-        // [新增] 二次检查：即使是 HKCU 如果是 Classes 相关也不要重定向
         if (IsSystemCriticalRegPath(fullNtPath)) return false;
 
         relPathOut = L"User";
@@ -3778,19 +3785,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-			// [修复] 计算正确的只读访问权限
-			// 过滤掉写权限，保留读权限 (QUERY_VALUE | ENUMERATE_SUB_KEYS | NOTIFY | READ_CONTROL)
-			ACCESS_MASK realAccess = DesiredAccess & (KEY_READ | READ_CONTROL);
-        
-			// 如果过滤后没有权限（例如原请求是 KEY_WRITE），则至少给一个最小读权限
-			// 或者如果原请求是纯粹的写权限，这里可能不应该回退读，但在 NtOpenKey 语义下，打开存在的键通常需要读权限
-			if (realAccess == 0) {
-				// 如果原请求不包含任何读权限，这里可能需要根据业务逻辑决定。
-				// 但为了兼容性，通常至少给 KEY_QUERY_VALUE 是不够的，建议给 KEY_READ
-				realAccess = KEY_READ; 
-			}
-
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, realAccess, &oaReal))) {
+            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
                     std::wstring relPathToCreate;
@@ -3812,7 +3807,8 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                     ULONG disposition;
                     if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
                         CopyRegistryValues(hRealCheck, hNewKey);
-                        fpNtClose(hRealCheck);
+                        fpNtClose(hNewKey);
+                        status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                     }
                 } else {
                     // 只读请求：直接返回真实句柄
