@@ -2742,36 +2742,32 @@ void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstrin
 }
 
 // [新增] 检查注册表路径是否在白名单中 (需要直通真实注册表)
-bool IsRegPathWhitelisted(const std::wstring& fullNtPath) {
-    // 转换为小写以进行不区分大小写的比较
-    std::wstring path = fullNtPath;
-    std::transform(path.begin(), path.end(), path.begin(), towlower);
+bool IsSystemCriticalRegPath(const std::wstring& path) {
+    // 转换为小写以进行比较
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
 
-    // 定义白名单关键词列表 (这些路径下的键值必须读取真实的)
-    const wchar_t* whitelist[] = {
-        // --- 音频与多媒体 (解决 DirectSound Error) ---
-        L"microsoft\\directx",                          // DirectX 配置
-        L"microsoft\\windows\\currentversion\\mmdevices", // 音频端点 (MMDevices)
-        L"microsoft\\windows nt\\currentversion\\drivers32", // 传统音频驱动映射
-        L"microsoft\\windows nt\\currentversion\\drivers.desc",
-        L"control\\class",                              // 硬件设备类 (查找声卡驱动)
-        L"control\\mediaproperties",                    // 媒体属性 (操纵杆/音频)
-        L"control\\deviceclasses",                      // 设备接口类
+    // 1. 绝对禁止重定向 Classes (COM 组件注册表)
+    // DirectSound, DirectShow, ActiveX 都依赖这里面的 CLSID
+    if (lowerPath.find(L"\\software\\classes") != std::wstring::npos) return true;
 
-        // --- 系统基础服务 (防止其他初始化错误) ---
-        L"microsoft\\cryptography",                     // 加密服务 (很多游戏依赖)
-        L"microsoft\\systemcertificates",               // 系统证书
-        L"software\\classes\\clsid",                    // COM 组件 (DirectSound 依赖 COM)
-        L"software\\classes\\interface",                // COM 接口
-        L"software\\classes\\directshow",               // DirectShow 滤镜
-        L"software\\classes\\mediatype"                 // 媒体类型
-    };
+    // 2. 音频与多媒体硬件配置 (MMDevices)
+    if (lowerPath.find(L"mmdevices") != std::wstring::npos) return true;
 
-    for (const auto& keyword : whitelist) {
-        if (path.find(keyword) != std::wstring::npos) {
-            return true; // 命中白名单 不重定向
-        }
-    }
+    // 3. 传统音频驱动映射
+    if (lowerPath.find(L"drivers32") != std::wstring::npos) return true;
+    if (lowerPath.find(L"drivers.desc") != std::wstring::npos) return true;
+
+    // 4. DirectX 配置
+    if (lowerPath.find(L"microsoft\\directx") != std::wstring::npos) return true;
+    if (lowerPath.find(L"direct3d") != std::wstring::npos) return true;
+    if (lowerPath.find(L"directdraw") != std::wstring::npos) return true;
+
+    // 5. 硬件设备类 (查找声卡/显卡)
+    if (lowerPath.find(L"control\\class") != std::wstring::npos) return true;
+
+    // 6. 密码学与证书 (防止安全校验失败)
+    if (lowerPath.find(L"cryptography") != std::wstring::npos) return true;
 
     return false;
 }
@@ -2782,21 +2778,20 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
 
     if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) return false;
 
-    // [新增] === 关键修复：检查白名单 ===
-    // 如果是关键系统路径 (如 DirectSound, Drivers) 直接返回 false (不重定向 读写真实注册表)
-    // 注意：这会让沙盒内的修改污染真实注册表 但对于 DirectSound 这种只读配置是必要的
-    // 如果需要更严格的隔离 可以在 Detour_NtOpenKey 中针对白名单路径强制降级为只读权限
-    if (IsRegPathWhitelisted(fullNtPath)) {
+    // [新增] === 关键修复：白名单检查 ===
+    // 如果是 COM、音频、驱动相关路径 强制直通真实注册表
+    if (IsSystemCriticalRegPath(fullNtPath)) {
         return false;
     }
 
     // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
-    std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    // std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
     std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
     std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
 
+    /*
     // 1. 匹配 HKCR (优先级高于 HKLM)
     if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixClasses.length());
@@ -2805,6 +2800,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
+    */
 
     // 2. 匹配 HKCC
     if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
@@ -2819,6 +2815,10 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixUser.length());
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+
+        // [新增] 二次检查：即使是 HKCU 如果是 Classes 相关也不要重定向
+        if (IsSystemCriticalRegPath(fullNtPath)) return false;
+
         relPathOut = L"User";
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
@@ -2826,6 +2826,9 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
 
     // 4. 匹配 HKLM
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
+        // [新增] 排除 SOFTWARE\Classes (虽然上面 IsSystemCriticalRegPath 已经处理了 双重保险)
+        if (ContainsCaseInsensitive(fullNtPath, L"\\SOFTWARE\\Classes")) return false;
+
         std::wstring sub = fullNtPath.substr(prefixMachine.length());
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
         relPathOut = L"Machine";
