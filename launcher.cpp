@@ -5173,11 +5173,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
 
             // 5. 设置环境变量供 HookDll 使用
-            SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", regMountName.c_str());
+            SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
         }
     } else {
         SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
-        SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", NULL);
+        SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
     }
 
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
