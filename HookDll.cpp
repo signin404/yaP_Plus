@@ -2741,11 +2741,54 @@ void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstrin
     fpNtClose(hParent);
 }
 
+// [新增] 检查注册表路径是否在白名单中 (需要直通真实注册表)
+bool IsRegPathWhitelisted(const std::wstring& fullNtPath) {
+    // 转换为小写以进行不区分大小写的比较
+    std::wstring path = fullNtPath;
+    std::transform(path.begin(), path.end(), path.begin(), towlower);
+
+    // 定义白名单关键词列表 (这些路径下的键值必须读取真实的)
+    const wchar_t* whitelist[] = {
+        // --- 音频与多媒体 (解决 DirectSound Error) ---
+        L"microsoft\\directx",                          // DirectX 配置
+        L"microsoft\\windows\\currentversion\\mmdevices", // 音频端点 (MMDevices)
+        L"microsoft\\windows nt\\currentversion\\drivers32", // 传统音频驱动映射
+        L"microsoft\\windows nt\\currentversion\\drivers.desc",
+        L"control\\class",                              // 硬件设备类 (查找声卡驱动)
+        L"control\\mediaproperties",                    // 媒体属性 (操纵杆/音频)
+        L"control\\deviceclasses",                      // 设备接口类
+
+        // --- 系统基础服务 (防止其他初始化错误) ---
+        L"microsoft\\cryptography",                     // 加密服务 (很多游戏依赖)
+        L"microsoft\\systemcertificates",               // 系统证书
+        L"software\\classes\\clsid",                    // COM 组件 (DirectSound 依赖 COM)
+        L"software\\classes\\interface",                // COM 接口
+        L"software\\classes\\directshow",               // DirectShow 滤镜
+        L"software\\classes\\mediatype"                 // 媒体类型
+    };
+
+    for (const auto& keyword : whitelist) {
+        if (path.find(keyword) != std::wstring::npos) {
+            return true; // 命中白名单 不重定向
+        }
+    }
+
+    return false;
+}
+
 // 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
 
     if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) return false;
+
+    // [新增] === 关键修复：检查白名单 ===
+    // 如果是关键系统路径 (如 DirectSound, Drivers) 直接返回 false (不重定向 读写真实注册表)
+    // 注意：这会让沙盒内的修改污染真实注册表 但对于 DirectSound 这种只读配置是必要的
+    // 如果需要更严格的隔离 可以在 Detour_NtOpenKey 中针对白名单路径强制降级为只读权限
+    if (IsRegPathWhitelisted(fullNtPath)) {
+        return false;
+    }
 
     // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
