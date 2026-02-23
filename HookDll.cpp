@@ -2548,7 +2548,6 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
 
     // 1. 解析 RootDirectory
     if (attr->RootDirectory) {
-        // 检查预定义句柄 (强制转换为 ULONG_PTR 比较)
         ULONG_PTR rootHandle = (ULONG_PTR)attr->RootDirectory;
 
         if (rootHandle == (ULONG_PTR)HKEY_CURRENT_USER) {
@@ -2557,10 +2556,13 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
         else if (rootHandle == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
              fullPath = L"\\REGISTRY\\MACHINE";
         }
+        // [修改] 移除 HKEY_CLASSES_ROOT 的手动映射
+        // 让其进入下面的 else 分支，或者直接返回空字符串让它直通
+        // 如果我们返回空字符串，后续逻辑会判定为"无需重定向"，从而直通系统调用
         else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
-             // HKCR 是合并视图 但在 NT 路径中通常映射到 Machine Classes
-             // 或者让系统去处理 但这里我们需要一个基准路径
-             fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+             // 不做任何路径构造，直接返回空
+             // 这样 ShouldRedirectReg 会返回 false，请求会直通真实的 HKCR
+             return L""; 
         }
         else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
              fullPath = L"\\REGISTRY\\USER";
