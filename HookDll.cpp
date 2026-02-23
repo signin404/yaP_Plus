@@ -2769,6 +2769,27 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     // 6. 密码学与证书 (防止安全校验失败)
     if (lowerPath.find(L"cryptography") != std::wstring::npos) return true;
 
+    // 7. Windows 防火墙与基础过滤引擎 (BFE)
+    if (lowerPath.find(L"services\\bfe") != std::wstring::npos) return true;
+
+    // 8. WinSxS 组件与 SideBySide (保证 DLL 正确加载)
+    if (lowerPath.find(L"currentversion\\sidebyside") != std::wstring::npos) return true;
+    if (lowerPath.find(L"\\registry\\machine\\components") != std::wstring::npos) return true;
+
+    // 9. Office ClickToRun 虚拟化层
+    if (lowerPath.find(L"microsoft\\office") != std::wstring::npos &&
+        lowerPath.find(L"clicktorun") != std::wstring::npos) return true;
+
+    // 10. 应用程序专用 Hive (App Hives)
+    if (lowerPath.compare(0, 12, L"\\registry\\a\\") == 0) return true;
+
+    // 11. IE 安全区域设置 (Zones)
+    if (lowerPath.find(L"internet settings\\zones") != std::wstring::npos) return true;
+
+    // 12. 系统硬件配置集映射
+    if (lowerPath.find(L"\\system\\controlset") != std::wstring::npos ||
+        lowerPath.find(L"\\system\\currentcontrolset") != std::wstring::npos) return true;
+
     return false;
 }
 
