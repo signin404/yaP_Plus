@@ -5151,8 +5151,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // 条件 B: 允许多实例 且 配置了第三方 DLL (即使当前进程不需要 Hook 也启动 IPC 为后续实例服务)
     bool startIpcServer = enableHook || (allowMultiple && !thirdPartyDlls.empty());
 
-    hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
-    finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
+    std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
+    std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
     // --- 3. 准备 IPC 与 DLL (如果启用 Hook) ---
     std::atomic<bool> stopIpc(false);
