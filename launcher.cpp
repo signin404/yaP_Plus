@@ -3003,9 +3003,9 @@ void UnloadTemporaryFonts() {
 }
 
 // --- [新增] 注册表 Hive 管理辅助函数 ---
-// --- [修改] 获取确定性的挂载名称 (YapHookReg_启动器名称) ---
-std::wstring GetHiveMountName(const std::wstring& launcherBaseName) {
-    return L"YapHookReg_" + launcherBaseName;
+// 计算 Hive 挂载名称 (基于启动器名称)
+std::wstring GetHiveMountName(const std::wstring& launcherName) {
+    return L"YapHookReg_" + launcherName;
 }
 
 // 确保 Hive 文件存在且有效 (如果不存在则创建并初始化)
@@ -3014,7 +3014,7 @@ bool EnsureHiveFileExists(const std::wstring& hivePath) {
 
     // 创建一个临时 Key 用于构建 Hive 结构
     HKEY hTempKey;
-    std::wstring tempKeyName = L"YapBoxTempHive_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring tempKeyName = L"YapHookTempHive_" + std::to_wstring(GetCurrentProcessId());
 
     if (RegCreateKeyExW(HKEY_CURRENT_USER, tempKeyName.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hTempKey, NULL) != ERROR_SUCCESS) {
         return false;
@@ -3029,7 +3029,7 @@ bool EnsureHiveFileExists(const std::wstring& hivePath) {
     if (RegCreateKeyW(hTempKey, L"Users", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
     if (RegCreateKeyW(hTempKey, L"Config", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
 
-    // 保存到文件 (需要 SeBackupPrivilege 已在 EnableAllPrivileges 中启用)
+    // 保存到文件 (需要 SeBackupPrivilege，已在 EnableAllPrivileges 中启用)
     // 注意：RegSaveKey 要求目标文件不存在
     LSTATUS status = RegSaveKeyW(hTempKey, hivePath.c_str(), NULL);
 
@@ -5125,38 +5125,59 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // 必须在启动进程前完成挂载
     std::wstring hookRegVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookreg");
     std::wstring regMountName;
+    std::wstring hivePath; // 提升作用域以便后续删除日志
     bool hiveLoadedByMe = false;
 
-    // 获取启动器基础名称用于挂载名
-    wchar_t ldrName[MAX_PATH];
-    GetModuleFileNameW(NULL, ldrName, MAX_PATH);
-    PathRemoveExtensionW(ldrName);
-    std::wstring baseNameStr = PathFindFileNameW(ldrName);
-
-    // 预先计算 finalHookPath
+    // 预先计算 finalHookPath 以便确定 Hive 位置
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
     if (!hookRegVal.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
-        std::wstring hivePath = data->variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+
+        // 1. 计算路径
+        hivePath = data->variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+        // 如果 hookpath 被设置，优先使用 hookpath 下的 dat
         if (!finalHookPath.empty()) {
              hivePath = finalHookPath + L"\\YapHookReg.dat";
         }
 
-        regMountName = GetHiveMountName(baseNameStr); // 使用 baseNameStr
+        // 2. 计算挂载名
+        std::wstring launcherName = data->variables[L"LAUNCHERNAME"];
+        regMountName = GetHiveMountName(launcherName);
+
+        // 3. 确保文件存在 (如果不存在则创建并初始化)
+        // 确保父目录存在
+        wchar_t parentDir[MAX_PATH];
+        wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
+        PathRemoveFileSpecW(parentDir);
+        SHCreateDirectoryExW(NULL, parentDir, NULL);
 
         if (EnsureHiveFileExists(hivePath)) {
+            // 4. 尝试挂载到 HKEY_USERS
+            // 先检查是否已经挂载 (可能由其他实例挂载)
             HKEY hTest;
-            if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest) == ERROR_SUCCESS) {
+            LSTATUS status = RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest);
+            if (status == ERROR_SUCCESS) {
                 RegCloseKey(hTest);
+                // 已挂载，直接使用
             } else {
-                if (RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str()) == ERROR_SUCCESS) {
+                // 未挂载，尝试加载 (需要 SeRestorePrivilege)
+                status = RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
+                if (status == ERROR_SUCCESS) {
                     hiveLoadedByMe = true;
+                } else {
+                    // 加载失败 (可能是权限不足或文件被其他进程独占锁定)
+                    // 如果失败，子进程将无法进行注册表重定向
                 }
             }
-            SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
+
+            // 5. 设置环境变量供 HookDll 使用
+            SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", regMountName.c_str());
         }
+    } else {
+        SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+        SetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", NULL);
     }
 
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
@@ -5491,39 +5512,17 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // [新增] 卸载注册表 Hive
     if (!regMountName.empty()) {
         // 尝试卸载 Hive
-        // 注意：如果子进程尚未完全退出或有句柄泄露 RegUnLoadKeyW 可能会失败
-        // 这是正常的系统行为 (Lazy Unload) 系统会在所有句柄关闭后最终卸载它
+        // 注意：如果子进程尚未完全退出或有句柄泄露，RegUnLoadKeyW 可能会失败
+        // 这是正常的系统行为 (Lazy Unload)，系统会在所有句柄关闭后最终卸载它
         RegUnLoadKeyW(HKEY_USERS, regMountName.c_str());
-    }
 
-        // 确定 Hive 文件所在的完整路径前缀
-        std::wstring hivePath = data->variables[L"YAPROOT"] + L"\\YapHookReg.dat";
-        std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
-        std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
-        if (!finalHookPath.empty()) {
-            hivePath = finalHookPath + L"\\YapHookReg.dat";
-        }
-
-        // 使用通配符删除所有以 YapHookReg.dat 开头的文件 (YapHookReg.dat*)
-        std::wstring searchPattern = hivePath + L"*";
-        WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            // 获取目录部分
-            std::wstring dir = hivePath;
-            size_t lastSlash = dir.find_last_of(L'\\');
-            if (lastSlash != std::wstring::npos) {
-                dir = dir.substr(0, lastSlash + 1);
-            }
-
-            do {
-                // 确保不删除目录 仅删除匹配前缀的文件
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    std::wstring filePath = dir + fd.cFileName;
-                    ActionHelpers::ForceDeleteFile(filePath.c_str());
-                }
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
+        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)
+        if (!hivePath.empty()) {
+            wchar_t hiveDir[MAX_PATH];
+            wcscpy_s(hiveDir, MAX_PATH, hivePath.c_str());
+            PathRemoveFileSpecW(hiveDir);
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat.*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat{*");
         }
     }
 
@@ -5540,9 +5539,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- [修改] 获取确定性的管道名称 (\\.\pipe\YapLauncherPipe_启动器名称) ---
-std::wstring GetDeterministicPipeName(const std::wstring& launcherBaseName) {
-    return L"\\\\.\\pipe\\YapLauncherPipe_" + launcherBaseName;
+// --- [修改] 获取确定性的管道名称 (基于启动器名称) ---
+std::wstring GetDeterministicPipeName(const std::wstring& launcherName) {
+    return L"\\\\.\\pipe\\YapLauncherPipe_" + launcherName;
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
@@ -5646,31 +5645,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
 
-    // [修改] 提前定义 baseNameStr 确保作用域覆盖整个函数
-    wchar_t ldrNameBuf[MAX_PATH];
-    GetModuleFileNameW(NULL, ldrNameBuf, MAX_PATH);
-    PathRemoveExtensionW(ldrNameBuf);
-    std::wstring baseNameStr = PathFindFileNameW(ldrNameBuf);
-
-    // 1. 获取启动器自身的文件名（不含路径和扩展名）
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
-    std::wstring baseNameStr = launcherBaseName; // 例如 "NVCleanstallPortable"
+    variables[L"LAUNCHERNAME"] = launcherBaseName; // 新增：保存启动器名称供后续使用
 
-    // 2. [修改] 生成基于名称的确定性管道名
-    std::wstring sharedPipeName = GetDeterministicPipeName(baseNameStr);
-
-    // 3. 生成互斥体名称（用于多实例检测）
     wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
         PathRemoveExtensionW(appBaseName);
     }
-    std::wstring mutexName = L"Global\\" + baseNameStr + L"_" + std::wstring(appBaseName);
+    std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
 
-    // [新增] 计算确定性的管道名称 供所有实例使用
-    std::wstring sharedPipeName = GetDeterministicPipeName(mutexName);
+    // [修改] 计算确定性的管道名称 供所有实例使用 (基于启动器名称)
+    std::wstring sharedPipeName = GetDeterministicPipeName(launcherBaseName);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -5935,12 +5923,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
 
-            // [修改] 重新获取启动器基础名称
-            wchar_t ldrName[MAX_PATH];
-            wcscpy_s(ldrName, PathFindFileNameW(launcherFullPath));
-            PathRemoveExtensionW(ldrName);
-            std::wstring currentBaseName = ldrName;
-
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
             if (hookFileVal.empty()) hookFileVal = L"0"; // 确保不为空
@@ -6072,7 +6054,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             // --- [新增] 条件设置：hookreg ---
             if (!hookRegVal.empty()) {
                 SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
-                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", GetHiveMountName(currentBaseName).c_str());
+                // 为多实例计算并设置挂载路径环境变量
+                std::wstring regMountName = GetHiveMountName(launcherBaseName);
+                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
             } else {
                 SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
                 SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
