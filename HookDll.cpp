@@ -2604,7 +2604,7 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
 
 // --- [新增] 沙盒墓碑机制 ---
 // 用于标记"已被虚拟删除"的特殊值名
-static const wchar_t* YAPBOX_TOMBSTONE_VALUE = L"__YapBox_Deleted__";
+static const wchar_t* YAPBOX_TOMBSTONE_VALUE = L"_YapBoxDeleted";
 
 // 在沙盒键上设置墓碑标记
 void SetSandboxTombstone(HANDLE hSandboxKey) {
@@ -2648,7 +2648,7 @@ void ClearSandboxKeyValues(HANDLE hKey) {
         index++;
     }
 
-    // 2. 统一删除 (这也会一并删掉 __YapBox_Deleted__ 墓碑)
+    // 2. 统一删除 (这也会一并删掉 _YapBoxDeleted 墓碑)
     for (const auto& name : valueNames) {
         UNICODE_STRING uName;
         RtlInitUnicodeString(&uName, name.c_str());
@@ -8379,9 +8379,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         // 2. [修改] 连接到由启动器挂载的注册表键
         // 不再使用 RegLoadAppKey 而是打开已挂载的键
-        // 启动器会将挂载点名称写入 YAP_REG_MOUNT_POINT 环境变量
+        // 启动器会将挂载点名称写入 YAP_HOOK_REGPATH 环境变量
         wchar_t mountPointBuf[256] = { 0 };
-        if (GetEnvironmentVariableW(L"YAP_REG_MOUNT_POINT", mountPointBuf, 256) > 0) {
+        if (GetEnvironmentVariableW(L"YAP_HOOK_REGPATH", mountPointBuf, 256) > 0) {
             // 构造 NT 路径: \REGISTRY\USER\<MountPointName>
             std::wstring mountPath = L"\\REGISTRY\\USER\\" + std::wstring(mountPointBuf);
 
@@ -8413,7 +8413,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
                 g_hAppHive = NULL;
             }
         } else {
-             DebugLog(L"RegHook: YAP_REG_MOUNT_POINT not set, registry redirection disabled.");
+             DebugLog(L"RegHook: YAP_HOOK_REGPATH not set, registry redirection disabled.");
              g_hAppHive = NULL;
         }
     }
