@@ -4070,124 +4070,6 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     return status;
 }
 
-NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
-    if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
-    RecursionGuard guard;
-
-    // ========================================================================
-    // [核心修复 1] 检查合并视图中是否还有子键。
-    // 如果有，必须返回 STATUS_CANNOT_DELETE (0xC0000121)
-    // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree），导致 0xc0000005 崩溃。
-    // ========================================================================
-    bool hasSubkeys = false;
-    {
-        g_IsInHook = false; // 临时解除 RecursionGuard，以便调用我们自己的 Detour_NtEnumerateKey
-        ULONG resLen = 0;
-        BYTE enumBuf[256];
-        // 尝试枚举第 0 个子键
-        NTSTATUS enumStatus = Detour_NtEnumerateKey(KeyHandle, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
-        
-        if (enumStatus == STATUS_ACCESS_DENIED) {
-            // 如果当前句柄没有枚举权限，尝试提权重新打开以进行准确检查
-            HANDLE hCheck = NULL;
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING emptyStr;
-            RtlInitUnicodeString(&emptyStr, L"");
-            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
-            if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_ENUMERATE_SUB_KEYS, &oa))) {
-                enumStatus = Detour_NtEnumerateKey(hCheck, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
-                fpNtClose(hCheck);
-            }
-        }
-
-        // 如果成功枚举到子键，或者缓冲区不足（说明确实有数据），则证明存在子键
-        if (NT_SUCCESS(enumStatus) || enumStatus == STATUS_BUFFER_OVERFLOW || enumStatus == STATUS_BUFFER_TOO_SMALL) {
-            hasSubkeys = true;
-        }
-        g_IsInHook = true; // 恢复 RecursionGuard
-    }
-
-    if (hasSubkeys) {
-        return 0xC0000121; // STATUS_CANNOT_DELETE
-    }
-
-    // ========================================================================
-    // [核心修复 2] 增加缓冲区大小并进行边界检查，防止 NtQueryObject 越界写入导致堆破坏
-    // ========================================================================
-    ULONG len = 0;
-    fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
-    if (len > 0) {
-        ULONG bufSize = len + 1024; // 增加 1024 字节的防溢出冗余
-        std::vector<BYTE> buffer(bufSize);
-        
-        if (NT_SUCCESS(fpNtQueryObject(KeyHandle, ObjectNameInformation, buffer.data(), bufSize, &len))) {
-            POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-            
-            if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
-                // 安全的字符串构造，防止 Name.Length 异常导致越界读取
-                ULONG strLen = nameInfo->Name.Length;
-                ULONG maxLen = bufSize - sizeof(OBJECT_NAME_INFORMATION);
-                if (strLen > maxLen) strLen = maxLen; // 强制截断，防止越界
-                
-                std::wstring path(nameInfo->Name.Buffer, strLen / sizeof(WCHAR));
-
-                if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
-                    // --- 沙盒键 ---
-                    std::wstring realPath;
-                    if (IsSandboxPathAndGetReal(path, realPath)) {
-                        HANDLE hRealCheck = NULL;
-                        OBJECT_ATTRIBUTES oaReal;
-                        UNICODE_STRING usReal;
-                        RtlInitUnicodeString(&usReal, realPath.c_str());
-                        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                        bool realExists = NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal));
-                        if (realExists) fpNtClose(hRealCheck);
-
-                        if (realExists) {
-                            HANDLE hWrite = NULL;
-                            OBJECT_ATTRIBUTES oaWrite;
-                            UNICODE_STRING usWrite;
-                            RtlInitUnicodeString(&usWrite, path.c_str());
-                            InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
-                                SetSandboxTombstone(hWrite);
-                                fpNtClose(hWrite);
-                            }
-                            InvalidateParentRegContext(path);
-                            return STATUS_SUCCESS;
-                        }
-                    }
-                    // 真实无对应 → 物理删除沙盒键
-                    InvalidateParentRegContext(path);
-                    return fpNtDeleteKey(KeyHandle);
-
-                } else if (g_HookReg && g_hAppHive) {
-                    std::wstring relPath;
-                    if (ShouldRedirectReg(path, relPath)) {
-                        // --- 真实键句柄 → 在沙盒中创建对应键并设置墓碑 ---
-                        EnsureRegPathExistsRelative(relPath);
-
-                        HANDLE hSandbox = NULL;
-                        UNICODE_STRING usRel;
-                        OBJECT_ATTRIBUTES oaSandbox;
-                        RtlInitUnicodeString(&usRel, relPath.c_str());
-                        InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-                        ULONG disposition;
-                        if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_SET_VALUE, &oaSandbox, 0, NULL, 0, &disposition))) {
-                            SetSandboxTombstone(hSandbox);
-                            fpNtClose(hSandbox);
-                        }
-                        std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
-                        InvalidateParentRegContext(sandboxPath);
-                        return STATUS_SUCCESS;
-                    }
-                }
-            }
-        }
-    }
-    return fpNtDeleteKey(KeyHandle);
-}
-
 NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
@@ -4488,6 +4370,124 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
     }
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
+    if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
+    RecursionGuard guard;
+
+    // ========================================================================
+    // [核心修复 1] 检查合并视图中是否还有子键。
+    // 如果有，必须返回 STATUS_CANNOT_DELETE (0xC0000121)
+    // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree），导致 0xc0000005 崩溃。
+    // ========================================================================
+    bool hasSubkeys = false;
+    {
+        g_IsInHook = false; // 临时解除 RecursionGuard，以便调用我们自己的 Detour_NtEnumerateKey
+        ULONG resLen = 0;
+        BYTE enumBuf[256];
+        // 尝试枚举第 0 个子键
+        NTSTATUS enumStatus = Detour_NtEnumerateKey(KeyHandle, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
+
+        if (enumStatus == STATUS_ACCESS_DENIED) {
+            // 如果当前句柄没有枚举权限，尝试提权重新打开以进行准确检查
+            HANDLE hCheck = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING emptyStr;
+            RtlInitUnicodeString(&emptyStr, L"");
+            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+            if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_ENUMERATE_SUB_KEYS, &oa))) {
+                enumStatus = Detour_NtEnumerateKey(hCheck, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
+                fpNtClose(hCheck);
+            }
+        }
+
+        // 如果成功枚举到子键，或者缓冲区不足（说明确实有数据），则证明存在子键
+        if (NT_SUCCESS(enumStatus) || enumStatus == STATUS_BUFFER_OVERFLOW || enumStatus == STATUS_BUFFER_TOO_SMALL) {
+            hasSubkeys = true;
+        }
+        g_IsInHook = true; // 恢复 RecursionGuard
+    }
+
+    if (hasSubkeys) {
+        return 0xC0000121; // STATUS_CANNOT_DELETE
+    }
+
+    // ========================================================================
+    // [核心修复 2] 增加缓冲区大小并进行边界检查，防止 NtQueryObject 越界写入导致堆破坏
+    // ========================================================================
+    ULONG len = 0;
+    fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
+    if (len > 0) {
+        ULONG bufSize = len + 1024; // 增加 1024 字节的防溢出冗余
+        std::vector<BYTE> buffer(bufSize);
+
+        if (NT_SUCCESS(fpNtQueryObject(KeyHandle, ObjectNameInformation, buffer.data(), bufSize, &len))) {
+            POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+
+            if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
+                // 安全的字符串构造，防止 Name.Length 异常导致越界读取
+                ULONG strLen = nameInfo->Name.Length;
+                ULONG maxLen = bufSize - sizeof(OBJECT_NAME_INFORMATION);
+                if (strLen > maxLen) strLen = maxLen; // 强制截断，防止越界
+
+                std::wstring path(nameInfo->Name.Buffer, strLen / sizeof(WCHAR));
+
+                if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
+                    // --- 沙盒键 ---
+                    std::wstring realPath;
+                    if (IsSandboxPathAndGetReal(path, realPath)) {
+                        HANDLE hRealCheck = NULL;
+                        OBJECT_ATTRIBUTES oaReal;
+                        UNICODE_STRING usReal;
+                        RtlInitUnicodeString(&usReal, realPath.c_str());
+                        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                        bool realExists = NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal));
+                        if (realExists) fpNtClose(hRealCheck);
+
+                        if (realExists) {
+                            HANDLE hWrite = NULL;
+                            OBJECT_ATTRIBUTES oaWrite;
+                            UNICODE_STRING usWrite;
+                            RtlInitUnicodeString(&usWrite, path.c_str());
+                            InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oaWrite))) {
+                                SetSandboxTombstone(hWrite);
+                                fpNtClose(hWrite);
+                            }
+                            InvalidateParentRegContext(path);
+                            return STATUS_SUCCESS;
+                        }
+                    }
+                    // 真实无对应 → 物理删除沙盒键
+                    InvalidateParentRegContext(path);
+                    return fpNtDeleteKey(KeyHandle);
+
+                } else if (g_HookReg && g_hAppHive) {
+                    std::wstring relPath;
+                    if (ShouldRedirectReg(path, relPath)) {
+                        // --- 真实键句柄 → 在沙盒中创建对应键并设置墓碑 ---
+                        EnsureRegPathExistsRelative(relPath);
+
+                        HANDLE hSandbox = NULL;
+                        UNICODE_STRING usRel;
+                        OBJECT_ATTRIBUTES oaSandbox;
+                        RtlInitUnicodeString(&usRel, relPath.c_str());
+                        InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                        ULONG disposition;
+                        if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_SET_VALUE, &oaSandbox, 0, NULL, 0, &disposition))) {
+                            SetSandboxTombstone(hSandbox);
+                            fpNtClose(hSandbox);
+                        }
+                        std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                        InvalidateParentRegContext(sandboxPath);
+                        return STATUS_SUCCESS;
+                    }
+                }
+            }
+        }
+    }
+    return fpNtDeleteKey(KeyHandle);
 }
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
