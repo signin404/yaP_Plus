@@ -3811,27 +3811,66 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                         status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                     }
                 } else {
-                    // 只读请求：直接返回真实句柄
+                    // [修复] 只读请求：不能直接返回真实句柄
+                    // 在沙盒中创建空影子键，返回沙盒句柄并将真实句柄缓存为 hRealKey
+                    // 这样 NtQueryValueKey 可以先查沙盒，沙盒无值时回退真实 hRealKey
+                    // 后续写入也正确进入沙盒，下次读取也能在沙盒中找到
+                
+                    std::wstring relPathToCreate;
+                    if (isRedirectedRoot) {
+                        relPathToCreate = relPath;
+                    } else {
+                        relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                        if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\')
+                            relPathToCreate = relPathToCreate.substr(1);
+                    }
+                
+                    EnsureRegPathExistsRelative(relPathToCreate);
+                
+                    HANDLE hNewKey = NULL;
+                    UNICODE_STRING usCreate;
+                    OBJECT_ATTRIBUTES oaCreate;
+                    RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
+                    InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                
+                    ULONG disposition;
+                    NTSTATUS createSt = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition);
+                    if (NT_SUCCESS(createSt)) {
+                        fpNtClose(hNewKey);
+                    }
+                
+                    // 用影子键打开，返回沙盒句柄
+                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+                    if (NT_SUCCESS(status)) {
+                        // hRealCheck 作为 hRealKey 缓存，供 NtQueryValueKey 回退使用
+                        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                        auto it = g_RegContextMap.find(*KeyHandle);
+                        if (it != g_RegContextMap.end()) {
+                            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                            it->second->hRealKey = hRealCheck;  // ← hRealCheck 不再 Close
+                            it->second->FullPath = g_RegMountPathNt + L"\\" + relPathToCreate;
+                            it->second->KeysInitialized = false;
+                            it->second->ValuesInitialized = false;
+                            it->second->SubKeys.clear();
+                            it->second->Values.clear();
+                        } else {
+                            RegContext* ctx = new RegContext();
+                            ctx->hRealKey = hRealCheck;  // ← hRealCheck 不再 Close
+                            ctx->FullPath = g_RegMountPathNt + L"\\" + relPathToCreate;
+                            g_RegContextMap[*KeyHandle] = ctx;
+                        }
+                        // 注意：hRealCheck 已转移所有权给 Context，不能在此 Close
+                        return status;
+                    }
+                
+                    // 影子键打开失败，回退：仍用真实句柄但绑定 hRealKey=NULL
                     *KeyHandle = hRealCheck;
                     status = STATUS_SUCCESS;
-
-                    // 更新上下文映射
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                    auto it = g_RegContextMap.find(*KeyHandle);
-                    if (it != g_RegContextMap.end()) {
-                        if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                        it->second->hRealKey = NULL;
-                        it->second->FullPath = realPathForCheck;
-                        it->second->KeysInitialized = false;
-                        it->second->ValuesInitialized = false;
-                        it->second->SubKeys.clear();
-                        it->second->Values.clear();
-                    } else {
-                        RegContext* ctx = new RegContext();
-                        ctx->hRealKey = NULL;
-                        ctx->FullPath = realPathForCheck;
-                        g_RegContextMap[*KeyHandle] = ctx;
-                    }
+                    RegContext* ctx = new RegContext();
+                    ctx->hRealKey = NULL;
+                    ctx->FullPath = realPathForCheck;
+                    g_RegContextMap[*KeyHandle] = ctx;
                     return status;
                 }
                 fpNtClose(hRealCheck);
@@ -3996,25 +4035,66 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
                         status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
                     }
                 } else {
+                    // [修复] 只读请求：不能直接返回真实句柄
+                    // 在沙盒中创建空影子键，返回沙盒句柄并将真实句柄缓存为 hRealKey
+                    // 这样 NtQueryValueKey 可以先查沙盒，沙盒无值时回退真实 hRealKey
+                    // 后续写入也正确进入沙盒，下次读取也能在沙盒中找到
+                
+                    std::wstring relPathToCreate;
+                    if (isRedirectedRoot) {
+                        relPathToCreate = relPath;
+                    } else {
+                        relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                        if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\')
+                            relPathToCreate = relPathToCreate.substr(1);
+                    }
+                
+                    EnsureRegPathExistsRelative(relPathToCreate);
+                
+                    HANDLE hNewKey = NULL;
+                    UNICODE_STRING usCreate;
+                    OBJECT_ATTRIBUTES oaCreate;
+                    RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
+                    InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+                
+                    ULONG disposition;
+                    NTSTATUS createSt = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition);
+                    if (NT_SUCCESS(createSt)) {
+                        fpNtClose(hNewKey);
+                    }
+                
+                    // 用影子键打开，返回沙盒句柄
+                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+                    if (NT_SUCCESS(status)) {
+                        // hRealCheck 作为 hRealKey 缓存，供 NtQueryValueKey 回退使用
+                        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                        auto it = g_RegContextMap.find(*KeyHandle);
+                        if (it != g_RegContextMap.end()) {
+                            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                            it->second->hRealKey = hRealCheck;  // ← hRealCheck 不再 Close
+                            it->second->FullPath = g_RegMountPathNt + L"\\" + relPathToCreate;
+                            it->second->KeysInitialized = false;
+                            it->second->ValuesInitialized = false;
+                            it->second->SubKeys.clear();
+                            it->second->Values.clear();
+                        } else {
+                            RegContext* ctx = new RegContext();
+                            ctx->hRealKey = hRealCheck;  // ← hRealCheck 不再 Close
+                            ctx->FullPath = g_RegMountPathNt + L"\\" + relPathToCreate;
+                            g_RegContextMap[*KeyHandle] = ctx;
+                        }
+                        // 注意：hRealCheck 已转移所有权给 Context，不能在此 Close
+                        return status;
+                    }
+                
+                    // 影子键打开失败，回退：仍用真实句柄但绑定 hRealKey=NULL
                     *KeyHandle = hRealCheck;
                     status = STATUS_SUCCESS;
-
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                    auto it = g_RegContextMap.find(*KeyHandle);
-                    if (it != g_RegContextMap.end()) {
-                        if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                        it->second->hRealKey = NULL;
-                        it->second->FullPath = realPathForCheck;
-                        it->second->KeysInitialized = false;
-                        it->second->ValuesInitialized = false;
-                        it->second->SubKeys.clear();
-                        it->second->Values.clear();
-                    } else {
-                        RegContext* ctx = new RegContext();
-                        ctx->hRealKey = NULL;
-                        ctx->FullPath = realPathForCheck;
-                        g_RegContextMap[*KeyHandle] = ctx;
-                    }
+                    RegContext* ctx = new RegContext();
+                    ctx->hRealKey = NULL;
+                    ctx->FullPath = realPathForCheck;
+                    g_RegContextMap[*KeyHandle] = ctx;
                     return status;
                 }
                 fpNtClose(hRealCheck);
