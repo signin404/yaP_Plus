@@ -3776,7 +3776,19 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
+			// [修复] 计算正确的只读访问权限
+			// 过滤掉写权限，保留读权限 (QUERY_VALUE | ENUMERATE_SUB_KEYS | NOTIFY | READ_CONTROL)
+			ACCESS_MASK realAccess = DesiredAccess & (KEY_READ | READ_CONTROL);
+        
+			// 如果过滤后没有权限（例如原请求是 KEY_WRITE），则至少给一个最小读权限
+			// 或者如果原请求是纯粹的写权限，这里可能不应该回退读，但在 NtOpenKey 语义下，打开存在的键通常需要读权限
+			if (realAccess == 0) {
+				// 如果原请求不包含任何读权限，这里可能需要根据业务逻辑决定。
+				// 但为了兼容性，通常至少给 KEY_QUERY_VALUE 是不够的，建议给 KEY_READ
+				realAccess = KEY_READ; 
+			}
+
+            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, realAccess, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
                     std::wstring relPathToCreate;
@@ -3798,8 +3810,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                     ULONG disposition;
                     if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
                         CopyRegistryValues(hRealCheck, hNewKey);
-                        fpNtClose(hNewKey);
-                        status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+                        fpNtClose(hRealCheck);
                     }
                 } else {
                     // 只读请求：直接返回真实句柄
