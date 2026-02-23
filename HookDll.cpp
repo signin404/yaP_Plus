@@ -3784,6 +3784,10 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+            // [修复] 动态计算回退权限：剔除写权限，保留请求的读/枚举权限
+            ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
+            if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
@@ -3970,6 +3974,10 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+            // [修复] 动态计算回退权限
+            ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
+            if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
             if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, KEY_QUERY_VALUE, &oaReal, OpenOptions))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     std::wstring relPathToCreate;
@@ -4066,14 +4074,62 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
 
+    // ========================================================================
+    // [核心修复 1] 检查合并视图中是否还有子键。
+    // 如果有，必须返回 STATUS_CANNOT_DELETE (0xC0000121)
+    // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree），导致 0xc0000005 崩溃。
+    // ========================================================================
+    bool hasSubkeys = false;
+    {
+        g_IsInHook = false; // 临时解除 RecursionGuard，以便调用我们自己的 Detour_NtEnumerateKey
+        ULONG resLen = 0;
+        BYTE enumBuf[256];
+        // 尝试枚举第 0 个子键
+        NTSTATUS enumStatus = Detour_NtEnumerateKey(KeyHandle, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
+        
+        if (enumStatus == STATUS_ACCESS_DENIED) {
+            // 如果当前句柄没有枚举权限，尝试提权重新打开以进行准确检查
+            HANDLE hCheck = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING emptyStr;
+            RtlInitUnicodeString(&emptyStr, L"");
+            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+            if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_ENUMERATE_SUB_KEYS, &oa))) {
+                enumStatus = Detour_NtEnumerateKey(hCheck, 0, KeyBasicInformation, enumBuf, sizeof(enumBuf), &resLen);
+                fpNtClose(hCheck);
+            }
+        }
+
+        // 如果成功枚举到子键，或者缓冲区不足（说明确实有数据），则证明存在子键
+        if (NT_SUCCESS(enumStatus) || enumStatus == STATUS_BUFFER_OVERFLOW || enumStatus == STATUS_BUFFER_TOO_SMALL) {
+            hasSubkeys = true;
+        }
+        g_IsInHook = true; // 恢复 RecursionGuard
+    }
+
+    if (hasSubkeys) {
+        return 0xC0000121; // STATUS_CANNOT_DELETE
+    }
+
+    // ========================================================================
+    // [核心修复 2] 增加缓冲区大小并进行边界检查，防止 NtQueryObject 越界写入导致堆破坏
+    // ========================================================================
     ULONG len = 0;
     fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
     if (len > 0) {
-        std::vector<BYTE> buffer(len);
-        if (NT_SUCCESS(fpNtQueryObject(KeyHandle, ObjectNameInformation, buffer.data(), len, &len))) {
+        ULONG bufSize = len + 1024; // 增加 1024 字节的防溢出冗余
+        std::vector<BYTE> buffer(bufSize);
+        
+        if (NT_SUCCESS(fpNtQueryObject(KeyHandle, ObjectNameInformation, buffer.data(), bufSize, &len))) {
             POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-            if (nameInfo->Name.Buffer) {
-                std::wstring path(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+            
+            if (nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
+                // 安全的字符串构造，防止 Name.Length 异常导致越界读取
+                ULONG strLen = nameInfo->Name.Length;
+                ULONG maxLen = bufSize - sizeof(OBJECT_NAME_INFORMATION);
+                if (strLen > maxLen) strLen = maxLen; // 强制截断，防止越界
+                
+                std::wstring path(nameInfo->Name.Buffer, strLen / sizeof(WCHAR));
 
                 if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
                     // --- 沙盒键 ---
@@ -4088,7 +4144,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                         if (realExists) fpNtClose(hRealCheck);
 
                         if (realExists) {
-                            // [修复1] 用新句柄以 KEY_SET_VALUE 权限写墓碑 而非使用 DELETE 权限的 KeyHandle
                             HANDLE hWrite = NULL;
                             OBJECT_ATTRIBUTES oaWrite;
                             UNICODE_STRING usWrite;
@@ -4098,7 +4153,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                                 SetSandboxTombstone(hWrite);
                                 fpNtClose(hWrite);
                             }
-                            // [修复2] 使父键枚举缓存失效 防止死循环
                             InvalidateParentRegContext(path);
                             return STATUS_SUCCESS;
                         }
@@ -4123,7 +4177,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                             SetSandboxTombstone(hSandbox);
                             fpNtClose(hSandbox);
                         }
-                        // [修复2] 同样需要使父键缓存失效
                         std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
                         InvalidateParentRegContext(sandboxPath);
                         return STATUS_SUCCESS;
