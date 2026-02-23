@@ -31,6 +31,8 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma pack(push, 1)
+#pragma pack(pop)
 
 // 导出函数转发
 #pragma comment(linker, "/export:GetFileVersionInfoA=C:\\Windows\\System32\\version.GetFileVersionInfoA")
@@ -55,6 +57,20 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// 标志位定义
+#define FILE_DISPOSITION_DELETE 0x00000001
+#define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
+#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
+#define FILE_DISPOSITION_ON_CLOSE 0x00000008
+#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
+
+// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
+#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
+
+// 字节序转换
+#define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
+#define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
+
 // [新增] 判断是否包含注册表写入/修改权限
 #ifndef IS_REG_WRITE_ACCESS
 #define IS_REG_WRITE_ACCESS(access) (((access) & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER | MAXIMUM_ALLOWED | GENERIC_WRITE | GENERIC_ALL)) != 0)
@@ -75,6 +91,10 @@
 
 #ifndef STATUS_BUFFER_TOO_SMALL
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+
+#ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
+#define _KEY_VALUE_INFORMATION_CLASS_DEFINED
 #endif
 
 // --- 注册表重定向相关常量与指针 ---
@@ -208,6 +228,58 @@
 #define IO_REPARSE_TAG_SYMLINK 0xA000000C
 #endif
 
+#ifndef FileNamesInformation
+#define FileNamesInformation ((FILE_INFORMATION_CLASS)12)
+#endif
+
+#ifndef FileIdFullDirectoryInformation
+#define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
+#endif
+
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
+#endif
+
+#ifndef FileDispositionInformation
+#define FileDispositionInformation ((FILE_INFORMATION_CLASS)13)
+#endif
+
+#ifndef ObjectNameInformation
+#define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
+#endif
+
+#ifndef FileRenameInformationEx
+#define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
+#endif
+
+#ifndef FileEndOfFileInformation
+#define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
+#endif
+
+#ifndef FileLinkInformation
+#define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
+#endif
+
+#ifndef FILE_DEVICE_CD_ROM
+#define FILE_DEVICE_CD_ROM 0x00000002
+#endif
+
+#ifndef FILE_READ_ONLY_DEVICE
+#define FILE_READ_ONLY_DEVICE 0x00000002
+#endif
+
+#ifndef FILE_REMOVABLE_MEDIA
+#define FILE_REMOVABLE_MEDIA 0x00000001
+#endif
+
+#ifndef _FILE_BASIC_INFORMATION_DEFINED
+#define _FILE_BASIC_INFORMATION_DEFINED
+#endif
+
+#ifndef _FILE_STANDARD_INFORMATION_DEFINED
+#define _FILE_STANDARD_INFORMATION_DEFINED
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
@@ -290,18 +362,6 @@ typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
     WCHAR FileSystemName[1];
 } FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
 
-#ifndef FILE_DEVICE_CD_ROM
-#define FILE_DEVICE_CD_ROM 0x00000002
-#endif
-
-#ifndef FILE_READ_ONLY_DEVICE
-#define FILE_READ_ONLY_DEVICE 0x00000002
-#endif
-
-#ifndef FILE_REMOVABLE_MEDIA
-#define FILE_REMOVABLE_MEDIA 0x00000001
-#endif
-
 // 注册表 TZI 二进制结构定义
 typedef struct _REG_TZI_FORMAT {
     LONG Bias;
@@ -332,9 +392,6 @@ typedef struct _RTL_TIME_ZONE_INFORMATION {
     LONG DaylightBias;
 } RTL_TIME_ZONE_INFORMATION, *PRTL_TIME_ZONE_INFORMATION;
 
-// --- [新增] 补全注册表相关结构体与枚举 ---
-#ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
-#define _KEY_VALUE_INFORMATION_CLASS_DEFINED
 typedef enum _KEY_VALUE_INFORMATION_CLASS {
     KeyValueBasicInformation = 0,
     KeyValueFullInformation,
@@ -343,7 +400,6 @@ typedef enum _KEY_VALUE_INFORMATION_CLASS {
     KeyValuePartialInformationAlign64,
     MaxKeyValueInfoClass
 } KEY_VALUE_INFORMATION_CLASS;
-#endif
 
 typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
     ULONG TitleIndex;
@@ -435,10 +491,6 @@ typedef struct _FILE_RENAME_INFORMATION {
     WCHAR FileName[1];
 } FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
-#ifndef FileLinkInformation
-#define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
-#endif
-
 typedef struct _FILE_LINK_INFORMATION {
     BOOLEAN ReplaceIfExists;
     HANDLE RootDirectory;
@@ -446,41 +498,18 @@ typedef struct _FILE_LINK_INFORMATION {
     WCHAR FileName[1];
 } FILE_LINK_INFORMATION, *PFILE_LINK_INFORMATION;
 
-#ifndef FileEndOfFileInformation
-#define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
-#endif
-
 typedef struct _FILE_END_OF_FILE_INFORMATION {
     LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
-
-#ifndef FileRenameInformationEx
-#define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
-#endif
 
 // 定义 Ex 结构体 (标志位)
 typedef struct _FILE_DISPOSITION_INFORMATION_EX {
     ULONG Flags;
 } FILE_DISPOSITION_INFORMATION_EX, *PFILE_DISPOSITION_INFORMATION_EX;
 
-// 标志位定义
-#define FILE_DISPOSITION_DELETE 0x00000001
-#define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
-#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
-#define FILE_DISPOSITION_ON_CLOSE 0x00000008
-#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
-
-#ifndef ObjectNameInformation
-#define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
-#endif
-
 typedef struct _OBJECT_NAME_INFORMATION {
     UNICODE_STRING Name;
 } OBJECT_NAME_INFORMATION, *POBJECT_NAME_INFORMATION;
-
-#ifndef FileDispositionInformation
-#define FileDispositionInformation ((FILE_INFORMATION_CLASS)13)
-#endif
 
 typedef struct _FILE_DISPOSITION_INFORMATION {
     BOOLEAN DeleteFile;
@@ -515,7 +544,6 @@ typedef struct _FILE_NAME_INFORMATION {
     WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
 
-#ifndef _FILE_BASIC_INFORMATION_DEFINED
 typedef struct _FILE_BASIC_INFORMATION {
     LARGE_INTEGER CreationTime;
     LARGE_INTEGER LastAccessTime;
@@ -523,10 +551,7 @@ typedef struct _FILE_BASIC_INFORMATION {
     LARGE_INTEGER ChangeTime;
     ULONG FileAttributes;
 } FILE_BASIC_INFORMATION, *PFILE_BASIC_INFORMATION;
-#define _FILE_BASIC_INFORMATION_DEFINED
-#endif
 
-#ifndef _FILE_STANDARD_INFORMATION_DEFINED
 typedef struct _FILE_STANDARD_INFORMATION {
     LARGE_INTEGER AllocationSize;
     LARGE_INTEGER EndOfFile;
@@ -534,8 +559,6 @@ typedef struct _FILE_STANDARD_INFORMATION {
     BOOLEAN DeletePending;
     BOOLEAN Directory;
 } FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
-#define _FILE_STANDARD_INFORMATION_DEFINED
-#endif
 
 typedef struct _FILE_NETWORK_OPEN_INFORMATION {
     LARGE_INTEGER CreationTime;
@@ -625,11 +648,6 @@ typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
 
-// 添加缺失的状态码
-#ifndef STATUS_INVALID_INFO_CLASS
-#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
-#endif
-
 // [新增] 补充缺失的目录信息结构体
 typedef struct _FILE_NAMES_INFORMATION {
     ULONG NextEntryOffset;
@@ -654,15 +672,6 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_FULL_DIR_INFORMATION, *PFILE_ID_FULL_DIR_INFORMATION;
 
-// [新增] 补充枚举值
-#ifndef FileNamesInformation
-#define FileNamesInformation ((FILE_INFORMATION_CLASS)12)
-#endif
-
-#ifndef FileIdFullDirectoryInformation
-#define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
-#endif
-
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
@@ -671,25 +680,13 @@ typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
 typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
-typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
-P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
-
 typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtEnumerateKey fpNtEnumerateKey; // 声明
 typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtEnumerateValueKey fpNtEnumerateValueKey; // 声明
-
 typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
-P_NtSetValueKey fpNtSetValueKey = NULL;
-
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtQueryValueKey fpNtQueryValueKey = NULL;
-
 typedef NTSTATUS (NTAPI *P_NtDeleteValueKey)(HANDLE KeyHandle, PUNICODE_STRING ValueName);
-P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
-
 typedef NTSTATUS (NTAPI *P_NtRenameKey)(HANDLE KeyHandle, PUNICODE_STRING NewName);
-P_NtRenameKey fpNtRenameKey = NULL;
+typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
 
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
@@ -701,30 +698,17 @@ typedef NTSTATUS(NTAPI* P_NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOI
 typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS, ULONG, PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
-P_NtDeleteFile fpNtDeleteFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
-P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
-P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
-P_NtResumeProcess fpNtResumeProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
-P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
-// --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
 typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID, DWORD, LPDWORD, LPOVERLAPPED);
 typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
-P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
-P_WSAConnectByList fpWSAConnectByList = NULL;
-// [新增] ShellExecuteExW 函数指针
-typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
-P_ShellExecuteExW fpShellExecuteExW = NULL;
-
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
@@ -753,6 +737,9 @@ typedef HINTERNET (WINAPI* P_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, 
 // 旧版 DNS
 typedef struct hostent* (WSAAPI* P_gethostbyname)(const char*);
 
+// [新增] ShellExecuteExW 函数指针
+typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -764,170 +751,106 @@ typedef DWORD(WINAPI* P_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD)
 
 // GDI 函数指针
 typedef HFONT(WINAPI* P_CreateFontIndirectW)(const LOGFONTW*);
-P_CreateFontIndirectW fpCreateFontIndirectW = NULL;
 typedef HFONT(WINAPI* P_CreateFontIndirectExW)(const ENUMLOGFONTEXDVW*);
-P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
 
 // [新增] GetStockObject 函数指针
 typedef HGDIOBJ(WINAPI* P_GetStockObject)(int);
-P_GetStockObject fpGetStockObject = NULL;
 
 // GDI+ 函数指针与类型
 typedef int GpStatus;
 typedef void GpFontCollection;
 typedef void GpFontFamily;
 typedef GpStatus(WINAPI* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
-P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
 
 // --- [新增] NLS 函数指针 ---
 typedef UINT(WINAPI* P_GetACP)(void);
-P_GetACP fpGetACP = NULL;
 typedef UINT(WINAPI* P_GetOEMCP)(void);
-P_GetOEMCP fpGetOEMCP = NULL;
 typedef LCID(WINAPI* P_GetUserDefaultLCID)(void);
-P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
 typedef LCID(WINAPI* P_GetSystemDefaultLCID)(void);
-P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
 typedef LCID(WINAPI* P_GetThreadLocale)(void);
-P_GetThreadLocale fpGetThreadLocale = NULL;
 typedef LANGID(WINAPI* P_GetUserDefaultLangID)(void);
-P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
 typedef LANGID(WINAPI* P_GetSystemDefaultLangID)(void);
-P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
 typedef int(WINAPI* P_GetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int);
-P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
 
 // [新增] 字符串转换函数指针
 typedef int(WINAPI* P_MultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
-P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
 typedef int(WINAPI* P_WideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
-P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
 
 // --- [新增] UI语言函数指针 ---
 typedef LANGID(WINAPI* P_GetUserDefaultUILanguage)(void);
-P_GetUserDefaultUILanguage fpGetUserDefaultUILanguage = NULL;
 typedef LANGID(WINAPI* P_GetSystemDefaultUILanguage)(void);
-P_GetSystemDefaultUILanguage fpGetSystemDefaultUILanguage = NULL;
 
 // --- [新增] 字体枚举函数指针 ---
 typedef int (WINAPI* P_EnumFontFamiliesExW)(HDC, LPLOGFONTW, FONTENUMPROCW, LPARAM, DWORD);
-P_EnumFontFamiliesExW fpEnumFontFamiliesExW = NULL;
 typedef int (WINAPI* P_EnumFontFamiliesW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
-P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
 typedef int (WINAPI* P_EnumFontsW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
-P_EnumFontsW fpEnumFontsW = NULL;
 
 // --- [新增] Ntdll 字符串函数指针 ---
 typedef NTSTATUS(NTAPI* P_RtlMultiByteToUnicodeN)(PWCH, ULONG, PULONG, PCSTR, ULONG);
-P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
 typedef NTSTATUS(NTAPI* P_RtlUnicodeToMultiByteN)(PCHAR, ULONG, PULONG, PCWSTR, ULONG);
-P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
 
 // --- [新增] ANSI 字体函数指针 ---
 typedef HFONT(WINAPI* P_CreateFontIndirectA)(const LOGFONTA*);
-P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
 typedef HFONT(WINAPI* P_CreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
-P_CreateFontA fpCreateFontA = NULL;
 
 // --- [新增] ANSI 注册表函数指针 ---
 typedef LSTATUS(WINAPI* P_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
-P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegCreateKeyExA)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
-P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-P_RegQueryValueExA fpRegQueryValueExA = NULL;
 typedef LSTATUS(WINAPI* P_RegSetValueExA)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
-P_RegSetValueExA fpRegSetValueExA = NULL;
 typedef LSTATUS(WINAPI* P_RegDeleteKeyA)(HKEY, LPCSTR);
-P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
 typedef LSTATUS(WINAPI* P_RegDeleteValueA)(HKEY, LPCSTR);
-P_RegDeleteValueA fpRegDeleteValueA = NULL;
 typedef LSTATUS(WINAPI* P_RegEnumKeyExA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPSTR, LPDWORD, PFILETIME);
-P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegEnumValueA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-P_RegEnumValueA fpRegEnumValueA = NULL;
 
 // --- [新增] User32 窗口函数指针 ---
 typedef HWND(WINAPI* P_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-P_CreateWindowExA fpCreateWindowExA = NULL;
 typedef int(WINAPI* P_GetWindowTextA)(HWND, LPSTR, int);
-P_GetWindowTextA fpGetWindowTextA = NULL;
 typedef LRESULT(WINAPI* P_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
-P_DefWindowProcA fpDefWindowProcA = NULL;
-// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
-#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
 
 // --- [新增] 消息与进程退出函数指针 ---
 typedef LRESULT(WINAPI* P_SendMessageA)(HWND, UINT, WPARAM, LPARAM);
-P_SendMessageA fpSendMessageA = NULL;
 typedef VOID(WINAPI* P_ExitProcess)(UINT);
-P_ExitProcess fpExitProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtTerminateProcess)(HANDLE, NTSTATUS);
-P_NtTerminateProcess fpNtTerminateProcess = NULL;
 
 // --- [新增] ANSI 字体枚举指针 ---
 typedef int (WINAPI* P_EnumFontFamiliesExA)(HDC, LPLOGFONTA, FONTENUMPROCA, LPARAM, DWORD);
-P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
 typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
-P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
 
 // --- [新增] 窗口过程与底层退出函数指针 ---
 typedef VOID(NTAPI* P_RtlExitUserProcess)(NTSTATUS);
-P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
 typedef VOID(WINAPI* P_PostQuitMessage)(int);
-P_PostQuitMessage fpPostQuitMessage = NULL;
 
 // --- [新增] 时区伪造相关 ---
 typedef DWORD(WINAPI* P_GetTimeZoneInformation)(LPTIME_ZONE_INFORMATION);
-P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
 typedef DWORD(WINAPI* P_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
-P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
 
 // GetDriveTypeW 函数指针
 typedef UINT(WINAPI* P_GetDriveTypeW)(LPCWSTR);
-P_GetDriveTypeW fpGetDriveTypeW = NULL;
 
 // [新增] 驱动器枚举函数指针
 typedef DWORD(WINAPI* P_GetLogicalDrives)(void);
-P_GetLogicalDrives fpGetLogicalDrives = NULL;
 typedef DWORD(WINAPI* P_GetLogicalDriveStringsW)(DWORD, LPWSTR);
-P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
 
 // --- [新增] 资源加载函数指针 ---
 typedef NTSTATUS(NTAPI* P_LdrResSearchResource)(PVOID, PULONG_PTR, ULONG, ULONG, PVOID*, PULONG, PVOID, PVOID);
-P_LdrResSearchResource fpLdrResSearchResource = NULL;
 
 // --- [新增] NLS 代码页信息函数指针 ---
 typedef BOOL(WINAPI* P_GetCPInfo)(UINT, LPCPINFO);
-P_GetCPInfo fpGetCPInfo = NULL;
 typedef BOOL(WINAPI* P_GetCPInfoExW)(UINT, DWORD, LPCPINFOEXW);
-P_GetCPInfoExW fpGetCPInfoExW = NULL;
 typedef BOOL(WINAPI* P_IsValidCodePage)(UINT);
-P_IsValidCodePage fpIsValidCodePage = NULL;
 
 // --- [新增] 时间伪造函数指针 ---
 typedef VOID(WINAPI* P_GetSystemTime)(LPSYSTEMTIME);
-P_GetSystemTime fpGetSystemTime = NULL;
 typedef VOID(WINAPI* P_GetLocalTime)(LPSYSTEMTIME);
-P_GetLocalTime fpGetLocalTime = NULL;
 typedef VOID(WINAPI* P_GetSystemTimeAsFileTime)(LPFILETIME);
-P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
 typedef VOID(WINAPI* P_GetSystemTimePreciseAsFileTime)(LPFILETIME);
-P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 
 // --- [新增] NtQuerySystemTime 及 KernelBase 函数指针 ---
 typedef NTSTATUS(NTAPI* P_NtQuerySystemTime)(PLARGE_INTEGER);
-P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
-
-// KernelBase 专用指针 (避免与 Kernel32 指针冲突)
-P_GetSystemTime fpGetSystemTime_KB = NULL;
-P_GetLocalTime fpGetLocalTime_KB = NULL;
-P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
-P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
 
 // --- WinExec 函数指针 ---
 typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
-P_WinExec fpWinExec = NULL;
 
 // 命令行处理工具集
 namespace CmdUtils {
@@ -1143,6 +1066,7 @@ bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
+
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
 std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
@@ -1205,6 +1129,85 @@ P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
 P_NtDeleteKey fpNtDeleteKey = NULL;
 P_NtEnumerateKey fpNtEnumerateKey = NULL;
 P_NtEnumerateValueKey fpNtEnumerateValueKey = NULL;
+P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
+P_NtSetValueKey fpNtSetValueKey = NULL;
+P_NtQueryValueKey fpNtQueryValueKey = NULL;
+P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
+P_NtRenameKey fpNtRenameKey = NULL;
+P_NtDeleteFile fpNtDeleteFile = NULL;
+P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
+P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
+P_NtResumeProcess fpNtResumeProcess = NULL;
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
+P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
+P_WSAConnectByList fpWSAConnectByList = NULL;
+P_ShellExecuteExW fpShellExecuteExW = NULL;
+P_CreateFontIndirectW fpCreateFontIndirectW = NULL;
+P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
+P_GetStockObject fpGetStockObject = NULL;
+P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
+P_GetACP fpGetACP = NULL;
+P_GetOEMCP fpGetOEMCP = NULL;
+P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
+P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
+P_GetThreadLocale fpGetThreadLocale = NULL;
+P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
+P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
+P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
+P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
+P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
+P_GetUserDefaultUILanguage fpGetUserDefaultUILanguage = NULL;
+P_GetSystemDefaultUILanguage fpGetSystemDefaultUILanguage = NULL;
+P_EnumFontFamiliesExW fpEnumFontFamiliesExW = NULL;
+P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
+P_EnumFontsW fpEnumFontsW = NULL;
+P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
+P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
+P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
+P_CreateFontA fpCreateFontA = NULL;
+P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
+P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
+P_RegQueryValueExA fpRegQueryValueExA = NULL;
+P_RegSetValueExA fpRegSetValueExA = NULL;
+P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
+P_RegDeleteValueA fpRegDeleteValueA = NULL;
+P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
+P_RegEnumValueA fpRegEnumValueA = NULL;
+P_CreateWindowExA fpCreateWindowExA = NULL;
+P_GetWindowTextA fpGetWindowTextA = NULL;
+P_DefWindowProcA fpDefWindowProcA = NULL;
+P_SendMessageA fpSendMessageA = NULL;
+P_ExitProcess fpExitProcess = NULL;
+P_NtTerminateProcess fpNtTerminateProcess = NULL;
+P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
+P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
+P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
+P_PostQuitMessage fpPostQuitMessage = NULL;
+P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
+P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
+P_GetDriveTypeW fpGetDriveTypeW = NULL;
+P_GetLogicalDrives fpGetLogicalDrives = NULL;
+P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
+P_LdrResSearchResource fpLdrResSearchResource = NULL;
+P_GetCPInfo fpGetCPInfo = NULL;
+P_GetCPInfoExW fpGetCPInfoExW = NULL;
+P_IsValidCodePage fpIsValidCodePage = NULL;
+P_GetSystemTime fpGetSystemTime = NULL;
+P_GetLocalTime fpGetLocalTime = NULL;
+P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
+P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
+P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
+P_WinExec fpWinExec = NULL;
+
+// KernelBase 专用指针 (避免与 Kernel32 指针冲突)
+P_GetSystemTime fpGetSystemTime_KB = NULL;
+P_GetLocalTime fpGetLocalTime_KB = NULL;
+P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
+P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
+
+extern P_NtEnumerateKey fpNtEnumerateKey;
+extern P_NtEnumerateValueKey fpNtEnumerateValueKey;
+extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -1462,12 +1465,6 @@ P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
 
 // --- [修改] 字体文件解析与加载工具 (支持 TTF/OTF/TTC) ---
 
-// 字节序转换
-#define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
-#define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
-
-#pragma pack(push, 1)
-
 // TTC 文件头
 struct TTC_HEADER {
     char   szTag[4]; // 'ttcf'
@@ -1508,7 +1505,6 @@ struct TT_NAME_RECORD {
     USHORT uStringLength;
     USHORT uStringOffset;
 };
-#pragma pack(pop)
 
 // 内部辅助：解析单个 TTF/OTF 数据块的名称
 std::wstring ParseSingleFontName(const BYTE* pBase, const BYTE* pFontStart, size_t totalSize) {
@@ -2619,7 +2615,7 @@ void SetSandboxTombstone(HANDLE hSandboxKey) {
     fpNtSetValueKey(hSandboxKey, &markerName, 0, REG_DWORD, &val, sizeof(val));
 }
 
-// --- [修改] 增加 accessDenied 参数，用于探测是否因权限不足导致查询失败 ---
+// --- [修改] 增加 accessDenied 参数 用于探测是否因权限不足导致查询失败 ---
 bool HasTombstone(HANDLE hKey, bool* accessDenied = nullptr) {
     if (!fpNtQueryValueKey) return false;
     UNICODE_STRING markerName;
@@ -2638,7 +2634,7 @@ void ClearSandboxKeyValues(HANDLE hKey) {
     std::vector<BYTE> buf(1024);
     std::vector<std::wstring> valueNames;
 
-    // 1. 先收集所有值名，防止边删边枚举导致死循环或遗漏
+    // 1. 先收集所有值名 防止边删边枚举导致死循环或遗漏
     while (true) {
         NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, buf.data(), (ULONG)buf.size(), &len);
         if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
@@ -2673,7 +2669,7 @@ void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
         while (true) {
             ULONG len;
             BYTE buf[1024];
-            // 始终枚举 index=0，因为每次删除后列表会缩短
+            // 始终枚举 index=0 因为每次删除后列表会缩短
             NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf, sizeof(buf), &len);
             if (!NT_SUCCESS(st)) break;
 
@@ -3111,6 +3107,125 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
 }
 
 // --- 注册表 NT API Hook 实现 ---
+NTSTATUS NTAPI Detour_NtQueryValueKey(
+    HANDLE KeyHandle,
+    PUNICODE_STRING ValueName,
+    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    PVOID KeyValueInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
+    // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
+    // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
+    NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
+    // 且启用了注册表 Hook 尝试从缓存的真实句柄中读取
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
+        HANDLE hReal = NULL;
+
+        // 从 Context 中查找缓存的真实句柄
+        {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                hReal = it->second->hRealKey;
+            }
+        }
+
+        // 如果找到了真实句柄 尝试从中查询
+        if (hReal) {
+            // 使用 RecursionGuard 防止某些底层 Hook 再次触发
+            RecursionGuard guard;
+            status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
+    }
+
+    // 3. [区域伪造逻辑] 如果查询成功 (或缓冲区溢出 说明值存在) 且启用了区域伪造
+    // 我们需要拦截 ACP/OEMCP 的查询结果
+    if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
+
+        // 检查是否查询的是 ACP 或 OEMCP
+        // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
+        // ValueName 分别是 "ACP" 或 "OEMCP"
+
+        bool isACP = (ValueName->Length == 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0);
+        bool isOEMCP = (ValueName->Length == 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0);
+
+        if (isACP || isOEMCP) {
+            const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
+            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t)); // 包含 NULL 结尾
+
+            // 根据查询的信息类进行处理
+            if (KeyValueInformationClass == KeyValuePartialInformation) {
+                // 结构: Header + Data
+                ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
+
+                if (Length >= requiredSize) {
+                    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+                    info->Type = REG_SZ;
+                    info->DataLength = fakeDataSize;
+                    memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
+                    status = STATUS_SUCCESS;
+                } else {
+                    status = STATUS_BUFFER_OVERFLOW;
+                }
+
+                if (ResultLength) *ResultLength = requiredSize;
+            }
+            else if (KeyValueInformationClass == KeyValueFullInformation) {
+                // 结构: Header + Name + Padding + Data
+                // 注意：这里我们只修改 Data 部分 假设 Name 部分已经由 fpNtQueryValueKey 填充好了
+                // 如果原始查询失败(回退逻辑也没找到) 这里进不来 所以 info 里的 Name 是有效的
+
+                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+
+                // 如果原始状态是 SUCCESS 我们可以直接修改数据
+                // 如果原始状态是 OVERFLOW 我们需要重新计算大小
+
+                // 简单起见 如果原始调用成功读取了数据 我们检查是否有空间覆写
+                if (status == STATUS_SUCCESS) {
+                    if (info->DataLength >= fakeDataSize) {
+                        // 原数据空间足够 直接覆盖
+                        info->Type = REG_SZ;
+                        info->DataLength = fakeDataSize;
+                        // DataOffset 是相对于结构体起始的偏移
+                        memcpy((BYTE*)info + info->DataOffset, fakeVal.c_str(), fakeDataSize);
+                    } else {
+                        // 原数据空间不足 (例如原值是 "1252" 长度 10 我们要写 "936" 长度 8 通常够用)
+                        // 如果不够 返回 OVERFLOW
+                        // 但通常代码页字符串长度都很短 这里做个防御性编程
+                        // 如果空间不够 我们只能告诉调用者需要更多内存
+                        // 重新计算所需大小
+                        ULONG dataOffset = info->DataOffset;
+                        ULONG requiredSize = dataOffset + fakeDataSize;
+
+                        if (Length >= requiredSize) {
+                             info->Type = REG_SZ;
+                             info->DataLength = fakeDataSize;
+                             memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
+                        } else {
+                             status = STATUS_BUFFER_OVERFLOW;
+                             if (ResultLength) *ResultLength = requiredSize;
+                        }
+                    }
+                }
+                else if (status == STATUS_BUFFER_OVERFLOW) {
+                    // 如果原始查询就溢出了 我们需要修正 ResultLength
+                    // 原始 ResultLength 是基于真实值的 我们需要基于伪造值计算
+                    // 这比较麻烦 因为我们不知道 Name 有多长
+                    // 但通常程序会先查长度再分配内存
+                    // 此时我们无法修改 ResultLength 准确值 因为不知道 NameLength
+                    // 只能寄希望于程序分配足够大的缓冲区（通常 MAX_PATH）
+                    // 或者 我们可以忽略这次修正 等程序分配了内存再次调用时 会进入上面的 STATUS_SUCCESS 分支
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
 NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
     if (g_IsInHook || !g_HookReg || !g_hAppHive || !NewName || !NewName->Buffer)
         return fpNtRenameKey(KeyHandle, NewName);
@@ -3129,14 +3244,14 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
     std::wstring newName(NewName->Buffer, NewName->Length / sizeof(WCHAR));
     std::wstring targetSandboxPath = parentSandboxPath + L"\\" + newName;
 
-    // 检查目标路径是否有墓碑键，有则物理删除以让路
+    // 检查目标路径是否有墓碑键 有则物理删除以让路
     HANDLE hTarget = NULL;
     OBJECT_ATTRIBUTES oaTarget;
     UNICODE_STRING usTarget;
     RtlInitUnicodeString(&usTarget, targetSandboxPath.c_str());
     InitializeObjectAttributes(&oaTarget, &usTarget, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // [修复] 使用 MAXIMUM_ALLOWED 打开，确保拥有 Rename 所需的权限，并修复 Use-After-Close 漏洞
+    // [修复] 使用 MAXIMUM_ALLOWED 打开 确保拥有 Rename 所需的权限 并修复 Use-After-Close 漏洞
     if (NT_SUCCESS(fpNtOpenKey(&hTarget, MAXIMUM_ALLOWED, &oaTarget))) {
         bool hasTomb = HasTombstone(hTarget);
 
@@ -3167,7 +3282,7 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
         }
         fpNtClose(hTarget);
     } else if (NT_SUCCESS(fpNtOpenKey(&hTarget, KEY_QUERY_VALUE, &oaTarget))) {
-        // 降级回退：如果无法以高权限打开，则尝试直接物理删除
+        // 降级回退：如果无法以高权限打开 则尝试直接物理删除
         bool hasTomb = HasTombstone(hTarget);
         fpNtClose(hTarget);
         if (hasTomb) {
@@ -3286,7 +3401,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
                     RtlInitUnicodeString(&usWrite, sandboxFullPath.c_str());
                     InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                    // [修改] 使用 KEY_SET_VALUE | KEY_QUERY_VALUE 权限打开，以清空所有值
+                    // [修改] 使用 KEY_SET_VALUE | KEY_QUERY_VALUE 权限打开 以清空所有值
                     if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaWrite))) {
                         ClearSandboxKeyValues(hWrite);
                         fpNtClose(hWrite);
@@ -3294,7 +3409,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 }
             }
-            
+
             std::wstring sandboxFullPath = g_RegMountPathNt + L"\\" + relPath;
             InvalidateParentRegContext(sandboxFullPath);
 
@@ -3304,7 +3419,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // [修复] 如果曾经有墓碑，说明是用户主动删除后重建的，绝不能从真实注册表复制旧数据！
+                // [修复] 如果曾经有墓碑 说明是用户主动删除后重建的 绝不能从真实注册表复制旧数据！
                 if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
@@ -3423,13 +3538,13 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     bool isTombstoned = false; // [新增] 标记是否因墓碑被视为不存在
 
-    // [修复] 只要打开的句柄落在沙盒内且有墓碑，无论是否经过重定向，都视为不存在
+    // [修复] 只要打开的句柄落在沙盒内且有墓碑 无论是否经过重定向 都视为不存在
     if (NT_SUCCESS(status)) {
         std::wstring openedPath = GetPathFromHandle(*KeyHandle);
         if (!openedPath.empty() && openedPath.find(g_RegMountPathNt) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
-            // 权限不足时，新开一个句柄去查
+            // 权限不足时 新开一个句柄去查
             if (!hasTomb && accessDenied) {
                 HANDLE hCheck = NULL;
                 OBJECT_ATTRIBUTES oaCheck;
@@ -3460,7 +3575,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         canCheckReal = true;
     }
 
-    // [修复] 如果是因为墓碑导致的不存在，绝不能回退到真实注册表！
+    // [修复] 如果是因为墓碑导致的不存在 绝不能回退到真实注册表！
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal && !isTombstoned) {
         HANDLE hRealCheck = NULL;
         bool realExists = false;
@@ -3615,7 +3730,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         canCheckReal = true;
     }
 
-    // [修复] 如果是因为墓碑导致的不存在，绝不能回退到真实注册表！
+    // [修复] 如果是因为墓碑导致的不存在 绝不能回退到真实注册表！
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && canCheckReal && !isTombstoned) {
         HANDLE hRealCheck = NULL;
         bool realExists = false;
@@ -3740,7 +3855,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                         if (realExists) fpNtClose(hRealCheck);
 
                         if (realExists) {
-                            // [修复1] 用新句柄以 KEY_SET_VALUE 权限写墓碑，而非使用 DELETE 权限的 KeyHandle
+                            // [修复1] 用新句柄以 KEY_SET_VALUE 权限写墓碑 而非使用 DELETE 权限的 KeyHandle
                             HANDLE hWrite = NULL;
                             OBJECT_ATTRIBUTES oaWrite;
                             UNICODE_STRING usWrite;
@@ -3750,7 +3865,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                                 SetSandboxTombstone(hWrite);
                                 fpNtClose(hWrite);
                             }
-                            // [修复2] 使父键枚举缓存失效，防止死循环
+                            // [修复2] 使父键枚举缓存失效 防止死循环
                             InvalidateParentRegContext(path);
                             return STATUS_SUCCESS;
                         }
@@ -3988,7 +4103,7 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             EnumerateValuesToMap(realPath, mergedValues);
             EnumerateValuesToMap(sandboxPath, mergedValues);
 
-            // [新增] 过滤墓碑标记值本身，不暴露给调用者
+            // [新增] 过滤墓碑标记值本身 不暴露给调用者
             std::wstring tombstoneKeyLower = YAPBOX_TOMBSTONE_VALUE;
             std::transform(tombstoneKeyLower.begin(), tombstoneKeyLower.end(), tombstoneKeyLower.begin(), towlower);
             mergedValues.erase(tombstoneKeyLower);
@@ -5529,126 +5644,6 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
                     memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
                     pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
-                }
-            }
-        }
-    }
-
-    return status;
-}
-
-// --- [新增] 注册表伪造核心 ---
-NTSTATUS NTAPI Detour_NtQueryValueKey(
-    HANDLE KeyHandle,
-    PUNICODE_STRING ValueName,
-    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    PVOID KeyValueInformation,
-    ULONG Length,
-    PULONG ResultLength
-) {
-    // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
-    // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
-    NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-
-    // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
-    // 且启用了注册表 Hook 尝试从缓存的真实句柄中读取
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
-        HANDLE hReal = NULL;
-
-        // 从 Context 中查找缓存的真实句柄
-        {
-            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) {
-                hReal = it->second->hRealKey;
-            }
-        }
-
-        // 如果找到了真实句柄 尝试从中查询
-        if (hReal) {
-            // 使用 RecursionGuard 防止某些底层 Hook 再次触发
-            RecursionGuard guard;
-            status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-        }
-    }
-
-    // 3. [区域伪造逻辑] 如果查询成功 (或缓冲区溢出 说明值存在) 且启用了区域伪造
-    // 我们需要拦截 ACP/OEMCP 的查询结果
-    if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
-
-        // 检查是否查询的是 ACP 或 OEMCP
-        // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
-        // ValueName 分别是 "ACP" 或 "OEMCP"
-
-        bool isACP = (ValueName->Length == 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0);
-        bool isOEMCP = (ValueName->Length == 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0);
-
-        if (isACP || isOEMCP) {
-            const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
-            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t)); // 包含 NULL 结尾
-
-            // 根据查询的信息类进行处理
-            if (KeyValueInformationClass == KeyValuePartialInformation) {
-                // 结构: Header + Data
-                ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
-
-                if (Length >= requiredSize) {
-                    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
-                    info->Type = REG_SZ;
-                    info->DataLength = fakeDataSize;
-                    memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
-                    status = STATUS_SUCCESS;
-                } else {
-                    status = STATUS_BUFFER_OVERFLOW;
-                }
-
-                if (ResultLength) *ResultLength = requiredSize;
-            }
-            else if (KeyValueInformationClass == KeyValueFullInformation) {
-                // 结构: Header + Name + Padding + Data
-                // 注意：这里我们只修改 Data 部分 假设 Name 部分已经由 fpNtQueryValueKey 填充好了
-                // 如果原始查询失败(回退逻辑也没找到) 这里进不来 所以 info 里的 Name 是有效的
-
-                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-
-                // 如果原始状态是 SUCCESS 我们可以直接修改数据
-                // 如果原始状态是 OVERFLOW 我们需要重新计算大小
-
-                // 简单起见 如果原始调用成功读取了数据 我们检查是否有空间覆写
-                if (status == STATUS_SUCCESS) {
-                    if (info->DataLength >= fakeDataSize) {
-                        // 原数据空间足够 直接覆盖
-                        info->Type = REG_SZ;
-                        info->DataLength = fakeDataSize;
-                        // DataOffset 是相对于结构体起始的偏移
-                        memcpy((BYTE*)info + info->DataOffset, fakeVal.c_str(), fakeDataSize);
-                    } else {
-                        // 原数据空间不足 (例如原值是 "1252" 长度 10 我们要写 "936" 长度 8 通常够用)
-                        // 如果不够 返回 OVERFLOW
-                        // 但通常代码页字符串长度都很短 这里做个防御性编程
-                        // 如果空间不够 我们只能告诉调用者需要更多内存
-                        // 重新计算所需大小
-                        ULONG dataOffset = info->DataOffset;
-                        ULONG requiredSize = dataOffset + fakeDataSize;
-
-                        if (Length >= requiredSize) {
-                             info->Type = REG_SZ;
-                             info->DataLength = fakeDataSize;
-                             memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
-                        } else {
-                             status = STATUS_BUFFER_OVERFLOW;
-                             if (ResultLength) *ResultLength = requiredSize;
-                        }
-                    }
-                }
-                else if (status == STATUS_BUFFER_OVERFLOW) {
-                    // 如果原始查询就溢出了 我们需要修正 ResultLength
-                    // 原始 ResultLength 是基于真实值的 我们需要基于伪造值计算
-                    // 这比较麻烦 因为我们不知道 Name 有多长
-                    // 但通常程序会先查长度再分配内存
-                    // 此时我们无法修改 ResultLength 准确值 因为不知道 NameLength
-                    // 只能寄希望于程序分配足够大的缓冲区（通常 MAX_PATH）
-                    // 或者 我们可以忽略这次修正 等程序分配了内存再次调用时 会进入上面的 STATUS_SUCCESS 分支
                 }
             }
         }
@@ -9224,7 +9219,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtQueryValueKey  = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
         void* pNtRenameKey = (void*)GetProcAddress(hNtdll, "NtRenameKey");
 
-        // 获取 NtSetValueKey 指针用于写入复制（内部调用，不 Hook）
+        // 获取 NtSetValueKey 指针用于写入复制（内部调用 不 Hook）
         fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
         fpNtDeleteValueKey = (P_NtDeleteValueKey)GetProcAddress(hNtdll, "NtDeleteValueKey");
 
@@ -9234,7 +9229,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (pNtDeleteKey)     MH_CreateHook(pNtDeleteKey,     &Detour_NtDeleteKey,     reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
         if (pNtRenameKey) MH_CreateHook(pNtRenameKey, &Detour_NtRenameKey, reinterpret_cast<LPVOID*>(&fpNtRenameKey));
 
-        // [修复核心] 安装 NtQueryValueKey Hook，使沙盒中不存在的值能回退读取真实注册表
+        // [修复核心] 安装 NtQueryValueKey Hook 使沙盒中不存在的值能回退读取真实注册表
         if (pNtQueryValueKey) MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
 
         void* pNtEnumerateKey = (void*)GetProcAddress(hNtdll, "NtEnumerateKey");
