@@ -5127,54 +5127,36 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring regMountName;
     bool hiveLoadedByMe = false;
 
-    // 预先计算 finalHookPath 以便确定 Hive 位置
+    // 获取启动器基础名称用于挂载名
+    wchar_t ldrName[MAX_PATH];
+    GetModuleFileNameW(NULL, ldrName, MAX_PATH);
+    PathRemoveExtensionW(ldrName);
+    std::wstring baseNameStr = PathFindFileNameW(ldrName);
+
+    // 预先计算 finalHookPath
     std::wstring hookPathRaw = GetValueFromIniContent(data->iniContent, L"Hook", L"hookpath");
     std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, data->variables), data->variables);
 
     if (!hookRegVal.empty()) {
         SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
-
-        // 统一 Hive 文件名
-        std::wstring hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+        std::wstring hivePath = data->variables[L"YAPROOT"] + L"\\YapHookReg.dat";
         if (!finalHookPath.empty()) {
              hivePath = finalHookPath + L"\\YapHookReg.dat";
         }
 
-        // 使用启动器名称作为挂载点
-        regMountName = GetHiveMountName(baseNameStr);
-
-        // 3. 确保文件存在 (如果不存在则创建并初始化)
-        // 确保父目录存在
-        wchar_t parentDir[MAX_PATH];
-        wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
-        PathRemoveFileSpecW(parentDir);
-        SHCreateDirectoryExW(NULL, parentDir, NULL);
+        regMountName = GetHiveMountName(baseNameStr); // 使用 baseNameStr
 
         if (EnsureHiveFileExists(hivePath)) {
-            // 4. 尝试挂载到 HKEY_USERS
-            // 先检查是否已经挂载 (可能由其他实例挂载)
             HKEY hTest;
-            LSTATUS status = RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest);
-            if (status == ERROR_SUCCESS) {
+            if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest) == ERROR_SUCCESS) {
                 RegCloseKey(hTest);
-                // 已挂载 直接使用
             } else {
-                // 未挂载 尝试加载 (需要 SeRestorePrivilege)
-                status = RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
-                if (status == ERROR_SUCCESS) {
+                if (RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str()) == ERROR_SUCCESS) {
                     hiveLoadedByMe = true;
-                } else {
-                    // 加载失败 (可能是权限不足或文件被其他进程独占锁定)
-                    // 如果失败 子进程将无法进行注册表重定向
                 }
             }
-
-            // 5. 设置环境变量供 HookDll 使用
             SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
         }
-    } else {
-        SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
-        SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
     }
 
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
@@ -5664,6 +5646,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
 
+    // [修改] 提前定义 baseNameStr 确保作用域覆盖整个函数
+    wchar_t ldrNameBuf[MAX_PATH];
+    GetModuleFileNameW(NULL, ldrNameBuf, MAX_PATH);
+    PathRemoveExtensionW(ldrNameBuf);
+    std::wstring baseNameStr = PathFindFileNameW(ldrNameBuf);
+
     // 1. 获取启动器自身的文件名（不含路径和扩展名）
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
@@ -6038,7 +6026,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 2. [关键修复] 为后续实例设置完整环境变量 确保子进程继承
-            SetEnvironmentVariableW(L"YAP_IPC_PIPE", GetDeterministicPipeName(currentBaseName).c_str());
+            SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
