@@ -57,6 +57,9 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
+#define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
+
 // 标志位定义
 #define FILE_DISPOSITION_DELETE 0x00000001
 #define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
@@ -2671,13 +2674,13 @@ void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | DELETE, &oa))) {
         while (true) {
             ULONG len = 0;
-            // [修复] 使用 vector 保证内存对齐，并支持动态扩容
-            std::vector<BYTE> buf(1024); 
-            
+            // [修复] 使用 vector 保证内存对齐 并支持动态扩容
+            std::vector<BYTE> buf(1024);
+
             // 始终枚举 index=0 因为每次删除后列表会缩短
             NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
-            
-            // [修复] 处理缓冲区不足的情况，防止死循环或漏删
+
+            // [修复] 处理缓冲区不足的情况 防止死循环或漏删
             if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
                 buf.resize(len);
                 st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
@@ -2922,38 +2925,6 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
     }
 }
 
-// [新增] 注册表写入复制 (CoW) 辅助函数
-void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
-    if (!fpNtSetValueKey || !fpNtEnumerateValueKey) return;
-
-    ULONG index = 0;
-    ULONG len;
-    std::vector<BYTE> buf(4096);
-
-    while (true) {
-        NTSTATUS status = fpNtEnumerateValueKey(hRealKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
-
-        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-            buf.resize(len);
-            continue;
-        }
-
-        if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
-
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
-        UNICODE_STRING valueName;
-        valueName.Buffer = info->Name;
-        valueName.Length = (USHORT)info->NameLength;
-        valueName.MaximumLength = (USHORT)info->NameLength;
-
-        // [修复] 安全计算数据指针，防止 DataLength 为 0 时越界引发 0xc0000005
-        BYTE* pData = (info->DataLength > 0) ? ((BYTE*)info + info->DataOffset) : NULL;
-        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, pData, info->DataLength);
-
-        index++;
-    }
-}
-
 // [新增] 检查真实键是否存在 如果存在则在沙盒中创建结构 (影子键)
 bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent, ACCESS_MASK DesiredAccess = KEY_WRITE) {
     HANDLE hRealChild = NULL;
@@ -2975,10 +2946,6 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
 
     if (NT_SUCCESS(status)) {
-        // [修改] 仅当请求了写入权限时 才执行写入复制
-        if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-            CopyRegistryValues(hRealChild, hNewKey);
-        }
         fpNtClose(hNewKey);
         fpNtClose(hRealChild);
         return true;
@@ -3205,6 +3172,18 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
     // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    // [新增] 检查是否是值墓碑 (惰性 CoW 删除标记)
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+        ULONG type = 0;
+        if (KeyValueInformationClass == KeyValueBasicInformation) type = ((PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation)->Type;
+        else if (KeyValueInformationClass == KeyValueFullInformation) type = ((PKEY_VALUE_FULL_INFORMATION)KeyValueInformation)->Type;
+        else if (KeyValueInformationClass == KeyValuePartialInformation) type = ((PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation)->Type;
+
+        if (type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+            status = STATUS_OBJECT_NAME_NOT_FOUND; // 伪装成不存在
+        }
+    }
 
     // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
     // 且启用了注册表 Hook 尝试从缓存的真实句柄中读取
@@ -3484,18 +3463,18 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         if (pos != std::wstring::npos) {
                             tempPathToClean = targetSandboxFull.substr(0, pos) + L"\\" + tempName;
                         }
-                        // [修复] 重命名成功后，句柄 hCheck 现在指向临时键，保持打开状态以便后续清理，
-                        // 但需要确保后面 fpNtClose(hCheck) 正常执行。
+                        // [修复] 重命名成功后 句柄 hCheck 现在指向临时键 保持打开状态以便后续清理
+                        // 但需要确保后面 fpNtClose(hCheck) 正常执行
                     } else {
-                        // [关键修复] 重命名失败，必须先关闭句柄再尝试强制删除！
-                        // 否则 DeleteSandboxKeyRecursive 会因为句柄占用而删除失败，导致残留或崩溃
+                        // [关键修复] 重命名失败 必须先关闭句柄再尝试强制删除！
+                        // 否则 DeleteSandboxKeyRecursive 会因为句柄占用而删除失败 导致残留或崩溃
                         fpNtClose(hCheck);
                         hCheck = NULL;
                         DeleteSandboxKeyRecursive(targetSandboxFull);
                     }
                     InvalidateParentRegContext(targetSandboxFull);
                 }
-                // [修复] 确保在任何分支下，如果句柄仍有效，都正确关闭
+                // [修复] 确保在任何分支下 如果句柄仍有效 都正确关闭
                 if (hCheck) fpNtClose(hCheck);
             }
             else if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
@@ -3517,7 +3496,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
         // [核心修复] 绝对不能直接修改调用者传入的 ObjectAttributes！
-        // 必须创建一个局部副本，防止只读内存崩溃或多线程竞争导致 0xc0000005
+        // 必须创建一个局部副本 防止只读内存崩溃或多线程竞争导致 0xc0000005
         OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
         oaModified.ObjectName = &uStr;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
@@ -3551,6 +3530,29 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
                     if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaWrite))) {
                         ClearSandboxKeyValues(hWrite);
+                        
+                        // [新增] 写入值墓碑以屏蔽真实注册表的值（防止复活后真实值泄漏）
+                        HANDLE hRealCheck = NULL;
+                        OBJECT_ATTRIBUTES oaRealCheck;
+                        UNICODE_STRING usRealCheck;
+                        RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
+                        InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                            ULONG idx = 0, vlen = 0;
+                            std::vector<BYTE> vbuf(1024);
+                            while (true) {
+                                NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, vbuf.data(), (ULONG)vbuf.size(), &vlen);
+                                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { vbuf.resize(vlen); continue; }
+                                if (!NT_SUCCESS(st)) break;
+                                PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)vbuf.data();
+                                UNICODE_STRING vName;
+                                vName.Buffer = vinfo->Name;
+                                vName.Length = vName.MaximumLength = (USHORT)vinfo->NameLength;
+                                fpNtSetValueKey(hWrite, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
+                                idx++;
+                            }
+                            fpNtClose(hRealCheck);
+                        }
                         fpNtClose(hWrite);
                     }
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
@@ -3567,10 +3569,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                // 仅当确实是新建且非复活时 才复制真实值
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
-                    CopyRegistryValues(hReal, *KeyHandle);
-                }
             }
 
             // 更新缓存上下文
@@ -3634,9 +3632,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
             if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-                if (Disposition && *Disposition == REG_CREATED_NEW_KEY && !wasTombstoned) {
-                    CopyRegistryValues(hReal, *KeyHandle);
-                }
             }
         }
 
@@ -3784,7 +3779,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
                     ULONG disposition;
                     if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                        CopyRegistryValues(hRealCheck, hNewKey);
                         fpNtClose(hNewKey);
                         status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
                     }
@@ -3975,7 +3969,6 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
                     ULONG disposition;
                     if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
-                        CopyRegistryValues(hRealCheck, hNewKey);
                         fpNtClose(hNewKey);
                         status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
                     }
@@ -4254,6 +4247,15 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             std::transform(tombstoneKeyLower.begin(), tombstoneKeyLower.end(), tombstoneKeyLower.begin(), towlower);
             mergedValues.erase(tombstoneKeyLower);
 
+            // [新增] 过滤惰性 CoW 的值墓碑
+            for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
+                if (it->second.Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+                    it = mergedValues.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
@@ -4464,6 +4466,92 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         }
     }
     return fpNtDeleteKey(KeyHandle);
+}
+
+// --- [新增] 惰性 CoW 核心：拦截写入 ---
+NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex, ULONG Type, PVOID Data, ULONG DataSize) {
+    if (g_IsInHook || !g_HookReg) return fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+    RecursionGuard guard;
+
+    NTSTATUS status = fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+
+    // 如果返回拒绝访问，可能是程序拿着只读的真实句柄尝试写入
+    // 我们需要提权重新打开该键（这会触发 Detour_NtOpenKey 重定向到沙盒影子键）
+    if (status == STATUS_ACCESS_DENIED) {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+
+        HANDLE hTemp = NULL;
+        if (NT_SUCCESS(Detour_NtOpenKey(&hTemp, KEY_WRITE, &oa))) {
+            status = fpNtSetValueKey(hTemp, ValueName, TitleIndex, Type, Data, DataSize);
+            fpNtClose(hTemp);
+        }
+    }
+
+    // 写入成功后，使该键的枚举缓存失效
+    if (NT_SUCCESS(status)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            it->second->ValuesInitialized = false;
+            it->second->Values.clear();
+        }
+    }
+    return status;
+}
+
+// --- [新增] 惰性 CoW 核心：拦截删除 ---
+NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName) {
+    if (g_IsInHook || !g_HookReg) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    RecursionGuard guard;
+
+    NTSTATUS status = fpNtDeleteValueKey(KeyHandle, ValueName);
+
+    HANDLE hWrite = KeyHandle;
+    HANDLE hTemp = NULL;
+
+    // 尝试提权打开
+    if (status == STATUS_ACCESS_DENIED) {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+        if (NT_SUCCESS(Detour_NtOpenKey(&hTemp, KEY_WRITE, &oa))) {
+            hWrite = hTemp;
+            status = STATUS_SUCCESS; // 提权成功
+        }
+    }
+
+    // 检查当前操作的句柄是否在沙盒内
+    bool isSandboxHandle = false;
+    std::wstring path = GetPathFromHandle(hWrite);
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxHandle = true;
+    }
+
+    if (isSandboxHandle) {
+        // 沙盒内：写入墓碑屏蔽真实注册表
+        fpNtSetValueKey(hWrite, ValueName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
+        status = STATUS_SUCCESS;
+    } else if (hTemp) {
+        // 真实注册表（白名单）：提权后执行真正的删除
+        status = fpNtDeleteValueKey(hTemp, ValueName);
+    }
+
+    if (hTemp) fpNtClose(hTemp);
+
+    // 更新缓存
+    if (NT_SUCCESS(status)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            it->second->ValuesInitialized = false;
+            it->second->Values.clear();
+        }
+    }
+    return status;
 }
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
@@ -9472,11 +9560,11 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtOpenKeyEx      = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
         void* pNtDeleteKey      = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
         void* pNtRenameKey = (void*)GetProcAddress(hNtdll, "NtRenameKey");
+        void* pNtSetValueKey = (void*)GetProcAddress(hNtdll, "NtSetValueKey");
+        void* pNtDeleteValueKey = (void*)GetProcAddress(hNtdll, "NtDeleteValueKey");
 
-        // 获取 NtSetValueKey 指针用于写入复制（内部调用 不 Hook）
-        fpNtSetValueKey = (P_NtSetValueKey)GetProcAddress(hNtdll, "NtSetValueKey");
-        fpNtDeleteValueKey = (P_NtDeleteValueKey)GetProcAddress(hNtdll, "NtDeleteValueKey");
-
+        if (pNtSetValueKey) MH_CreateHook(pNtSetValueKey, &Detour_NtSetValueKey, reinterpret_cast<LPVOID*>(&fpNtSetValueKey));
+        if (pNtDeleteValueKey) MH_CreateHook(pNtDeleteValueKey, &Detour_NtDeleteValueKey, reinterpret_cast<LPVOID*>(&fpNtDeleteValueKey));
         if (pNtCreateKey)     MH_CreateHook(pNtCreateKey,     &Detour_NtCreateKey,     reinterpret_cast<LPVOID*>(&fpNtCreateKey));
         if (pNtOpenKey)       MH_CreateHook(pNtOpenKey,       &Detour_NtOpenKey,       reinterpret_cast<LPVOID*>(&fpNtOpenKey));
         if (pNtOpenKeyEx)     MH_CreateHook(pNtOpenKeyEx,     &Detour_NtOpenKeyEx,     reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
