@@ -3207,6 +3207,42 @@ NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
     return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
 
+// --- [新增/修复] 清空沙盒键下的所有值 ---
+void ClearSandboxKeyValues(HANDLE hKey) {
+    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
+    
+    // 循环删除直到没有值
+    while (true) {
+        ULONG len = 0;
+        BYTE buf[256]; // 只需要读取基础信息，不需要大缓冲区
+        
+        // 始终枚举第 0 个，因为删除后列表会前移
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, buf, sizeof(buf), &len);
+        
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        
+        // 如果缓冲区不足，我们只需要名字来删除，所以重新分配
+        std::vector<BYTE> dynamicBuf;
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf;
+        
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            dynamicBuf.resize(len);
+            st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
+            if (!NT_SUCCESS(st)) break;
+            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
+        } else if (!NT_SUCCESS(st)) {
+            break;
+        }
+
+        UNICODE_STRING uName;
+        uName.Buffer = info->Name;
+        uName.Length = (USHORT)info->NameLength;
+        uName.MaximumLength = (USHORT)info->NameLength;
+
+        fpNtDeleteValueKey(hKey, &uName);
+    }
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtQueryValueKey(
     HANDLE KeyHandle,
@@ -3429,7 +3465,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
-    // --- 1. 白名单检查 ---
+    // --- 1. 白名单检查 (保持不变) ---
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
     if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
@@ -3475,29 +3511,25 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             bool isResurrected = false;
             bool isNewKey = false;
 
-            if (Disposition) {
-                if (*Disposition == REG_CREATED_NEW_KEY) isNewKey = true;
-            }
+            if (Disposition && *Disposition == REG_CREATED_NEW_KEY) isNewKey = true;
 
             // [核心] 检查魔数时间戳 (复活逻辑)
             if (IsKeyMarkedDeleted(*KeyHandle)) {
-                // === 复活 (Resurrection) ===
                 // 1. 重置时间戳为当前时间 (取消删除标记)
                 SetKeyLastWriteTime(*KeyHandle, false);
-
+                
                 // 2. 清空该键下的所有值 (逻辑上这是个新键，不能残留旧值)
-                ClearSandboxKeyValues(*KeyHandle);
-
+                ClearSandboxKeyValues(*KeyHandle); 
+                
                 // 3. 标记为“新建”
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-
+                
                 isResurrected = true;
                 isNewKey = true; // 复活等同于新建
             }
 
             // [核心] 惰性 CoW 初始化：屏蔽真实值
             // 如果是新建的键（包括复活的），我们需要确保程序看不到真实注册表中该路径下的值
-            // 因为这是一个“覆盖”在真实键之上的新键。
             if (isNewKey) {
                 HANDLE hRealCheck = NULL;
                 OBJECT_ATTRIBUTES oaRealCheck;
@@ -3505,16 +3537,19 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
                 InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+                // 尝试打开真实键
                 if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                     ULONG idx = 0, vlen = 0;
                     std::vector<BYTE> vbuf(1024);
-
+                    BYTE dummyByte = 0; // [修复] 安全的 dummy 数据地址
+                    
                     // 枚举真实键的所有值，在沙盒键中写入“值墓碑”
                     while (true) {
                         NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, vbuf.data(), (ULONG)vbuf.size(), &vlen);
-                        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
-                            vbuf.resize(vlen);
-                            continue;
+                        
+                        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
+                            vbuf.resize(vlen); 
+                            continue; 
                         }
                         if (!NT_SUCCESS(st)) break;
 
@@ -3524,17 +3559,17 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         vName.Length = (USHORT)vinfo->NameLength;
                         vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                        // 写入值墓碑 (Type = YAPBOX_VALUE_TOMBSTONE_TYPE)
-                        // 这会阻止 Detour_NtQueryValueKey 读取到真实值
-                        fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
-
+                        // [修复] 写入值墓碑
+                        // 传入 &dummyByte 而不是 NULL，防止 0xc0000005 访问违规
+                        fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                        
                         idx++;
                     }
                     fpNtClose(hRealCheck);
                 }
             }
 
-            // 刷新父级缓存 (因为创建了新键)
+            // 刷新父级缓存
             InvalidateParentRegContext(targetSandboxFull);
 
             // 更新当前键的 Context
@@ -3567,13 +3602,10 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     // --- 3. 非重定向路径 (直接创建) ---
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-
-    // 同样需要处理魔数时间戳 (针对直接操作沙盒路径的情况)
+    
     if (NT_SUCCESS(status)) {
-        // 检查是否是沙盒路径
         if (isSandboxPath) {
              if (IsKeyMarkedDeleted(*KeyHandle)) {
-                // 复活逻辑
                 SetKeyLastWriteTime(*KeyHandle, false);
                 ClearSandboxKeyValues(*KeyHandle);
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
@@ -3581,7 +3613,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
              }
         }
 
-        // 更新缓存
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(*KeyHandle);
         if (it == g_RegContextMap.end()) {
