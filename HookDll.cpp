@@ -2725,6 +2725,43 @@ void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
     }
 }
 
+// [辅助函数] 从沙盒绝对路径反推真实绝对路径
+// 输入: \REGISTRY\USER\YapBoxReg_...\Machine\Software\Classes
+// 输出: \REGISTRY\MACHINE\SOFTWARE\Classes
+bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outReal) {
+    if (g_RegMountPathNt.empty()) return false;
+
+    // 检查前缀是否匹配沙盒挂载点 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
+
+    // 提取相对路径 (例如 \User\Software\Classes)
+    std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
+    if (relPath.empty() || relPath[0] != L'\\') return false;
+
+    std::wstring sub = relPath.substr(1); // 去掉开头的 \
+
+    // 根据子根进行反向映射 [修复] 使用不区分大小写的比较
+    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
+        outReal = L"\\REGISTRY\\USER" + sub.substr(5);
+    }
+    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
+        outReal = g_CurrentUserSidPath + sub.substr(4);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
+    }
+    else {
+        return false;
+    }
+    return true;
+}
+
 // 使指定沙盒路径的父键枚举缓存失效
 void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
     size_t pos = sandboxKeyPath.rfind(L'\\');
@@ -3139,43 +3176,6 @@ HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
         return hReal;
     }
     return NULL;
-}
-
-// [辅助函数] 从沙盒绝对路径反推真实绝对路径
-// 输入: \REGISTRY\USER\YapBoxReg_...\Machine\Software\Classes
-// 输出: \REGISTRY\MACHINE\SOFTWARE\Classes
-bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outReal) {
-    if (g_RegMountPathNt.empty()) return false;
-
-    // 检查前缀是否匹配沙盒挂载点 [修复] 使用 _wcsnicmp
-    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
-
-    // 提取相对路径 (例如 \User\Software\Classes)
-    std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
-    if (relPath.empty() || relPath[0] != L'\\') return false;
-
-    std::wstring sub = relPath.substr(1); // 去掉开头的 \
-
-    // 根据子根进行反向映射 [修复] 使用不区分大小写的比较
-    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
-        outReal = L"\\REGISTRY\\USER" + sub.substr(5);
-    }
-    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
-        outReal = g_CurrentUserSidPath + sub.substr(4);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
-    }
-    else {
-        return false;
-    }
-    return true;
 }
 
 // [新增] 确保绝对路径存在 (用于创建影子键)
