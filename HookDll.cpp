@@ -3567,19 +3567,35 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
             }
+            
+            // [关键修复] 复活墓碑键 = 用户创建了全新的键
+            // 不应将真实键句柄挂入 context，否则 QueryValueKey 回退逻辑
+            // 会把旧真实键的值注入进来，导致调用方读到意外数据 → 崩溃
+            if (wasTombstoned) {
+                if (hReal) { fpNtClose(hReal); hReal = NULL; }
+            }
 
             // 更新缓存上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                it->second->hRealKey = hReal;
-                it->second->FullPath = targetSandboxFull;
-                it->second->KeysInitialized = false;
-                it->second->ValuesInitialized = false;
-                it->second->SubKeys.clear();
-                it->second->Values.clear();
-            } else {
+                // [修复] 若路径不匹配说明是复用的旧句柄，先销毁旧 context
+                if (_wcsicmp(it->second->FullPath.c_str(), targetSandboxFull.c_str()) != 0) {
+                    if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                    delete it->second;
+                    it = g_RegContextMap.end();
+                    g_RegContextMap.erase(*KeyHandle);
+                } else {
+                    if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                    it->second->hRealKey = hReal;
+                    it->second->FullPath = targetSandboxFull;
+                    it->second->KeysInitialized = false;
+                    it->second->ValuesInitialized = false;
+                    it->second->SubKeys.clear();
+                    it->second->Values.clear();
+                }
+            }
+            if (it == g_RegContextMap.end()) {
                 RegContext* ctx = new RegContext();
                 ctx->FullPath = targetSandboxFull;
                 ctx->hRealKey = hReal;
@@ -3639,17 +3655,26 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(*KeyHandle);
         if (it != g_RegContextMap.end()) {
-            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-            it->second->hRealKey = hReal;
-            it->second->FullPath = fullNtPath;
-            it->second->KeysInitialized = false;
-            it->second->ValuesInitialized = false;
-            it->second->SubKeys.clear();
-            it->second->Values.clear();
-        } else {
+            // [修复] 路径不匹配 → 句柄被复用，销毁旧 context
+            if (_wcsicmp(it->second->FullPath.c_str(), fullNtPath.c_str()) != 0) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                delete it->second;
+                it = g_RegContextMap.end();
+                g_RegContextMap.erase(*KeyHandle);
+            } else {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = hReal;
+                it->second->FullPath = fullNtPath;
+                it->second->KeysInitialized = false;
+                it->second->ValuesInitialized = false;
+                it->second->SubKeys.clear();
+                it->second->Values.clear();
+            }
+        }
+        if (it == g_RegContextMap.end()) {
             RegContext* ctx = new RegContext();
             ctx->FullPath = fullNtPath;
-            ctx->hRealKey = NULL;
+            ctx->hRealKey = hReal;
             g_RegContextMap[*KeyHandle] = ctx;
         }
     }
