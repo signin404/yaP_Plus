@@ -3039,12 +3039,13 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
         ULONG len;
+        // 使用 vector 动态扩容，防止栈溢出
         std::vector<BYTE> buf(4096);
 
         while (true) {
+            // 使用 KeyNodeInformation，因为它包含 LastWriteTime
             NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
 
-            // 处理缓冲区不足的情况 (虽然预分配了4k 但仍可能不足)
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
                 if (len > buf.size()) buf.resize(len);
                 continue; // 重试
@@ -3058,10 +3059,10 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
 
             CachedRegKey entry;
             entry.Name = name;
-            entry.LastWriteTime = info->LastWriteTime;
+            entry.LastWriteTime = info->LastWriteTime; // [关键] 保存时间戳
             entry.TitleIndex = info->TitleIndex;
+            
             if (info->ClassLength > 0 && info->ClassOffset > 0) {
-                // 边界检查
                 if (info->ClassOffset + info->ClassLength <= buf.size()) {
                     entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
                 }
@@ -3069,6 +3070,10 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
 
             std::wstring keyName = name;
             std::transform(keyName.begin(), keyName.end(), keyName.begin(), towlower);
+            
+            // [关键] map[] 操作符会覆盖旧值。
+            // 如果沙盒里有同名键（墓碑），它会覆盖真实注册表的条目，
+            // 从而将 LastWriteTime 更新为魔数。
             map[keyName] = entry;
 
             index++;
@@ -4023,31 +4028,22 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
     if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     RecursionGuard guard;
 
-    // 1. 获取当前句柄的真实 NT 路径 (这是唯一真理)
+    // 1. 获取当前句柄的真实 NT 路径
     std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
     if (currentNtPath.empty()) {
         return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
 
-    // 2. 解析出用于合并的 Real/Sandbox 路径
-    std::wstring realPath, sandboxPath;
-    // 注意：这里传入 currentNtPath 避免 GetRegPaths 内部再次调用 GetPathFromHandle
-    // 我们需要稍微修改 GetRegPaths 或者在这里手动处理 为了性能 建议复用 currentNtPath
-    // 这里为了代码改动最小化 我们假设 GetRegPaths 会再次获取路径 或者我们手动实现路径判断逻辑
-    // 为了稳妥 我们先用 currentNtPath 进行缓存校验
-
     RegContext* ctx = nullptr;
     bool needsBuild = false;
 
-    // 3. 检查缓存并校验身份
+    // 2. 检查缓存
     {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex); // 使用写锁 因为可能需要删除过期缓存
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
 
         if (it != g_RegContextMap.end()) {
-            // [关键修复] 检查缓存的路径与当前句柄路径是否一致 (忽略大小写)
             if (_wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
-                // 句柄被复用了！旧缓存是脏数据 必须清除
                 delete it->second;
                 g_RegContextMap.erase(it);
                 needsBuild = true;
@@ -4059,38 +4055,38 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             needsBuild = true;
         }
 
-        // 如果需要构建 先占位
         if (needsBuild && ctx == nullptr) {
             ctx = new RegContext();
-            ctx->FullPath = currentNtPath; // [关键] 绑定当前路径
+            ctx->FullPath = currentNtPath;
             g_RegContextMap[KeyHandle] = ctx;
         }
     }
 
-    // 4. 构建合并列表 (无锁操作)
+    // 3. 构建合并列表
     if (needsBuild) {
+        std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             std::map<std::wstring, CachedRegKey> mergedKeys;
 
             // A. 枚举真实路径
             EnumerateKeysToMap(realPath, mergedKeys);
 
-            // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
+            // B. HKCR 特殊合并
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
                 std::wstring subPath = realPath.substr(34);
                 std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
                 EnumerateKeysToMap(userClassesPath, mergedKeys);
             }
 
-            // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
+            // C. 枚举沙盒路径 (覆盖真实路径)
+            // 此时，如果沙盒中有墓碑键，它会覆盖真实键，并将 LastWriteTime 设为魔数
             EnumerateKeysToMap(sandboxPath, mergedKeys);
 
-            // [修正] D. 过滤带魔数时间戳的子键
-            // 注意：这里变量名必须是 mergedKeys (Map<wstring, CachedRegKey>)
+            // [核心修复] D. 过滤掉所有被标记为删除（魔数时间戳）的键
+            // 这样应用程序就看不到它们了，从而认为该名称可用
             for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
-                // 检查 CachedRegKey 中的 LastWriteTime
                 if (IsDeleteMark(it->second.LastWriteTime)) {
-                    it = mergedKeys.erase(it); // 从列表中移除
+                    it = mergedKeys.erase(it); // 从列表中彻底移除
                 } else {
                     ++it;
                 }
@@ -4099,7 +4095,6 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
                 ctx->SubKeys.clear();
@@ -4107,23 +4102,21 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
                 ctx->KeysInitialized = true;
             }
         } else {
+            // 无法获取路径，回退到原始调用
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end()) {
                 delete it->second;
                 g_RegContextMap.erase(it);
-                return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
             }
+            return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
         }
     }
 
-    // 5. 从缓存读取数据
+    // 4. 从缓存读取数据
     std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-
-    // 再次校验 ctx 有效性
     auto it = g_RegContextMap.find(KeyHandle);
     if (it == g_RegContextMap.end() || _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
-        // 极端并发情况：缓存被删除了
         return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
     }
     ctx = it->second;
