@@ -3425,7 +3425,7 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
 
     return status;
 }
-
+-
 NTSTATUS NTAPI Detour_NtCreateKey(
     PHANDLE KeyHandle,
     ACCESS_MASK DesiredAccess,
@@ -3481,56 +3481,75 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         oaModified.ObjectName = &uStr;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
 
-        // 直接尝试创建/打开沙盒键
+        // 尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
         if (NT_SUCCESS(status)) {
-            // [核心修复] 使用临时句柄检查并处理墓碑复活
             HANDLE hMaintenance = NULL;
             OBJECT_ATTRIBUTES oaMaint;
             UNICODE_STRING usMaint;
             RtlInitUnicodeString(&usMaint, targetSandboxFull.c_str());
             InitializeObjectAttributes(&oaMaint, &usMaint, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            // 打开用于维护的句柄
+            // 打开维护句柄
             NTSTATUS maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
             if (!NT_SUCCESS(maintStatus)) {
                 maintStatus = fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaMaint);
             }
 
             bool isNewKey = false;
-            
+            bool needsResurrect = false;
+
             if (NT_SUCCESS(maintStatus)) {
                 // 检查是否被标记为删除 (墓碑)
                 if (IsKeyMarkedDeleted(hMaintenance)) {
-                    // === 策略修改：物理删除后重建，而非仅修改时间戳 ===
-                    // 这解决了时间戳修改失败或权限不足导致“刷新后消失”的问题
+                    // === 策略：尝试物理删除，失败则就地复活 ===
                     
-                    // 1. 关闭维护句柄和用户句柄，否则无法物理删除
+                    // 1. 关闭维护句柄和用户句柄
                     fpNtClose(hMaintenance);
                     hMaintenance = NULL;
-                    fpNtClose(*KeyHandle);
+                    
+                    // 保存用户句柄副本以便关闭
+                    HANDLE hUserTmp = *KeyHandle;
                     *KeyHandle = NULL;
 
-                    // 2. 物理递归删除该键
-                    DeleteSandboxKeyRecursive(targetSandboxFull);
-
-                    // 3. 重新创建键
-                    status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+                    // 2. 尝试物理递归删除
+                    NTSTATUS delSt = DeleteSandboxKeyRecursive(targetSandboxFull);
                     
-                    if (!NT_SUCCESS(status)) {
-                         // 创建失败，直接返回错误
-                         return status;
+                    if (NT_SUCCESS(delSt)) {
+                        // 3a. 物理删除成功 -> 重新创建
+                        status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+                        if (!NT_SUCCESS(status)) {
+                            fpNtClose(hUserTmp);
+                            return status; // 创建失败
+                        }
+                        isNewKey = true; // 这是一个全新的键
+                    } else {
+                        // 3b. 物理删除失败 (可能权限不足或被占用) -> 就地复活
+                        // 恢复用户句柄
+                        *KeyHandle = hUserTmp;
+                        
+                        // 重置时间戳 (复活)
+                        SetKeyLastWriteTime(*KeyHandle, false);
+                        
+                        // 清空该键下的所有值 (防止旧数据残留)
+                        ClearSandboxKeyValues(*KeyHandle);
+                        
+                        isNewKey = true;
+                        needsResurrect = true;
+                    }
+                    
+                    // 关闭旧句柄 (如果是物理删除成功的情况，hUserTmp 已经无效，但关闭 NULL 是安全的；如果是复活，需要重新获取维护句柄)
+                    if (!needsResurrect) {
+                         fpNtClose(hUserTmp); // 关闭指向已删除键的旧句柄
                     }
 
-                    // 4. 重新打开维护句柄
-                    maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
-                    if (!NT_SUCCESS(maintStatus)) {
-                        maintStatus = fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaMaint);
+                    // 如果是复活或新建，重新打开维护句柄用于后续写入墓碑
+                    if (isNewKey) {
+                        maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
+                        if (!NT_SUCCESS(maintStatus)) maintStatus = fpNtOpenKey(&hMaintenance, KEY_SET_VALUE, &oaMaint);
                     }
 
-                    // 标记为新建，后续需屏蔽真实值
-                    isNewKey = true; 
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 }
                 else {
@@ -3541,7 +3560,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 }
 
                 // [核心] 惰性 CoW 初始化：屏蔽真实值
-                // 仅当 isNewKey 为 true 时执行 (包含复活和新创建的情况)
+                // 仅当 isNewKey 为 true 时执行
                 if (isNewKey && NT_SUCCESS(maintStatus)) {
                     HANDLE hRealCheck = NULL;
                     OBJECT_ATTRIBUTES oaRealCheck;
@@ -3575,7 +3594,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             vName.Length = (USHORT)vinfo->NameLength;
                             vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                            // 写入值墓碑 (使用 hMaintenance 句柄)
+                            // 写入值墓碑
                             fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
                             
                             idx++;
@@ -3587,10 +3606,9 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 if (hMaintenance) fpNtClose(hMaintenance);
             }
 
-            // 刷新父级缓存
             InvalidateParentRegContext(targetSandboxFull);
 
-            // 更新当前键的 Context
+            // 更新 Context
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
@@ -3622,7 +3640,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     
     if (NT_SUCCESS(status)) {
-        // ... (保持原有的非重定向逻辑不变) ...
         if (isSandboxPath) {
              HANDLE hMaint = NULL;
              OBJECT_ATTRIBUTES oaM;
@@ -3632,16 +3649,29 @@ NTSTATUS NTAPI Detour_NtCreateKey(
              
              if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
                  if (IsKeyMarkedDeleted(hMaint)) {
-                    // 同样应用物理删除策略
+                    // 同样应用 物理删除/复活 策略
                     fpNtClose(hMaint);
                     fpNtClose(*KeyHandle);
                     *KeyHandle = NULL;
-                    DeleteSandboxKeyRecursive(fullNtPath);
-                    status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-                    if (NT_SUCCESS(status)) {
-                        if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                        InvalidateParentRegContext(fullNtPath);
+                    
+                    if (NT_SUCCESS(DeleteSandboxKeyRecursive(fullNtPath))) {
+                         status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+                         if (!NT_SUCCESS(status)) return status;
+                    } else {
+                         // 恢复句柄并复活
+                         *KeyHandle = hMaint; // 注意这里逻辑需严谨，实际上应重新打开，但简化起见假设之前的句柄还在（实际上上面关闭了）
+                         // 为安全起见，针对非重定向路径，简单的重置时间戳和清值即可
+                         // 重新打开句柄
+                         fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM);
+                         SetKeyLastWriteTime(hMaint, false);
+                         ClearSandboxKeyValues(hMaint);
+                         fpNtClose(hMaint);
+                         // 重新打开用户句柄
+                         status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaM);
                     }
+                    
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    InvalidateParentRegContext(fullNtPath);
                  } else {
                      fpNtClose(hMaint);
                  }
