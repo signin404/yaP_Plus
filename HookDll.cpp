@@ -2725,41 +2725,6 @@ void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
     }
 }
 
-// 使指定沙盒路径的父键枚举缓存失效
-void InvalidateParentRegContext(const std::wstring& keyPath) {
-    size_t pos = keyPath.rfind(L'\\');
-    if (pos == std::wstring::npos) return;
-    std::wstring parentPath = keyPath.substr(0, pos);
-
-    // 推导父级的"另一面"路径（沙盒 ↔ 真实），确保两种句柄的缓存都被清除
-    std::wstring altParentPath;
-    if (!g_RegMountPathNt.empty() &&
-        _wcsnicmp(parentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0)
-    {
-        // parentPath 是沙盒路径 → 推导对应的真实路径
-        GetRealFromSandboxPath(parentPath, altParentPath);
-    }
-    else
-    {
-        // parentPath 是真实路径 → 推导对应的沙盒路径
-        std::wstring relPath;
-        if (ShouldRedirectReg(parentPath, relPath)) {
-            altParentPath = g_RegMountPathNt + L"\\" + relPath;
-        }
-    }
-
-    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-    for (auto& pair : g_RegContextMap) {
-        const std::wstring& fp = pair.second->FullPath;
-        if (_wcsicmp(fp.c_str(), parentPath.c_str()) == 0 ||
-            (!altParentPath.empty() && _wcsicmp(fp.c_str(), altParentPath.c_str()) == 0))
-        {
-            pair.second->KeysInitialized = false;
-            pair.second->SubKeys.clear();
-        }
-    }
-}
-
 // 枚举沙盒路径下带有墓碑标记的子键名 (小写) 写入集合
 void CollectTombstonedKeys(const std::wstring& sandboxPath, std::set<std::wstring>& tombstones) {
     if (!fpNtOpenKey || !fpNtEnumerateKey || !fpNtQueryValueKey) return;
@@ -3204,6 +3169,41 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
         std::wstring relPath = fullSandboxPath.substr(g_RegMountPathNt.length());
         if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
         EnsureRegPathExistsRelative(relPath);
+    }
+}
+
+// 使指定沙盒路径的父键枚举缓存失效
+void InvalidateParentRegContext(const std::wstring& keyPath) {
+    size_t pos = keyPath.rfind(L'\\');
+    if (pos == std::wstring::npos) return;
+    std::wstring parentPath = keyPath.substr(0, pos);
+
+    // 推导父级的"另一面"路径（沙盒 ↔ 真实），确保两种句柄的缓存都被清除
+    std::wstring altParentPath;
+    if (!g_RegMountPathNt.empty() &&
+        _wcsnicmp(parentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0)
+    {
+        // parentPath 是沙盒路径 → 推导对应的真实路径
+        GetRealFromSandboxPath(parentPath, altParentPath);
+    }
+    else
+    {
+        // parentPath 是真实路径 → 推导对应的沙盒路径
+        std::wstring relPath;
+        if (ShouldRedirectReg(parentPath, relPath)) {
+            altParentPath = g_RegMountPathNt + L"\\" + relPath;
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+    for (auto& pair : g_RegContextMap) {
+        const std::wstring& fp = pair.second->FullPath;
+        if (_wcsicmp(fp.c_str(), parentPath.c_str()) == 0 ||
+            (!altParentPath.empty() && _wcsicmp(fp.c_str(), altParentPath.c_str()) == 0))
+        {
+            pair.second->KeysInitialized = false;
+            pair.second->SubKeys.clear();
+        }
     }
 }
 
