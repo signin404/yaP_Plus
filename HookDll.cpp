@@ -2652,29 +2652,35 @@ bool HasTombstone(HANDLE hKey, bool* accessDenied = nullptr) {
 // --- [新增] 清除键的所有值 (用于复活墓碑键时) ---
 void ClearSandboxKeyValues(HANDLE hKey) {
     if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
-    ULONG index = 0;
-    ULONG len;
-    std::vector<BYTE> buf(1024);
-    std::vector<std::wstring> valueNames;
-
-    // 1. 先收集所有值名 防止边删边枚举导致死循环或遗漏
+    
+    // 循环删除直到没有值
     while (true) {
-        NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+        ULONG len = 0;
+        BYTE buf[256]; // 只需要读取基础信息，不需要大缓冲区
+        
+        // 始终枚举第 0 个，因为删除后列表会前移
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, buf, sizeof(buf), &len);
+        
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        
+        // 如果缓冲区不足，我们只需要名字来删除，所以重新分配
+        std::vector<BYTE> dynamicBuf;
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf;
+        
         if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
-            buf.resize(len);
-            continue;
+            dynamicBuf.resize(len);
+            st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
+            if (!NT_SUCCESS(st)) break;
+            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
+        } else if (!NT_SUCCESS(st)) {
+            break;
         }
-        if (!NT_SUCCESS(st) || st == STATUS_NO_MORE_ENTRIES) break;
 
-        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf.data();
-        valueNames.push_back(std::wstring(info->Name, info->NameLength / sizeof(WCHAR)));
-        index++;
-    }
-
-    // 2. 统一删除 (这也会一并删掉 _YapBoxDeleted 墓碑)
-    for (const auto& name : valueNames) {
         UNICODE_STRING uName;
-        RtlInitUnicodeString(&uName, name.c_str());
+        uName.Buffer = info->Name;
+        uName.Length = (USHORT)info->NameLength;
+        uName.MaximumLength = (USHORT)info->NameLength;
+
         fpNtDeleteValueKey(hKey, &uName);
     }
 }
@@ -3205,42 +3211,6 @@ NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
 
     // 需要 KEY_SET_VALUE 权限
     return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
-}
-
-// --- [新增/修复] 清空沙盒键下的所有值 ---
-void ClearSandboxKeyValues(HANDLE hKey) {
-    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
-    
-    // 循环删除直到没有值
-    while (true) {
-        ULONG len = 0;
-        BYTE buf[256]; // 只需要读取基础信息，不需要大缓冲区
-        
-        // 始终枚举第 0 个，因为删除后列表会前移
-        NTSTATUS st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, buf, sizeof(buf), &len);
-        
-        if (st == STATUS_NO_MORE_ENTRIES) break;
-        
-        // 如果缓冲区不足，我们只需要名字来删除，所以重新分配
-        std::vector<BYTE> dynamicBuf;
-        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf;
-        
-        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
-            dynamicBuf.resize(len);
-            st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
-            if (!NT_SUCCESS(st)) break;
-            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
-        } else if (!NT_SUCCESS(st)) {
-            break;
-        }
-
-        UNICODE_STRING uName;
-        uName.Buffer = info->Name;
-        uName.Length = (USHORT)info->NameLength;
-        uName.MaximumLength = (USHORT)info->NameLength;
-
-        fpNtDeleteValueKey(hKey, &uName);
-    }
 }
 
 // --- 注册表 NT API Hook 实现 ---
