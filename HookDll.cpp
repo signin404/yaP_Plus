@@ -20,6 +20,7 @@
 #include <shellapi.h>
 #include <numeric>
 #include <set>
+#include <ntstatus.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
