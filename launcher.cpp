@@ -5460,7 +5460,19 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         // 尝试卸载 Hive
         // 注意：如果子进程尚未完全退出或有句柄泄露 RegUnLoadKeyW 可能会失败
         // 这是正常的系统行为 (Lazy Unload) 系统会在所有句柄关闭后最终卸载它
-        RegUnLoadKeyW(HKEY_USERS, data->regMountName.c_str());
+        
+        // [修改] 添加重试机制：如果卸载失败，每隔1秒重试1次，总共重试10次
+        for (int retry = 0; retry <= 10; ++retry) {
+            LSTATUS status = RegUnLoadKeyW(HKEY_USERS, data->regMountName.c_str());
+            if (status == ERROR_SUCCESS) {
+                break; // 卸载成功，跳出重试循环
+            }
+            
+            if (retry < 10) {
+                Sleep(1000); // 卸载失败，等待 1 秒后重试
+            }
+            // 如果 retry == 10 依然失败，循环将自然结束，放弃卸载并继续执行后续操作
+        }
 
         // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)
         if (!data->hivePath.empty()) {

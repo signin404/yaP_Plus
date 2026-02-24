@@ -2804,7 +2804,8 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
 
-    if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) return false;
+    // [修复] 使用不区分大小写的 _wcsnicmp 替换 find
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) return false;
 
     // [新增] === 关键修复：白名单检查 ===
     // 如果是 COM、音频、驱动相关路径 强制直通真实注册表
@@ -2981,27 +2982,27 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
     std::wstring keyPath = GetPathFromHandle(hKey);
     if (keyPath.empty()) return false;
 
-    // 检查是否在沙盒内
-    if (g_HookReg && !g_RegMountPathNt.empty() && keyPath.find(g_RegMountPathNt) == 0) {
-        // ... (沙盒路径反向映射逻辑保持不变) ...
+    // 检查是否在沙盒内 [修复] 使用 _wcsnicmp
+    if (g_HookReg && !g_RegMountPathNt.empty() && _wcsnicmp(keyPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         outSandbox = keyPath;
         std::wstring relPath = keyPath.substr(g_RegMountPathNt.length());
         if (relPath.empty() || relPath[0] != L'\\') return false;
         std::wstring sub = relPath.substr(1);
 
-        if (sub == L"Machine" || sub.find(L"Machine\\") == 0) {
+        // [修复] 使用不区分大小写的比较
+        if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
             outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
         }
-        else if (sub == L"Users" || sub.find(L"Users\\") == 0) { // 提到前面或使用精确匹配均可
+        else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
             outReal = L"\\REGISTRY\\USER" + sub.substr(5);
         }
-        else if (sub == L"User" || sub.find(L"User\\") == 0) {
+        else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
             outReal = g_CurrentUserSidPath + sub.substr(4);
         }
-        else if (sub == L"Classes" || sub.find(L"Classes\\") == 0) {
+        else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
             outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
         }
-        else if (sub == L"Config" || sub.find(L"Config\\") == 0) {
+        else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
             outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
         }
         else {
@@ -3013,10 +3014,6 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
         // 句柄指向真实路径
         outReal = keyPath;
         std::wstring relPath;
-
-        // [新增] 针对 HKCR 的特殊检查
-        // 如果路径是 \REGISTRY\MACHINE\SOFTWARE\Classes 它可能被视为 HKLM 但我们需要确保它被正确重定向到 Classes 挂载点
-        // ShouldRedirectReg 已经处理了 Classes 前缀 所以这里通常没问题
 
         if (ShouldRedirectReg(outReal, relPath)) {
             outSandbox = g_RegMountPathNt + L"\\" + relPath;
@@ -3139,8 +3136,8 @@ HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
 bool IsSandboxPathAndGetReal(const std::wstring& sandboxPath, std::wstring& outReal) {
     if (g_RegMountPathNt.empty()) return false;
 
-    // 检查前缀
-    if (sandboxPath.find(g_RegMountPathNt) != 0) return false;
+    // 检查前缀 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
 
     // 提取相对路径 (例如 \User\Software\Rime)
     std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
@@ -3148,20 +3145,20 @@ bool IsSandboxPathAndGetReal(const std::wstring& sandboxPath, std::wstring& outR
 
     std::wstring sub = relPath.substr(1); // 去掉开头的 \
 
-    // 根据子根进行映射
-    if (sub == L"Machine" || sub.find(L"Machine\\") == 0) {
+    // 根据子根进行映射 [修复] 使用不区分大小写的比较
+    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
         outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
     }
-    else if (sub == L"Users" || sub.find(L"Users\\") == 0) { // 提到前面或使用精确匹配均可
+    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
         outReal = L"\\REGISTRY\\USER" + sub.substr(5);
     }
-    else if (sub == L"User" || sub.find(L"User\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
         outReal = g_CurrentUserSidPath + sub.substr(4);
     }
-    else if (sub == L"Classes" || sub.find(L"Classes\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
         outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
     }
-    else if (sub == L"Config" || sub.find(L"Config\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
         outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
     }
     else {
@@ -3176,8 +3173,8 @@ bool IsSandboxPathAndGetReal(const std::wstring& sandboxPath, std::wstring& outR
 bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outReal) {
     if (g_RegMountPathNt.empty()) return false;
 
-    // 检查前缀是否匹配沙盒挂载点
-    if (sandboxPath.find(g_RegMountPathNt) != 0) return false;
+    // 检查前缀是否匹配沙盒挂载点 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
 
     // 提取相对路径 (例如 \User\Software\Classes)
     std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
@@ -3185,20 +3182,20 @@ bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outRe
 
     std::wstring sub = relPath.substr(1); // 去掉开头的 \
 
-    // 根据子根进行反向映射
-    if (sub == L"Machine" || sub.find(L"Machine\\") == 0) {
+    // 根据子根进行反向映射 [修复] 使用不区分大小写的比较
+    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
         outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
     }
-    else if (sub == L"Users" || sub.find(L"Users\\") == 0) { // 提到前面或使用精确匹配均可
+    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
         outReal = L"\\REGISTRY\\USER" + sub.substr(5);
     }
-    else if (sub == L"User" || sub.find(L"User\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
         outReal = g_CurrentUserSidPath + sub.substr(4);
     }
-    else if (sub == L"Classes" || sub.find(L"Classes\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
         outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
     }
-    else if (sub == L"Config" || sub.find(L"Config\\") == 0) {
+    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
         outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
     }
     else {
@@ -3213,8 +3210,8 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     if (fullSandboxPath.empty()) return;
 
     // 我们需要逐级创建为了简单 我们利用 EnsureRegPathExistsRelative
-    // 先转成相对路径
-    if (fullSandboxPath.find(g_RegMountPathNt) == 0) {
+    // 先转成相对路径 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(fullSandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         std::wstring relPath = fullSandboxPath.substr(g_RegMountPathNt.length());
         if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
         EnsureRegPathExistsRelative(relPath);
@@ -3346,9 +3343,9 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
         return fpNtRenameKey(KeyHandle, NewName);
     RecursionGuard guard;
 
-    // 只处理沙盒内的句柄
+    // 只处理沙盒内的句柄 [修复] 使用 _wcsnicmp
     std::wstring currentPath = GetPathFromHandle(KeyHandle);
-    if (currentPath.empty() || currentPath.find(g_RegMountPathNt) != 0)
+    if (currentPath.empty() || _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0)
         return fpNtRenameKey(KeyHandle, NewName);
 
     // 构造目标沙盒路径
@@ -3435,7 +3432,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
 
-    if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
+    // [修复] 使用 _wcsnicmp
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         isSandboxPath = true;
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
@@ -3631,7 +3629,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         bool wasTombstoned = false;
         bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
 
-        if (checkTomb && !g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
+        // [修复] 使用 _wcsnicmp
+        if (checkTomb && !g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
             if (hasTomb) {
@@ -3700,7 +3699,8 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     bool isSandboxPath = false;
     std::wstring realPathCandidate;
 
-    if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
+    // [修复] 使用 _wcsnicmp
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         isSandboxPath = true;
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
@@ -3742,7 +3742,8 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     if (NT_SUCCESS(status)) {
         std::wstring openedPath = GetPathFromHandle(*KeyHandle);
-        if (!openedPath.empty() && openedPath.find(g_RegMountPathNt) == 0) {
+        // [修复] 使用 _wcsnicmp
+        if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
             if (!hasTomb && accessDenied) {
@@ -3895,7 +3896,8 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
     bool isSandboxPath = false;
     std::wstring realPathCandidate;
 
-    if (!g_RegMountPathNt.empty() && fullNtPath.find(g_RegMountPathNt) == 0) {
+    // [修复] 使用 _wcsnicmp
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         isSandboxPath = true;
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
@@ -3933,7 +3935,8 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     if (NT_SUCCESS(status)) {
         std::wstring openedPath = GetPathFromHandle(*KeyHandle);
-        if (!openedPath.empty() && openedPath.find(g_RegMountPathNt) == 0) {
+        // [修复] 使用 _wcsnicmp
+        if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
             if (!hasTomb && accessDenied) {
@@ -4376,11 +4379,9 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
 
-    // ========================================================================
     // [核心修复 1] 检查合并视图中是否还有子键
     // 如果有 必须返回 STATUS_CANNOT_DELETE (0xC0000121)
     // 否则会破坏应用程序的递归删除逻辑（如 RegDeleteTree） 导致 0xc0000005 崩溃
-    // ========================================================================
     bool hasSubkeys = false;
     {
         g_IsInHook = false; // 临时解除 RecursionGuard 以便调用我们自己的 Detour_NtEnumerateKey
@@ -4413,9 +4414,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         return 0xC0000121; // STATUS_CANNOT_DELETE
     }
 
-    // ========================================================================
     // [核心修复 2] 增加缓冲区大小并进行边界检查 防止 NtQueryObject 越界写入导致堆破坏
-    // ========================================================================
     ULONG len = 0;
     fpNtQueryObject(KeyHandle, ObjectNameInformation, NULL, 0, &len);
     if (len > 0) {
@@ -4433,7 +4432,8 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
                 std::wstring path(nameInfo->Name.Buffer, strLen / sizeof(WCHAR));
 
-                if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && path.find(g_RegMountPathNt) == 0) {
+                // [修复] 使用 _wcsnicmp
+                if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
                     // --- 沙盒键 ---
                     std::wstring realPath;
                     if (IsSandboxPathAndGetReal(path, realPath)) {
