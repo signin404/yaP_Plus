@@ -3506,17 +3506,29 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 // 检查是否是“已删除”的键 (墓碑)
                 if (IsKeyMarkedDeleted(hMaintenance)) {
                     // === 复活 (Resurrection) ===
-                    // 1. 重置时间戳为当前时间
-                    SetKeyLastWriteTime(hMaintenance, false);
-                    
-                    // 2. 清空该键下的所有值
-                    ClearSandboxKeyValues(hMaintenance); 
-                    
-                    // 3. 标记为“新建”
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                    
-                    isResurrected = true;
-                    isNewKey = true;
+    // ✅ 关键修复：先物理删除整个墓碑键（避免保留旧时间戳）
+    fpNtClose(hMaintenance);
+    DeleteSandboxKeyRecursive(targetSandboxFull);
+
+    // 重新创建一个干净的新键
+    HANDLE hRecreate = NULL;
+    ULONG disp2;
+    if (NT_SUCCESS(fpNtCreateKey(&hRecreate,
+                                 KEY_READ | KEY_WRITE,
+                                 &oaMaint,
+                                 0,
+                                 NULL,
+                                 0,
+                                 &disp2))) {
+
+        ClearSandboxKeyValues(hRecreate);
+        fpNtClose(hRecreate);
+    }
+
+    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+
+    isResurrected = true;
+    isNewKey = true;
                 }
                 else {
                     // 常规新建检查
@@ -3659,14 +3671,15 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         realPathCandidate = fullNtPath;
     }
 
-    // 3. [核心修复] 白名单检查
+    // 3. [核心修复] 白名单检查 (DirectSound/Drivers 等)
+    // 如果是系统关键路径 强制使用绝对路径打开真实键 丢弃可能指向沙盒的 RootDirectory
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
 
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
-        oaReal.RootDirectory = NULL; 
+        oaReal.RootDirectory = NULL; // 丢弃父句柄
 
         return fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
     }
@@ -3677,6 +3690,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
+    // 如果不是沙盒路径 且符合重定向规则 (例如 HKLM\Software\MyGame)
     if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
@@ -3684,41 +3698,15 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         isRedirectedRoot = true;
     }
 
+    // 调用原始函数
     NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
-    // === [修复] 删除标记检查增强 ===
-    bool isDeletedTombstone = false;
     if (NT_SUCCESS(status)) {
-        bool isDeleted = false;
-        
-        // 1. 尝试使用当前句柄直接检查
+        // 检查是否被标记为删除
         if (IsKeyMarkedDeleted(*KeyHandle)) {
-            isDeleted = true;
-        }
-        else {
-            // 2. 如果直接检查失败（可能权限不足），尝试以查询权限重新打开验证
-            std::wstring openedPath = GetPathFromHandle(*KeyHandle);
-            if (!openedPath.empty()) {
-                HANDLE hCheck = NULL;
-                OBJECT_ATTRIBUTES oaCheck;
-                UNICODE_STRING usCheck;
-                RtlInitUnicodeString(&usCheck, openedPath.c_str());
-                InitializeObjectAttributes(&oaCheck, &usCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                
-                if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
-                    if (IsKeyMarkedDeleted(hCheck)) {
-                        isDeleted = true;
-                    }
-                    fpNtClose(hCheck);
-                }
-            }
-        }
-
-        if (isDeleted) {
             fpNtClose(*KeyHandle);
             *KeyHandle = NULL;
-            status = STATUS_OBJECT_NAME_NOT_FOUND;
-            isDeletedTombstone = true; // 标记为已删除的墓碑，阻止后续回退
+            return STATUS_OBJECT_NAME_NOT_FOUND; // 告诉程序找不到
         }
     }
 
@@ -3727,6 +3715,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     if (NT_SUCCESS(status)) {
         std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+        // [修复] 使用 _wcsnicmp
         if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
@@ -3746,13 +3735,12 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                 *KeyHandle = NULL;
                 status = STATUS_OBJECT_NAME_NOT_FOUND;
                 isTombstoned = true;
-                isDeletedTombstone = true; // 同样标记，阻止回退
             }
         }
     }
 
-    // [核心修复] 只有当键确实不存在(且不是因为被删除导致的不存在)时，才进行回退
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND && !isDeletedTombstone) {
+    // 如果沙盒中未找到 且不是因为墓碑导致的 尝试读取真实注册表 (Copy-on-Read / Fallback)
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && !isTombstoned) {
         std::wstring realPathForCheck;
         bool canCheckReal = false;
 
@@ -3770,12 +3758,13 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+            // [修复] 动态计算回退权限：剔除写权限 保留请求的读/枚举权限
             ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                    // 写权限请求：执行 Copy-on-Write (创建影子键)
+                    // 写权限请求：执行 Copy-on-Write
                     std::wstring relPathToCreate;
                     if (isRedirectedRoot) {
                         relPathToCreate = relPath;
@@ -3819,8 +3808,49 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                         ctx->FullPath = realPathForCheck;
                         g_RegContextMap[*KeyHandle] = ctx;
                     }
+                    return status;
                 }
+                fpNtClose(hRealCheck);
             }
+        }
+    }
+
+    // 6. 更新上下文缓存
+    if (NT_SUCCESS(status)) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        HANDLE hRealTarget = NULL;
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+            it->second->hRealKey = hRealTarget;
+            it->second->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
+            RegContext* ctx = new RegContext();
+            ctx->hRealKey = hRealTarget;
+            ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            g_RegContextMap[*KeyHandle] = ctx;
         }
     }
 
@@ -4332,35 +4362,50 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     }
 
     // 2. 如果是沙盒内的键，执行“逻辑删除”
-    if (isSandboxKey) {
-        // 检查是否有子键 (如果有子键，标准行为是返回 STATUS_CANNOT_DELETE)
-        // 这里为了简化，假设调用者已经递归删除了子键，或者我们只标记当前键
-        // Sandboxie 的逻辑是：如果还有物理子键，不能标记父键删除。
-        // 但为了修复你的问题，我们先实现最简单的标记逻辑。
+if (isSandboxKey) {
 
-        // 尝试设置时间戳标记为删除
-        NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
+    // 如果键下面还有子键，则不允许删除（否则会残留物理子键导致后续无法正确复活）
+    ULONG len = 0;
+    BYTE buf[512];
+    NTSTATUS enumStatus = fpNtEnumerateKey(KeyHandle, 0, KeyBasicInformation, buf, sizeof(buf), &len);
 
-        if (status == STATUS_ACCESS_DENIED) {
-            // 如果句柄没有 KEY_SET_VALUE 权限，尝试重新打开
-            HANDLE hWrite = NULL;
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING emptyStr;
-            RtlInitUnicodeString(&emptyStr, L"");
-            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+    if (enumStatus != STATUS_NO_MORE_ENTRIES) {
+        // 还有子键，按标准行为返回
+        return STATUS_CANNOT_DELETE;
+    }
 
-            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
-                status = SetKeyLastWriteTime(hWrite, true);
-                fpNtClose(hWrite);
+    // 标记删除时间戳
+    NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
+
+    if (status == STATUS_ACCESS_DENIED) {
+        HANDLE hWrite = NULL;
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+
+        if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
+            status = SetKeyLastWriteTime(hWrite, true);
+            fpNtClose(hWrite);
+        }
+    }
+
+    if (NT_SUCCESS(status)) {
+        // ✅ 关键修复：删除当前键自己的缓存，而不仅仅是父级
+        {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                delete it->second;
+                g_RegContextMap.erase(it);
             }
         }
 
-        // 成功标记后，清除缓存并返回成功
-        if (NT_SUCCESS(status)) {
-            InvalidateParentRegContext(path);
-            return STATUS_SUCCESS;
-        }
+        InvalidateParentRegContext(path);
+        return STATUS_SUCCESS;
     }
+}
 
     // 3. 如果是真实注册表路径（通过重定向逻辑），需要在沙盒创建墓碑
     // (这部分逻辑保持你原有的结构，但创建出来的键要立即打上时间戳标记)
