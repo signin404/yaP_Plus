@@ -3132,41 +3132,6 @@ HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
     return NULL;
 }
 
-// [新增] 判断是否为沙盒路径 并尝试获取对应的真实路径
-bool IsSandboxPathAndGetReal(const std::wstring& sandboxPath, std::wstring& outReal) {
-    if (g_RegMountPathNt.empty()) return false;
-
-    // 检查前缀 [修复] 使用 _wcsnicmp
-    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
-
-    // 提取相对路径 (例如 \User\Software\Rime)
-    std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
-    if (relPath.empty() || relPath[0] != L'\\') return false;
-
-    std::wstring sub = relPath.substr(1); // 去掉开头的 \
-
-    // 根据子根进行映射 [修复] 使用不区分大小写的比较
-    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
-        outReal = L"\\REGISTRY\\USER" + sub.substr(5);
-    }
-    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
-        outReal = g_CurrentUserSidPath + sub.substr(4);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
-    }
-    else {
-        return false;
-    }
-    return true;
-}
-
 // [辅助函数] 从沙盒绝对路径反推真实绝对路径
 // 输入: \REGISTRY\USER\YapBoxReg_...\Machine\Software\Classes
 // 输出: \REGISTRY\MACHINE\SOFTWARE\Classes
@@ -3261,8 +3226,8 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
         // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
         // ValueName 分别是 "ACP" 或 "OEMCP"
 
-        bool isACP = (ValueName->Length == 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0);
-        bool isOEMCP = (ValueName->Length == 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0);
+        bool isACP = (ValueName->Length >= 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && (ValueName->Length == 6 || ValueName->Buffer[3] == L'\0'));
+        bool isOEMCP = (ValueName->Length >= 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && (ValueName->Length == 10 || ValueName->Buffer[5] == L'\0'));
 
         if (isACP || isOEMCP) {
             const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
@@ -3653,7 +3618,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         // 尝试关联真实键 (用于读取回退)
         std::wstring realPath;
         HANDLE hReal = NULL;
-        if (IsSandboxPathAndGetReal(fullNtPath, realPath)) {
+        if (GetRealFromSandboxPath(fullNtPath, realPath)) {
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPath.c_str());
@@ -3774,7 +3739,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         if (isRedirectedRoot) {
             realPathForCheck = fullNtPath;
             canCheckReal = true;
-        } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
             canCheckReal = true;
         }
 
@@ -3851,7 +3816,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         if (isRedirectedRoot) {
             realPathForCheck = fullNtPath;
             canCheckReal = true;
-        } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
             canCheckReal = true;
         }
 
@@ -3966,7 +3931,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         if (isRedirectedRoot) {
             realPathForCheck = fullNtPath;
             canCheckReal = true;
-        } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
             canCheckReal = true;
         }
 
@@ -4039,7 +4004,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         if (isRedirectedRoot) {
             realPathForCheck = fullNtPath;
             canCheckReal = true;
-        } else if (IsSandboxPathAndGetReal(fullNtPath, realPathForCheck)) {
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
             canCheckReal = true;
         }
 
@@ -4147,7 +4112,7 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            // [修复] 使用 _wcsicmp 忽略大小写比较，防止因大小写不同导致缓存不更新
+            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
                 ctx->SubKeys.clear();
@@ -4282,7 +4247,7 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            // [修复] 使用 _wcsicmp 忽略大小写比较，防止因大小写不同导致缓存不更新
+            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
                 ctx->Values.clear();
@@ -4438,7 +4403,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                 if (g_HookReg && g_hAppHive && !g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
                     // --- 沙盒键 ---
                     std::wstring realPath;
-                    if (IsSandboxPathAndGetReal(path, realPath)) {
+                    if (GetRealFromSandboxPath(path, realPath)) {
                         HANDLE hRealCheck = NULL;
                         OBJECT_ATTRIBUTES oaReal;
                         UNICODE_STRING usReal;
