@@ -3440,7 +3440,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
-    // --- 1. 白名单检查 (保持不变) ---
+    // --- 1. 白名单检查 (逻辑不变) ---
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
     if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
@@ -3479,38 +3479,47 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         oaModified.ObjectName = &uStr;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
 
-        // 第一次尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
-        // [核心修复] 新的复活逻辑: 如果打开了一个已存在的键，检查它是否是墓碑
-        if (NT_SUCCESS(status) && Disposition && *Disposition == REG_OPENED_EXISTING_KEY) {
-            if (IsKeyMarkedDeleted(*KeyHandle)) {
-                // 是墓碑，需要物理删除后重建
-                // 1. 关闭刚刚打开的句柄
-                fpNtClose(*KeyHandle);
-                *KeyHandle = NULL;
-
-                // 2. 递归物理删除旧的墓碑键
-                DeleteSandboxKeyRecursive(targetSandboxFull);
-
-                // 3. 再次调用创建函数，这次将会是一个全新的创建
-                status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
-            }
-        }
-
         if (NT_SUCCESS(status)) {
-            // [核心] 惰性 CoW 初始化：如果键是新创建的（包括复活的），则需要屏蔽真实注册表中同名键下的所有值
-            if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+            bool isResurrected = false;
+
+            // [核心修复] 使用一个独立的、拥有足够权限的句柄来安全地检查和修改键状态
+            // 避免依赖于程序传入的 DesiredAccess，也避免直接操作 KeyHandle
+            HANDLE hMaintenance = NULL;
+            if (NT_SUCCESS(fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaModified))) {
+                
+                // 检查是否打开了一个已存在的键，并且这个键是墓碑
+                if (Disposition && *Disposition == REG_OPENED_EXISTING_KEY && IsKeyMarkedDeleted(hMaintenance)) {
+                    // === 复活 (Resurrection) 逻辑 ===
+                    // 1. 重置时间戳，移除删除标记
+                    SetKeyLastWriteTime(hMaintenance, false);
+                    
+                    // 2. 清空该键下的所有值，确保它是一个干净的键
+                    ClearSandboxKeyValues(hMaintenance); 
+                    
+                    // 3. 欺骗调用者，告诉它这是一个“新创建”的键
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    
+                    isResurrected = true;
+                }
+                fpNtClose(hMaintenance);
+            }
+
+            // [核心逻辑] 如果键是新创建的，或刚刚被复活，则执行惰性CoW初始化
+            bool isNewlyCreatedOrResurrected = (Disposition && *Disposition == REG_CREATED_NEW_KEY) || isResurrected;
+
+            if (isNewlyCreatedOrResurrected) {
                 HANDLE hRealCheck = NULL;
                 OBJECT_ATTRIBUTES oaRealCheck;
                 UNICODE_STRING usRealCheck;
                 RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
                 InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-                // 尝试打开对应的真实键
+                // 尝试打开对应的真实键，以便屏蔽其下的值
                 if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaRealCheck))) {
                     ULONG idx = 0, vlen = 0;
-                    std::vector<BYTE> valBuf(4096); // 使用动态缓冲区避免栈溢出风险
+                    std::vector<BYTE> valBuf(4096);
                     BYTE dummyByte = 0;
                     
                     while (true) {
@@ -3520,7 +3529,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             try { valBuf.resize(vlen); } catch(...) { break; }
                             st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, valBuf.data(), vlen, &vlen);
                         }
-
                         if (!NT_SUCCESS(st)) break;
 
                         PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)valBuf.data();
@@ -3529,24 +3537,21 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         vName.Length = (USHORT)vinfo->NameLength;
                         vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                        // 在新创建的沙盒键中写入“值墓碑”，以屏蔽真实值
+                        // 在新键中写入“值墓碑”，以屏蔽真实值
                         fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
-                        
                         idx++;
                     }
                     fpNtClose(hRealCheck);
                 }
             }
             
-            // 刷新父级缓存，确保枚举时能看到这个新键
+            // 刷新父级缓存
             InvalidateParentRegContext(targetSandboxFull);
 
-            // [核心修复] 如果是新建的键(包括复活的)，则不关联真实句柄，因为它现在是一个纯粹的沙盒键
-            bool isNewlyCreated = (Disposition && *Disposition == REG_CREATED_NEW_KEY);
+            // [关键修复] 更新上下文，决定是否关联真实句柄
             HANDLE hReal = NULL;
-
-            if (!isNewlyCreated) {
-                // 仅当打开一个已存在的、非墓碑的键时，才尝试关联真实句柄用于回退读取
+            // 仅当打开一个已存在的、非墓碑的沙盒键时，才需要关联真实句柄用于回退读取
+            if (!isNewlyCreatedOrResurrected) {
                 OBJECT_ATTRIBUTES oaReal;
                 UNICODE_STRING usReal;
                 RtlInitUnicodeString(&usReal, fullNtPath.c_str());
@@ -3554,12 +3559,12 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
             }
 
-            // 更新当前键的 Context
+            // 更新或创建当前句柄的上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
                 if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                it->second->hRealKey = hReal;
+                it->second->hRealKey = hReal; // 对于新键或复活键，hReal将是NULL
                 it->second->FullPath = targetSandboxFull;
                 it->second->KeysInitialized = false;
                 it->second->ValuesInitialized = false;
@@ -3568,7 +3573,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             } else {
                 RegContext* ctx = new RegContext();
                 ctx->FullPath = targetSandboxFull;
-                ctx->hRealKey = hReal;
+                ctx->hRealKey = hReal; // 对于新键或复活键，hReal将是NULL
                 g_RegContextMap[*KeyHandle] = ctx;
             }
         }
@@ -3579,8 +3584,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
     
     if (NT_SUCCESS(status)) {
+        // 对于直接在沙盒中操作的路径，也需要处理复活逻辑
         if (isSandboxPath) {
-             // 如果直接在沙盒路径下创建，同样需要处理可能存在的墓碑
              HANDLE hMaint = NULL;
              OBJECT_ATTRIBUTES oaM;
              UNICODE_STRING usM;
@@ -3588,7 +3593,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
              InitializeObjectAttributes(&oaM, &usM, OBJ_CASE_INSENSITIVE, NULL, NULL);
              
              if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaM))) {
-                 if (IsKeyMarkedDeleted(hMaint)) {
+                 if (Disposition && *Disposition == REG_OPENED_EXISTING_KEY && IsKeyMarkedDeleted(hMaint)) {
                     SetKeyLastWriteTime(hMaint, false);
                     ClearSandboxKeyValues(hMaint);
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
@@ -3603,7 +3608,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         if (it == g_RegContextMap.end()) {
             RegContext* ctx = new RegContext();
             ctx->FullPath = fullNtPath;
-            ctx->hRealKey = NULL;
+            ctx->hRealKey = NULL; // 非重定向路径，没有真实句柄关联
             g_RegContextMap[*KeyHandle] = ctx;
         }
     }
