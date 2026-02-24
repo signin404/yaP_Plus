@@ -20,7 +20,6 @@
 #include <shellapi.h>
 #include <numeric>
 #include <set>
-#include <ntstatus.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -3483,30 +3482,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         // 直接尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
-        // [新增修复] 如果因为与“墓碑键”冲突而创建失败 (STATUS_OBJECT_NAME_COLLISION)，
-        // 则将其转换为打开现有键的成功状态，以便进入下面的“复活”逻辑。
-        if (status == STATUS_OBJECT_NAME_COLLISION) {
-            HANDLE hTempCheck = NULL;
-            // 尝试以只读方式打开，检查它是否是墓碑
-            if (NT_SUCCESS(fpNtOpenKey(&hTempCheck, KEY_READ, &oaModified))) {
-                if (IsKeyMarkedDeleted(hTempCheck)) {
-                    // 确认是墓碑。现在，我们需要为调用者获取一个具有其所请求权限的句柄。
-                    fpNtClose(hTempCheck); // 关闭临时检查句柄
-                    
-                    // 以调用者请求的权限重新打开键
-                    status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
-                    
-                    // 如果成功，伪造 Disposition，让后续逻辑认为它刚刚打开了一个现有键
-                    if (NT_SUCCESS(status)) {
-                        if (Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
-                    }
-                } else {
-                    // 是一个真实的冲突，不是墓碑。保持原始的 COLLISION 状态。
-                    fpNtClose(hTempCheck);
-                }
-            }
-        }
-
         if (NT_SUCCESS(status)) {
             // [核心修复] 打开一个拥有完全权限的临时句柄，用于执行维护操作
             // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
@@ -3684,15 +3659,14 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         realPathCandidate = fullNtPath;
     }
 
-    // 3. [核心修复] 白名单检查 (DirectSound/Drivers 等)
-    // 如果是系统关键路径 强制使用绝对路径打开真实键 丢弃可能指向沙盒的 RootDirectory
+    // 3. [核心修复] 白名单检查
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
 
         OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
         oaReal.ObjectName = &usReal;
-        oaReal.RootDirectory = NULL; // 丢弃父句柄
+        oaReal.RootDirectory = NULL; 
 
         return fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
     }
@@ -3703,7 +3677,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     std::wstring relPath;
     bool isRedirectedRoot = false;
 
-    // 如果不是沙盒路径 且符合重定向规则 (例如 HKLM\Software\MyGame)
     if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
         RtlInitUnicodeString(&usRedirected, relPath.c_str());
         oaModified.ObjectName = &usRedirected;
@@ -3711,12 +3684,39 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         isRedirectedRoot = true;
     }
 
-    // 调用原始函数
     NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
 
+    // === [修复] 删除标记检查增强 ===
+    // 修复问题：当仅真实存在的项被删除（标记为墓碑）后，程序检查是否存在时，
+    // 若权限不足(如仅KEY_WRITE)，会导致无法读取时间戳，从而误判为“存在”，导致重建时序号递增(#2)。
     if (NT_SUCCESS(status)) {
-        // 检查是否被标记为删除
+        bool isDeleted = false;
+        
+        // 1. 尝试使用当前句柄直接检查
         if (IsKeyMarkedDeleted(*KeyHandle)) {
+            isDeleted = true;
+        }
+        else {
+            // 2. 如果直接检查失败（可能权限不足），尝试以查询权限重新打开验证
+            std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+            if (!openedPath.empty()) {
+                HANDLE hCheck = NULL;
+                OBJECT_ATTRIBUTES oaCheck;
+                UNICODE_STRING usCheck;
+                RtlInitUnicodeString(&usCheck, openedPath.c_str());
+                InitializeObjectAttributes(&oaCheck, &usCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                
+                // 使用 KEY_QUERY_VALUE 权限尝试打开
+                if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
+                    if (IsKeyMarkedDeleted(hCheck)) {
+                        isDeleted = true;
+                    }
+                    fpNtClose(hCheck);
+                }
+            }
+        }
+
+        if (isDeleted) {
             fpNtClose(*KeyHandle);
             *KeyHandle = NULL;
             return STATUS_OBJECT_NAME_NOT_FOUND; // 告诉程序找不到
@@ -3728,7 +3728,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
     if (NT_SUCCESS(status)) {
         std::wstring openedPath = GetPathFromHandle(*KeyHandle);
-        // [修复] 使用 _wcsnicmp
         if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             bool accessDenied = false;
             bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
