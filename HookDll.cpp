@@ -291,6 +291,20 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef enum _KEY_SET_INFORMATION_CLASS {
+    KeyWriteTimeInformation = 0,
+    KeyWow64FlagsInformation,
+    KeyControlFlagsInformation,
+    KeySetVirtualizationInformation,
+    KeySetDebugInformation,
+    KeySetHandleTagsInformation,
+    MaxKeySetInfoClass
+} KEY_SET_INFORMATION_CLASS;
+
+typedef struct _KEY_WRITE_TIME_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+} KEY_WRITE_TIME_INFORMATION, *PKEY_WRITE_TIME_INFORMATION;
+
 // 1. 基础信息 (包含名称)
 typedef struct _KEY_BASIC_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -683,6 +697,8 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
@@ -1221,6 +1237,8 @@ P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
 P_WinExec fpWinExec = NULL;
 P_NtClose fpNtClose = NULL;
+P_NtQueryKey fpNtQueryKey = NULL; 
+P_NtSetInformationKey fpNtSetInformationKey = NULL;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -3180,6 +3198,21 @@ bool IsKeyMarkedDeleted(HANDLE hKey) {
     return false;
 }
 
+// 设置键的时间戳（用于标记删除或复活）
+NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
+    KEY_WRITE_TIME_INFORMATION kwti;
+    if (isDelete) {
+        kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
+        kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
+    } else {
+        // 复活：设置为当前系统时间
+        GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
+    }
+    
+    // 需要 KEY_SET_VALUE 权限
+    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtQueryValueKey(
     HANDLE KeyHandle,
@@ -4013,14 +4046,12 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
             EnumerateKeysToMap(sandboxPath, mergedKeys);
 
-            // [修改] D. 过滤带魔数时间戳的子键
-            // 我们不能只看名字了，必须检查每个沙盒键的时间戳
-            
-            // 遍历 mergedKeys，如果来源于沙盒且标记为删除，则移除
-            for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
-                // 假设 CachedRegKey 结构体里存了 LastWriteTime
+            // [修正] D. 过滤带魔数时间戳的子键
+            // 注意：这里变量名必须是 mergedKeys (Map<wstring, CachedRegKey>)
+            for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
+                // 检查 CachedRegKey 中的 LastWriteTime
                 if (IsDeleteMark(it->second.LastWriteTime)) {
-                    it = mergedValues.erase(it); // 从列表中移除，假装不存在
+                    it = mergedKeys.erase(it); // 从列表中移除
                 } else {
                     ++it;
                 }
@@ -4424,21 +4455,6 @@ NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueNa
         }
     }
     return status;
-}
-
-// 设置键的时间戳（用于标记删除或复活）
-NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
-    KEY_WRITE_TIME_INFORMATION kwti;
-    if (isDelete) {
-        kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
-        kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
-    } else {
-        // 复活：设置为当前系统时间
-        GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
-    }
-    
-    // 需要 KEY_SET_VALUE 权限
-    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
@@ -9450,6 +9466,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtSetValueKey = (void*)GetProcAddress(hNtdll, "NtSetValueKey");
         void* pNtDeleteValueKey = (void*)GetProcAddress(hNtdll, "NtDeleteValueKey");
 
+        fpNtSetInformationKey = (P_NtSetInformationKey)GetProcAddress(hNtdll, "NtSetInformationKey");
+
+        if (!fpNtQueryKey) fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
         if (pNtSetValueKey) MH_CreateHook(pNtSetValueKey, &Detour_NtSetValueKey, reinterpret_cast<LPVOID*>(&fpNtSetValueKey));
         if (pNtDeleteValueKey) MH_CreateHook(pNtDeleteValueKey, &Detour_NtDeleteValueKey, reinterpret_cast<LPVOID*>(&fpNtDeleteValueKey));
         if (pNtCreateKey)     MH_CreateHook(pNtCreateKey,     &Detour_NtCreateKey,     reinterpret_cast<LPVOID*>(&fpNtCreateKey));
