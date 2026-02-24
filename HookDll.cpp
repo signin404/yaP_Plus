@@ -2662,7 +2662,6 @@ void ClearSandboxKeyValues(HANDLE hKey) {
 
 // 递归物理删除沙盒键（含所有子键）
 void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
-    // 先枚举并递归删除所有子键
     HANDLE hKey = NULL;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING uStr;
@@ -2671,13 +2670,22 @@ void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
 
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | DELETE, &oa))) {
         while (true) {
-            ULONG len;
-            BYTE buf[1024];
+            ULONG len = 0;
+            // [修复] 使用 vector 保证内存对齐，并支持动态扩容
+            std::vector<BYTE> buf(1024); 
+            
             // 始终枚举 index=0 因为每次删除后列表会缩短
-            NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf, sizeof(buf), &len);
+            NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+            
+            // [修复] 处理缓冲区不足的情况，防止死循环或漏删
+            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                buf.resize(len);
+                st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+            }
+
             if (!NT_SUCCESS(st)) break;
 
-            PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf;
+            PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf.data();
             std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
             std::wstring childPath = fullPath + L"\\" + childName;
             DeleteSandboxKeyRecursive(childPath);
@@ -2938,7 +2946,9 @@ void CopyRegistryValues(HANDLE hRealKey, HANDLE hSandboxKey) {
         valueName.Length = (USHORT)info->NameLength;
         valueName.MaximumLength = (USHORT)info->NameLength;
 
-        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, (BYTE*)info + info->DataOffset, info->DataLength);
+        // [修复] 安全计算数据指针，防止 DataLength 为 0 时越界引发 0xc0000005
+        BYTE* pData = (info->DataLength > 0) ? ((BYTE*)info + info->DataOffset) : NULL;
+        fpNtSetValueKey(hSandboxKey, &valueName, info->TitleIndex, info->Type, pData, info->DataLength);
 
         index++;
     }
@@ -3501,20 +3511,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         UNICODE_STRING uStr;
         RtlInitUnicodeString(&uStr, relPath.c_str());
 
-        // 备份原始参数
-        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+        // [核心修复] 绝对不能直接修改调用者传入的 ObjectAttributes！
+        // 必须创建一个局部副本，防止只读内存崩溃或多线程竞争导致 0xc0000005
+        OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+        oaModified.ObjectName = &uStr;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
 
-        // 修改为指向沙盒 Hive
-        ObjectAttributes->ObjectName = &uStr;
-        ObjectAttributes->RootDirectory = (HANDLE)g_hAppHive;
-
-        // 执行创建
-        NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-
-        // 还原参数
-        ObjectAttributes->ObjectName = oldName;
-        ObjectAttributes->RootDirectory = oldRoot;
+        // 执行创建 (使用 oaModified)
+        NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
         // 清理临时墓碑键
         if (!tempPathToClean.empty()) {
