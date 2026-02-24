@@ -57,6 +57,8 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+#define STATUS_NOT_IMPLEMENTED           ((NTSTATUS)0xC0000002L)
+
 // [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
 #define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
 
