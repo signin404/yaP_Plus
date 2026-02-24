@@ -3484,22 +3484,27 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         if (pos != std::wstring::npos) {
                             tempPathToClean = targetSandboxFull.substr(0, pos) + L"\\" + tempName;
                         }
+                        // [修复] 重命名成功后，句柄 hCheck 现在指向临时键，保持打开状态以便后续清理，
+                        // 但需要确保后面 fpNtClose(hCheck) 正常执行。
                     } else {
-                        // 重命名失败 强制递归删除
+                        // [关键修复] 重命名失败，必须先关闭句柄再尝试强制删除！
+                        // 否则 DeleteSandboxKeyRecursive 会因为句柄占用而删除失败，导致残留或崩溃
                         fpNtClose(hCheck);
                         hCheck = NULL;
                         DeleteSandboxKeyRecursive(targetSandboxFull);
                     }
                     InvalidateParentRegContext(targetSandboxFull);
                 }
+                // [修复] 确保在任何分支下，如果句柄仍有效，都正确关闭
                 if (hCheck) fpNtClose(hCheck);
             }
             else if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
                 // 降级权限检查
                 if (HasTombstone(hCheck)) {
                     wasTombstoned = true;
-                    fpNtClose(hCheck);
-                    DeleteSandboxKeyRecursive(targetSandboxFull);
+                    fpNtClose(hCheck); // [修复] 先关闭句柄
+                    hCheck = NULL;
+                    DeleteSandboxKeyRecursive(targetSandboxFull); // 再执行删除
                     InvalidateParentRegContext(targetSandboxFull);
                 } else {
                     fpNtClose(hCheck);
@@ -3567,35 +3572,19 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     CopyRegistryValues(hReal, *KeyHandle);
                 }
             }
-            
-            // [关键修复] 复活墓碑键 = 用户创建了全新的键
-            // 不应将真实键句柄挂入 context，否则 QueryValueKey 回退逻辑
-            // 会把旧真实键的值注入进来，导致调用方读到意外数据 → 崩溃
-            if (wasTombstoned) {
-                if (hReal) { fpNtClose(hReal); hReal = NULL; }
-            }
 
             // 更新缓存上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
-                // [修复] 若路径不匹配说明是复用的旧句柄，先销毁旧 context
-                if (_wcsicmp(it->second->FullPath.c_str(), targetSandboxFull.c_str()) != 0) {
-                    if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                    delete it->second;
-                    it = g_RegContextMap.end();
-                    g_RegContextMap.erase(*KeyHandle);
-                } else {
-                    if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                    it->second->hRealKey = hReal;
-                    it->second->FullPath = targetSandboxFull;
-                    it->second->KeysInitialized = false;
-                    it->second->ValuesInitialized = false;
-                    it->second->SubKeys.clear();
-                    it->second->Values.clear();
-                }
-            }
-            if (it == g_RegContextMap.end()) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = hReal;
+                it->second->FullPath = targetSandboxFull;
+                it->second->KeysInitialized = false;
+                it->second->ValuesInitialized = false;
+                it->second->SubKeys.clear();
+                it->second->Values.clear();
+            } else {
                 RegContext* ctx = new RegContext();
                 ctx->FullPath = targetSandboxFull;
                 ctx->hRealKey = hReal;
@@ -3655,26 +3644,17 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(*KeyHandle);
         if (it != g_RegContextMap.end()) {
-            // [修复] 路径不匹配 → 句柄被复用，销毁旧 context
-            if (_wcsicmp(it->second->FullPath.c_str(), fullNtPath.c_str()) != 0) {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                delete it->second;
-                it = g_RegContextMap.end();
-                g_RegContextMap.erase(*KeyHandle);
-            } else {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                it->second->hRealKey = hReal;
-                it->second->FullPath = fullNtPath;
-                it->second->KeysInitialized = false;
-                it->second->ValuesInitialized = false;
-                it->second->SubKeys.clear();
-                it->second->Values.clear();
-            }
-        }
-        if (it == g_RegContextMap.end()) {
+            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+            it->second->hRealKey = hReal;
+            it->second->FullPath = fullNtPath;
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
             RegContext* ctx = new RegContext();
             ctx->FullPath = fullNtPath;
-            ctx->hRealKey = hReal;
+            ctx->hRealKey = NULL;
             g_RegContextMap[*KeyHandle] = ctx;
         }
     }
