@@ -4147,7 +4147,8 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
+            // [修复] 使用 _wcsicmp 忽略大小写比较，防止因大小写不同导致缓存不更新
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
                 ctx->SubKeys.clear();
                 for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
@@ -4281,7 +4282,8 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end() && it->second->FullPath == currentNtPath) {
+            // [修复] 使用 _wcsicmp 忽略大小写比较，防止因大小写不同导致缓存不更新
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
                 ctx->Values.clear();
                 for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
