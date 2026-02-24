@@ -57,8 +57,6 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
-#define STATUS_NOT_IMPLEMENTED           ((NTSTATUS)0xC0000002L)
-
 // [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
 #define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
 
@@ -3207,35 +3205,17 @@ bool IsKeyMarkedDeleted(HANDLE hKey) {
 
 // 设置键的时间戳（用于标记删除或复活）
 NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
-    if (!fpNtSetInformationKey) return STATUS_NOT_IMPLEMENTED;
-
     KEY_WRITE_TIME_INFORMATION kwti;
     if (isDelete) {
         kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
         kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
     } else {
+        // 复活：设置为当前系统时间
         GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
     }
-    
-    // 第一次尝试直接设置
-    NTSTATUS status = fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 
-    // [核心修复] 如果因为权限不足失败，则重新打开句柄并重试
-    if (status == STATUS_ACCESS_DENIED) {
-        HANDLE hTemp = NULL;
-        OBJECT_ATTRIBUTES oa;
-        UNICODE_STRING emptyStr;
-        
-        RtlInitUnicodeString(&emptyStr, L"");
-        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, hKey, NULL);
-        
-        // 明确请求 KEY_SET_VALUE 权限
-        if (NT_SUCCESS(fpNtOpenKey(&hTemp, KEY_SET_VALUE, &oa))) {
-            status = fpNtSetInformationKey(hTemp, KeyWriteTimeInformation, &kwti, sizeof(kwti));
-            fpNtClose(hTemp);
-        }
-    }
-    return status;
+    // 需要 KEY_SET_VALUE 权限
+    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
 
 // --- 注册表 NT API Hook 实现 ---
@@ -3499,111 +3479,82 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         oaModified.ObjectName = &uStr;
         oaModified.RootDirectory = (HANDLE)g_hAppHive;
 
-        // 直接尝试创建/打开沙盒键
+        // 第一次尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
+        // [核心修复] 新的复活逻辑: 如果打开了一个已存在的键，检查它是否是墓碑
+        if (NT_SUCCESS(status) && Disposition && *Disposition == REG_OPENED_EXISTING_KEY) {
+            if (IsKeyMarkedDeleted(*KeyHandle)) {
+                // 是墓碑，需要物理删除后重建
+                // 1. 关闭刚刚打开的句柄
+                fpNtClose(*KeyHandle);
+                *KeyHandle = NULL;
+
+                // 2. 递归物理删除旧的墓碑键
+                DeleteSandboxKeyRecursive(targetSandboxFull);
+
+                // 3. 再次调用创建函数，这次将会是一个全新的创建
+                status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+            }
+        }
+
         if (NT_SUCCESS(status)) {
-            // [核心修复] 打开一个拥有完全权限的临时句柄，用于执行维护操作
-            // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
-            HANDLE hMaintenance = NULL;
-            OBJECT_ATTRIBUTES oaMaint;
-            UNICODE_STRING usMaint;
-            RtlInitUnicodeString(&usMaint, targetSandboxFull.c_str());
-            InitializeObjectAttributes(&oaMaint, &usMaint, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            // [核心] 惰性 CoW 初始化：如果键是新创建的（包括复活的），则需要屏蔽真实注册表中同名键下的所有值
+            if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                HANDLE hRealCheck = NULL;
+                OBJECT_ATTRIBUTES oaRealCheck;
+                UNICODE_STRING usRealCheck;
+                RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
+                InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            // 使用 KEY_ALL_ACCESS 确保我们可以查询、枚举、写入时间戳
-            NTSTATUS maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
-            
-            // 如果 KEY_ALL_ACCESS 失败 (极少见)，尝试最小必要权限
-            if (!NT_SUCCESS(maintStatus)) {
-                maintStatus = fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaMaint);
-            }
-
-            if (NT_SUCCESS(maintStatus)) {
-                bool isNewKey = false;
-                bool isResurrected = false;
-
-                // 检查是否是“已删除”的键 (墓碑)
-                if (IsKeyMarkedDeleted(hMaintenance)) {
-                    // === 复活 (Resurrection) ===
-                    // 1. 重置时间戳为当前时间
-                    SetKeyLastWriteTime(hMaintenance, false);
+                // 尝试打开对应的真实键
+                if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaRealCheck))) {
+                    ULONG idx = 0, vlen = 0;
+                    std::vector<BYTE> valBuf(4096); // 使用动态缓冲区避免栈溢出风险
+                    BYTE dummyByte = 0;
                     
-                    // 2. 清空该键下的所有值
-                    ClearSandboxKeyValues(hMaintenance); 
-                    
-                    // 3. 标记为“新建”
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                    
-                    isResurrected = true;
-                    isNewKey = true;
-                }
-                else {
-                    // 常规新建检查
-                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                        isNewKey = true;
-                    }
-                }
-
-                // [核心] 惰性 CoW 初始化：屏蔽真实值
-                if (isNewKey) {
-                    HANDLE hRealCheck = NULL;
-                    OBJECT_ATTRIBUTES oaRealCheck;
-                    UNICODE_STRING usRealCheck;
-                    RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
-                    InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-                    // 打开真实键
-                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
-                        ULONG idx = 0, vlen = 0;
-                        BYTE staticValBuf[4096]; // 使用栈内存
-                        BYTE dummyByte = 0;
+                    while (true) {
+                        NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, valBuf.data(), (ULONG)valBuf.size(), &vlen);
                         
-                        while (true) {
-                            NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
-                            
-                            // 处理大值
-                            std::vector<BYTE> dynamicValBuf;
-                            PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
-
-                            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
-                                try { dynamicValBuf.resize(vlen); } catch(...) { break; }
-                                st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
-                                if (!NT_SUCCESS(st)) break;
-                                vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
-                            } else if (!NT_SUCCESS(st)) {
-                                break;
-                            }
-
-                            UNICODE_STRING vName;
-                            vName.Buffer = vinfo->Name;
-                            vName.Length = (USHORT)vinfo->NameLength;
-                            vName.MaximumLength = (USHORT)vinfo->NameLength;
-
-                            // 写入值墓碑 (使用 hMaintenance 句柄)
-                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
-                            
-                            idx++;
+                        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
+                            try { valBuf.resize(vlen); } catch(...) { break; }
+                            st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, valBuf.data(), vlen, &vlen);
                         }
-                        fpNtClose(hRealCheck);
-                    }
-                }
-                
-                // 关闭临时维护句柄
-                fpNtClose(hMaintenance);
-            }
 
-            // 刷新父级缓存
+                        if (!NT_SUCCESS(st)) break;
+
+                        PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)valBuf.data();
+                        UNICODE_STRING vName;
+                        vName.Buffer = vinfo->Name;
+                        vName.Length = (USHORT)vinfo->NameLength;
+                        vName.MaximumLength = (USHORT)vinfo->NameLength;
+
+                        // 在新创建的沙盒键中写入“值墓碑”，以屏蔽真实值
+                        fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                        
+                        idx++;
+                    }
+                    fpNtClose(hRealCheck);
+                }
+            }
+            
+            // 刷新父级缓存，确保枚举时能看到这个新键
             InvalidateParentRegContext(targetSandboxFull);
 
-            // 更新当前键的 Context
+            // [核心修复] 如果是新建的键(包括复活的)，则不关联真实句柄，因为它现在是一个纯粹的沙盒键
+            bool isNewlyCreated = (Disposition && *Disposition == REG_CREATED_NEW_KEY);
             HANDLE hReal = NULL;
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, fullNtPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
 
+            if (!isNewlyCreated) {
+                // 仅当打开一个已存在的、非墓碑的键时，才尝试关联真实句柄用于回退读取
+                OBJECT_ATTRIBUTES oaReal;
+                UNICODE_STRING usReal;
+                RtlInitUnicodeString(&usReal, fullNtPath.c_str());
+                InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            }
+
+            // 更新当前键的 Context
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
@@ -3629,14 +3580,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     
     if (NT_SUCCESS(status)) {
         if (isSandboxPath) {
-             // 同样使用临时句柄进行维护
+             // 如果直接在沙盒路径下创建，同样需要处理可能存在的墓碑
              HANDLE hMaint = NULL;
              OBJECT_ATTRIBUTES oaM;
              UNICODE_STRING usM;
              RtlInitUnicodeString(&usM, fullNtPath.c_str());
              InitializeObjectAttributes(&oaM, &usM, OBJ_CASE_INSENSITIVE, NULL, NULL);
              
-             if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
+             if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaM))) {
                  if (IsKeyMarkedDeleted(hMaint)) {
                     SetKeyLastWriteTime(hMaint, false);
                     ClearSandboxKeyValues(hMaint);
