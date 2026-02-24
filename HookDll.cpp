@@ -3382,7 +3382,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
-    // --- 白名单检查 (保持不变) ---
+    // --- 白名单检查 ---
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
     if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
@@ -3410,8 +3410,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     // --- 重定向逻辑 ---
     std::wstring relPath;
-    bool wasTombstoned = false; // 标记是否发生了复活
-    std::wstring tempPathToClean; // 需要清理的临时路径
+    bool wasTombstoned = false; 
+    std::wstring tempPathToClean; 
 
     if (ShouldRedirectReg(fullNtPath, relPath)) {
         EnsureRegPathExistsRelative(relPath);
@@ -3425,37 +3425,29 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             RtlInitUnicodeString(&usCheck, targetSandboxFull.c_str());
             InitializeObjectAttributes(&oaCheck, &usCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            // 尝试打开以检查是否存在墓碑
             if (NT_SUCCESS(fpNtOpenKey(&hCheck, MAXIMUM_ALLOWED, &oaCheck))) {
                 if (HasTombstone(hCheck)) {
                     wasTombstoned = true;
-                    
-                    // 构造临时名称
                     wchar_t tempName[64];
                     swprintf_s(tempName, L"__YBTmp%u_%u__", GetTickCount(), GetCurrentThreadId());
                     UNICODE_STRING usTempName;
                     RtlInitUnicodeString(&usTempName, tempName);
 
-                    // 尝试重命名移走
                     if (NT_SUCCESS(fpNtRenameKey(hCheck, &usTempName))) {
                         size_t pos = targetSandboxFull.rfind(L'\\');
                         if (pos != std::wstring::npos) {
                             tempPathToClean = targetSandboxFull.substr(0, pos) + L"\\" + tempName;
                         }
                     } else {
-                        // 重命名失败，强制物理删除
-                        // [关键] 必须先关闭句柄，否则无法删除
                         fpNtClose(hCheck); 
                         hCheck = NULL; 
                         DeleteSandboxKeyRecursive(targetSandboxFull);
                     }
-                    
                     InvalidateParentRegContext(targetSandboxFull);
                 }
-                if (hCheck) fpNtClose(hCheck); // 确保关闭
+                if (hCheck) fpNtClose(hCheck);
             }
             else if (NT_SUCCESS(fpNtOpenKey(&hCheck, KEY_QUERY_VALUE, &oaCheck))) {
-                // 降级权限检查逻辑
                 if (HasTombstone(hCheck)) {
                     wasTombstoned = true;
                     fpNtClose(hCheck);
@@ -3477,20 +3469,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
-        // 清理临时键 (如果有)
         if (!tempPathToClean.empty()) {
             DeleteSandboxKeyRecursive(tempPathToClean);
         }
 
         // === 阶段 3: 屏蔽真实值 (Post-Create) ===
-        // 如果创建成功，且这是一个“复活”的键，我们需要屏蔽掉真实注册表中的值
-        // 否则程序会看到它以为已经删除掉的旧值
         if (NT_SUCCESS(status) && wasTombstoned) {
-            
-            // 1. 清空沙盒键中可能残留的值 (虽然刚创建应该是空的，但为了保险)
             ClearSandboxKeyValues(*KeyHandle);
 
-            // 2. 打开真实键，枚举所有值，并在沙盒中写入“值墓碑”
             HANDLE hRealCheck = NULL;
             OBJECT_ATTRIBUTES oaRealCheck;
             UNICODE_STRING usRealCheck;
@@ -3500,13 +3486,9 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                 ULONG idx = 0, vlen = 0;
                 std::vector<BYTE> vbuf(1024);
-                
                 while (true) {
                     NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, vbuf.data(), (ULONG)vbuf.size(), &vlen);
-                    if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
-                        vbuf.resize(vlen); 
-                        continue; 
-                    }
+                    if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { vbuf.resize(vlen); continue; }
                     if (!NT_SUCCESS(st)) break;
 
                     PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)vbuf.data();
@@ -3515,24 +3497,18 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     vName.Length = (USHORT)vinfo->NameLength;
                     vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                    // 写入值墓碑 (Type = YAPBOX_VALUE_TOMBSTONE_TYPE)
                     fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
-                    
                     idx++;
                 }
                 fpNtClose(hRealCheck);
             }
 
-            // 修正 Disposition，告诉程序这是个“新”键
             if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-            
-            // 刷新缓存
             InvalidateParentRegContext(targetSandboxFull);
         }
 
         // 更新上下文缓存 (Context)
         if (NT_SUCCESS(status)) {
-            // 尝试关联真实键句柄以便后续读取回退
             HANDLE hReal = NULL;
             OBJECT_ATTRIBUTES oaReal;
             UNICODE_STRING usReal;
@@ -3540,7 +3516,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
             fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
 
-            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            // [修改] 使用 lock1 避免重定义
+            std::unique_lock<std::shared_mutex> lock1(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
             if (it != g_RegContextMap.end()) {
                 if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
@@ -3561,57 +3538,48 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         return status;
     }
 
-    // 6. 直接创建 (未重定向的情况)
-    // 可能是已经在沙盒路径下 或者是完全无关的路径
+    // --- 非重定向路径 (直接创建) ---
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-
+    
+    // 同样需要处理缓存更新
     if (NT_SUCCESS(status)) {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        // 同样需要处理墓碑和缓存 逻辑类似
-        bool wasTombstoned = false;
-        bool checkTomb = (!Disposition || *Disposition == REG_OPENED_EXISTING_KEY);
-
-        // [修复] 使用 _wcsnicmp
-        if (checkTomb && !g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
-            bool accessDenied = false;
-            bool hasTomb = HasTombstone(*KeyHandle, &accessDenied);
-            if (hasTomb) {
-                wasTombstoned = true;
-                // 清理逻辑...
-                HANDLE hWrite = NULL;
-                UNICODE_STRING usWrite;
-                OBJECT_ATTRIBUTES oaWrite;
-                RtlInitUnicodeString(&usWrite, fullNtPath.c_str());
-                InitializeObjectAttributes(&oaWrite, &usWrite, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaWrite))) {
-                    ClearSandboxKeyValues(hWrite);
-                    fpNtClose(hWrite);
-                }
-                if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                InvalidateParentRegContext(fullNtPath);
-            }
-        }
-
-        // 尝试关联真实键 (用于读取回退)
-        std::wstring realPath;
-        HANDLE hReal = NULL;
-        if (GetRealFromSandboxPath(fullNtPath, realPath)) {
-            OBJECT_ATTRIBUTES oaReal;
-            UNICODE_STRING usReal;
-            RtlInitUnicodeString(&usReal, realPath.c_str());
-            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal))) {
-            }
-        }
-
-        // 更新缓存
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        // [修改] 使用 lock2 避免重定义
+        std::unique_lock<std::shared_mutex> lock2(g_RegContextMutex);
+        
         auto it = g_RegContextMap.find(*KeyHandle);
-        if (it == g_RegContextMap.end()) {
+        if (it != g_RegContextMap.end()) {
+            // 如果已存在，更新真实句柄（如果之前是 NULL）
+            if (it->second->hRealKey == NULL) {
+                 // 尝试获取真实路径并打开
+                 std::wstring realPath;
+                 if (GetRealFromSandboxPath(fullNtPath, realPath)) {
+                     OBJECT_ATTRIBUTES oaReal;
+                     UNICODE_STRING usReal;
+                     RtlInitUnicodeString(&usReal, realPath.c_str());
+                     InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                     fpNtOpenKey(&it->second->hRealKey, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+                 }
+            }
+            // 刷新缓存状态
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
             RegContext* ctx = new RegContext();
             ctx->FullPath = fullNtPath;
             ctx->hRealKey = NULL;
+            
+            // 尝试关联真实键
+            std::wstring realPath;
+            if (GetRealFromSandboxPath(fullNtPath, realPath)) {
+                 OBJECT_ATTRIBUTES oaReal;
+                 UNICODE_STRING usReal;
+                 RtlInitUnicodeString(&usReal, realPath.c_str());
+                 InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                 fpNtOpenKey(&ctx->hRealKey, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            }
+            
             g_RegContextMap[*KeyHandle] = ctx;
         }
     }
