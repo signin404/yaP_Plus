@@ -3481,10 +3481,10 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             bool isResurrected = false;
             bool isNewKey = false;
 
-            if (Disposition && *Disposition == REG_CREATED_NEW_KEY) isNewKey = true;
-
-            // [核心] 检查魔数时间戳 (复活逻辑)
+            // 检查是否是“已删除”的键 (墓碑)
+            // [关键修复] 这个检查必须在 if (Disposition) 之外！
             if (IsKeyMarkedDeleted(*KeyHandle)) {
+                // === 复活 (Resurrection) ===
                 // 1. 重置时间戳为当前时间 (取消删除标记)
                 SetKeyLastWriteTime(*KeyHandle, false);
                 
@@ -3492,14 +3492,22 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 ClearSandboxKeyValues(*KeyHandle); 
                 
                 // 3. 标记为“新建”
+                // 即使调用者没传 Disposition 指针，我们内部也要知道这是个新键
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 
                 isResurrected = true;
                 isNewKey = true; // 复活等同于新建
             }
+            else {
+                // 如果没有被标记删除，检查是否是常规新建
+                if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    isNewKey = true;
+                }
+            }
 
             // [核心] 惰性 CoW 初始化：屏蔽真实值
             // 如果是新建的键（包括复活的），我们需要确保程序看不到真实注册表中该路径下的值
+            // 因为这是一个“覆盖”在真实键之上的新键，它应该是空的。
             if (isNewKey) {
                 HANDLE hRealCheck = NULL;
                 OBJECT_ATTRIBUTES oaRealCheck;
@@ -3511,7 +3519,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                     ULONG idx = 0, vlen = 0;
                     std::vector<BYTE> vbuf(1024);
-                    BYTE dummyByte = 0; // [修复] 安全的 dummy 数据地址
+                    BYTE dummyByte = 0;
                     
                     // 枚举真实键的所有值，在沙盒键中写入“值墓碑”
                     while (true) {
@@ -3529,8 +3537,8 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         vName.Length = (USHORT)vinfo->NameLength;
                         vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                        // [修复] 写入值墓碑
-                        // 传入 &dummyByte 而不是 NULL，防止 0xc0000005 访问违规
+                        // 写入值墓碑 (Type = YAPBOX_VALUE_TOMBSTONE_TYPE)
+                        // 这会阻止 Detour_NtQueryValueKey 读取到真实值
                         fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
                         
                         idx++;
@@ -3539,7 +3547,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 }
             }
 
-            // 刷新父级缓存
+            // 刷新父级缓存 (因为创建/复活了键)
             InvalidateParentRegContext(targetSandboxFull);
 
             // 更新当前键的 Context
@@ -3575,6 +3583,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     
     if (NT_SUCCESS(status)) {
         if (isSandboxPath) {
+             // 同样，这里的复活逻辑也不能依赖 Disposition
              if (IsKeyMarkedDeleted(*KeyHandle)) {
                 SetKeyLastWriteTime(*KeyHandle, false);
                 ClearSandboxKeyValues(*KeyHandle);
