@@ -64,6 +64,10 @@
 #define DELETE_MARK_LOW   0xDEAD44A0
 #define DELETE_MARK_HIGH  0x01B01234
 
+#ifndef _KEY_WRITE_TIME_INFORMATION_DEFINED
+#define _KEY_WRITE_TIME_INFORMATION_DEFINED
+#endif
+
 // 标志位定义
 #define FILE_DISPOSITION_DELETE 0x00000001
 #define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
@@ -290,16 +294,6 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
-
-typedef enum _KEY_SET_INFORMATION_CLASS {
-    KeyWriteTimeInformation = 0,
-    KeyWow64FlagsInformation,
-    KeyControlFlagsInformation,
-    KeySetVirtualizationInformation,
-    KeySetDebugInformation,
-    KeySetHandleTagsInformation,
-    MaxKeySetInfoClass
-} KEY_SET_INFORMATION_CLASS;
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -1237,7 +1231,7 @@ P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
 P_WinExec fpWinExec = NULL;
 P_NtClose fpNtClose = NULL;
-P_NtQueryKey fpNtQueryKey = NULL; 
+P_NtQueryKey fpNtQueryKey = NULL;
 P_NtSetInformationKey fpNtSetInformationKey = NULL;
 
 // 原始函数指针
@@ -3208,7 +3202,7 @@ NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
         // 复活：设置为当前系统时间
         GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
     }
-    
+
     // 需要 KEY_SET_VALUE 权限
     return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
@@ -3490,13 +3484,13 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 // === 复活 (Resurrection) ===
                 // 1. 重置时间戳为当前时间 (取消删除标记)
                 SetKeyLastWriteTime(*KeyHandle, false);
-                
+
                 // 2. 清空该键下的所有值 (逻辑上这是个新键，不能残留旧值)
-                ClearSandboxKeyValues(*KeyHandle); 
-                
+                ClearSandboxKeyValues(*KeyHandle);
+
                 // 3. 标记为“新建”
                 if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                
+
                 isResurrected = true;
                 isNewKey = true; // 复活等同于新建
             }
@@ -3514,13 +3508,13 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                     ULONG idx = 0, vlen = 0;
                     std::vector<BYTE> vbuf(1024);
-                    
+
                     // 枚举真实键的所有值，在沙盒键中写入“值墓碑”
                     while (true) {
                         NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, vbuf.data(), (ULONG)vbuf.size(), &vlen);
-                        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
-                            vbuf.resize(vlen); 
-                            continue; 
+                        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                            vbuf.resize(vlen);
+                            continue;
                         }
                         if (!NT_SUCCESS(st)) break;
 
@@ -3533,7 +3527,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         // 写入值墓碑 (Type = YAPBOX_VALUE_TOMBSTONE_TYPE)
                         // 这会阻止 Detour_NtQueryValueKey 读取到真实值
                         fpNtSetValueKey(*KeyHandle, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
-                        
+
                         idx++;
                     }
                     fpNtClose(hRealCheck);
@@ -3573,7 +3567,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
     // --- 3. 非重定向路径 (直接创建) ---
     NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
-    
+
     // 同样需要处理魔数时间戳 (针对直接操作沙盒路径的情况)
     if (NT_SUCCESS(status)) {
         // 检查是否是沙盒路径
@@ -4319,7 +4313,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
         // 尝试设置时间戳标记为删除
         NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
-        
+
         if (status == STATUS_ACCESS_DENIED) {
             // 如果句柄没有 KEY_SET_VALUE 权限，尝试重新打开
             HANDLE hWrite = NULL;
@@ -4327,7 +4321,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             UNICODE_STRING emptyStr;
             RtlInitUnicodeString(&emptyStr, L"");
             InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
-            
+
             if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
                 status = SetKeyLastWriteTime(hWrite, true);
                 fpNtClose(hWrite);
@@ -4337,30 +4331,30 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         // 成功标记后，清除缓存并返回成功
         if (NT_SUCCESS(status)) {
             InvalidateParentRegContext(path);
-            return STATUS_SUCCESS; 
+            return STATUS_SUCCESS;
         }
     }
-    
+
     // 3. 如果是真实注册表路径（通过重定向逻辑），需要在沙盒创建墓碑
     // (这部分逻辑保持你原有的结构，但创建出来的键要立即打上时间戳标记)
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
         std::wstring relPath;
         if (ShouldRedirectReg(path, relPath)) {
             EnsureRegPathExistsRelative(relPath);
-            
+
             HANDLE hSandbox = NULL;
             UNICODE_STRING usRel;
             OBJECT_ATTRIBUTES oaSandbox;
             RtlInitUnicodeString(&usRel, relPath.c_str());
             InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
-            
+
             ULONG disposition;
             // 创建或打开沙盒键
             if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_SET_VALUE, &oaSandbox, 0, NULL, 0, &disposition))) {
                 // 标记为删除
                 SetKeyLastWriteTime(hSandbox, true);
                 fpNtClose(hSandbox);
-                
+
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
                 InvalidateParentRegContext(sandboxPath);
                 return STATUS_SUCCESS;
@@ -9466,9 +9460,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtSetValueKey = (void*)GetProcAddress(hNtdll, "NtSetValueKey");
         void* pNtDeleteValueKey = (void*)GetProcAddress(hNtdll, "NtDeleteValueKey");
 
+        fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
         fpNtSetInformationKey = (P_NtSetInformationKey)GetProcAddress(hNtdll, "NtSetInformationKey");
 
-        if (!fpNtQueryKey) fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
         if (pNtSetValueKey) MH_CreateHook(pNtSetValueKey, &Detour_NtSetValueKey, reinterpret_cast<LPVOID*>(&fpNtSetValueKey));
         if (pNtDeleteValueKey) MH_CreateHook(pNtDeleteValueKey, &Detour_NtDeleteValueKey, reinterpret_cast<LPVOID*>(&fpNtDeleteValueKey));
         if (pNtCreateKey)     MH_CreateHook(pNtCreateKey,     &Detour_NtCreateKey,     reinterpret_cast<LPVOID*>(&fpNtCreateKey));
