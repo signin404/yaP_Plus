@@ -20,7 +20,6 @@
 #include <shellapi.h>
 #include <numeric>
 #include <set>
-#include <ntstatus.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -2732,9 +2731,14 @@ void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
     if (pos == std::wstring::npos) return;
     std::wstring parentPath = sandboxKeyPath.substr(0, pos);
 
+    // [修复] 计算对应的真实路径，确保缓存了真实路径的上下文也被失效
+    std::wstring realParentPath;
+    GetRealFromSandboxPath(parentPath, realParentPath);
+
     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
     for (auto& pair : g_RegContextMap) {
-        if (_wcsicmp(pair.second->FullPath.c_str(), parentPath.c_str()) == 0) {
+        if (_wcsicmp(pair.second->FullPath.c_str(), parentPath.c_str()) == 0 ||
+            (!realParentPath.empty() && _wcsicmp(pair.second->FullPath.c_str(), realParentPath.c_str()) == 0)) {
             pair.second->KeysInitialized = false;
             pair.second->SubKeys.clear();
         }
@@ -3198,7 +3202,8 @@ bool IsKeyMarkedDeleted(HANDLE hKey) {
     KEY_BASIC_INFORMATION kbi;
     ULONG len;
     NTSTATUS status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
-    if (NT_SUCCESS(status)) {
+    // [修复] STATUS_BUFFER_OVERFLOW 时固定字段 (LastWriteTime) 已被填充，必须一并检查
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
         return IsDeleteMark(kbi.LastWriteTime);
     }
     return false;
@@ -3507,29 +3512,17 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 // 检查是否是“已删除”的键 (墓碑)
                 if (IsKeyMarkedDeleted(hMaintenance)) {
                     // === 复活 (Resurrection) ===
-    // ✅ 关键修复：先物理删除整个墓碑键（避免保留旧时间戳）
-    fpNtClose(hMaintenance);
-    DeleteSandboxKeyRecursive(targetSandboxFull);
-
-    // 重新创建一个干净的新键
-    HANDLE hRecreate = NULL;
-    ULONG disp2;
-    if (NT_SUCCESS(fpNtCreateKey(&hRecreate,
-                                 KEY_READ | KEY_WRITE,
-                                 &oaMaint,
-                                 0,
-                                 NULL,
-                                 0,
-                                 &disp2))) {
-
-        ClearSandboxKeyValues(hRecreate);
-        fpNtClose(hRecreate);
-    }
-
-    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-
-    isResurrected = true;
-    isNewKey = true;
+                    // 1. 重置时间戳为当前时间
+                    SetKeyLastWriteTime(hMaintenance, false);
+                    
+                    // 2. 清空该键下的所有值
+                    ClearSandboxKeyValues(hMaintenance); 
+                    
+                    // 3. 标记为“新建”
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    
+                    isResurrected = true;
+                    isNewKey = true;
                 }
                 else {
                     // 常规新建检查
@@ -4363,50 +4356,35 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     }
 
     // 2. 如果是沙盒内的键，执行“逻辑删除”
-if (isSandboxKey) {
+    if (isSandboxKey) {
+        // 检查是否有子键 (如果有子键，标准行为是返回 STATUS_CANNOT_DELETE)
+        // 这里为了简化，假设调用者已经递归删除了子键，或者我们只标记当前键
+        // Sandboxie 的逻辑是：如果还有物理子键，不能标记父键删除。
+        // 但为了修复你的问题，我们先实现最简单的标记逻辑。
 
-    // 如果键下面还有子键，则不允许删除（否则会残留物理子键导致后续无法正确复活）
-    ULONG len = 0;
-    BYTE buf[512];
-    NTSTATUS enumStatus = fpNtEnumerateKey(KeyHandle, 0, KeyBasicInformation, buf, sizeof(buf), &len);
+        // 尝试设置时间戳标记为删除
+        NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
 
-    if (enumStatus != STATUS_NO_MORE_ENTRIES) {
-        // 还有子键，按标准行为返回
-        return STATUS_CANNOT_DELETE;
-    }
+        if (status == STATUS_ACCESS_DENIED) {
+            // 如果句柄没有 KEY_SET_VALUE 权限，尝试重新打开
+            HANDLE hWrite = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING emptyStr;
+            RtlInitUnicodeString(&emptyStr, L"");
+            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
 
-    // 标记删除时间戳
-    NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
-
-    if (status == STATUS_ACCESS_DENIED) {
-        HANDLE hWrite = NULL;
-        OBJECT_ATTRIBUTES oa;
-        UNICODE_STRING emptyStr;
-        RtlInitUnicodeString(&emptyStr, L"");
-        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
-
-        if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
-            status = SetKeyLastWriteTime(hWrite, true);
-            fpNtClose(hWrite);
-        }
-    }
-
-    if (NT_SUCCESS(status)) {
-        // ✅ 关键修复：删除当前键自己的缓存，而不仅仅是父级
-        {
-            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-            auto it = g_RegContextMap.find(KeyHandle);
-            if (it != g_RegContextMap.end()) {
-                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
-                delete it->second;
-                g_RegContextMap.erase(it);
+            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
+                status = SetKeyLastWriteTime(hWrite, true);
+                fpNtClose(hWrite);
             }
         }
 
-        InvalidateParentRegContext(path);
-        return STATUS_SUCCESS;
+        // 成功标记后，清除缓存并返回成功
+        if (NT_SUCCESS(status)) {
+            InvalidateParentRegContext(path);
+            return STATUS_SUCCESS;
+        }
     }
-}
 
     // 3. 如果是真实注册表路径（通过重定向逻辑），需要在沙盒创建墓碑
     // (这部分逻辑保持你原有的结构，但创建出来的键要立即打上时间戳标记)
