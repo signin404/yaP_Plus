@@ -5801,17 +5801,31 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
                 }
 
-                // [新增] 将挂载的注册表配置单元设置为 Low Integrity 并包含继承标志
-                PSECURITY_DESCRIPTOR pSD = NULL;
-                if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
-                    HKEY hKey;
-                    // 需要 KEY_ALL_ACCESS (包含 WRITE_OWNER/WRITE_DAC) 以及 ACCESS_SYSTEM_SECURITY 来修改 SACL
-                    if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_ALL_ACCESS | ACCESS_SYSTEM_SECURITY, &hKey) == ERROR_SUCCESS) {
-                        RegSetKeySecurity(hKey, LABEL_SECURITY_INFORMATION, pSD);
-                        RegCloseKey(hKey);
-                    }
-                    LocalFree(pSD);
-                }
+HKEY hKey;
+// [关键] 必须申请 ACCESS_SYSTEM_SECURITY 权限，否则无法写入 SACL
+LSTATUS lOpen = RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, 
+                              WRITE_DAC | ACCESS_SYSTEM_SECURITY, &hKey);
+
+if (lOpen == ERROR_SUCCESS) {
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    // S:(ML;OICI;NW;;;LW) 
+    // ML = Mandatory Label
+    // OICI = 继承到子项
+    // NW = No Write Up (低权限不能写高权限)
+    // LW = Low Integrity (低完整性)
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+        
+        // [关键] 必须使用 LABEL_SECURITY_INFORMATION
+        // 这告诉系统我们要修改的是“强制性标签”，而不是普通的权限(DACL)
+        LSTATUS lSet = RegSetKeySecurity(hKey, LABEL_SECURITY_INFORMATION, pSD);
+        
+        if (lSet != ERROR_SUCCESS) {
+            // 如果这里失败，错误码 1314 代表特权没生效，5 代表权限不足
+        }
+        LocalFree(pSD);
+    }
+    RegCloseKey(hKey);
+}
 
                 SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
             }
