@@ -1,7 +1,5 @@
 #include <windows.h>
 #include <winternl.h>
-#include <aclapi.h>
-#include <sddl.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -5772,77 +5770,62 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         // --- [新增] 提前解析并挂载注册表配置单元 (支持 [Before] 写入) ---
-        std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
-        std::wstring regMountName;
-        std::wstring hivePath;
-
-        if (!hookRegVal.empty()) {
-            SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
-
-            std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
-            std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
-
-            hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
-            if (!finalHookPath.empty()) {
-                 hivePath = finalHookPath + L"\\YapHookReg.dat";
-            }
-
-            regMountName = GetHiveMountName(launcherBaseName);
-
-            wchar_t parentDir[MAX_PATH];
-            wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
-            PathRemoveFileSpecW(parentDir);
-            SHCreateDirectoryExW(NULL, parentDir, NULL);
-
-            if (EnsureHiveFileExists(hivePath)) {
-                HKEY hTest;
-                if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest) == ERROR_SUCCESS) {
-                    RegCloseKey(hTest);
-                } else {
-                    RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
-                }
-
-// 2. 构造完整的注册表路径字符串
-// 注意：RegLoadKey 挂载在 HKEY_USERS 下
-std::wstring fullRegPath = L"CURRENT_USER\\SOFTWARE\\LAV"; 
-// 如果是挂载的 Hive，请使用：L"USERS\\" + regMountName;
-
-PSECURITY_DESCRIPTOR pSD = NULL;
-// S:(ML;OICI;NW;;;LW) 
-// ML = Mandatory Label, OICI = 继承, NW = No Write Up, LW = Low Integrity
-if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
-    
-    // 获取 SACL 指针
-    BOOL bSaclPresent = FALSE;
-    BOOL bSaclDefaulted = FALSE;
-    PACL pSacl = NULL;
-    
-    if (GetSecurityDescriptorSacl(pSD, &bSaclPresent, &pSacl, &bSaclDefaulted) && bSaclPresent) {
-        
-        // [核心修改] 使用 SetNamedSecurityInfoW 直接作用于路径
-        // 这种方式比通过 Handle 设置更不容易出错
-        DWORD result = SetNamedSecurityInfoW(
-            (LPWSTR)fullRegPath.c_str(),
-            SE_REGISTRY_KEY,
-            LABEL_SECURITY_INFORMATION, // 明确指定我们要设置的是完整性标签
-            NULL, NULL, NULL,           // 不修改所有者、组、DACL
-            pSacl                       // 只修改 SACL 中的 Label
-        );
-
-        if (result != ERROR_SUCCESS) {
-            // 如果返回 1314，说明 SeSecurityPrivilege 没起作用
-            // 如果返回 2，说明路径不对
-        }
+std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
+std::wstring regMountName;
+std::wstring hivePath;
+if (!hookRegVal.empty()) {
+    SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+    std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
+    std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
+    hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+    if (!finalHookPath.empty()) {
+         hivePath = finalHookPath + L"\\YapHookReg.dat";
     }
-    LocalFree(pSD);
-}
-
-                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
-            }
+    regMountName = GetHiveMountName(launcherBaseName);
+    wchar_t parentDir[MAX_PATH];
+    wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
+    PathRemoveFileSpecW(parentDir);
+    SHCreateDirectoryExW(NULL, parentDir, NULL);
+    if (EnsureHiveFileExists(hivePath)) {
+        HKEY hTest;
+        if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest) == ERROR_SUCCESS) {
+            RegCloseKey(hTest);
         } else {
-            SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
-            SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
+            RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
+
+            // 将已挂载的注册表配置单元设置为 Low Integrity（含继承标志）
+            {
+                PSECURITY_DESCRIPTOR pSD = nullptr;
+                // OICI 使完整性标签向下继承到子键和子值
+                if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        L"S:(ML;OICI;NW;;;LW)",
+                        SDDL_REVISION_1,
+                        &pSD,
+                        nullptr))
+                {
+                    PACL pSacl       = nullptr;
+                    BOOL saclPresent = FALSE;
+                    BOOL saclDefault = FALSE;
+                    if (GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefault) && saclPresent)
+                    {
+                        std::wstring fullKeyPath = L"USERS\\" + regMountName;
+                        SetNamedSecurityInfoW(
+                            const_cast<LPWSTR>(fullKeyPath.c_str()),
+                            SE_REGISTRY_KEY,
+                            LABEL_SECURITY_INFORMATION,
+                            nullptr, nullptr, nullptr,
+                            pSacl);
+                    }
+                    LocalFree(pSD);
+                }
+            }
         }
+        SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
+    }
+} else {
+    SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+    SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
+}
 
         // <-- [新增] 为 [Before] 阶段的操作定义受信任的PID（仅限启动器自身）
         std::set<DWORD> beforeTrustedPids;
