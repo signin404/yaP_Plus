@@ -1145,6 +1145,7 @@ bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
+std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
 
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
@@ -2653,6 +2654,65 @@ struct RecursionGuard {
 };
 
 // --- 注册表重定向辅助函数 ---
+// 获取当前进程名 (小写 懒加载)
+const std::wstring& GetCurrentProcessNameLower() {
+    if (g_CurrentProcessNameLower.empty()) {
+        wchar_t path[MAX_PATH];
+        if (GetModuleFileNameW(NULL, path, MAX_PATH)) {
+            wchar_t* name = wcsrchr(path, L'\\');
+            g_CurrentProcessNameLower = name ? name + 1 : path;
+            std::transform(g_CurrentProcessNameLower.begin(), g_CurrentProcessNameLower.end(), g_CurrentProcessNameLower.begin(), towlower);
+        }
+    }
+    return g_CurrentProcessNameLower;
+}
+
+// 检查是否需要伪造特定的注册表值
+// 返回 true 表示需要伪造 outData 和 outType 将被填充
+bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& outType) {
+    const std::wstring& proc = GetCurrentProcessNameLower();
+
+    // 1. Internet Explorer / WebBrowser Control 兼容性
+    // 禁用保护模式 (Protected Mode) 防止 IE 尝试启动 Broker 进程
+    if (proc == L"iexplore.exe" || proc == L"microsoftedgecp.exe" || true) { // "true" 表示对所有进程生效 防止内嵌 WebBrowser 控件崩溃
+        // Zone 设定: 2500 = Protected Mode. 3 = OFF, 0 = ON.
+        if (valueName == L"2500") {
+            outType = REG_DWORD; outData = 3; return true;
+        }
+        // 显式关闭保护模式
+        if (_wcsicmp(valueName.c_str(), L"ProtectedModeOffForAllZones") == 0) {
+            outType = REG_DWORD; outData = 1; return true;
+        }
+        // 隐藏“保护模式已关闭”的警告条
+        if (_wcsicmp(valueName.c_str(), L"NoProtectedModeBanner") == 0) {
+            outType = REG_DWORD; outData = 1; return true;
+        }
+        // 禁用 IE9+ 的 USER32 Detours (Sandboxie 特有 防止冲突)
+        if (_wcsicmp(valueName.c_str(), L"DetourDialogs") == 0) {
+            outType = REG_DWORD; outData = 0; return true;
+        }
+    }
+
+    // 2. Adobe Acrobat / Reader 兼容性
+    // 禁用 Adobe 自带的沙盒 (Protected Mode) 和更新检查
+    if (proc == L"acrord32.exe" || proc == L"acrobat.exe" || proc == L"acrodist.exe") {
+        if (_wcsicmp(valueName.c_str(), L"bProtectedMode") == 0) {
+            outType = REG_DWORD; outData = 0; return true; // 关沙盒
+        }
+        if (_wcsicmp(valueName.c_str(), L"iCheckReader") == 0) {
+            outType = REG_DWORD; outData = 0; return true; // 关更新
+        }
+    }
+
+    // 3. 通用兼容性 (SRP / CreateProcess)
+    // 禁用 Authenticode 检查 防止递归调用 SandboxieCrypto 导致死锁
+    if (_wcsicmp(valueName.c_str(), L"AuthenticodeEnabled") == 0) {
+        outType = REG_DWORD; outData = 0; return true;
+    }
+
+    return false;
+}
+
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
@@ -3549,6 +3609,32 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
     // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    // ========== [新增] 特定应用兼容性伪造 (移植自 Sandboxie) ==========
+    // 无论原始调用是否成功 只要程序查询敏感值 我们都强制覆盖为“安全”的值
+    // 仅处理最常用的 KeyValuePartialInformation (RegQueryValueEx 默认使用此类型)
+    if (ValueName && ValueName->Buffer && KeyValueInformationClass == KeyValuePartialInformation) {
+        std::wstring queryName(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
+        DWORD fakeData = 0;
+        ULONG fakeType = REG_DWORD;
+
+        if (TryGetAppCompatValue(queryName, fakeData, fakeType)) {
+            ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD);
+
+            if (ResultLength) *ResultLength = requiredSize;
+
+            if (Length >= requiredSize) {
+                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+                info->TitleIndex = 0;
+                info->Type = fakeType;
+                info->DataLength = sizeof(DWORD);
+                memcpy(info->Data, &fakeData, sizeof(DWORD));
+                return STATUS_SUCCESS; // 强制返回成功
+            } else {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+        }
+    }
 
     // [新增] 检查是否是值墓碑 (惰性 CoW 删除标记)
     if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
