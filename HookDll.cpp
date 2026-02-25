@@ -2834,7 +2834,7 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
 
     // 1. Classes (COM 组件) - 核心修复
     // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
-    if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
+    // if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
 
     // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
     // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
@@ -3443,18 +3443,8 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
 
     // 只处理沙盒内的句柄 [修复] 使用 _wcsnicmp
     std::wstring currentPath = GetPathFromHandle(KeyHandle);
-    if (currentPath.empty())
+    if (currentPath.empty() || _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0)
         return fpNtRenameKey(KeyHandle, NewName);
-
-    if (_wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) {
-        // [修复] 如果试图重命名真实注册表中的键（由于权限被分配了真实句柄），
-        // 应该拒绝，否则会破坏沙盒隔离，直接修改宿主环境。
-        std::wstring relPath;
-        if (ShouldRedirectReg(currentPath, relPath)) {
-            return STATUS_ACCESS_DENIED;
-        }
-        return fpNtRenameKey(KeyHandle, NewName);
-    }
 
     // 构造目标沙盒路径
     size_t pos = currentPath.rfind(L'\\');
@@ -3497,34 +3487,7 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
             std::wstring tempPath = parentSandboxPath + L"\\" + tempName;
             DeleteSandboxKeyRecursive(tempPath);
 
-            if (NT_SUCCESS(status)) {
-                // [新增] 如果并非仅仅是大小写变化，我们需要为旧名字创建墓碑，以屏蔽真实注册表中可能遗留的同名键
-                if (_wcsicmp(currentPath.c_str(), targetSandboxPath.c_str()) != 0) {
-                    HANDLE hTombOld = NULL;
-                    OBJECT_ATTRIBUTES oaTombOld;
-                    UNICODE_STRING usTombOld;
-                    RtlInitUnicodeString(&usTombOld, currentPath.c_str());
-                    InitializeObjectAttributes(&oaTombOld, &usTombOld, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                    ULONG disp;
-                    if (NT_SUCCESS(fpNtCreateKey(&hTombOld, KEY_ALL_ACCESS, &oaTombOld, 0, NULL, 0, &disp))) {
-                        SetKeyLastWriteTime(hTombOld, true);
-                        fpNtClose(hTombOld);
-                    }
-                }
-
-                InvalidateParentRegContext(currentPath);
-
-                // [新增] 更新当前句柄的缓存路径，防止后续由于路径不一致导致缓存频繁重建和报错
-                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-                auto it = g_RegContextMap.find(KeyHandle);
-                if (it != g_RegContextMap.end()) {
-                    it->second->FullPath = targetSandboxPath;
-                    if (it->second->hRealKey) {
-                        fpNtClose(it->second->hRealKey);
-                        it->second->hRealKey = NULL;
-                    }
-                }
-            }
+            if (NT_SUCCESS(status)) InvalidateParentRegContext(currentPath);
             return status;
         }
         fpNtClose(hTarget);
@@ -3540,33 +3503,8 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
     NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
 
     if (NT_SUCCESS(status)) {
-        // [新增] 为旧名字创建墓碑
-        if (_wcsicmp(currentPath.c_str(), targetSandboxPath.c_str()) != 0) {
-            HANDLE hTombOld = NULL;
-            OBJECT_ATTRIBUTES oaTombOld;
-            UNICODE_STRING usTombOld;
-            RtlInitUnicodeString(&usTombOld, currentPath.c_str());
-            InitializeObjectAttributes(&oaTombOld, &usTombOld, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            ULONG disp;
-            if (NT_SUCCESS(fpNtCreateKey(&hTombOld, KEY_ALL_ACCESS, &oaTombOld, 0, NULL, 0, &disp))) {
-                SetKeyLastWriteTime(hTombOld, true);
-                fpNtClose(hTombOld);
-            }
-        }
-
         // 使父键枚举缓存失效
         InvalidateParentRegContext(currentPath);
-
-        // [新增] 更新当前句柄的缓存路径
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        auto it = g_RegContextMap.find(KeyHandle);
-        if (it != g_RegContextMap.end()) {
-            it->second->FullPath = targetSandboxPath;
-            if (it->second->hRealKey) {
-                fpNtClose(it->second->hRealKey);
-                it->second->hRealKey = NULL;
-            }
-        }
     }
 
     return status;
@@ -5102,13 +5040,7 @@ NTSTATUS NTAPI Detour_NtQueryMultipleValueKey(
         );
 
         if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
-            // [修复] 防止超大内存请求异常引发 Exception Processing Message 0xc0000005 崩溃
-            try {
-                tempBuf.resize(resultLength);
-            } catch (...) {
-                finalStatus = STATUS_NO_MEMORY;
-                break;
-            }
+            tempBuf.resize(resultLength);
             status = Detour_NtQueryValueKey(
                 KeyHandle,
                 entry->ValueName,
