@@ -2856,13 +2856,13 @@ bool IsRestrictedToken() {
             CloseHandle(hToken);
             return true;
         }
-        
+
         PTOKEN_MANDATORY_LABEL pTIL = NULL;
         GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
         if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
             pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(LPTR, len);
             if (pTIL && GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
-                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid, 
+                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid,
                     (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
                 LocalFree(pTIL);
                 CloseHandle(hToken);
@@ -2882,18 +2882,18 @@ bool SetLowLabelKeyByName(const std::wstring& ntPath) {
     UNICODE_STRING us;
     RtlInitUnicodeString(&us, ntPath.c_str());
     InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    
+
     // 尝试以 WRITE_OWNER | WRITE_DAC 权限打开
     if (NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY, &oa)) ||
         NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC, &oa))) {
-        
+
         PSECURITY_DESCRIPTOR pSD = NULL;
         // S:(ML;;NW;;;LW) 表示 Low Mandatory Level
         if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
             PACL pSacl = NULL;
             BOOL saclPresent = FALSE, saclDefaulted = FALSE;
             GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
-            
+
             DWORD res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
             LocalFree(pSD);
             fpNtClose(hKey);
@@ -3211,7 +3211,7 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
                 parentNtPath += L"\\" + relPath.substr(0, currentPos - 1);
             }
             SetLowLabelKeyByName(parentNtPath);
-            
+
             // 重试创建
             status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
         }
@@ -3830,6 +3830,15 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         }
 
         if (NT_SUCCESS(status)) {
+			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
+			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+			}
+
             // [核心修复] 打开一个拥有完全权限的临时句柄 用于执行维护操作
             // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
             HANDLE hMaintenance = NULL;
@@ -4976,11 +4985,20 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
             if (pos != std::wstring::npos) {
                 SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
             }
-            // 重试
-            status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+            // 重试 (注意：必须包含 TransactionHandle 参数)
+            status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
         }
 
         if (NT_SUCCESS(status)) {
+			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
+			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+			}
+
             // [维护操作] 使用非事务句柄进行墓碑复活和初始化
             HANDLE hMaintenance = NULL;
             OBJECT_ATTRIBUTES oaMaint;
