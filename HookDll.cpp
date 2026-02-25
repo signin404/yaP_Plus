@@ -3502,13 +3502,12 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 bool isNewKey = false;
                 bool isResurrected = false;
 
-                // [核心修复] 检查是否是“已删除”的键 (墓碑)
                 if (IsKeyMarkedDeleted(hMaintenance)) {
                     // === 复活 (Resurrection) ===
                     isResurrected = true;
                     isNewKey = true;
 
-                    // 1. 清空该键下的所有旧值 (例如，旧的墓碑值)
+                    // 1. 清空该键下的所有旧值
                     ClearSandboxKeyValues(hMaintenance);
 
                     // 2. 检查真实键是否存在，若存在，则为其所有值创建墓碑以进行屏蔽
@@ -3518,7 +3517,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
                     InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-                    // 只读打开真实键
                     if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaRealCheck))) {
                         ULONG idx = 0, vlen = 0;
                         BYTE staticValBuf[4096];
@@ -3544,7 +3542,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             vName.Length = (USHORT)vinfo->NameLength;
                             vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                            // 在沙盒键中写入值墓碑
+                            // [修正] 在沙盒键中写入正确类型的值墓碑
                             fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
                             
                             idx++;
@@ -3559,14 +3557,12 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                 }
                 else {
-                    // 常规新建检查
                     if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
                         isNewKey = true;
                     }
                 }
 
                 // [核心] 惰性 CoW 初始化：屏蔽真实值
-                // [修改] 仅对全新的键执行此操作，复活的键已在上面处理完毕
                 if (isNewKey && !isResurrected) {
                     HANDLE hRealCheck = NULL;
                     OBJECT_ATTRIBUTES oaRealCheck;
@@ -3599,6 +3595,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             vName.Length = (USHORT)vinfo->NameLength;
                             vName.MaximumLength = (USHORT)vinfo->NameLength;
 
+                            // [修正] 在沙盒键中写入正确类型的值墓碑
                             fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
                             
                             idx++;
