@@ -4174,7 +4174,25 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             std::map<std::wstring, CachedRegKey> mergedKeys;
 
             // A. 枚举真实路径
-            EnumerateKeysToMap(realPath, mergedKeys);
+            // [安全检查] 防止沙盒深层子键错误地映射到了真实根目录 (导致在子键中看到 .386 等根内容)
+            bool skipRealEnum = false;
+            
+            // 检查是否计算出的真实路径是 Classes 根
+            if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
+                bool isRealRoot = (realPath.length() == 34 || realPath[34] == L'\0');
+                
+                // 如果真实路径是根，但沙盒路径显然比根更长（说明是子键）
+                if (isRealRoot && sandboxPath.length() > g_RegMountPathNt.length() + 8) { // +8 预留 \Machine 等
+                    // 再次确认沙盒路径结尾不是 Classes
+                    if (sandboxPath.length() > 7 && _wcsicmp(sandboxPath.substr(sandboxPath.length() - 7).c_str(), L"Classes") != 0) {
+                        skipRealEnum = true;
+                    }
+                }
+            }
+
+            if (!skipRealEnum) {
+                EnumerateKeysToMap(realPath, mergedKeys);
+            }
 
             // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
