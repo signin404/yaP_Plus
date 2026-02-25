@@ -1188,13 +1188,19 @@ bool g_EnableTimeHook = false;
 thread_local bool g_InTimeHook = false;
 thread_local bool g_IsInHook = false;
 
+// 辅助类：自动设置和清除标志
+struct TimeRecursionGuard {
+    TimeRecursionGuard() { g_InTimeHook = true; }
+    ~TimeRecursionGuard() { g_InTimeHook = false; }
+};
+
 //[修改] 直接定义并自动初始化全局架构标志
 inline bool InitIsWin64() {
 #ifdef _WIN64
-    return true; // 64位编译环境下，系统必然是64位
+    return true; // 64位编译环境下 系统必然是64位
 #else
     BOOL isWow64 = FALSE;
-    // 32位编译环境下，如果当前是Wow64进程，说明系统是64位
+    // 32位编译环境下 如果当前是Wow64进程 说明系统是64位
     if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
         return isWow64 != FALSE;
     }
@@ -1214,14 +1220,8 @@ inline bool InitIsWow64Process() {
 #endif
 }
 
-bool g_IsWin64 = InitIsWin64(); 
+bool g_IsWin64 = InitIsWin64();
 bool g_IsWow64Process = InitIsWow64Process();
-
-// 辅助类：自动设置和清除标志
-struct TimeRecursionGuard {
-    TimeRecursionGuard() { g_InTimeHook = true; }
-    ~TimeRecursionGuard() { g_InTimeHook = false; }
-};
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -2704,6 +2704,43 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
         fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
     }
 
+    // ========== [新增] 路径规范化 (移植自 Sandboxie) ==========
+    if (!fullPath.empty()) {
+        std::wstring lowerPath = fullPath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+        // 1. 统一 ControlSetXXX 为 CurrentControlSet
+        // 匹配 \registry\machine\system\controlset001 等 (前缀长度 35)
+        if (lowerPath.compare(0, 35, L"\\registry\\machine\\system\\controlset") == 0 && lowerPath.length() >= 38) {
+            // 确保后面 3 个字符是数字 (例如 001, 002)
+            if (iswdigit(fullPath[35]) && iswdigit(fullPath[36]) && iswdigit(fullPath[37])) {
+                fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet" + fullPath.substr(38);
+                // 更新 lowerPath 以供后续匹配
+                lowerPath = fullPath;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+            }
+        }
+
+        // 2. 统一 \REGISTRY\USER\CURRENT 为 当前用户 SID
+        // 匹配 \registry\user\current (前缀长度 23)
+        if (lowerPath.compare(0, 23, L"\\registry\\user\\current") == 0) {
+            // 确保是完整路径节点 (末尾 或者以 \ 继续)
+            if (lowerPath.length() == 23 || lowerPath[23] == L'\\') {
+                fullPath = g_CurrentUserSidPath + fullPath.substr(23);
+                lowerPath = fullPath;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+            }
+        }
+
+        // 3. WinSxS (SideBySide) 重定向 (Vista+)
+        // 匹配 \registry\machine\software\microsoft\windows\currentversion\sidebyside (前缀长度 70)
+        if (lowerPath.compare(0, 70, L"\\registry\\machine\\software\\microsoft\\windows\\currentversion\\sidebyside") == 0) {
+            if (lowerPath.length() == 70 || lowerPath[70] == L'\\') {
+                fullPath = L"\\REGISTRY\\MACHINE\\COMPONENTS" + fullPath.substr(70);
+            }
+        }
+    }
+
     return fullPath;
 }
 
@@ -2724,7 +2761,7 @@ std::wstring GetNameFromHandle(HANDLE hKey) {
 
 // [替换] 完善的 WOW64 路径修正 (移植自 Sandboxie Key_FixNameWow64)
 std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess) {
-    // 如果不是 64 位系统，不需要重定向
+    // 如果不是 64 位系统 不需要重定向
     if (!g_IsWin64) return path;
 
     // 排除 Office ClickToRun 等特殊路径 (Sandboxie 兼容性逻辑)
@@ -2741,35 +2778,39 @@ std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess
         wants32 = g_IsWow64Process;
     }
 
-    // 如果明确需要 64 位视图，且路径中没有 Wow6432Node，直接返回
     std::wstring lowerPath = path;
     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-    if (!wants32 && lowerPath.find(L"wow6432node") == std::wstring::npos) {
+
+    // 如果明确需要 64 位视图 或者路径中已经包含 wow6432node 则不处理
+    if (!wants32 || lowerPath.find(L"wow6432node") != std::wstring::npos) {
         return path;
     }
 
     // 核心逻辑：利用 Windows 内核的重定向机制
-    // 尝试打开真实注册表键，让内核完成 WOW64 路径转换，然后查回真实路径
     std::wstring currentPath = path;
     std::wstring choppedPath = L"";
     HANDLE hTemp = NULL;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
 
-    // 仅请求读取权限，并带上 WOW64 标志让内核重定向
-    ACCESS_MASK openAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_32KEY | KEY_WOW64_64KEY));
+    // [修正] 显式指定 WOW64 标志 确保内核使用正确的视图进行路径解析
+    ACCESS_MASK openAccess = KEY_QUERY_VALUE;
+    if (wants32) {
+        openAccess |= KEY_WOW64_32KEY;
+    } else {
+        openAccess |= KEY_WOW64_64KEY;
+    }
 
     while (!currentPath.empty()) {
         RtlInitUnicodeString(&us, currentPath.c_str());
         InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        // 注意：这里调用 fpNtOpenKey 不会被 Hook 拦截，因为外层已经有 RecursionGuard
         NTSTATUS st = fpNtOpenKey(&hTemp, openAccess, &oa);
         if (NT_SUCCESS(st)) {
             break; // 成功打开
         }
 
-        // 如果找不到，砍掉最后一级目录继续往上找 (应对新建键的情况)
+        // 如果找不到 砍掉最后一级目录继续往上找 (应对新建键的情况)
         size_t pos = currentPath.rfind(L'\\');
         if (pos == std::wstring::npos || pos == 0) {
             break;
@@ -2787,11 +2828,11 @@ std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess
         if (!realResolvedPath.empty()) {
             std::wstring finalPath = realResolvedPath + choppedPath;
 
-            // 清理可能出现的双重 Wow6432Node (移植自 Sandboxie Key_FixNameWow64_3)
+            // 清理可能出现的双重 Wow6432Node
             std::wstring lowerFinal = finalPath;
             std::transform(lowerFinal.begin(), lowerFinal.end(), lowerFinal.begin(), towlower);
             size_t doubleWow = lowerFinal.find(L"\\wow6432node\\wow6432node");
-            
+
             if (doubleWow != std::wstring::npos) {
                 finalPath.erase(doubleWow, 12); // 删掉一个 \Wow6432Node
             }
@@ -2988,6 +3029,11 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
 
     // 8. IE Zones
     if (contains(L"internet settings\\zones")) return true;
+
+    // ==========[新增] AppHive 直通 (移植自 Sandboxie) ==========
+    // 9. AppHive (UWP/Centennial 私有配置单元)
+    // 路径形如 \REGISTRY\A\... 必须直通 否则现代应用无法运行
+    if (lowerPath.compare(0, 13, L"\\registry\\a\\") == 0) return true;
 
     return false;
 }
@@ -3658,7 +3704,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         if (!isSandboxPath) {
             fullNtPath = fixedRealPath;
         } else {
-            // 如果是沙盒路径，且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
             // 需要重新计算沙盒路径 fullNtPath
             std::wstring relPath;
             if (ShouldRedirectReg(realPathCandidate, relPath)) {
@@ -3927,7 +3973,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         if (!isSandboxPath) {
             fullNtPath = fixedRealPath;
         } else {
-            // 如果是沙盒路径，且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
             // 需要重新计算沙盒路径 fullNtPath
             std::wstring relPath;
             if (ShouldRedirectReg(realPathCandidate, relPath)) {
@@ -4116,7 +4162,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         if (!isSandboxPath) {
             fullNtPath = fixedRealPath;
         } else {
-            // 如果是沙盒路径，且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
             // 需要重新计算沙盒路径 fullNtPath
             std::wstring relPath;
             if (ShouldRedirectReg(realPathCandidate, relPath)) {
@@ -4797,7 +4843,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
         if (!isSandboxPath) {
             fullNtPath = fixedRealPath;
         } else {
-            // 如果是沙盒路径，且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
             // 需要重新计算沙盒路径 fullNtPath
             std::wstring relPath;
             if (ShouldRedirectReg(realPathCandidate, relPath)) {
@@ -5037,7 +5083,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
         if (!isSandboxPath) {
             fullNtPath = fixedRealPath;
         } else {
-            // 如果是沙盒路径，且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
             // 需要重新计算沙盒路径 fullNtPath
             std::wstring relPath;
             if (ShouldRedirectReg(realPathCandidate, relPath)) {
