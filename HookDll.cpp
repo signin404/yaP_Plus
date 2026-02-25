@@ -20,6 +20,8 @@
 #include <shellapi.h>
 #include <numeric>
 #include <set>
+#include <sddl.h>
+#include <aclapi.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -2843,7 +2845,64 @@ std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess
     return path; // 回退到原路径
 }
 
-// --- [新增] 沙盒墓碑机制 ---
+// ========== [新增] 权限与降权 (Low Integrity) 支持 ==========
+// 检查当前进程是否是受限令牌 (Low Integrity / AppContainer)
+bool IsRestrictedToken() {
+    HANDLE hToken;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD isRestricted = 0;
+        DWORD len = 0;
+        if (GetTokenInformation(hToken, TokenIsRestricted, &isRestricted, sizeof(isRestricted), &len) && isRestricted) {
+            CloseHandle(hToken);
+            return true;
+        }
+        
+        PTOKEN_MANDATORY_LABEL pTIL = NULL;
+        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(LPTR, len);
+            if (pTIL && GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
+                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid, 
+                    (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
+                LocalFree(pTIL);
+                CloseHandle(hToken);
+                return dwIntegrityLevel < SECURITY_MANDATORY_MEDIUM_RID;
+            }
+            if (pTIL) LocalFree(pTIL);
+        }
+        CloseHandle(hToken);
+    }
+    return false;
+}
+
+// 降低指定注册表键的完整性级别 (Mandatory Integrity Control) 为 Low
+bool SetLowLabelKeyByName(const std::wstring& ntPath) {
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING us;
+    RtlInitUnicodeString(&us, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    
+    // 尝试以 WRITE_OWNER | WRITE_DAC 权限打开
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY, &oa)) ||
+        NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC, &oa))) {
+        
+        PSECURITY_DESCRIPTOR pSD = NULL;
+        // S:(ML;;NW;;;LW) 表示 Low Mandatory Level
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+            PACL pSacl = NULL;
+            BOOL saclPresent = FALSE, saclDefaulted = FALSE;
+            GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
+            
+            DWORD res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
+            LocalFree(pSD);
+            fpNtClose(hKey);
+            return res == ERROR_SUCCESS;
+        }
+        fpNtClose(hKey);
+    }
+    return false;
+}
 
 // --- [新增] 清除键的所有值 (用于复活墓碑键时) ---
 void ClearSandboxKeyValues(HANDLE hKey) {
@@ -3143,6 +3202,19 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
 
         ULONG disposition;
         NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_CreatePath) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 如果创建失败 说明父键权限过高 降低父键的完整性级别
+            std::wstring parentNtPath = g_RegMountPathNt;
+            if (currentPos > 0) {
+                parentNtPath += L"\\" + relPath.substr(0, currentPos - 1);
+            }
+            SetLowLabelKeyByName(parentNtPath);
+            
+            // 重试创建
+            status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+        }
 
         if (NT_SUCCESS(status)) {
             fpNtClose(hKey);
@@ -3744,6 +3816,18 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
         // 直接尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 降低目标键及其父键的完整性级别
+            SetLowLabelKeyByName(targetSandboxFull);
+            size_t pos = targetSandboxFull.rfind(L'\\');
+            if (pos != std::wstring::npos) {
+                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
+            }
+            // 重试
+            status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+        }
 
         if (NT_SUCCESS(status)) {
             // [核心修复] 打开一个拥有完全权限的临时句柄 用于执行维护操作
@@ -4883,6 +4967,18 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
         // 尝试创建/打开沙盒键 (带事务)
         NTSTATUS status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 降低目标键及其父键的完整性级别
+            SetLowLabelKeyByName(targetSandboxFull);
+            size_t pos = targetSandboxFull.rfind(L'\\');
+            if (pos != std::wstring::npos) {
+                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
+            }
+            // 重试
+            status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+        }
 
         if (NT_SUCCESS(status)) {
             // [维护操作] 使用非事务句柄进行墓碑复活和初始化
