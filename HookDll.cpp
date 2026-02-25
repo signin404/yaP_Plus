@@ -3437,9 +3437,28 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
 }
 
 NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
+    // 1. 基础检查
     if (g_IsInHook || !g_HookReg || !g_hAppHive || !NewName || !NewName->Buffer)
         return fpNtRenameKey(KeyHandle, NewName);
+    
+    // 防止递归
     RecursionGuard guard;
+
+    // 2. 获取路径
+    std::wstring currentPath = GetPathFromHandle(KeyHandle);
+    if (currentPath.empty()) {
+        // 如果无法获取路径，可能是无效句柄，直接调用原始 API 让系统处理错误
+        return fpNtRenameKey(KeyHandle, NewName);
+    }
+
+    // 3. 检查是否在沙盒内
+    // [修复] 必须严格检查是否在沙盒挂载点下，否则直接放行
+    if (g_RegMountPathNt.empty() || _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) {
+        // 这是一个真实注册表句柄。
+        // 理论上不应该发生（因为 OpenKey 应该已重定向），但以防万一，直接调用原始 API。
+        // 注意：这可能会因为权限不足失败，但不会导致本 DLL 崩溃。
+        return fpNtRenameKey(KeyHandle, NewName);
+    }
 
     // 只处理沙盒内的句柄 [修复] 使用 _wcsnicmp
     std::wstring currentPath = GetPathFromHandle(KeyHandle);
@@ -3853,29 +3872,34 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
-                    // 写权限请求：执行 Copy-on-Write
-                    // 必须在沙盒中创建影子键，否则后续 Rename 会操作真实注册表导致崩溃或逃逸
+                    // [核心修复] 请求写权限：必须执行 Copy-on-Write
+                    // 如果无法重定向到沙盒，应返回失败，而不是返回只读的真实句柄
                     
-                    // 1. 确定要在沙盒中创建的相对路径
+                    // 1. 解析相对路径
                     std::wstring relPathToCreate;
                     bool needCreate = false;
 
                     if (isRedirectedRoot) {
                         relPathToCreate = relPath;
                         needCreate = true;
-                    } else {
-                        // 如果是因为回退逻辑进入这里，尝试解析相对路径
-                        // 注意：realPathForCheck 是真实路径，需要转换为沙盒相对路径
+                    } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+                        // 这种情况是：传入的是沙盒路径，但不存在，回退检查发现真实键存在
+                        // 此时 realPathForCheck 已经是真实路径，需要转回沙盒相对路径
                         if (ShouldRedirectReg(realPathForCheck, relPathToCreate)) {
                             needCreate = true;
                         }
+                    } else {
+                         // 传入的是普通真实路径 (如 HKLM\Software\MyKey)
+                         if (ShouldRedirectReg(realPathForCheck, relPathToCreate)) {
+                             needCreate = true;
+                         }
                     }
 
                     if (needCreate && !relPathToCreate.empty()) {
-                        // 2. 确保路径存在
+                        // 2. 确保父路径存在
                         EnsureRegPathExistsRelative(relPathToCreate);
 
-                        // 3. 创建/打开沙盒键
+                        // 3. 创建沙盒键
                         HANDLE hSandboxKey = NULL;
                         UNICODE_STRING usRel;
                         RtlInitUnicodeString(&usRel, relPathToCreate.c_str());
@@ -3883,18 +3907,14 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                         InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
                         
                         ULONG disp;
-                        // 使用用户请求的权限创建/打开
                         NTSTATUS createStatus = fpNtCreateKey(&hSandboxKey, DesiredAccess, &oaSandbox, 0, NULL, 0, &disp);
 
                         if (NT_SUCCESS(createStatus)) {
-                            // 4. [核心] 初始化值墓碑
-                            // 只要真实键存在，我们就在沙盒中为其值创建墓碑，实现惰性 CoW
-                            HANDLE hMaint = NULL;
-                            // 尝试以写权限打开用于维护，如果用户请求的权限不足，则尝试提权
+                            // 4. 初始化值墓碑 (Copy-on-Write)
+                            HANDLE hMaint = hSandboxKey;
+                            // 如果用户请求的权限不含 KEY_SET_VALUE，我们需要临时提权来写入墓碑
                             if ((DesiredAccess & KEY_SET_VALUE) == 0) {
                                 fpNtOpenKey(&hMaint, KEY_SET_VALUE | KEY_QUERY_VALUE, &oaSandbox);
-                            } else {
-                                hMaint = hSandboxKey; // 复用句柄
                             }
 
                             if (hMaint) {
@@ -3902,7 +3922,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                                 BYTE staticValBuf[4096];
                                 BYTE dummyByte = 0;
                                 
-                                // 枚举真实键的值并写入墓碑
                                 while (true) {
                                     NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
                                     if (st == STATUS_NO_MORE_ENTRIES) break;
@@ -3926,38 +3945,41 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
                                     idx++;
                                 }
                                 
+                                // 如果使用了临时句柄，关闭它
                                 if (hMaint != hSandboxKey) fpNtClose(hMaint);
                             }
 
-                            // 关闭真实句柄，返回沙盒句柄
-                            fpNtClose(hRealCheck);
-                            *KeyHandle = hSandboxKey;
+                            fpNtClose(hRealCheck); // 关闭真实句柄
+                            *KeyHandle = hSandboxKey; // 返回沙盒句柄
 
-                            // 更新上下文
+                            // 更新 Context
                             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                             auto it = g_RegContextMap.find(*KeyHandle);
                             if (it == g_RegContextMap.end()) {
                                 RegContext* ctx = new RegContext();
                                 ctx->FullPath = g_RegMountPathNt + L"\\" + relPathToCreate;
-                                ctx->hRealKey = NULL; // 值已由墓碑代理，无需保持真实句柄打开，或按需重新打开
+                                ctx->hRealKey = NULL; 
                                 g_RegContextMap[*KeyHandle] = ctx;
                             }
                             
                             return createStatus;
+                        } else {
+                            // [核心修复] 沙盒创建失败 (如权限不足)，关闭真实句柄并返回错误
+                            fpNtClose(hRealCheck);
+                            return createStatus; // 返回失败状态，防止返回只读真实句柄导致后续崩溃
                         }
                     }
                 }
                 
-                // 如果不是写权限请求，或者 CoW 创建失败，则返回真实句柄（只读回退）
-                // 注意：返回真实句柄可能导致后续写操作失败，但至少能读
+                // 如果不是写权限请求，或者是系统关键路径，则返回真实句柄
                 *KeyHandle = hRealCheck;
-                // 更新上下文，记录这是真实句柄
+                // 更新 Context
                 {
                     std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                     if (g_RegContextMap.find(*KeyHandle) == g_RegContextMap.end()) {
                          RegContext* ctx = new RegContext();
                          ctx->FullPath = realPathForCheck;
-                         ctx->hRealKey = *KeyHandle; // 自引用，标记为真实句柄
+                         ctx->hRealKey = *KeyHandle; 
                          g_RegContextMap[*KeyHandle] = ctx;
                     }
                 }
