@@ -295,6 +295,50 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
+typedef struct _KEY_VALUE_ENTRY {
+    PUNICODE_STRING ValueName;
+    ULONG           DataLength;
+    ULONG           DataOffset;
+    ULONG           Type;
+} KEY_VALUE_ENTRY, *PKEY_VALUE_ENTRY;
+
+typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
+    HANDLE KeyHandle,
+    PKEY_VALUE_ENTRY ValueEntries,
+    ULONG EntryCount,
+    PVOID ValueBuffer,
+    PULONG BufferLength,
+    PULONG RequiredBufferLength
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(
+    HANDLE KeyHandle,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
+    HANDLE MasterKeyHandle,
+    ULONG Count,
+    POBJECT_ATTRIBUTES SlaveObjects,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
+
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
 } KEY_WRITE_TIME_INFORMATION, *PKEY_WRITE_TIME_INFORMATION;
@@ -1058,6 +1102,7 @@ struct CachedRegValue {
 struct RegContext {
     std::wstring FullPath;
     HANDLE hRealKey = NULL; // [新增] 缓存对应的真实键句柄
+    HANDLE hMonitorKey = NULL; // [新增] 用于 NtNotifyChangeKey 的沙盒监视句柄
     std::vector<CachedRegKey> SubKeys;
     std::vector<CachedRegValue> Values;
     bool KeysInitialized = false;
@@ -1233,6 +1278,9 @@ P_WinExec fpWinExec = NULL;
 P_NtClose fpNtClose = NULL;
 P_NtQueryKey fpNtQueryKey = NULL;
 P_NtSetInformationKey fpNtSetInformationKey = NULL;
+P_NtQueryMultipleValueKey fpNtQueryMultipleValueKey = NULL;
+P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
+P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -4538,6 +4586,192 @@ NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueNa
     return status;
 }
 
+// --- [新增] 现代软件多值查询 Hook (复用单值查询逻辑以支持墓碑和回退) ---
+NTSTATUS NTAPI Detour_NtQueryMultipleValueKey(
+    HANDLE KeyHandle,
+    PKEY_VALUE_ENTRY ValueEntries,
+    ULONG EntryCount,
+    PVOID ValueBuffer,
+    PULONG BufferLength,
+    PULONG RequiredBufferLength
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount, ValueBuffer, BufferLength, RequiredBufferLength);
+    RecursionGuard guard;
+
+    ULONG totalRequiredSize = 0;
+    NTSTATUS finalStatus = STATUS_SUCCESS;
+    ULONG currentOffset = 0;
+
+    std::vector<BYTE> tempBuf(4096);
+
+    for (ULONG i = 0; i < EntryCount; i++) {
+        PKEY_VALUE_ENTRY entry = &ValueEntries[i];
+
+        ULONG resultLength = 0;
+        // 复用 Detour_NtQueryValueKey，自动处理墓碑值、真实注册表回退和 FakeACP
+        NTSTATUS status = Detour_NtQueryValueKey(
+            KeyHandle,
+            entry->ValueName,
+            KeyValuePartialInformation,
+            tempBuf.data(),
+            (ULONG)tempBuf.size(),
+            &resultLength
+        );
+
+        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+            tempBuf.resize(resultLength);
+            status = Detour_NtQueryValueKey(
+                KeyHandle,
+                entry->ValueName,
+                KeyValuePartialInformation,
+                tempBuf.data(),
+                (ULONG)tempBuf.size(),
+                &resultLength
+            );
+        }
+
+        if (NT_SUCCESS(status)) {
+            PKEY_VALUE_PARTIAL_INFORMATION partialInfo = (PKEY_VALUE_PARTIAL_INFORMATION)tempBuf.data();
+
+            entry->Type = partialInfo->Type;
+            entry->DataLength = partialInfo->DataLength;
+
+            if (BufferLength && currentOffset + partialInfo->DataLength <= *BufferLength) {
+                entry->DataOffset = currentOffset;
+                if (ValueBuffer) {
+                    memcpy((PUCHAR)ValueBuffer + currentOffset, partialInfo->Data, partialInfo->DataLength);
+                }
+                currentOffset += partialInfo->DataLength;
+
+                // 强制 4 字节对齐
+                currentOffset = (currentOffset + 3) & ~3;
+            } else {
+                finalStatus = STATUS_BUFFER_OVERFLOW;
+            }
+            // 累加所需大小，包括对齐
+            totalRequiredSize += partialInfo->DataLength;
+            totalRequiredSize = (totalRequiredSize + 3) & ~3;
+        } else {
+            // 如果任何一个值找不到，整体返回 STATUS_OBJECT_NAME_NOT_FOUND
+            finalStatus = STATUS_OBJECT_NAME_NOT_FOUND;
+            entry->DataLength = 0;
+            entry->DataOffset = 0;
+            entry->Type = 0;
+        }
+    }
+
+    if (RequiredBufferLength) {
+        *RequiredBufferLength = totalRequiredSize;
+    }
+
+    return finalStatus;
+}
+
+// --- [新增] 注册表变更通知 Hook (解决回退真实句柄无法收到沙盒变更的问题) ---
+NTSTATUS NTAPI Detour_NtNotifyChangeKey(
+    HANDLE KeyHandle,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    RecursionGuard guard;
+
+    HANDLE hTargetKey = KeyHandle;
+    std::wstring relPath;
+    std::wstring path = GetPathFromHandle(KeyHandle);
+
+    // 如果当前句柄指向真实注册表，且属于应重定向的路径，说明它是只读回退句柄
+    // 我们需要将其重定向到沙盒影子键，以便程序能收到沙盒内的变更通知
+    if (!path.empty() && ShouldRedirectReg(path, relPath)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (!it->second->hMonitorKey) {
+                EnsureRegPathExistsRelative(relPath);
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, sandboxPath.c_str());
+                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                HANDLE hMonitor = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hMonitor, KEY_NOTIFY, &oa))) {
+                    it->second->hMonitorKey = hMonitor;
+                } else {
+                    ULONG disp;
+                    if (NT_SUCCESS(fpNtCreateKey(&hMonitor, KEY_NOTIFY, &oa, 0, NULL, 0, &disp))) {
+                        it->second->hMonitorKey = hMonitor;
+                    }
+                }
+            }
+            if (it->second->hMonitorKey) {
+                hTargetKey = it->second->hMonitorKey;
+            }
+        }
+    }
+
+    return fpNtNotifyChangeKey(hTargetKey, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+}
+
+NTSTATUS NTAPI Detour_NtNotifyChangeMultipleKeys(
+    HANDLE MasterKeyHandle,
+    ULONG Count,
+    POBJECT_ATTRIBUTES SlaveObjects,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtNotifyChangeMultipleKeys(MasterKeyHandle, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    RecursionGuard guard;
+
+    HANDLE hTargetKey = MasterKeyHandle;
+    std::wstring relPath;
+    std::wstring path = GetPathFromHandle(MasterKeyHandle);
+
+    if (!path.empty() && ShouldRedirectReg(path, relPath)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(MasterKeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (!it->second->hMonitorKey) {
+                EnsureRegPathExistsRelative(relPath);
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, sandboxPath.c_str());
+                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                HANDLE hMonitor = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hMonitor, KEY_NOTIFY, &oa))) {
+                    it->second->hMonitorKey = hMonitor;
+                } else {
+                    ULONG disp;
+                    if (NT_SUCCESS(fpNtCreateKey(&hMonitor, KEY_NOTIFY, &oa, 0, NULL, 0, &disp))) {
+                        it->second->hMonitorKey = hMonitor;
+                    }
+                }
+            }
+            if (it->second->hMonitorKey) {
+                hTargetKey = it->second->hMonitorKey;
+            }
+        }
+    }
+
+    return fpNtNotifyChangeMultipleKeys(hTargetKey, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+}
+
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
     HANDLE hDir = INVALID_HANDLE_VALUE;
@@ -6252,6 +6486,10 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
             // [新增] 关闭缓存的真实句柄
             if (it->second->hRealKey) {
                 fpNtClose(it->second->hRealKey);
+            }
+            // [新增] 关闭监视句柄
+            if (it->second->hMonitorKey) {
+                fpNtClose(it->second->hMonitorKey);
             }
             delete it->second;
             g_RegContextMap.erase(it);
@@ -9566,6 +9804,22 @@ DWORD WINAPI InitHookThread(LPVOID) {
         void* pNtEnumerateValueKey = (void*)GetProcAddress(hNtdll, "NtEnumerateValueKey");
         if (pNtEnumerateValueKey) {
             MH_CreateHook(pNtEnumerateValueKey, &Detour_NtEnumerateValueKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateValueKey));
+        }
+
+        // [新增] 注册表多值查询与变更通知 Hook
+        void* pNtQueryMultipleValueKey = (void*)GetProcAddress(hNtdll, "NtQueryMultipleValueKey");
+        if (pNtQueryMultipleValueKey) {
+            MH_CreateHook(pNtQueryMultipleValueKey, &Detour_NtQueryMultipleValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryMultipleValueKey));
+        }
+
+        void* pNtNotifyChangeKey = (void*)GetProcAddress(hNtdll, "NtNotifyChangeKey");
+        if (pNtNotifyChangeKey) {
+            MH_CreateHook(pNtNotifyChangeKey, &Detour_NtNotifyChangeKey, reinterpret_cast<LPVOID*>(&fpNtNotifyChangeKey));
+        }
+
+        void* pNtNotifyChangeMultipleKeys = (void*)GetProcAddress(hNtdll, "NtNotifyChangeMultipleKeys");
+        if (pNtNotifyChangeMultipleKeys) {
+            MH_CreateHook(pNtNotifyChangeMultipleKeys, &Detour_NtNotifyChangeMultipleKeys, reinterpret_cast<LPVOID*>(&fpNtNotifyChangeMultipleKeys));
         }
     }
 
