@@ -3144,6 +3144,89 @@ bool IsKeyMarkedDeleted(HANDLE hKey) {
     return false;
 }
 
+// --- [新增] 清除键中的所有非墓碑值 (保留 YAPBOX_VALUE_TOMBSTONE_TYPE 值墓碑) ---
+void CleanNonTombstoneValues(HANDLE hKey) {
+    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
+
+    BYTE staticBuf[4096];
+    ULONG len = 0;
+    ULONG index = 0;
+
+    while (true) {
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, staticBuf, sizeof(staticBuf), &len);
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+
+        std::vector<BYTE> dynamicBuf;
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)staticBuf;
+
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            try { dynamicBuf.resize(len); } catch (...) { break; }
+            st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
+            if (!NT_SUCCESS(st)) break;
+            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
+        } else if (!NT_SUCCESS(st)) {
+            break;
+        }
+
+        // 保留值墓碑 只删除非墓碑值
+        if (info->Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+            index++; // 跳过墓碑
+            continue;
+        }
+
+        UNICODE_STRING vName;
+        vName.Buffer = info->Name;
+        vName.Length = (USHORT)info->NameLength;
+        vName.MaximumLength = (USHORT)info->NameLength;
+
+        if (NT_SUCCESS(fpNtDeleteValueKey(hKey, &vName))) {
+            continue; // 删除成功 列表缩短 不递增 index
+        }
+        index++; // 删除失败（权限等） 跳过避免死循环
+    }
+}
+
+// --- [新增] 递归清除沙盒键及其子键中的所有非墓碑值 ---
+void CleanNonTombstoneValuesRecursive(const std::wstring& sandboxPath) {
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, sandboxPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 尝试以完全权限打开 失败则降级
+    if (!NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+        if (!NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+            return; // 无法打开 跳过
+        }
+    }
+
+    // 清除本键的非墓碑值
+    CleanNonTombstoneValues(hKey);
+
+    // 枚举子键并递归
+    ULONG index = 0, len = 0;
+    std::vector<BYTE> buf(1024);
+
+    while (true) {
+        NTSTATUS st = fpNtEnumerateKey(hKey, index, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            buf.resize(len);
+            continue;
+        }
+        if (!NT_SUCCESS(st)) break;
+
+        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf.data();
+        std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
+        std::wstring childPath = sandboxPath + L"\\" + childName;
+
+        CleanNonTombstoneValuesRecursive(childPath);
+        index++;
+    }
+
+    fpNtClose(hKey);
+}
+
 // 设置键的时间戳（用于标记删除或复活）
 NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
     KEY_WRITE_TIME_INFORMATION kwti;
@@ -4326,6 +4409,10 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
         // 成功标记后 清除缓存并返回成功
         if (NT_SUCCESS(status)) {
+            // [新增] 清除该键的非墓碑值 (保留值墓碑以屏蔽真实注册表)
+            CleanNonTombstoneValues(KeyHandle);
+            // [新增] 递归清除子键中的非墓碑值
+            CleanNonTombstoneValuesRecursive(path);
             InvalidateParentRegContext(path);
             return STATUS_SUCCESS;
         }
@@ -4346,12 +4433,16 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
             ULONG disposition;
             // 创建或打开沙盒键
-            if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_SET_VALUE, &oaSandbox, 0, NULL, 0, &disposition))) {
+            if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
+                // [新增] 清除已有非墓碑值 (如果沙盒键已存在)
+                CleanNonTombstoneValues(hSandbox);
                 // 标记为删除
                 SetKeyLastWriteTime(hSandbox, true);
                 fpNtClose(hSandbox);
 
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                // [新增] 递归清除子键中的非墓碑值
+                CleanNonTombstoneValuesRecursive(sandboxPath);
                 InvalidateParentRegContext(sandboxPath);
                 return STATUS_SUCCESS;
             }
