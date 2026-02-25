@@ -3042,8 +3042,13 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
         else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
             outReal = g_CurrentUserSidPath + sub.substr(4);
         }
-        else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
+        else if (_wcsicmp(sub.c_str(), L"Classes") == 0) {
+            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+        }
+        else if (_wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
+            // 显式提取后缀，确保包含开头的反斜杠 (例如 \NewKey #1)
+            std::wstring suffix = sub.substr(7); 
+            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + suffix;
         }
         else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
             outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
