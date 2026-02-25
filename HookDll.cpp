@@ -1188,11 +1188,34 @@ bool g_EnableTimeHook = false;
 thread_local bool g_InTimeHook = false;
 thread_local bool g_IsInHook = false;
 
-// [新增] 全局架构标志
-// g_IsWin64 = true; // 如果是 64 位操作系统
-// IsWow64Process(GetCurrentProcess(), &g_IsWow64Process);
-extern bool g_IsWin64; 
-extern bool g_IsWow64Process;
+//[修改] 直接定义并自动初始化全局架构标志
+inline bool InitIsWin64() {
+#ifdef _WIN64
+    return true; // 64位编译环境下，系统必然是64位
+#else
+    BOOL isWow64 = FALSE;
+    // 32位编译环境下，如果当前是Wow64进程，说明系统是64位
+    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
+        return isWow64 != FALSE;
+    }
+    return false;
+#endif
+}
+
+inline bool InitIsWow64Process() {
+#ifdef _WIN64
+    return false; // 64位进程本身不是Wow64进程
+#else
+    BOOL isWow64 = FALSE;
+    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
+        return isWow64 != FALSE;
+    }
+    return false;
+#endif
+}
+
+bool g_IsWin64 = InitIsWin64(); 
+bool g_IsWow64Process = InitIsWow64Process();
 
 // 辅助类：自动设置和清除标志
 struct TimeRecursionGuard {
