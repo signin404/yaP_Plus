@@ -295,13 +295,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-typedef struct _KEY_VALUE_ENTRY {
-    PUNICODE_STRING ValueName;
-    ULONG           DataLength;
-    ULONG           DataOffset;
-    ULONG           Type;
-} KEY_VALUE_ENTRY, *PKEY_VALUE_ENTRY;
-
 typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
     HANDLE KeyHandle,
     PKEY_VALUE_ENTRY ValueEntries,
