@@ -59,6 +59,9 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// [新增] 辅助宏：计算对齐
+#define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+
 // [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
 #define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
 
@@ -6968,49 +6971,79 @@ NTSTATUS NTAPI Detour_NtQueryObject(
     ULONG Length,
     PULONG ReturnLength
 ) {
-    // 调用原始函数
+    // 1. 调用原始函数
     NTSTATUS status = fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
 
-    // 仅处理成功且为 ObjectNameInformation 的情况
+    // 2. 仅处理成功且为 ObjectNameInformation (1) 的情况
+    // 注意：ObjectAllInformation (3) 返回的是全局类型统计 不包含当前对象的路径 因此无需伪装
     if (NT_SUCCESS(status) && ObjectInformationClass == ObjectNameInformation && ObjectInformation) {
 
         POBJECT_NAME_INFORMATION pNameInfo = (POBJECT_NAME_INFORMATION)ObjectInformation;
+
+        // 确保缓冲区包含有效的 Name 结构且 Name 不为空
         if (pNameInfo->Name.Buffer && pNameInfo->Name.Length > 0) {
 
-            // 获取当前返回的路径 (设备路径格式)
-            // 例如: \Device\HarddiskVolume2\Sandbox\C\Windows\System32\notepad.exe
             std::wstring currentPath(pNameInfo->Name.Buffer, pNameInfo->Name.Length / sizeof(wchar_t));
+            std::wstring spoofedPath;
+            bool needSpoof = false;
 
-            // 检查是否以沙盒设备路径开头
-            if (!g_SandboxDevicePath.empty() &&
-                currentPath.size() > g_SandboxDevicePath.size() &&
-                _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+            // ---------------------------------------------------------
+            // A. 注册表对象伪装 (配合 g_RegMountPathNt)
+            // ---------------------------------------------------------
+            if (!g_RegMountPathNt.empty() &&
+                _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
 
-                // 检查分隔符 确保匹配完整目录
-                // currentPath[devLen] 应该是 '\' 后面跟着盘符 'C' 再后面是 '\'
+                // 反推真实路径
+                std::wstring realRegPath;
+                if (GetRealFromSandboxPath(currentPath, realRegPath)) {
+                    spoofedPath = realRegPath;
+                    needSpoof = true;
+                }
+            }
+            // ---------------------------------------------------------
+            // B. 文件对象伪装 (配合 g_SandboxDevicePath)
+            // ---------------------------------------------------------
+            else if (!g_SandboxDevicePath.empty() &&
+                     currentPath.size() > g_SandboxDevicePath.size() &&
+                     _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+
                 size_t devLen = g_SandboxDevicePath.size();
-                if (currentPath[devLen] == L'\\' && currentPath[devLen + 2] == L'\\') {
-
-                    wchar_t driveLetter = currentPath[devLen + 1]; // 'C'
+                // 检查格式 ...\C\...
+                if (currentPath[devLen] == L'\\' && currentPath.length() > devLen + 2 && currentPath[devLen + 2] == L'\\') {
+                    wchar_t driveLetter = currentPath[devLen + 1];
                     std::wstring realDevicePrefix = GetDevicePathByDrive(driveLetter);
 
                     if (!realDevicePrefix.empty()) {
-                        // 构造欺骗后的路径
-                        // \Device\HarddiskVolume1 + \Windows\System32\notepad.exe
-                        std::wstring spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
+                        spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
+                        needSpoof = true;
+                    }
+                }
+            }
 
-                        // 检查缓冲区是否足够 (通常欺骗后的路径比沙盒路径短 所以是安全的)
-                        if (spoofedPath.length() * sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
+            // ---------------------------------------------------------
+            // C. 执行伪装并修正 ReturnLength
+            // ---------------------------------------------------------
+            if (needSpoof && !spoofedPath.empty()) {
+                USHORT newByteLength = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
 
-                            // 原地修改缓冲区
-                            memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
-                            pNameInfo->Name.Length = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
+                // 检查缓冲区是否足够 (通常伪装后的路径比沙盒路径短 所以是安全的)
+                if (newByteLength <= pNameInfo->Name.MaximumLength) {
 
-                            // 确保 NULL 结尾 (虽然 UNICODE_STRING 不强制 但为了安全)
-                            if (pNameInfo->Name.Length + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
-                                pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
-                            }
-                        }
+                    // 1. 覆盖路径数据
+                    memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), newByteLength);
+                    pNameInfo->Name.Length = newByteLength;
+
+                    // 2. 确保 NULL 结尾 (安全防御)
+                    if (newByteLength + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
+                        pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
+                    }
+
+                    // 3. [关键] 修正 ReturnLength
+                    // 很多程序(如.NET)会检查 ReturnLength 是否与实际数据匹配
+                    if (ReturnLength) {
+                        // 计算实际需要的总大小：结构体头 + 字符串长度 + NULL结尾
+                        ULONG actualSize = sizeof(OBJECT_NAME_INFORMATION) + newByteLength + sizeof(wchar_t);
+                        *ReturnLength = actualSize;
                     }
                 }
             }
@@ -9762,8 +9795,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
         // [修复] 无论何种模式 都初始化 NtClose
-        // 注册表 Hook 中的 EnsureRegPathExistsNT 和 Detour_NtOpenKey 依赖此指针
-        // 如果不在此处初始化 当 YAP_HOOK_FILE=0 时 fpNtClose 为空导致崩溃
         fpNtClose = (P_NtClose)GetProcAddress(hNtdll, "NtClose");
     }
 
@@ -10223,16 +10254,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 分组挂钩逻辑
     // =======================================================
 
+    // [修改] 公共基础 Hook：NtQueryObject
+    // 只要启用了 文件重定向 OR 虚拟盘符 OR 注册表重定向
+    // 就必须挂钩 NtQueryObject 以进行路径伪装 (防止通过句柄反查到沙盒路径)
+    if (hNtdll && (g_HookMode > 0 || g_VirtualCdDrive != 0 || g_HookReg)) {
+        void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
+        if (pNtQueryObject) {
+            // MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址(Trampoline)
+            // 这样 GetPathFromHandle 内部调用 fpNtQueryObject 时依然能正常工作
+            MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+        }
+    }
+
     // --- 组 A: 文件系统 Hook ---
     if (hNtdll) {
-        // 1. 预先初始化必要的函数指针
-        // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
-        // 如果 g_HookMode=0 我们不会挂钩 NtQueryObject 因此必须手动获取其原始地址
-        // 否则 fpNtQueryObject 为 NULL 会导致崩溃
-        if (fpNtQueryObject == NULL) {
-            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
-        }
-
         // [修改] 启用文件重定向挂钩的条件
         // 1. hookfile > 0 (常规重定向)
         // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
@@ -10247,10 +10282,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
-
-            // 挂钩 NtQueryObject (用于路径伪装)
-            // 注意：MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址
-            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             // [新增] 挂钩 NtCreateNamedPipeFile
             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
