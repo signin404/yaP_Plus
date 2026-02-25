@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winternl.h>
+#include <aclapi.h>
 #include <sddl.h>
 #include <string>
 #include <vector>
@@ -5801,30 +5802,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
                 }
 
-HKEY hKey;
-// [关键] 必须申请 ACCESS_SYSTEM_SECURITY 权限，否则无法写入 SACL
-LSTATUS lOpen = RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, 
-                              WRITE_DAC | ACCESS_SYSTEM_SECURITY, &hKey);
+// 2. 构造完整的注册表路径字符串
+// 注意：RegLoadKey 挂载在 HKEY_USERS 下
+std::wstring fullRegPath = L"CURRENT_USER\\SOFTWARE\\LAV"; 
+// 如果是挂载的 Hive，请使用：L"USERS\\" + regMountName;
 
-if (lOpen == ERROR_SUCCESS) {
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    // S:(ML;OICI;NW;;;LW) 
-    // ML = Mandatory Label
-    // OICI = 继承到子项
-    // NW = No Write Up (低权限不能写高权限)
-    // LW = Low Integrity (低完整性)
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+PSECURITY_DESCRIPTOR pSD = NULL;
+// S:(ML;OICI;NW;;;LW) 
+// ML = Mandatory Label, OICI = 继承, NW = No Write Up, LW = Low Integrity
+if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+    
+    // 获取 SACL 指针
+    BOOL bSaclPresent = FALSE;
+    BOOL bSaclDefaulted = FALSE;
+    PACL pSacl = NULL;
+    
+    if (GetSecurityDescriptorSacl(pSD, &bSaclPresent, &pSacl, &bSaclDefaulted) && bSaclPresent) {
         
-        // [关键] 必须使用 LABEL_SECURITY_INFORMATION
-        // 这告诉系统我们要修改的是“强制性标签”，而不是普通的权限(DACL)
-        LSTATUS lSet = RegSetKeySecurity(hKey, LABEL_SECURITY_INFORMATION, pSD);
-        
-        if (lSet != ERROR_SUCCESS) {
-            // 如果这里失败，错误码 1314 代表特权没生效，5 代表权限不足
+        // [核心修改] 使用 SetNamedSecurityInfoW 直接作用于路径
+        // 这种方式比通过 Handle 设置更不容易出错
+        DWORD result = SetNamedSecurityInfoW(
+            (LPWSTR)fullRegPath.c_str(),
+            SE_REGISTRY_KEY,
+            LABEL_SECURITY_INFORMATION, // 明确指定我们要设置的是完整性标签
+            NULL, NULL, NULL,           // 不修改所有者、组、DACL
+            pSacl                       // 只修改 SACL 中的 Label
+        );
+
+        if (result != ERROR_SUCCESS) {
+            // 如果返回 1314，说明 SeSecurityPrivilege 没起作用
+            // 如果返回 2，说明路径不对
         }
-        LocalFree(pSD);
     }
-    RegCloseKey(hKey);
+    LocalFree(pSD);
 }
 
                 SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
