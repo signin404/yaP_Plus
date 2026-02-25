@@ -2672,11 +2672,8 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     }
 
     // 2. 拼接 ObjectName
-    if (attr->ObjectName && attr->ObjectName->Buffer && attr->ObjectName->Length > 0) {
-		if (!fullPath.empty() && fullPath.back() != L'\\') {
-			fullPath += L'\\';
-		}
-		fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    if (attr->ObjectName && attr->ObjectName->Buffer) {
+        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
     }
 
     return fullPath;
@@ -2896,10 +2893,11 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
-    std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    // std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
     std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
     std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
 
+    /*
     // 1. 匹配 HKCR (优先级高于 HKLM)
     if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixClasses.length());
@@ -2908,6 +2906,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
+    */
 
     // 2. 匹配 HKCC
     if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
@@ -3043,13 +3042,8 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
         else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
             outReal = g_CurrentUserSidPath + sub.substr(4);
         }
-        else if (_wcsicmp(sub.c_str(), L"Classes") == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
-        }
-        else if (_wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-            // 显式提取后缀，确保包含开头的反斜杠 (例如 \NewKey #1)
-            std::wstring suffix = sub.substr(7); 
-            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + suffix;
+        else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
+            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
         }
         else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
             outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
@@ -4180,25 +4174,7 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             std::map<std::wstring, CachedRegKey> mergedKeys;
 
             // A. 枚举真实路径
-            // [安全检查] 防止沙盒深层子键错误地映射到了真实根目录 (导致在子键中看到 .386 等根内容)
-            bool skipRealEnum = false;
-            
-            // 检查是否计算出的真实路径是 Classes 根
-            if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
-                bool isRealRoot = (realPath.length() == 34 || realPath[34] == L'\0');
-                
-                // 如果真实路径是根，但沙盒路径显然比根更长（说明是子键）
-                if (isRealRoot && sandboxPath.length() > g_RegMountPathNt.length() + 8) { // +8 预留 \Machine 等
-                    // 再次确认沙盒路径结尾不是 Classes
-                    if (sandboxPath.length() > 7 && _wcsicmp(sandboxPath.substr(sandboxPath.length() - 7).c_str(), L"Classes") != 0) {
-                        skipRealEnum = true;
-                    }
-                }
-            }
-
-            if (!skipRealEnum) {
-                EnumerateKeysToMap(realPath, mergedKeys);
-            }
+            EnumerateKeysToMap(realPath, mergedKeys);
 
             // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
             if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
