@@ -2672,8 +2672,11 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     }
 
     // 2. 拼接 ObjectName
-    if (attr->ObjectName && attr->ObjectName->Buffer) {
-        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    if (attr->ObjectName && attr->ObjectName->Buffer && attr->ObjectName->Length > 0) {
+		if (!fullPath.empty() && fullPath.back() != L'\\') {
+			fullPath += L'\\';
+		}
+		fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
     }
 
     return fullPath;
@@ -2893,11 +2896,10 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
-    // std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
     std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
     std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
 
-    /*
     // 1. 匹配 HKCR (优先级高于 HKLM)
     if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
         std::wstring sub = fullNtPath.substr(prefixClasses.length());
@@ -2906,7 +2908,6 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
         if (!sub.empty()) relPathOut += L"\\" + sub;
         return true;
     }
-    */
 
     // 2. 匹配 HKCC
     if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
