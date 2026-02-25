@@ -18,8 +18,10 @@
 #include <shared_mutex>
 #include <mswsock.h>
 #include <shellapi.h>
-#include <string_view>
 #include <numeric>
+#include <set>
+#include <sddl.h>
+#include <aclapi.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -31,6 +33,8 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma pack(push, 1)
+#pragma pack(pop)
 
 // 导出函数转发
 #pragma comment(linker, "/export:GetFileVersionInfoA=C:\\Windows\\System32\\version.GetFileVersionInfoA")
@@ -54,6 +58,73 @@
 // -----------------------------------------------------------
 // 1. 常量和宏补全
 // -----------------------------------------------------------
+
+// [新增] 辅助宏：计算对齐
+#define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+
+// [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
+#define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
+
+// --- Sandboxie 魔数时间戳定义 ---
+#define DELETE_MARK_LOW   0xDEAD44A0
+#define DELETE_MARK_HIGH  0x01B01234
+
+#ifndef _KEY_WRITE_TIME_INFORMATION_DEFINED
+#define _KEY_WRITE_TIME_INFORMATION_DEFINED
+#endif
+
+// 标志位定义
+#define FILE_DISPOSITION_DELETE 0x00000001
+#define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
+#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
+#define FILE_DISPOSITION_ON_CLOSE 0x00000008
+#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
+
+// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
+#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
+
+// 字节序转换
+#define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
+#define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
+
+// [新增] 判断是否包含注册表写入/修改权限
+#ifndef IS_REG_WRITE_ACCESS
+#define IS_REG_WRITE_ACCESS(access) (((access) & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER | MAXIMUM_ALLOWED | GENERIC_WRITE | GENERIC_ALL)) != 0)
+#endif
+
+// [新增] 补充注册表创建状态宏
+#ifndef REG_CREATED_NEW_KEY
+#define REG_CREATED_NEW_KEY (0x00000001L)
+#endif
+
+#ifndef _KEY_INFORMATION_CLASS_DEFINED
+#define _KEY_INFORMATION_CLASS_DEFINED
+#endif
+
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001AL)
+#endif
+
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+
+#ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
+#define _KEY_VALUE_INFORMATION_CLASS_DEFINED
+#endif
+
+// --- 注册表重定向相关常量与指针 ---
+#ifndef REG_PROCESS_APPKEY
+#define REG_PROCESS_APPKEY 0x00000001
+#endif
+
+#ifndef KEY_WOW64_32KEY
+#define KEY_WOW64_32KEY 0x0200
+#endif
+#ifndef KEY_WOW64_64KEY
+#define KEY_WOW64_64KEY 0x0100
+#endif
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #endif
@@ -173,9 +244,175 @@
 #define IO_REPARSE_TAG_SYMLINK 0xA000000C
 #endif
 
+#ifndef FileNamesInformation
+#define FileNamesInformation ((FILE_INFORMATION_CLASS)12)
+#endif
+
+#ifndef FileIdFullDirectoryInformation
+#define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
+#endif
+
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
+#endif
+
+#ifndef FileDispositionInformation
+#define FileDispositionInformation ((FILE_INFORMATION_CLASS)13)
+#endif
+
+#ifndef ObjectNameInformation
+#define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
+#endif
+
+#ifndef FileRenameInformationEx
+#define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
+#endif
+
+#ifndef FileEndOfFileInformation
+#define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
+#endif
+
+#ifndef FileLinkInformation
+#define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
+#endif
+
+#ifndef FILE_DEVICE_CD_ROM
+#define FILE_DEVICE_CD_ROM 0x00000002
+#endif
+
+#ifndef FILE_READ_ONLY_DEVICE
+#define FILE_READ_ONLY_DEVICE 0x00000002
+#endif
+
+#ifndef FILE_REMOVABLE_MEDIA
+#define FILE_REMOVABLE_MEDIA 0x00000001
+#endif
+
+#ifndef _FILE_BASIC_INFORMATION_DEFINED
+#define _FILE_BASIC_INFORMATION_DEFINED
+#endif
+
+#ifndef _FILE_STANDARD_INFORMATION_DEFINED
+#define _FILE_STANDARD_INFORMATION_DEFINED
+#endif
+
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// --- [新增] 事务注册表相关函数指针 ---
+typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG TitleIndex,
+    PUNICODE_STRING Class,
+    ULONG CreateOptions,
+    HANDLE TransactionHandle,
+    PULONG Disposition
+);
+
+typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE TransactionHandle
+);
+
+typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
+    HANDLE KeyHandle,
+    PKEY_VALUE_ENTRY ValueEntries,
+    ULONG EntryCount,
+    PVOID ValueBuffer,
+    PULONG BufferLength,
+    PULONG RequiredBufferLength
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(
+    HANDLE KeyHandle,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
+    HANDLE MasterKeyHandle,
+    ULONG Count,
+    POBJECT_ATTRIBUTES SlaveObjects,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
+
+typedef struct _KEY_WRITE_TIME_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+} KEY_WRITE_TIME_INFORMATION, *PKEY_WRITE_TIME_INFORMATION;
+
+// 1. 基础信息 (包含名称)
+typedef struct _KEY_BASIC_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
+
+// 2. 节点信息 (包含名称和类名)
+typedef struct _KEY_NODE_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG ClassOffset;
+    ULONG ClassLength;
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_NODE_INFORMATION, *PKEY_NODE_INFORMATION;
+
+// 3. 完整信息 (包含类名和统计信息 不含键名)
+typedef struct _KEY_FULL_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG ClassOffset;
+    ULONG ClassLength;
+    ULONG SubKeys;
+    ULONG MaxNameLen;
+    ULONG MaxClassLen;
+    ULONG Values;
+    ULONG MaxValueNameLen;
+    ULONG MaxValueDataLen;
+    WCHAR Class[1];
+} KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
+
+// 4. 名称信息
+typedef struct _KEY_NAME_INFORMATION {
+    ULONG NameLength;
+    WCHAR Name[1];
+} KEY_NAME_INFORMATION, *PKEY_NAME_INFORMATION;
+
+// 注册表信息类枚举
+typedef enum _KEY_INFORMATION_CLASS {
+    KeyBasicInformation = 0,
+    KeyNodeInformation,
+    KeyFullInformation,
+    KeyNameInformation,
+    KeyCachedInformation,
+    KeyFlagsInformation,
+    KeyVirtualizationInformation,
+    KeyHandleTagsInformation,
+    KeyTrustInformation,
+    KeyLayerInformation,
+    MaxKeyInfoClass
+} KEY_INFORMATION_CLASS;
 
 typedef struct _YAP_SYSTEM_TIMEOFDAY_INFORMATION {
     LARGE_INTEGER BootTime;
@@ -200,18 +437,6 @@ typedef struct _FILE_FS_ATTRIBUTE_INFORMATION {
     ULONG FileSystemNameLength;
     WCHAR FileSystemName[1];
 } FILE_FS_ATTRIBUTE_INFORMATION, *PFILE_FS_ATTRIBUTE_INFORMATION;
-
-#ifndef FILE_DEVICE_CD_ROM
-#define FILE_DEVICE_CD_ROM 0x00000002
-#endif
-
-#ifndef FILE_READ_ONLY_DEVICE
-#define FILE_READ_ONLY_DEVICE 0x00000002
-#endif
-
-#ifndef FILE_REMOVABLE_MEDIA
-#define FILE_REMOVABLE_MEDIA 0x00000001
-#endif
 
 // 注册表 TZI 二进制结构定义
 typedef struct _REG_TZI_FORMAT {
@@ -243,9 +468,6 @@ typedef struct _RTL_TIME_ZONE_INFORMATION {
     LONG DaylightBias;
 } RTL_TIME_ZONE_INFORMATION, *PRTL_TIME_ZONE_INFORMATION;
 
-// --- [新增] 补全注册表相关结构体与枚举 ---
-#ifndef _KEY_VALUE_INFORMATION_CLASS_DEFINED
-#define _KEY_VALUE_INFORMATION_CLASS_DEFINED
 typedef enum _KEY_VALUE_INFORMATION_CLASS {
     KeyValueBasicInformation = 0,
     KeyValueFullInformation,
@@ -254,7 +476,6 @@ typedef enum _KEY_VALUE_INFORMATION_CLASS {
     KeyValuePartialInformationAlign64,
     MaxKeyValueInfoClass
 } KEY_VALUE_INFORMATION_CLASS;
-#endif
 
 typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
     ULONG TitleIndex;
@@ -346,10 +567,6 @@ typedef struct _FILE_RENAME_INFORMATION {
     WCHAR FileName[1];
 } FILE_RENAME_INFORMATION, *PFILE_RENAME_INFORMATION;
 
-#ifndef FileLinkInformation
-#define FileLinkInformation ((FILE_INFORMATION_CLASS)11)
-#endif
-
 typedef struct _FILE_LINK_INFORMATION {
     BOOLEAN ReplaceIfExists;
     HANDLE RootDirectory;
@@ -357,41 +574,18 @@ typedef struct _FILE_LINK_INFORMATION {
     WCHAR FileName[1];
 } FILE_LINK_INFORMATION, *PFILE_LINK_INFORMATION;
 
-#ifndef FileEndOfFileInformation
-#define FileEndOfFileInformation ((FILE_INFORMATION_CLASS)20)
-#endif
-
 typedef struct _FILE_END_OF_FILE_INFORMATION {
     LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
-
-#ifndef FileRenameInformationEx
-#define FileRenameInformationEx ((FILE_INFORMATION_CLASS)65)
-#endif
 
 // 定义 Ex 结构体 (标志位)
 typedef struct _FILE_DISPOSITION_INFORMATION_EX {
     ULONG Flags;
 } FILE_DISPOSITION_INFORMATION_EX, *PFILE_DISPOSITION_INFORMATION_EX;
 
-// 标志位定义
-#define FILE_DISPOSITION_DELETE 0x00000001
-#define FILE_DISPOSITION_POSIX_SEMANTICS 0x00000002
-#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK 0x00000004
-#define FILE_DISPOSITION_ON_CLOSE 0x00000008
-#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE 0x00000010
-
-#ifndef ObjectNameInformation
-#define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
-#endif
-
 typedef struct _OBJECT_NAME_INFORMATION {
     UNICODE_STRING Name;
 } OBJECT_NAME_INFORMATION, *POBJECT_NAME_INFORMATION;
-
-#ifndef FileDispositionInformation
-#define FileDispositionInformation ((FILE_INFORMATION_CLASS)13)
-#endif
 
 typedef struct _FILE_DISPOSITION_INFORMATION {
     BOOLEAN DeleteFile;
@@ -426,7 +620,6 @@ typedef struct _FILE_NAME_INFORMATION {
     WCHAR FileName[1];
 } FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
 
-#ifndef _FILE_BASIC_INFORMATION_DEFINED
 typedef struct _FILE_BASIC_INFORMATION {
     LARGE_INTEGER CreationTime;
     LARGE_INTEGER LastAccessTime;
@@ -434,10 +627,7 @@ typedef struct _FILE_BASIC_INFORMATION {
     LARGE_INTEGER ChangeTime;
     ULONG FileAttributes;
 } FILE_BASIC_INFORMATION, *PFILE_BASIC_INFORMATION;
-#define _FILE_BASIC_INFORMATION_DEFINED
-#endif
 
-#ifndef _FILE_STANDARD_INFORMATION_DEFINED
 typedef struct _FILE_STANDARD_INFORMATION {
     LARGE_INTEGER AllocationSize;
     LARGE_INTEGER EndOfFile;
@@ -445,8 +635,6 @@ typedef struct _FILE_STANDARD_INFORMATION {
     BOOLEAN DeletePending;
     BOOLEAN Directory;
 } FILE_STANDARD_INFORMATION, *PFILE_STANDARD_INFORMATION;
-#define _FILE_STANDARD_INFORMATION_DEFINED
-#endif
 
 typedef struct _FILE_NETWORK_OPEN_INFORMATION {
     LARGE_INTEGER CreationTime;
@@ -536,11 +724,6 @@ typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
 
-// 添加缺失的状态码
-#ifndef STATUS_INVALID_INFO_CLASS
-#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003L)
-#endif
-
 // [新增] 补充缺失的目录信息结构体
 typedef struct _FILE_NAMES_INFORMATION {
     ULONG NextEntryOffset;
@@ -565,21 +748,24 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_FULL_DIR_INFORMATION, *PFILE_ID_FULL_DIR_INFORMATION;
 
-// [新增] 补充枚举值
-#ifndef FileNamesInformation
-#define FileNamesInformation ((FILE_INFORMATION_CLASS)12)
-#endif
-
-#ifndef FileIdFullDirectoryInformation
-#define FileIdFullDirectoryInformation ((FILE_INFORMATION_CLASS)38)
-#endif
-
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
+typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtOpenKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+typedef NTSTATUS(NTAPI* P_NtOpenKeyEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
+typedef NTSTATUS(NTAPI* P_NtDeleteKey)(HANDLE);
+typedef NTSTATUS(NTAPI* P_NtEnumerateKey)(HANDLE, ULONG, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtEnumerateValueKey)(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* P_NtSetValueKey)(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtQueryValueKey)(HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-P_NtQueryValueKey fpNtQueryValueKey = NULL;
+typedef NTSTATUS (NTAPI *P_NtDeleteValueKey)(HANDLE KeyHandle, PUNICODE_STRING ValueName);
+typedef NTSTATUS (NTAPI *P_NtRenameKey)(HANDLE KeyHandle, PUNICODE_STRING NewName);
+typedef NTSTATUS(NTAPI* P_RtlFormatCurrentUserKeyPath)(PUNICODE_STRING);
+
 typedef NTSTATUS(NTAPI* P_NtCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtOpenFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
 typedef NTSTATUS(NTAPI* P_NtQueryAttributesFile)(POBJECT_ATTRIBUTES, PFILE_BASIC_INFORMATION);
@@ -590,30 +776,17 @@ typedef NTSTATUS(NTAPI* P_NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOI
 typedef NTSTATUS(NTAPI* P_NtQueryDirectoryFileEx)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS, ULONG, PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* P_NtQueryObject)(HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* P_NtDeleteFile)(POBJECT_ATTRIBUTES);
-P_NtDeleteFile fpNtDeleteFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtCreateNamedPipeFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
-P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS);
-P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
 typedef NTSTATUS(NTAPI* P_NtResumeProcess)(HANDLE ProcessHandle);
-P_NtResumeProcess fpNtResumeProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
-P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
 
-// --- 函数指针定义 ---
 typedef int (WSAAPI* P_connect)(SOCKET s, const struct sockaddr* name, int namelen);
 typedef int (WSAAPI* P_WSAConnect)(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS);
 typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID, DWORD, LPDWORD, LPOVERLAPPED);
 typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
-P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
-P_WSAConnectByList fpWSAConnectByList = NULL;
-// [新增] ShellExecuteExW 函数指针
-typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
-P_ShellExecuteExW fpShellExecuteExW = NULL;
-
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
@@ -642,6 +815,9 @@ typedef HINTERNET (WINAPI* P_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, 
 // 旧版 DNS
 typedef struct hostent* (WSAAPI* P_gethostbyname)(const char*);
 
+// [新增] ShellExecuteExW 函数指针
+typedef BOOL(WINAPI* P_ShellExecuteExW)(SHELLEXECUTEINFOW*);
+
 // CreateProcess 系列
 typedef BOOL(WINAPI* P_CreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL(WINAPI* P_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
@@ -653,170 +829,109 @@ typedef DWORD(WINAPI* P_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD)
 
 // GDI 函数指针
 typedef HFONT(WINAPI* P_CreateFontIndirectW)(const LOGFONTW*);
-P_CreateFontIndirectW fpCreateFontIndirectW = NULL;
 typedef HFONT(WINAPI* P_CreateFontIndirectExW)(const ENUMLOGFONTEXDVW*);
-P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
 
 // [新增] GetStockObject 函数指针
 typedef HGDIOBJ(WINAPI* P_GetStockObject)(int);
-P_GetStockObject fpGetStockObject = NULL;
 
 // GDI+ 函数指针与类型
 typedef int GpStatus;
 typedef void GpFontCollection;
 typedef void GpFontFamily;
 typedef GpStatus(WINAPI* P_GdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
-P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
 
 // --- [新增] NLS 函数指针 ---
 typedef UINT(WINAPI* P_GetACP)(void);
-P_GetACP fpGetACP = NULL;
 typedef UINT(WINAPI* P_GetOEMCP)(void);
-P_GetOEMCP fpGetOEMCP = NULL;
 typedef LCID(WINAPI* P_GetUserDefaultLCID)(void);
-P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
 typedef LCID(WINAPI* P_GetSystemDefaultLCID)(void);
-P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
 typedef LCID(WINAPI* P_GetThreadLocale)(void);
-P_GetThreadLocale fpGetThreadLocale = NULL;
 typedef LANGID(WINAPI* P_GetUserDefaultLangID)(void);
-P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
 typedef LANGID(WINAPI* P_GetSystemDefaultLangID)(void);
-P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
 typedef int(WINAPI* P_GetLocaleInfoW)(LCID, LCTYPE, LPWSTR, int);
-P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
 
 // [新增] 字符串转换函数指针
 typedef int(WINAPI* P_MultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
-P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
 typedef int(WINAPI* P_WideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
-P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
 
 // --- [新增] UI语言函数指针 ---
 typedef LANGID(WINAPI* P_GetUserDefaultUILanguage)(void);
-P_GetUserDefaultUILanguage fpGetUserDefaultUILanguage = NULL;
 typedef LANGID(WINAPI* P_GetSystemDefaultUILanguage)(void);
-P_GetSystemDefaultUILanguage fpGetSystemDefaultUILanguage = NULL;
 
 // --- [新增] 字体枚举函数指针 ---
 typedef int (WINAPI* P_EnumFontFamiliesExW)(HDC, LPLOGFONTW, FONTENUMPROCW, LPARAM, DWORD);
-P_EnumFontFamiliesExW fpEnumFontFamiliesExW = NULL;
 typedef int (WINAPI* P_EnumFontFamiliesW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
-P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
 typedef int (WINAPI* P_EnumFontsW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
-P_EnumFontsW fpEnumFontsW = NULL;
 
 // --- [新增] Ntdll 字符串函数指针 ---
 typedef NTSTATUS(NTAPI* P_RtlMultiByteToUnicodeN)(PWCH, ULONG, PULONG, PCSTR, ULONG);
-P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
 typedef NTSTATUS(NTAPI* P_RtlUnicodeToMultiByteN)(PCHAR, ULONG, PULONG, PCWSTR, ULONG);
-P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
 
 // --- [新增] ANSI 字体函数指针 ---
 typedef HFONT(WINAPI* P_CreateFontIndirectA)(const LOGFONTA*);
-P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
 typedef HFONT(WINAPI* P_CreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
-P_CreateFontA fpCreateFontA = NULL;
 
 // --- [新增] ANSI 注册表函数指针 ---
 typedef LSTATUS(WINAPI* P_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
-P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegCreateKeyExA)(HKEY, LPCSTR, DWORD, LPSTR, DWORD, REGSAM, LPSECURITY_ATTRIBUTES, PHKEY, LPDWORD);
-P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-P_RegQueryValueExA fpRegQueryValueExA = NULL;
 typedef LSTATUS(WINAPI* P_RegSetValueExA)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
-P_RegSetValueExA fpRegSetValueExA = NULL;
 typedef LSTATUS(WINAPI* P_RegDeleteKeyA)(HKEY, LPCSTR);
-P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
 typedef LSTATUS(WINAPI* P_RegDeleteValueA)(HKEY, LPCSTR);
-P_RegDeleteValueA fpRegDeleteValueA = NULL;
 typedef LSTATUS(WINAPI* P_RegEnumKeyExA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPSTR, LPDWORD, PFILETIME);
-P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
 typedef LSTATUS(WINAPI* P_RegEnumValueA)(HKEY, DWORD, LPSTR, LPDWORD, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
-P_RegEnumValueA fpRegEnumValueA = NULL;
 
 // --- [新增] User32 窗口函数指针 ---
 typedef HWND(WINAPI* P_CreateWindowExA)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-P_CreateWindowExA fpCreateWindowExA = NULL;
 typedef int(WINAPI* P_GetWindowTextA)(HWND, LPSTR, int);
-P_GetWindowTextA fpGetWindowTextA = NULL;
 typedef LRESULT(WINAPI* P_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
-P_DefWindowProcA fpDefWindowProcA = NULL;
-// 辅助宏：判断是否为 ATOM (类名可能是字符串也可能是整数 ID)
-#define IS_ATOM(x) (((ULONG_PTR)(x) & 0xFFFF0000) == 0)
 
 // --- [新增] 消息与进程退出函数指针 ---
 typedef LRESULT(WINAPI* P_SendMessageA)(HWND, UINT, WPARAM, LPARAM);
-P_SendMessageA fpSendMessageA = NULL;
 typedef VOID(WINAPI* P_ExitProcess)(UINT);
-P_ExitProcess fpExitProcess = NULL;
 typedef NTSTATUS(NTAPI* P_NtTerminateProcess)(HANDLE, NTSTATUS);
-P_NtTerminateProcess fpNtTerminateProcess = NULL;
 
 // --- [新增] ANSI 字体枚举指针 ---
 typedef int (WINAPI* P_EnumFontFamiliesExA)(HDC, LPLOGFONTA, FONTENUMPROCA, LPARAM, DWORD);
-P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
 typedef int (WINAPI* P_EnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
-P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
 
 // --- [新增] 窗口过程与底层退出函数指针 ---
 typedef VOID(NTAPI* P_RtlExitUserProcess)(NTSTATUS);
-P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
 typedef VOID(WINAPI* P_PostQuitMessage)(int);
-P_PostQuitMessage fpPostQuitMessage = NULL;
 
 // --- [新增] 时区伪造相关 ---
 typedef DWORD(WINAPI* P_GetTimeZoneInformation)(LPTIME_ZONE_INFORMATION);
-P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
 typedef DWORD(WINAPI* P_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
-P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
 
 // GetDriveTypeW 函数指针
 typedef UINT(WINAPI* P_GetDriveTypeW)(LPCWSTR);
-P_GetDriveTypeW fpGetDriveTypeW = NULL;
 
 // [新增] 驱动器枚举函数指针
 typedef DWORD(WINAPI* P_GetLogicalDrives)(void);
-P_GetLogicalDrives fpGetLogicalDrives = NULL;
 typedef DWORD(WINAPI* P_GetLogicalDriveStringsW)(DWORD, LPWSTR);
-P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
 
 // --- [新增] 资源加载函数指针 ---
 typedef NTSTATUS(NTAPI* P_LdrResSearchResource)(PVOID, PULONG_PTR, ULONG, ULONG, PVOID*, PULONG, PVOID, PVOID);
-P_LdrResSearchResource fpLdrResSearchResource = NULL;
 
 // --- [新增] NLS 代码页信息函数指针 ---
 typedef BOOL(WINAPI* P_GetCPInfo)(UINT, LPCPINFO);
-P_GetCPInfo fpGetCPInfo = NULL;
 typedef BOOL(WINAPI* P_GetCPInfoExW)(UINT, DWORD, LPCPINFOEXW);
-P_GetCPInfoExW fpGetCPInfoExW = NULL;
 typedef BOOL(WINAPI* P_IsValidCodePage)(UINT);
-P_IsValidCodePage fpIsValidCodePage = NULL;
 
 // --- [新增] 时间伪造函数指针 ---
 typedef VOID(WINAPI* P_GetSystemTime)(LPSYSTEMTIME);
-P_GetSystemTime fpGetSystemTime = NULL;
 typedef VOID(WINAPI* P_GetLocalTime)(LPSYSTEMTIME);
-P_GetLocalTime fpGetLocalTime = NULL;
 typedef VOID(WINAPI* P_GetSystemTimeAsFileTime)(LPFILETIME);
-P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
 typedef VOID(WINAPI* P_GetSystemTimePreciseAsFileTime)(LPFILETIME);
-P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
 
 // --- [新增] NtQuerySystemTime 及 KernelBase 函数指针 ---
 typedef NTSTATUS(NTAPI* P_NtQuerySystemTime)(PLARGE_INTEGER);
-P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
-
-// KernelBase 专用指针 (避免与 Kernel32 指针冲突)
-P_GetSystemTime fpGetSystemTime_KB = NULL;
-P_GetLocalTime fpGetLocalTime_KB = NULL;
-P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
-P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
 
 // --- WinExec 函数指针 ---
 typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
-P_WinExec fpWinExec = NULL;
+
+// 原始 NtClose 指针 (需要 Hook 它来清理内存)
+typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
 
 // 命令行处理工具集
 namespace CmdUtils {
@@ -986,6 +1101,31 @@ namespace CmdUtils {
     }
 }
 
+// --- 注册表枚举合并缓存 ---
+struct CachedRegKey {
+    std::wstring Name;
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    std::wstring Class;
+};
+
+struct CachedRegValue {
+    std::wstring Name;
+    ULONG TitleIndex;
+    ULONG Type;
+    std::vector<BYTE> Data;
+};
+
+struct RegContext {
+    std::wstring FullPath;
+    HANDLE hRealKey = NULL; // [新增] 缓存对应的真实键句柄
+    HANDLE hMonitorKey = NULL; // [新增] 用于 NtNotifyChangeKey 的沙盒监视句柄
+    std::vector<CachedRegKey> SubKeys;
+    std::vector<CachedRegValue> Values;
+    bool KeysInitialized = false;
+    bool ValuesInitialized = false;
+};
+
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
@@ -1008,6 +1148,24 @@ bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
+std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
+
+bool g_HookReg = false;
+HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
+std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
+std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 \REGISTRY\USER\YapBoxReg_xxx)
+std::map<HANDLE, RegContext*> g_RegContextMap;
+std::shared_mutex g_RegContextMutex;
+
+// 缓存的 NT 路径
+std::wstring g_LauncherDirNt;
+std::wstring g_UserProfileNt;
+std::wstring g_UserProfileNtShort;
+std::wstring g_UsersDirNt;      // [新增] Users 根目录 (长路径)
+std::wstring g_UsersDirNtShort; // [新增] Users 根目录 (短路径)
+std::wstring g_ProgramDataNt;
+std::wstring g_ProgramDataNtShort;
+std::wstring g_PublicNt;
 
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
@@ -1034,12 +1192,42 @@ bool g_EnableTimeHook = false;
 
 // [新增] 防止时间函数递归调用的标志
 thread_local bool g_InTimeHook = false;
+thread_local bool g_IsInHook = false;
 
 // 辅助类：自动设置和清除标志
 struct TimeRecursionGuard {
     TimeRecursionGuard() { g_InTimeHook = true; }
     ~TimeRecursionGuard() { g_InTimeHook = false; }
 };
+
+//[修改] 直接定义并自动初始化全局架构标志
+inline bool InitIsWin64() {
+#ifdef _WIN64
+    return true; // 64位编译环境下 系统必然是64位
+#else
+    BOOL isWow64 = FALSE;
+    // 32位编译环境下 如果当前是Wow64进程 说明系统是64位
+    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
+        return isWow64 != FALSE;
+    }
+    return false;
+#endif
+}
+
+inline bool InitIsWow64Process() {
+#ifdef _WIN64
+    return false; // 64位进程本身不是Wow64进程
+#else
+    BOOL isWow64 = FALSE;
+    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
+        return isWow64 != FALSE;
+    }
+    return false;
+#endif
+}
+
+bool g_IsWin64 = InitIsWin64();
+bool g_IsWow64Process = InitIsWow64Process();
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -1058,6 +1246,118 @@ P_InternetOpenUrlA fpInternetOpenUrlA = NULL;
 P_gethostbyname fpGethostbyname = NULL;
 LPFN_CONNECTEX fpConnectEx_Real = NULL; // 保存系统真实的 ConnectEx
 P_WSAIoctl fpWSAIoctl = NULL;           // 保存系统真实的 WSAIoctl
+P_NtCreateKey fpNtCreateKey = NULL;
+P_NtOpenKey fpNtOpenKey = NULL;
+P_NtOpenKeyEx fpNtOpenKeyEx = NULL;
+P_NtDeleteKey fpNtDeleteKey = NULL;
+P_NtEnumerateKey fpNtEnumerateKey = NULL;
+P_NtEnumerateValueKey fpNtEnumerateValueKey = NULL;
+P_RtlFormatCurrentUserKeyPath fpRtlFormatCurrentUserKeyPath = NULL;
+P_NtSetValueKey fpNtSetValueKey = NULL;
+P_NtQueryValueKey fpNtQueryValueKey = NULL;
+P_NtDeleteValueKey fpNtDeleteValueKey = NULL;
+P_NtRenameKey fpNtRenameKey = NULL;
+P_NtDeleteFile fpNtDeleteFile = NULL;
+P_NtCreateNamedPipeFile fpNtCreateNamedPipeFile = NULL;
+P_NtQueryVolumeInformationFile fpNtQueryVolumeInformationFile = NULL;
+P_NtResumeProcess fpNtResumeProcess = NULL;
+P_NtQuerySystemInformation fpNtQuerySystemInformation = NULL;
+P_WSAConnectByNameW fpWSAConnectByNameW = NULL;
+P_WSAConnectByList fpWSAConnectByList = NULL;
+P_ShellExecuteExW fpShellExecuteExW = NULL;
+P_CreateFontIndirectW fpCreateFontIndirectW = NULL;
+P_CreateFontIndirectExW fpCreateFontIndirectExW = NULL;
+P_GetStockObject fpGetStockObject = NULL;
+P_GdipCreateFontFamilyFromName fpGdipCreateFontFamilyFromName = NULL;
+P_GetACP fpGetACP = NULL;
+P_GetOEMCP fpGetOEMCP = NULL;
+P_GetUserDefaultLCID fpGetUserDefaultLCID = NULL;
+P_GetSystemDefaultLCID fpGetSystemDefaultLCID = NULL;
+P_GetThreadLocale fpGetThreadLocale = NULL;
+P_GetUserDefaultLangID fpGetUserDefaultLangID = NULL;
+P_GetSystemDefaultLangID fpGetSystemDefaultLangID = NULL;
+P_GetLocaleInfoW fpGetLocaleInfoW = NULL;
+P_MultiByteToWideChar fpMultiByteToWideChar = NULL;
+P_WideCharToMultiByte fpWideCharToMultiByte = NULL;
+P_GetUserDefaultUILanguage fpGetUserDefaultUILanguage = NULL;
+P_GetSystemDefaultUILanguage fpGetSystemDefaultUILanguage = NULL;
+P_EnumFontFamiliesExW fpEnumFontFamiliesExW = NULL;
+P_EnumFontFamiliesW fpEnumFontFamiliesW = NULL;
+P_EnumFontsW fpEnumFontsW = NULL;
+P_RtlMultiByteToUnicodeN fpRtlMultiByteToUnicodeN = NULL;
+P_RtlUnicodeToMultiByteN fpRtlUnicodeToMultiByteN = NULL;
+P_CreateFontIndirectA fpCreateFontIndirectA = NULL;
+P_CreateFontA fpCreateFontA = NULL;
+P_RegOpenKeyExA fpRegOpenKeyExA = NULL;
+P_RegCreateKeyExA fpRegCreateKeyExA = NULL;
+P_RegQueryValueExA fpRegQueryValueExA = NULL;
+P_RegSetValueExA fpRegSetValueExA = NULL;
+P_RegDeleteKeyA fpRegDeleteKeyA = NULL;
+P_RegDeleteValueA fpRegDeleteValueA = NULL;
+P_RegEnumKeyExA fpRegEnumKeyExA = NULL;
+P_RegEnumValueA fpRegEnumValueA = NULL;
+P_CreateWindowExA fpCreateWindowExA = NULL;
+P_GetWindowTextA fpGetWindowTextA = NULL;
+P_DefWindowProcA fpDefWindowProcA = NULL;
+P_SendMessageA fpSendMessageA = NULL;
+P_ExitProcess fpExitProcess = NULL;
+P_NtTerminateProcess fpNtTerminateProcess = NULL;
+P_EnumFontFamiliesExA fpEnumFontFamiliesExA = NULL;
+P_EnumFontFamiliesA fpEnumFontFamiliesA = NULL;
+P_RtlExitUserProcess fpRtlExitUserProcess = NULL;
+P_PostQuitMessage fpPostQuitMessage = NULL;
+P_GetTimeZoneInformation fpGetTimeZoneInformation = NULL;
+P_GetDynamicTimeZoneInformation fpGetDynamicTimeZoneInformation = NULL;
+P_GetDriveTypeW fpGetDriveTypeW = NULL;
+P_GetLogicalDrives fpGetLogicalDrives = NULL;
+P_GetLogicalDriveStringsW fpGetLogicalDriveStringsW = NULL;
+P_LdrResSearchResource fpLdrResSearchResource = NULL;
+P_GetCPInfo fpGetCPInfo = NULL;
+P_GetCPInfoExW fpGetCPInfoExW = NULL;
+P_IsValidCodePage fpIsValidCodePage = NULL;
+P_GetSystemTime fpGetSystemTime = NULL;
+P_GetLocalTime fpGetLocalTime = NULL;
+P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime = NULL;
+P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime = NULL;
+P_NtQuerySystemTime fpNtQuerySystemTime = NULL;
+P_WinExec fpWinExec = NULL;
+P_NtClose fpNtClose = NULL;
+P_NtQueryKey fpNtQueryKey = NULL;
+P_NtSetInformationKey fpNtSetInformationKey = NULL;
+P_NtQueryMultipleValueKey fpNtQueryMultipleValueKey = NULL;
+P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
+P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
+P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
+P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
+
+// 原始函数指针
+P_NtCreateFile fpNtCreateFile = NULL;
+P_NtOpenFile fpNtOpenFile = NULL;
+P_NtQueryAttributesFile fpNtQueryAttributesFile = NULL;
+P_NtQueryFullAttributesFile fpNtQueryFullAttributesFile = NULL;
+P_NtSetInformationFile fpNtSetInformationFile = NULL;
+P_NtQueryDirectoryFile fpNtQueryDirectoryFile = NULL;
+P_NtQueryDirectoryFileEx fpNtQueryDirectoryFileEx = NULL;
+P_NtQueryInformationFile fpNtQueryInformationFile = NULL;
+P_NtQueryObject fpNtQueryObject = NULL;
+
+P_CreateProcessW fpCreateProcessW = NULL;
+P_CreateProcessA fpCreateProcessA = NULL;
+P_CreateProcessAsUserW fpCreateProcessAsUserW = NULL;
+P_CreateProcessAsUserA fpCreateProcessAsUserA = NULL;
+P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
+P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
+P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
+
+// KernelBase 专用指针 (避免与 Kernel32 指针冲突)
+P_GetSystemTime fpGetSystemTime_KB = NULL;
+P_GetLocalTime fpGetLocalTime_KB = NULL;
+P_GetSystemTimeAsFileTime fpGetSystemTimeAsFileTime_KB = NULL;
+P_GetSystemTimePreciseAsFileTime fpGetSystemTimePreciseAsFileTime_KB = NULL;
+
+extern P_NtEnumerateKey fpNtEnumerateKey;
+extern P_NtEnumerateValueKey fpNtEnumerateValueKey;
+extern P_NtQuerySystemInformation fpNtQuerySystemInformation;
 
 // 函数前向声明 (Forward Declarations)
 bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath);
@@ -1235,10 +1535,6 @@ struct DirContext {
 std::map<HANDLE, DirContext*> g_DirContextMap;
 std::shared_mutex g_DirContextMutex; // 读写锁
 
-// 原始 NtClose 指针 (需要 Hook 它来清理内存)
-typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
-P_NtClose fpNtClose = NULL;
-
 // --- 设备路径映射缓存 ---
 std::vector<std::pair<std::wstring, std::wstring>> g_DeviceMap;
 
@@ -1282,44 +1578,7 @@ std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
     return devicePath;
 }
 
-// 缓存的 NT 路径
-std::wstring g_LauncherDirNt;
-std::wstring g_UserProfileNt;
-std::wstring g_UserProfileNtShort;
-std::wstring g_UsersDirNt;      // [新增] Users 根目录 (长路径)
-std::wstring g_UsersDirNtShort; // [新增] Users 根目录 (短路径)
-std::wstring g_ProgramDataNt;
-std::wstring g_ProgramDataNtShort;
-std::wstring g_PublicNt;
-
-thread_local bool g_IsInHook = false;
-
-// 原始函数指针
-P_NtCreateFile fpNtCreateFile = NULL;
-P_NtOpenFile fpNtOpenFile = NULL;
-P_NtQueryAttributesFile fpNtQueryAttributesFile = NULL;
-P_NtQueryFullAttributesFile fpNtQueryFullAttributesFile = NULL;
-P_NtSetInformationFile fpNtSetInformationFile = NULL;
-P_NtQueryDirectoryFile fpNtQueryDirectoryFile = NULL;
-P_NtQueryDirectoryFileEx fpNtQueryDirectoryFileEx = NULL;
-P_NtQueryInformationFile fpNtQueryInformationFile = NULL;
-P_NtQueryObject fpNtQueryObject = NULL;
-
-P_CreateProcessW fpCreateProcessW = NULL;
-P_CreateProcessA fpCreateProcessA = NULL;
-P_CreateProcessAsUserW fpCreateProcessAsUserW = NULL;
-P_CreateProcessAsUserA fpCreateProcessAsUserA = NULL;
-P_CreateProcessWithTokenW fpCreateProcessWithTokenW = NULL;
-P_CreateProcessWithLogonW fpCreateProcessWithLogonW = NULL;
-P_GetFinalPathNameByHandleW fpGetFinalPathNameByHandleW = NULL;
-
 // --- [修改] 字体文件解析与加载工具 (支持 TTF/OTF/TTC) ---
-
-// 字节序转换
-#define SWAPWORD(x) MAKEWORD(HIBYTE(x), LOBYTE(x))
-#define SWAPLONG(x) MAKELONG(SWAPWORD(HIWORD(x)), SWAPWORD(LOWORD(x)))
-
-#pragma pack(push, 1)
 
 // TTC 文件头
 struct TTC_HEADER {
@@ -1361,7 +1620,6 @@ struct TT_NAME_RECORD {
     USHORT uStringLength;
     USHORT uStringOffset;
 };
-#pragma pack(pop)
 
 // 内部辅助：解析单个 TTF/OTF 数据块的名称
 std::wstring ParseSingleFontName(const BYTE* pBase, const BYTE* pFontStart, size_t totalSize) {
@@ -1565,15 +1823,16 @@ std::wstring GetDevicePathByDrive(wchar_t driveLetter) {
 
 // 辅助：获取文件句柄对应的路径
 std::wstring GetPathFromHandle(HANDLE hFile) {
+    if (!fpNtQueryObject) return L""; // 防止空指针
     ULONG len = 0;
     fpNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &len);
     if (len == 0) return L"";
 
-    std::vector<BYTE> buffer(len);
+    std::vector<BYTE> buffer(len + 2); // 多分配一点防止溢出
     if (!NT_SUCCESS(fpNtQueryObject(hFile, ObjectNameInformation, buffer.data(), len, &len))) return L"";
 
     POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-    if (!nameInfo->Name.Buffer) return L"";
+    if (!nameInfo->Name.Buffer || nameInfo->Name.Length == 0) return L"";
 
     return std::wstring(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
 }
@@ -2397,7 +2656,2986 @@ struct RecursionGuard {
     ~RecursionGuard() { g_IsInHook = false; }
 };
 
-// --- NTDLL Hooks ---
+// --- 注册表重定向辅助函数 ---
+// 获取当前进程名 (小写 懒加载)
+const std::wstring& GetCurrentProcessNameLower() {
+    if (g_CurrentProcessNameLower.empty()) {
+        wchar_t path[MAX_PATH];
+        if (GetModuleFileNameW(NULL, path, MAX_PATH)) {
+            wchar_t* name = wcsrchr(path, L'\\');
+            g_CurrentProcessNameLower = name ? name + 1 : path;
+            std::transform(g_CurrentProcessNameLower.begin(), g_CurrentProcessNameLower.end(), g_CurrentProcessNameLower.begin(), towlower);
+        }
+    }
+    return g_CurrentProcessNameLower;
+}
+
+// 检查是否需要伪造特定的注册表值
+// 返回 true 表示需要伪造 outData 和 outType 将被填充
+bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& outType) {
+    const std::wstring& proc = GetCurrentProcessNameLower();
+
+    // 1. Internet Explorer / WebBrowser Control 兼容性
+    // 禁用保护模式 (Protected Mode) 防止 IE 尝试启动 Broker 进程
+    if (proc == L"iexplore.exe" || proc == L"microsoftedgecp.exe" || true) { // "true" 表示对所有进程生效 防止内嵌 WebBrowser 控件崩溃
+        // Zone 设定: 2500 = Protected Mode. 3 = OFF, 0 = ON.
+        if (valueName == L"2500") {
+            outType = REG_DWORD; outData = 3; return true;
+        }
+        // 显式关闭保护模式
+        if (_wcsicmp(valueName.c_str(), L"ProtectedModeOffForAllZones") == 0) {
+            outType = REG_DWORD; outData = 1; return true;
+        }
+        // 隐藏“保护模式已关闭”的警告条
+        if (_wcsicmp(valueName.c_str(), L"NoProtectedModeBanner") == 0) {
+            outType = REG_DWORD; outData = 1; return true;
+        }
+        // 禁用 IE9+ 的 USER32 Detours (Sandboxie 特有 防止冲突)
+        if (_wcsicmp(valueName.c_str(), L"DetourDialogs") == 0) {
+            outType = REG_DWORD; outData = 0; return true;
+        }
+    }
+
+    // 2. Adobe Acrobat / Reader 兼容性
+    // 禁用 Adobe 自带的沙盒 (Protected Mode) 和更新检查
+    if (proc == L"acrord32.exe" || proc == L"acrobat.exe" || proc == L"acrodist.exe") {
+        if (_wcsicmp(valueName.c_str(), L"bProtectedMode") == 0) {
+            outType = REG_DWORD; outData = 0; return true; // 关沙盒
+        }
+        if (_wcsicmp(valueName.c_str(), L"iCheckReader") == 0) {
+            outType = REG_DWORD; outData = 0; return true; // 关更新
+        }
+    }
+
+    // 3. 通用兼容性 (SRP / CreateProcess)
+    // 禁用 Authenticode 检查 防止递归调用 SandboxieCrypto 导致死锁
+    if (_wcsicmp(valueName.c_str(), L"AuthenticodeEnabled") == 0) {
+        outType = REG_DWORD; outData = 0; return true;
+    }
+
+    return false;
+}
+
+// 解析注册表对象属性为完整 NT 路径
+std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
+    std::wstring fullPath;
+
+    // 1. 解析 RootDirectory
+    if (attr->RootDirectory) {
+        // 检查预定义句柄 (强制转换为 ULONG_PTR 比较)
+        ULONG_PTR rootHandle = (ULONG_PTR)attr->RootDirectory;
+
+        if (rootHandle == (ULONG_PTR)HKEY_CURRENT_USER) {
+             fullPath = g_CurrentUserSidPath;
+        }
+        else if (rootHandle == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
+             fullPath = L"\\REGISTRY\\MACHINE";
+        }
+        else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
+             // HKCR 是合并视图 但在 NT 路径中通常映射到 Machine Classes
+             // 或者让系统去处理 但这里我们需要一个基准路径
+             fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+        }
+        else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
+             fullPath = L"\\REGISTRY\\USER";
+        }
+        else if (rootHandle == (ULONG_PTR)HKEY_CURRENT_CONFIG) {
+             fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
+        }
+        else {
+            // 普通句柄 查询对象名称
+            if (fpNtQueryObject) {
+                ULONG len = 0;
+                fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
+                if (len > 0) {
+                    std::vector<BYTE> buffer(len + 2); // +2 防止溢出
+                    if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
+                        POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
+                        if (nameInfo->Name.Buffer) {
+                            fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!fullPath.empty() && fullPath.back() != L'\\') {
+            fullPath += L'\\';
+        }
+    }
+
+    // 2. 拼接 ObjectName
+    if (attr->ObjectName && attr->ObjectName->Buffer) {
+        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    }
+
+    // ========== [新增] 路径规范化 (移植自 Sandboxie) ==========
+    if (!fullPath.empty()) {
+        std::wstring lowerPath = fullPath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+        // 1. 统一 ControlSetXXX 为 CurrentControlSet
+        // 匹配 \registry\machine\system\controlset001 等 (前缀长度 35)
+        if (lowerPath.compare(0, 35, L"\\registry\\machine\\system\\controlset") == 0 && lowerPath.length() >= 38) {
+            // 确保后面 3 个字符是数字 (例如 001, 002)
+            if (iswdigit(fullPath[35]) && iswdigit(fullPath[36]) && iswdigit(fullPath[37])) {
+                fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet" + fullPath.substr(38);
+                // 更新 lowerPath 以供后续匹配
+                lowerPath = fullPath;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+            }
+        }
+
+        // 2. 统一 \REGISTRY\USER\CURRENT 为 当前用户 SID
+        // 匹配 \registry\user\current (前缀长度 23)
+        if (lowerPath.compare(0, 23, L"\\registry\\user\\current") == 0) {
+            // 确保是完整路径节点 (末尾 或者以 \ 继续)
+            if (lowerPath.length() == 23 || lowerPath[23] == L'\\') {
+                fullPath = g_CurrentUserSidPath + fullPath.substr(23);
+                lowerPath = fullPath;
+                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+            }
+        }
+
+        // 3. WinSxS (SideBySide) 重定向 (Vista+)
+        // 匹配 \registry\machine\software\microsoft\windows\currentversion\sidebyside (前缀长度 70)
+        if (lowerPath.compare(0, 70, L"\\registry\\machine\\software\\microsoft\\windows\\currentversion\\sidebyside") == 0) {
+            if (lowerPath.length() == 70 || lowerPath[70] == L'\\') {
+                fullPath = L"\\REGISTRY\\MACHINE\\COMPONENTS" + fullPath.substr(70);
+            }
+        }
+    }
+
+    return fullPath;
+}
+
+// [新增] 辅助函数：通过句柄获取内核解析后的真实 NT 路径
+std::wstring GetNameFromHandle(HANDLE hKey) {
+    if (!hKey || !fpNtQueryKey) return L"";
+    ULONG len = 0;
+    NTSTATUS st = fpNtQueryKey(hKey, KeyNameInformation, NULL, 0, &len);
+    if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL || len > 0) {
+        std::vector<BYTE> buf(len + 2);
+        if (NT_SUCCESS(fpNtQueryKey(hKey, KeyNameInformation, buf.data(), len, &len))) {
+            PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)buf.data();
+            return std::wstring(info->Name, info->NameLength / sizeof(WCHAR));
+        }
+    }
+    return L"";
+}
+
+// [替换] 完善的 WOW64 路径修正 (移植自 Sandboxie Key_FixNameWow64)
+std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess) {
+    // 如果不是 64 位系统 不需要重定向
+    if (!g_IsWin64) return path;
+
+    // 排除 Office ClickToRun 等特殊路径 (Sandboxie 兼容性逻辑)
+    if (_wcsnicmp(path.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Office", 43) == 0) {
+        return path;
+    }
+
+    bool wants32 = false;
+    if (DesiredAccess & KEY_WOW64_32KEY) {
+        wants32 = true;
+    } else if (DesiredAccess & KEY_WOW64_64KEY) {
+        wants32 = false;
+    } else {
+        wants32 = g_IsWow64Process;
+    }
+
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    // 如果明确需要 64 位视图 或者路径中已经包含 wow6432node 则不处理
+    if (!wants32 || lowerPath.find(L"wow6432node") != std::wstring::npos) {
+        return path;
+    }
+
+    // 核心逻辑：利用 Windows 内核的重定向机制
+    std::wstring currentPath = path;
+    std::wstring choppedPath = L"";
+    HANDLE hTemp = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING us;
+
+    // [修正] 显式指定 WOW64 标志 确保内核使用正确的视图进行路径解析
+    ACCESS_MASK openAccess = KEY_QUERY_VALUE;
+    if (wants32) {
+        openAccess |= KEY_WOW64_32KEY;
+    } else {
+        openAccess |= KEY_WOW64_64KEY;
+    }
+
+    while (!currentPath.empty()) {
+        RtlInitUnicodeString(&us, currentPath.c_str());
+        InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        NTSTATUS st = fpNtOpenKey(&hTemp, openAccess, &oa);
+        if (NT_SUCCESS(st)) {
+            break; // 成功打开
+        }
+
+        // 如果找不到 砍掉最后一级目录继续往上找 (应对新建键的情况)
+        size_t pos = currentPath.rfind(L'\\');
+        if (pos == std::wstring::npos || pos == 0) {
+            break;
+        }
+
+        std::wstring chopped = currentPath.substr(pos);
+        choppedPath = chopped + choppedPath;
+        currentPath = currentPath.substr(0, pos);
+    }
+
+    if (hTemp) {
+        std::wstring realResolvedPath = GetNameFromHandle(hTemp);
+        fpNtClose(hTemp);
+
+        if (!realResolvedPath.empty()) {
+            std::wstring finalPath = realResolvedPath + choppedPath;
+
+            // 清理可能出现的双重 Wow6432Node
+            std::wstring lowerFinal = finalPath;
+            std::transform(lowerFinal.begin(), lowerFinal.end(), lowerFinal.begin(), towlower);
+            size_t doubleWow = lowerFinal.find(L"\\wow6432node\\wow6432node");
+
+            if (doubleWow != std::wstring::npos) {
+                finalPath.erase(doubleWow, 12); // 删掉一个 \Wow6432Node
+            }
+            return finalPath;
+        }
+    }
+
+    return path; // 回退到原路径
+}
+
+// ========== [新增] 权限与降权 (Low Integrity) 支持 ==========
+// 检查当前进程是否是受限令牌 (Low Integrity / AppContainer)
+bool IsRestrictedToken() {
+    HANDLE hToken;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD isRestricted = 0;
+        DWORD len = 0;
+        if (GetTokenInformation(hToken, TokenIsRestricted, &isRestricted, sizeof(isRestricted), &len) && isRestricted) {
+            CloseHandle(hToken);
+            return true;
+        }
+
+        PTOKEN_MANDATORY_LABEL pTIL = NULL;
+        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(LPTR, len);
+            if (pTIL && GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
+                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid,
+                    (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
+                LocalFree(pTIL);
+                CloseHandle(hToken);
+                return dwIntegrityLevel < SECURITY_MANDATORY_MEDIUM_RID;
+            }
+            if (pTIL) LocalFree(pTIL);
+        }
+        CloseHandle(hToken);
+    }
+    return false;
+}
+
+// 降低指定注册表键的完整性级别 (Mandatory Integrity Control) 为 Low
+bool SetLowLabelKeyByName(const std::wstring& ntPath) {
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING us;
+    RtlInitUnicodeString(&us, ntPath.c_str());
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 尝试以 WRITE_OWNER | WRITE_DAC 权限打开
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY, &oa)) ||
+        NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC, &oa))) {
+
+        PSECURITY_DESCRIPTOR pSD = NULL;
+        // S:(ML;;NW;;;LW) 表示 Low Mandatory Level
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+            PACL pSacl = NULL;
+            BOOL saclPresent = FALSE, saclDefaulted = FALSE;
+            GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
+
+            DWORD res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
+            LocalFree(pSD);
+            fpNtClose(hKey);
+            return res == ERROR_SUCCESS;
+        }
+        fpNtClose(hKey);
+    }
+    return false;
+}
+
+// --- [新增] 清除键的所有值 (用于复活墓碑键时) ---
+void ClearSandboxKeyValues(HANDLE hKey) {
+    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
+
+    // 使用固定缓冲区避免频繁 vector 分配 4KB 通常足够存储 KeyValueBasicInformation
+    BYTE staticBuf[4096];
+    ULONG len = 0;
+
+    while (true) {
+        // 始终枚举索引 0
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, staticBuf, sizeof(staticBuf), &len);
+
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)staticBuf;
+        std::vector<BYTE> dynamicBuf;
+
+        // 如果缓冲区不够 分配堆内存
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            try {
+                dynamicBuf.resize(len);
+            } catch (...) { break; } // 内存分配失败保护
+
+            st = fpNtEnumerateValueKey(hKey, 0, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
+            if (!NT_SUCCESS(st)) break;
+            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
+        } else if (!NT_SUCCESS(st)) {
+            break; // 其他错误 (如权限不足)
+        }
+
+        UNICODE_STRING uName;
+        uName.Buffer = info->Name;
+        uName.Length = (USHORT)info->NameLength;
+        uName.MaximumLength = (USHORT)info->NameLength;
+
+        // 删除值
+        st = fpNtDeleteValueKey(hKey, &uName);
+        if (!NT_SUCCESS(st)) break; // 防止死循环
+    }
+}
+
+// 递归物理删除沙盒键（含所有子键）
+void DeleteSandboxKeyRecursive(const std::wstring& fullPath) {
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, fullPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | DELETE, &oa))) {
+        while (true) {
+            ULONG len = 0;
+            // [修复] 使用 vector 保证内存对齐 并支持动态扩容
+            std::vector<BYTE> buf(1024);
+
+            // 始终枚举 index=0 因为每次删除后列表会缩短
+            NTSTATUS st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+
+            // [修复] 处理缓冲区不足的情况 防止死循环或漏删
+            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                buf.resize(len);
+                st = fpNtEnumerateKey(hKey, 0, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+            }
+
+            if (!NT_SUCCESS(st)) break;
+
+            PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf.data();
+            std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
+            std::wstring childPath = fullPath + L"\\" + childName;
+            DeleteSandboxKeyRecursive(childPath);
+        }
+        fpNtDeleteKey(hKey);
+        fpNtClose(hKey);
+    }
+}
+
+// [辅助函数] 从沙盒绝对路径反推真实绝对路径
+// 输入: \REGISTRY\USER\YapBoxReg_...\Machine\Software\Classes
+// 输出: \REGISTRY\MACHINE\SOFTWARE\Classes
+bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outReal) {
+    if (g_RegMountPathNt.empty()) return false;
+
+    // 检查前缀是否匹配沙盒挂载点 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(sandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0) return false;
+
+    // 提取相对路径 (例如 \User\Software\Classes)
+    std::wstring relPath = sandboxPath.substr(g_RegMountPathNt.length());
+    if (relPath.empty() || relPath[0] != L'\\') return false;
+
+    std::wstring sub = relPath.substr(1); // 去掉开头的 \
+
+    // 根据子根进行反向映射 [修复] 使用不区分大小写的比较
+    if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
+        outReal = L"\\REGISTRY\\USER" + sub.substr(5);
+    }
+    else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
+        outReal = g_CurrentUserSidPath + sub.substr(4);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
+    }
+    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
+        outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
+    }
+    else {
+        return false;
+    }
+    return true;
+}
+
+// 使指定沙盒路径的父键枚举缓存失效
+void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
+    size_t pos = sandboxKeyPath.rfind(L'\\');
+    if (pos == std::wstring::npos) return;
+    std::wstring parentPath = sandboxKeyPath.substr(0, pos);
+
+    // [修复] 计算对应的真实路径 确保缓存了真实路径的上下文也被失效
+    std::wstring realParentPath;
+    GetRealFromSandboxPath(parentPath, realParentPath);
+
+    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+    for (auto& pair : g_RegContextMap) {
+        if (_wcsicmp(pair.second->FullPath.c_str(), parentPath.c_str()) == 0 ||
+            (!realParentPath.empty() && _wcsicmp(pair.second->FullPath.c_str(), realParentPath.c_str()) == 0)) {
+            pair.second->KeysInitialized = false;
+            pair.second->SubKeys.clear();
+        }
+    }
+}
+
+// [新增] 检查注册表路径是否在白名单中 (需要直通真实注册表)
+bool IsSystemCriticalRegPath(const std::wstring& path) {
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    // 辅助 lambda：检查是否包含关键词
+    auto contains = [&](const wchar_t* sub) {
+        return lowerPath.find(sub) != std::wstring::npos;
+    };
+
+    // 1. Classes (COM 组件) - 核心修复
+    // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
+    // if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
+
+    // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
+    // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
+    // if (contains(L"_classes\\") ||
+		// (lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
+
+    // 2. 音频与多媒体
+    if (contains(L"mmdevices")) return true;
+    if (contains(L"audiocore")) return true;
+    if (contains(L"drivers32")) return true;
+    if (contains(L"drivers.desc")) return true;
+
+    // 3. DirectX
+    if (contains(L"microsoft\\directx")) return true;
+    if (contains(L"direct3d")) return true;
+    if (contains(L"directdraw")) return true;
+    if (contains(L"directsound")) return true;  // ← 修复 DirectSound Error
+    if (contains(L"directinput")) return true;  // ← 预防
+    if (contains(L"directplay")) return true;   // ← 预防
+
+    // 4. 硬件设备类
+    if (contains(L"control\\class")) return true;
+    if (contains(L"control\\deviceclasses")) return true;
+
+    // 5. 密码学与证书
+    if (contains(L"cryptography")) return true;
+    if (contains(L"systemcertificates")) return true;
+
+    // 6. 基础服务
+    if (contains(L"services\\bfe")) return true; // 防火墙
+    if (contains(L"currentversion\\sidebyside")) return true; // WinSxS
+    if (contains(L"\\registry\\machine\\components")) return true; // WinSxS
+
+    // 7. Office ClickToRun (Sandboxie 源码中提到的)
+    if (contains(L"clicktorun")) return true;
+
+    // 8. IE Zones
+    if (contains(L"internet settings\\zones")) return true;
+
+    // ==========[新增] AppHive 直通 (移植自 Sandboxie) ==========
+    // 9. AppHive (UWP/Centennial 私有配置单元)
+    // 路径形如 \REGISTRY\A\... 必须直通 否则现代应用无法运行
+    if (lowerPath.compare(0, 13, L"\\registry\\a\\") == 0) return true;
+
+    return false;
+}
+
+// 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
+bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
+    if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
+
+    // [修复] 使用不区分大小写的 _wcsnicmp 替换 find
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) return false;
+
+    // [新增] === 关键修复：白名单检查 ===
+    // 如果是 COM、音频、驱动相关路径 强制直通真实注册表
+    if (IsSystemCriticalRegPath(fullNtPath)) {
+        return false;
+    }
+
+    // 定义各根键的 NT 路径前缀
+    std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
+    std::wstring prefixUser = g_CurrentUserSidPath;
+    // std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
+    std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
+
+    /*
+    // 1. 匹配 HKCR (优先级高于 HKLM)
+    if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixClasses.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"Classes";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+    */
+
+    // 2. 匹配 HKCC
+    if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixConfig.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"Config";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 3. 匹配 HKCU
+    if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixUser.length());
+
+        // [关键修复] sub 必须为空(精确匹配)或以 \ 开头(子键)
+        // 若以 _ 开头说明是同级配置单元(如 SID_Classes), 不是 HKCU 子键, 不应重定向
+        if (!sub.empty() && sub[0] != L'\\') return false;
+
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+
+        if (IsSystemCriticalRegPath(fullNtPath)) return false;
+
+        relPathOut = L"User";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 4. 匹配 HKLM
+    if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
+        // [新增] 排除 SOFTWARE\Classes (虽然上面 IsSystemCriticalRegPath 已经处理了 双重保险)
+        // if (ContainsCaseInsensitive(fullNtPath, L"\\SOFTWARE\\Classes")) return false;
+
+        std::wstring sub = fullNtPath.substr(prefixMachine.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+        relPathOut = L"Machine";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    // 5. 匹配 HKU (排除掉已经处理的 HKCU 和沙盒挂载点)
+    if (_wcsnicmp(fullNtPath.c_str(), prefixUsersRoot.c_str(), prefixUsersRoot.length()) == 0) {
+        std::wstring sub = fullNtPath.substr(prefixUsersRoot.length());
+        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
+
+        // 如果 sub 为空 说明访问的是 \REGISTRY\USER 根
+        // 如果不为空 且不是当前用户 SID 则映射到 Users
+        relPathOut = L"Users";
+        if (!sub.empty()) relPathOut += L"\\" + sub;
+        return true;
+    }
+
+    return false;
+}
+
+// 递归创建注册表键 (相对于 AppHive)
+void EnsureRegPathExistsRelative(const std::wstring& relPath) {
+    if (relPath.empty() || !g_hAppHive) return;
+
+    size_t currentPos = 0;
+    while (true) {
+        size_t nextSlash = relPath.find(L'\\', currentPos);
+        if (nextSlash == std::wstring::npos) break; // 只创建父级 最后一级由 NtCreateKey 创建
+
+        std::wstring subPath = relPath.substr(0, nextSlash);
+
+        HANDLE hKey = NULL;
+        UNICODE_STRING uStr;
+        OBJECT_ATTRIBUTES oa;
+        RtlInitUnicodeString(&uStr, subPath.c_str());
+
+        // 关键：RootDirectory 指向我们的私有 Hive
+        InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+        ULONG disposition;
+        NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_CreatePath) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 如果创建失败 说明父键权限过高 降低父键的完整性级别
+            std::wstring parentNtPath = g_RegMountPathNt;
+            if (currentPos > 0) {
+                parentNtPath += L"\\" + relPath.substr(0, currentPos - 1);
+            }
+            SetLowLabelKeyByName(parentNtPath);
+
+            // 重试创建
+            status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+        }
+
+        if (NT_SUCCESS(status)) {
+            fpNtClose(hKey);
+        }
+
+        currentPos = nextSlash + 1;
+    }
+}
+
+// [新增] 检查真实键是否存在 如果存在则在沙盒中创建结构 (影子键)
+bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HANDLE RealParent, ACCESS_MASK DesiredAccess = KEY_WRITE) {
+    HANDLE hRealChild = NULL;
+    OBJECT_ATTRIBUTES oaReal;
+    InitializeObjectAttributes(&oaReal, ObjectName, OBJ_CASE_INSENSITIVE, RealParent, NULL);
+
+    // 1. 探测真实键是否存在
+    NTSTATUS status = fpNtOpenKey(&hRealChild, KEY_QUERY_VALUE, &oaReal);
+    if (!NT_SUCCESS(status)) {
+        return false;
+    }
+
+    // 2. 真实存在 在沙盒中创建影子结构
+    HANDLE hNewKey = NULL;
+    OBJECT_ATTRIBUTES oaNew;
+    InitializeObjectAttributes(&oaNew, ObjectName, OBJ_CASE_INSENSITIVE, SandboxParent, NULL);
+
+    ULONG disposition;
+    status = fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaNew, 0, NULL, 0, &disposition);
+
+    if (NT_SUCCESS(status)) {
+        fpNtClose(hNewKey);
+        fpNtClose(hRealChild);
+        return true;
+    }
+    fpNtClose(hRealChild);
+    return false;
+}
+
+// [新增] 获取句柄对应的真实路径和沙盒路径
+bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
+    std::wstring keyPath = GetPathFromHandle(hKey);
+    if (keyPath.empty()) return false;
+
+    // 检查是否在沙盒内 [修复] 使用 _wcsnicmp
+    if (g_HookReg && !g_RegMountPathNt.empty() && _wcsnicmp(keyPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        outSandbox = keyPath;
+        std::wstring relPath = keyPath.substr(g_RegMountPathNt.length());
+        if (relPath.empty() || relPath[0] != L'\\') return false;
+        std::wstring sub = relPath.substr(1);
+
+        // [修复] 使用不区分大小写的比较
+        if (_wcsicmp(sub.c_str(), L"Machine") == 0 || _wcsnicmp(sub.c_str(), L"Machine\\", 8) == 0) {
+            outReal = L"\\REGISTRY\\MACHINE" + sub.substr(7);
+        }
+        else if (_wcsicmp(sub.c_str(), L"Users") == 0 || _wcsnicmp(sub.c_str(), L"Users\\", 6) == 0) {
+            outReal = L"\\REGISTRY\\USER" + sub.substr(5);
+        }
+        else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
+            outReal = g_CurrentUserSidPath + sub.substr(4);
+        }
+        else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
+            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
+        }
+        else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
+            outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
+        }
+        else {
+            return false;
+        }
+        return true;
+    }
+    else {
+        // 句柄指向真实路径
+        outReal = keyPath;
+        std::wstring relPath;
+
+        if (ShouldRedirectReg(outReal, relPath)) {
+            outSandbox = g_RegMountPathNt + L"\\" + relPath;
+            return true;
+        }
+    }
+    return false;
+}
+
+// [新增] 枚举指定路径的子键到 Map (用于去重)
+void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedRegKey>& map) {
+    HANDLE hKey;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, path.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 尝试打开键
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
+        ULONG index = 0;
+        ULONG len;
+        std::vector<BYTE> buf(4096);
+
+        while (true) {
+            NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
+
+            // 处理缓冲区不足的情况 (虽然预分配了4k 但仍可能不足)
+            if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+                if (len > buf.size()) buf.resize(len);
+                continue; // 重试
+            }
+
+            if (status == STATUS_NO_MORE_ENTRIES) break;
+            if (!NT_SUCCESS(status)) break;
+
+            PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf.data();
+            std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
+
+            CachedRegKey entry;
+            entry.Name = name;
+            entry.LastWriteTime = info->LastWriteTime;
+            entry.TitleIndex = info->TitleIndex;
+            if (info->ClassLength > 0 && info->ClassOffset > 0) {
+                // 边界检查
+                if (info->ClassOffset + info->ClassLength <= buf.size()) {
+                    entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
+                }
+            }
+
+            std::wstring keyName = name;
+            std::transform(keyName.begin(), keyName.end(), keyName.begin(), towlower);
+            map[keyName] = entry;
+
+            index++;
+        }
+        fpNtClose(hKey);
+    }
+}
+
+// [新增] 枚举指定路径的值到 Map
+void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, CachedRegValue>& map) {
+    HANDLE hKey;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, path.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa))) {
+        ULONG index = 0;
+        ULONG len;
+        std::vector<BYTE> buf(4096);
+
+        while (true) {
+            NTSTATUS status = fpNtEnumerateValueKey(hKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
+            if (status == STATUS_NO_MORE_ENTRIES) break;
+            if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+                buf.resize(len);
+                continue;
+            }
+            if (!NT_SUCCESS(status)) break;
+
+            PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
+            std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
+
+            CachedRegValue entry;
+            entry.Name = name;
+            entry.TitleIndex = info->TitleIndex;
+            entry.Type = info->Type;
+            if (info->DataLength > 0) {
+                BYTE* pData = (BYTE*)info + info->DataOffset;
+                entry.Data.assign(pData, pData + info->DataLength);
+            }
+
+            std::wstring keyName = name;
+            std::transform(keyName.begin(), keyName.end(), keyName.begin(), towlower);
+            map[keyName] = entry;
+
+            index++;
+        }
+        fpNtClose(hKey);
+    }
+}
+
+// [新增] 尝试打开对应的真实键 (用于读取回退)
+HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
+    HANDLE hReal = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, realPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 只读打开
+    if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+        return hReal;
+    }
+    return NULL;
+}
+
+// [新增] 确保绝对路径存在 (用于创建影子键)
+// 输入: \REGISTRY\USER\YapBoxReg_...\User\Software\Rime\Weasel
+void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
+    if (fullSandboxPath.empty()) return;
+
+    // 我们需要逐级创建为了简单 我们利用 EnsureRegPathExistsRelative
+    // 先转成相对路径 [修复] 使用 _wcsnicmp
+    if (_wcsnicmp(fullSandboxPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        std::wstring relPath = fullSandboxPath.substr(g_RegMountPathNt.length());
+        if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
+        EnsureRegPathExistsRelative(relPath);
+    }
+}
+
+// 检查时间戳是否为删除标记
+bool IsDeleteMark(const LARGE_INTEGER& li) {
+    return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
+}
+
+// 检查键是否被标记为删除
+bool IsKeyMarkedDeleted(HANDLE hKey) {
+    KEY_BASIC_INFORMATION kbi;
+    ULONG len;
+    NTSTATUS status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
+    // [修复] STATUS_BUFFER_OVERFLOW 时固定字段 (LastWriteTime) 已被填充 必须一并检查
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+        return IsDeleteMark(kbi.LastWriteTime);
+    }
+    return false;
+}
+
+// --- [新增] 清除键中的所有非墓碑值 (保留 YAPBOX_VALUE_TOMBSTONE_TYPE 值墓碑) ---
+void CleanNonTombstoneValues(HANDLE hKey) {
+    if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
+
+    BYTE staticBuf[4096];
+    ULONG len = 0;
+    ULONG index = 0;
+
+    while (true) {
+        NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, staticBuf, sizeof(staticBuf), &len);
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+
+        std::vector<BYTE> dynamicBuf;
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)staticBuf;
+
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            try { dynamicBuf.resize(len); } catch (...) { break; }
+            st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, dynamicBuf.data(), len, &len);
+            if (!NT_SUCCESS(st)) break;
+            info = (PKEY_VALUE_BASIC_INFORMATION)dynamicBuf.data();
+        } else if (!NT_SUCCESS(st)) {
+            break;
+        }
+
+        // 保留值墓碑 只删除非墓碑值
+        if (info->Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+            index++; // 跳过墓碑
+            continue;
+        }
+
+        UNICODE_STRING vName;
+        vName.Buffer = info->Name;
+        vName.Length = (USHORT)info->NameLength;
+        vName.MaximumLength = (USHORT)info->NameLength;
+
+        if (NT_SUCCESS(fpNtDeleteValueKey(hKey, &vName))) {
+            continue; // 删除成功 列表缩短 不递增 index
+        }
+        index++; // 删除失败（权限等） 跳过避免死循环
+    }
+}
+
+// --- [新增] 递归清除沙盒键及其子键中的所有非墓碑值 ---
+void CleanNonTombstoneValuesRecursive(const std::wstring& sandboxPath) {
+    HANDLE hKey = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, sandboxPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 尝试以完全权限打开 失败则降级
+    if (!NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ALL_ACCESS, &oa))) {
+        if (!NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+            return; // 无法打开 跳过
+        }
+    }
+
+    // 清除本键的非墓碑值
+    CleanNonTombstoneValues(hKey);
+
+    // 枚举子键并递归
+    ULONG index = 0, len = 0;
+    std::vector<BYTE> buf(1024);
+
+    while (true) {
+        NTSTATUS st = fpNtEnumerateKey(hKey, index, KeyBasicInformation, buf.data(), (ULONG)buf.size(), &len);
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+            buf.resize(len);
+            continue;
+        }
+        if (!NT_SUCCESS(st)) break;
+
+        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)buf.data();
+        std::wstring childName(info->Name, info->NameLength / sizeof(WCHAR));
+        std::wstring childPath = sandboxPath + L"\\" + childName;
+
+        CleanNonTombstoneValuesRecursive(childPath);
+        index++;
+    }
+
+    fpNtClose(hKey);
+}
+
+// 设置键的时间戳（用于标记删除或复活）
+NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
+    KEY_WRITE_TIME_INFORMATION kwti;
+    if (isDelete) {
+        kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
+        kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
+    } else {
+        // 复活：设置为当前系统时间
+        GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
+    }
+
+    // 需要 KEY_SET_VALUE 权限
+    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
+}
+
+// --- 注册表 NT API Hook 实现 ---
+NTSTATUS NTAPI Detour_NtQueryValueKey(
+    HANDLE KeyHandle,
+    PUNICODE_STRING ValueName,
+    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    PVOID KeyValueInformation,
+    ULONG Length,
+    PULONG ResultLength
+) {
+    // 1. 尝试从当前句柄 (通常是沙盒句柄) 查询
+    // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
+    NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    // ========== [新增] 特定应用兼容性伪造 (移植自 Sandboxie) ==========
+    // 无论原始调用是否成功 只要程序查询敏感值 我们都强制覆盖为“安全”的值
+    // 仅处理最常用的 KeyValuePartialInformation (RegQueryValueEx 默认使用此类型)
+    if (ValueName && ValueName->Buffer && KeyValueInformationClass == KeyValuePartialInformation) {
+        std::wstring queryName(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
+        DWORD fakeData = 0;
+        ULONG fakeType = REG_DWORD;
+
+        if (TryGetAppCompatValue(queryName, fakeData, fakeType)) {
+            ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD);
+
+            if (ResultLength) *ResultLength = requiredSize;
+
+            if (Length >= requiredSize) {
+                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+                info->TitleIndex = 0;
+                info->Type = fakeType;
+                info->DataLength = sizeof(DWORD);
+                memcpy(info->Data, &fakeData, sizeof(DWORD));
+                return STATUS_SUCCESS; // 强制返回成功
+            } else {
+                return STATUS_BUFFER_OVERFLOW;
+            }
+        }
+    }
+
+    // [新增] 检查是否是值墓碑 (惰性 CoW 删除标记)
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+        ULONG type = 0;
+        if (KeyValueInformationClass == KeyValueBasicInformation) type = ((PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation)->Type;
+        else if (KeyValueInformationClass == KeyValueFullInformation) type = ((PKEY_VALUE_FULL_INFORMATION)KeyValueInformation)->Type;
+        else if (KeyValueInformationClass == KeyValuePartialInformation) type = ((PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation)->Type;
+
+        if (type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+            status = STATUS_OBJECT_NAME_NOT_FOUND; // 伪装成不存在
+        }
+    }
+
+    // 2. [回退逻辑] 如果沙盒中未找到该值 (STATUS_OBJECT_NAME_NOT_FOUND)
+    // 且启用了注册表 Hook 尝试从缓存的真实句柄中读取
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_HookReg && !g_IsInHook) {
+        HANDLE hReal = NULL;
+
+        // 从 Context 中查找缓存的真实句柄
+        {
+            std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                hReal = it->second->hRealKey;
+            }
+        }
+
+        // 如果找到了真实句柄 尝试从中查询
+        if (hReal) {
+            // 使用 RecursionGuard 防止某些底层 Hook 再次触发
+            RecursionGuard guard;
+            status = fpNtQueryValueKey(hReal, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
+    }
+
+    // 3. [区域伪造逻辑] 如果查询成功 (或缓冲区溢出 说明值存在) 且启用了区域伪造
+    // 我们需要拦截 ACP/OEMCP 的查询结果
+    if ((NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
+
+        // 检查是否查询的是 ACP 或 OEMCP
+        // 注册表路径通常是: HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage
+        // ValueName 分别是 "ACP" 或 "OEMCP"
+
+        bool isACP = (ValueName->Length >= 6 && _wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && (ValueName->Length == 6 || ValueName->Buffer[3] == L'\0'));
+        bool isOEMCP = (ValueName->Length >= 10 && _wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && (ValueName->Length == 10 || ValueName->Buffer[5] == L'\0'));
+
+        if (isACP || isOEMCP) {
+            const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
+            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t)); // 包含 NULL 结尾
+
+            // 根据查询的信息类进行处理
+            if (KeyValueInformationClass == KeyValuePartialInformation) {
+                // 结构: Header + Data
+                ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
+
+                if (Length >= requiredSize) {
+                    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+                    info->Type = REG_SZ;
+                    info->DataLength = fakeDataSize;
+                    memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
+                    status = STATUS_SUCCESS;
+                } else {
+                    status = STATUS_BUFFER_OVERFLOW;
+                }
+
+                if (ResultLength) *ResultLength = requiredSize;
+            }
+            else if (KeyValueInformationClass == KeyValueFullInformation) {
+                // 结构: Header + Name + Padding + Data
+                // 注意：这里我们只修改 Data 部分 假设 Name 部分已经由 fpNtQueryValueKey 填充好了
+                // 如果原始查询失败(回退逻辑也没找到) 这里进不来 所以 info 里的 Name 是有效的
+
+                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+
+                // 如果原始状态是 SUCCESS 我们可以直接修改数据
+                // 如果原始状态是 OVERFLOW 我们需要重新计算大小
+
+                // 简单起见 如果原始调用成功读取了数据 我们检查是否有空间覆写
+                if (status == STATUS_SUCCESS) {
+                    if (info->DataLength >= fakeDataSize) {
+                        // 原数据空间足够 直接覆盖
+                        info->Type = REG_SZ;
+                        info->DataLength = fakeDataSize;
+                        // DataOffset 是相对于结构体起始的偏移
+                        memcpy((BYTE*)info + info->DataOffset, fakeVal.c_str(), fakeDataSize);
+                    } else {
+                        // 原数据空间不足 (例如原值是 "1252" 长度 10 我们要写 "936" 长度 8 通常够用)
+                        // 如果不够 返回 OVERFLOW
+                        // 但通常代码页字符串长度都很短 这里做个防御性编程
+                        // 如果空间不够 我们只能告诉调用者需要更多内存
+                        // 重新计算所需大小
+                        ULONG dataOffset = info->DataOffset;
+                        ULONG requiredSize = dataOffset + fakeDataSize;
+
+                        if (Length >= requiredSize) {
+                             info->Type = REG_SZ;
+                             info->DataLength = fakeDataSize;
+                             memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
+                        } else {
+                             status = STATUS_BUFFER_OVERFLOW;
+                             if (ResultLength) *ResultLength = requiredSize;
+                        }
+                    }
+                }
+                else if (status == STATUS_BUFFER_OVERFLOW) {
+                    // 如果原始查询就溢出了 我们需要修正 ResultLength
+                    // 原始 ResultLength 是基于真实值的 我们需要基于伪造值计算
+                    // 这比较麻烦 因为我们不知道 Name 有多长
+                    // 但通常程序会先查长度再分配内存
+                    // 此时我们无法修改 ResultLength 准确值 因为不知道 NameLength
+                    // 只能寄希望于程序分配足够大的缓冲区（通常 MAX_PATH）
+                    // 或者 我们可以忽略这次修正 等程序分配了内存再次调用时 会进入上面的 STATUS_SUCCESS 分支
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
+    if (g_IsInHook || !g_HookReg || !g_hAppHive || !NewName || !NewName->Buffer)
+        return fpNtRenameKey(KeyHandle, NewName);
+    RecursionGuard guard;
+
+    // 只处理沙盒内的句柄 [修复] 使用 _wcsnicmp
+    std::wstring currentPath = GetPathFromHandle(KeyHandle);
+    if (currentPath.empty() || _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0)
+        return fpNtRenameKey(KeyHandle, NewName);
+
+    // 构造目标沙盒路径
+    size_t pos = currentPath.rfind(L'\\');
+    if (pos == std::wstring::npos) return fpNtRenameKey(KeyHandle, NewName);
+
+    std::wstring parentSandboxPath = currentPath.substr(0, pos);
+    std::wstring newName(NewName->Buffer, NewName->Length / sizeof(WCHAR));
+    std::wstring targetSandboxPath = parentSandboxPath + L"\\" + newName;
+
+    // 检查目标路径是否有墓碑键 有则物理删除以让路
+    HANDLE hTarget = NULL;
+    OBJECT_ATTRIBUTES oaTarget;
+    UNICODE_STRING usTarget;
+    RtlInitUnicodeString(&usTarget, targetSandboxPath.c_str());
+    InitializeObjectAttributes(&oaTarget, &usTarget, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // [修复] 使用 MAXIMUM_ALLOWED 打开 确保拥有 Rename 所需的权限 并修复 Use-After-Close 漏洞
+    if (NT_SUCCESS(fpNtOpenKey(&hTarget, MAXIMUM_ALLOWED, &oaTarget))) {
+        bool hasTomb = IsKeyMarkedDeleted(hTarget);
+
+        if (hasTomb) {
+            wchar_t tempName[64];
+            swprintf_s(tempName, L"__YBTmp%u_%u__", GetTickCount(), GetCurrentThreadId());
+            UNICODE_STRING usTempName;
+            RtlInitUnicodeString(&usTempName, tempName);
+
+            // 把墓碑键 rename 到临时名（目标名现在空出来了）
+            NTSTATUS mvSt = fpNtRenameKey(hTarget, &usTempName);
+            fpNtClose(hTarget); // [修复] 必须在 Rename 之后 Close
+
+            if (!NT_SUCCESS(mvSt)) {
+                DeleteSandboxKeyRecursive(targetSandboxPath);
+                return fpNtRenameKey(KeyHandle, NewName); // 回退
+            }
+
+            // 正式 rename 源键到目标名
+            NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
+
+            // 清理临时键（递归删除）
+            std::wstring tempPath = parentSandboxPath + L"\\" + tempName;
+            DeleteSandboxKeyRecursive(tempPath);
+
+            if (NT_SUCCESS(status)) InvalidateParentRegContext(currentPath);
+            return status;
+        }
+        fpNtClose(hTarget);
+    } else if (NT_SUCCESS(fpNtOpenKey(&hTarget, KEY_QUERY_VALUE, &oaTarget))) {
+        // 降级回退：如果无法以高权限打开 则尝试直接物理删除
+        bool hasTomb = IsKeyMarkedDeleted(hTarget);
+        fpNtClose(hTarget);
+        if (hasTomb) {
+            DeleteSandboxKeyRecursive(targetSandboxPath);
+        }
+    }
+
+    NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
+
+    if (NT_SUCCESS(status)) {
+        // 使父键枚举缓存失效
+        InvalidateParentRegContext(currentPath);
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtCreateKey(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG TitleIndex,
+    PUNICODE_STRING Class,
+    ULONG CreateOptions,
+    PULONG Disposition)
+{
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
+        return fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+    }
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // --- 1. 白名单检查 (保持不变) ---
+    std::wstring realPathCandidate;
+    bool isSandboxPath = false;
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxPath = true;
+        GetRealFromSandboxPath(fullNtPath, realPathCandidate);
+    } else {
+        realPathCandidate = fullNtPath;
+    }
+
+    // ========== [新增] WOW64 路径重定向修正 ==========
+    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
+    if (fixedRealPath != realPathCandidate) {
+        realPathCandidate = fixedRealPath;
+        if (!isSandboxPath) {
+            fullNtPath = fixedRealPath;
+        } else {
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 需要重新计算沙盒路径 fullNtPath
+            std::wstring relPath;
+            if (ShouldRedirectReg(realPathCandidate, relPath)) {
+                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
+            }
+        }
+    }
+
+    if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
+        OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+        oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL;
+
+        NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaReal, TitleIndex, Class, CreateOptions, Disposition);
+        if (status == STATUS_ACCESS_DENIED) {
+            ACCESS_MASK readOnlyAccess = DesiredAccess & (KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY | READ_CONTROL);
+            if (readOnlyAccess == 0) readOnlyAccess = KEY_READ;
+            status = fpNtOpenKey(KeyHandle, readOnlyAccess, &oaReal);
+            if (NT_SUCCESS(status) && Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
+        }
+        return status;
+    }
+
+    // --- 2. 重定向逻辑 ---
+    std::wstring relPath;
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
+        EnsureRegPathExistsRelative(relPath);
+        std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
+
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, relPath.c_str());
+        OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+        oaModified.ObjectName = &uStr;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+
+        // 直接尝试创建/打开沙盒键
+        NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 降低目标键及其父键的完整性级别
+            SetLowLabelKeyByName(targetSandboxFull);
+            size_t pos = targetSandboxFull.rfind(L'\\');
+            if (pos != std::wstring::npos) {
+                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
+            }
+            // 重试
+            status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
+        }
+
+        if (NT_SUCCESS(status)) {
+			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
+			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+			}
+
+            // [核心修复] 打开一个拥有完全权限的临时句柄 用于执行维护操作
+            // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
+            HANDLE hMaintenance = NULL;
+            OBJECT_ATTRIBUTES oaMaint;
+            UNICODE_STRING usMaint;
+            RtlInitUnicodeString(&usMaint, targetSandboxFull.c_str());
+            InitializeObjectAttributes(&oaMaint, &usMaint, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 使用 KEY_ALL_ACCESS 确保我们可以查询、枚举、写入时间戳
+            NTSTATUS maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
+
+            // 如果 KEY_ALL_ACCESS 失败 (极少见) 尝试最小必要权限
+            if (!NT_SUCCESS(maintStatus)) {
+                maintStatus = fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaMaint);
+            }
+
+            if (NT_SUCCESS(maintStatus)) {
+                bool isNewKey = false;
+                bool isResurrected = false;
+
+                // 检查是否是“已删除”的键 (墓碑)
+                if (IsKeyMarkedDeleted(hMaintenance)) {
+                    // === 复活 (Resurrection) ===
+                    // 1. 重置时间戳为当前时间
+                    SetKeyLastWriteTime(hMaintenance, false);
+
+                    // 2. 清空该键下的所有值
+                    ClearSandboxKeyValues(hMaintenance);
+
+                    // 3. 标记为“新建”
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+
+                    isResurrected = true;
+                    isNewKey = true;
+                }
+                else {
+                    // 常规新建检查
+                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                        isNewKey = true;
+                    }
+                }
+
+                // [核心] 惰性 CoW 初始化：屏蔽真实值
+                if (isNewKey) {
+                    HANDLE hRealCheck = NULL;
+                    OBJECT_ATTRIBUTES oaRealCheck;
+                    UNICODE_STRING usRealCheck;
+                    RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
+                    InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                    // 打开真实键
+                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                        ULONG idx = 0, vlen = 0;
+                        BYTE staticValBuf[4096]; // 使用栈内存
+                        BYTE dummyByte = 0;
+
+                        while (true) {
+                            NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
+
+                            // 处理大值
+                            std::vector<BYTE> dynamicValBuf;
+                            PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+
+                            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                                try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                if (!NT_SUCCESS(st)) break;
+                                vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                            } else if (!NT_SUCCESS(st)) {
+                                break;
+                            }
+
+                            UNICODE_STRING vName;
+                            vName.Buffer = vinfo->Name;
+                            vName.Length = (USHORT)vinfo->NameLength;
+                            vName.MaximumLength = (USHORT)vinfo->NameLength;
+
+                            // 写入值墓碑 (使用 hMaintenance 句柄)
+                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+
+                            idx++;
+                        }
+                        fpNtClose(hRealCheck);
+                    }
+                }
+
+                // 关闭临时维护句柄
+                fpNtClose(hMaintenance);
+            }
+
+            // 刷新父级缓存
+            InvalidateParentRegContext(targetSandboxFull);
+
+            // 更新当前键的 Context
+            HANDLE hReal = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, fullNtPath.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(*KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = hReal;
+                it->second->FullPath = targetSandboxFull;
+                it->second->KeysInitialized = false;
+                it->second->ValuesInitialized = false;
+                it->second->SubKeys.clear();
+                it->second->Values.clear();
+            } else {
+                RegContext* ctx = new RegContext();
+                ctx->FullPath = targetSandboxFull;
+                ctx->hRealKey = hReal;
+                g_RegContextMap[*KeyHandle] = ctx;
+            }
+        }
+        return status;
+    }
+
+    // --- 3. 非重定向路径 (直接创建) ---
+    NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, Disposition);
+
+    if (NT_SUCCESS(status)) {
+        if (isSandboxPath) {
+             // [修复] 使用临时句柄进行维护 并补全值墓碑初始化
+             HANDLE hMaint = NULL;
+             OBJECT_ATTRIBUTES oaM;
+             UNICODE_STRING usM;
+             RtlInitUnicodeString(&usM, fullNtPath.c_str());
+             InitializeObjectAttributes(&oaM, &usM, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+             if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
+                 bool needValueTombstones = false;
+                 if (IsKeyMarkedDeleted(hMaint)) {
+                    // === 复活 (Resurrection) ===
+                    SetKeyLastWriteTime(hMaint, false);
+                    ClearSandboxKeyValues(hMaint);
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    InvalidateParentRegContext(fullNtPath);
+                    needValueTombstones = true;
+                 }
+                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    // 首次在沙盒创建、但真实路径已有同名键
+                    needValueTombstones = true;
+                 }
+                 // [核心修复] 惰性 CoW 值墓碑初始化：屏蔽真实路径的值
+                 if (needValueTombstones) {
+                    std::wstring realPathForTombstone;
+                    if (GetRealFromSandboxPath(fullNtPath, realPathForTombstone)) {
+                        HANDLE hRealCheck = NULL;
+                        OBJECT_ATTRIBUTES oaRealCheck;
+                        UNICODE_STRING usRealCheck;
+                        RtlInitUnicodeString(&usRealCheck, realPathForTombstone.c_str());
+                        InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                            ULONG idx = 0, vlen = 0;
+                            BYTE staticValBuf[4096];
+                            BYTE dummyByte = 0;
+                            while (true) {
+                                NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
+                                std::vector<BYTE> dynamicValBuf;
+                                PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+                                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                                    try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                    st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                    if (!NT_SUCCESS(st)) break;
+                                    vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                                } else if (!NT_SUCCESS(st)) {
+                                    break;
+                                }
+                                UNICODE_STRING vName;
+                                vName.Buffer = vinfo->Name;
+                                vName.Length = (USHORT)vinfo->NameLength;
+                                vName.MaximumLength = (USHORT)vinfo->NameLength;
+                                // 写入值墓碑
+                                fpNtSetValueKey(hMaint, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                                idx++;
+                            }
+                            fpNtClose(hRealCheck);
+                        }
+                    }
+                 }
+                 fpNtClose(hMaint);
+             }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it == g_RegContextMap.end()) {
+            RegContext* ctx = new RegContext();
+            ctx->FullPath = fullNtPath;
+            ctx->hRealKey = NULL;
+            g_RegContextMap[*KeyHandle] = ctx;
+        }
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+    RecursionGuard guard;
+
+    // 1. 解析完整路径
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // 2. 检查是否为沙盒路径并获取真实路径候选
+    bool isSandboxPath = false;
+    std::wstring realPathCandidate;
+
+    // [修复] 使用 _wcsnicmp
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxPath = true;
+        GetRealFromSandboxPath(fullNtPath, realPathCandidate);
+    } else {
+        realPathCandidate = fullNtPath;
+    }
+
+    // ========== [新增] WOW64 路径重定向修正 ==========
+    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
+    if (fixedRealPath != realPathCandidate) {
+        realPathCandidate = fixedRealPath;
+        if (!isSandboxPath) {
+            fullNtPath = fixedRealPath;
+        } else {
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 需要重新计算沙盒路径 fullNtPath
+            std::wstring relPath;
+            if (ShouldRedirectReg(realPathCandidate, relPath)) {
+                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
+            }
+        }
+    }
+
+    // 3. [核心修复] 白名单检查 (DirectSound/Drivers 等)
+    // 如果是系统关键路径 强制使用绝对路径打开真实键 丢弃可能指向沙盒的 RootDirectory
+    if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
+
+        OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+        oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL; // 丢弃父句柄
+
+        return fpNtOpenKey(KeyHandle, DesiredAccess, &oaReal);
+    }
+
+    // 4. 常规重定向逻辑
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
+    std::wstring relPath;
+    bool isRedirectedRoot = false;
+
+    // 如果不是沙盒路径 且符合重定向规则 (例如 HKLM\Software\MyGame)
+    if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+        isRedirectedRoot = true;
+    }
+
+    // 调用原始函数
+    NTSTATUS status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+
+    if (NT_SUCCESS(status)) {
+        // 检查是否被标记为删除
+        if (IsKeyMarkedDeleted(*KeyHandle)) {
+            fpNtClose(*KeyHandle);
+            *KeyHandle = NULL;
+            return STATUS_OBJECT_NAME_NOT_FOUND; // 告诉程序找不到
+        }
+    }
+
+    // 如果沙盒中未找到 且不是因为墓碑导致的 尝试读取真实注册表 (Copy-on-Read / Fallback)
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        if (canCheckReal) {
+            HANDLE hRealCheck = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // [修复] 动态计算回退权限：剔除写权限 保留请求的读/枚举权限
+            ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
+            if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
+            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal))) {
+                if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                    // 写权限请求：执行 Copy-on-Write
+                    std::wstring relPathToCreate;
+                    if (isRedirectedRoot) {
+                        relPathToCreate = relPath;
+                    } else {
+                        relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                        if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
+                    }
+
+                    EnsureRegPathExistsRelative(relPathToCreate);
+
+                    HANDLE hNewKey = NULL;
+                    UNICODE_STRING usCreate;
+                    OBJECT_ATTRIBUTES oaCreate;
+                    RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
+                    InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+                    ULONG disposition;
+                    if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
+                        fpNtClose(hNewKey);
+                        status = fpNtOpenKey(KeyHandle, DesiredAccess, &oaModified);
+                    }
+                } else {
+                    // 只读请求：直接返回真实句柄
+                    *KeyHandle = hRealCheck;
+                    status = STATUS_SUCCESS;
+
+                    // 更新上下文映射
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    auto it = g_RegContextMap.find(*KeyHandle);
+                    if (it != g_RegContextMap.end()) {
+                        if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                        it->second->hRealKey = NULL;
+                        it->second->FullPath = realPathForCheck;
+                        it->second->KeysInitialized = false;
+                        it->second->ValuesInitialized = false;
+                        it->second->SubKeys.clear();
+                        it->second->Values.clear();
+                    } else {
+                        RegContext* ctx = new RegContext();
+                        ctx->hRealKey = NULL;
+                        ctx->FullPath = realPathForCheck;
+                        g_RegContextMap[*KeyHandle] = ctx;
+                    }
+                    return status;
+                }
+                fpNtClose(hRealCheck);
+            }
+        }
+    }
+
+    // 6. 更新上下文缓存
+    if (NT_SUCCESS(status)) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        HANDLE hRealTarget = NULL;
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+            it->second->hRealKey = hRealTarget;
+            it->second->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
+            RegContext* ctx = new RegContext();
+            ctx->hRealKey = hRealTarget;
+            ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            g_RegContextMap[*KeyHandle] = ctx;
+        }
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    RecursionGuard guard;
+
+    // 1. 解析路径与白名单检查
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring realPathCandidate;
+    bool isSandboxPath = false;
+
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxPath = true;
+        GetRealFromSandboxPath(fullNtPath, realPathCandidate);
+    } else {
+        realPathCandidate = fullNtPath;
+    }
+
+    // ========== [新增] WOW64 路径重定向修正 ==========
+    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
+    if (fixedRealPath != realPathCandidate) {
+        realPathCandidate = fixedRealPath;
+        if (!isSandboxPath) {
+            fullNtPath = fixedRealPath;
+        } else {
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 需要重新计算沙盒路径 fullNtPath
+            std::wstring relPath;
+            if (ShouldRedirectReg(realPathCandidate, relPath)) {
+                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
+            }
+        }
+    }
+
+    // 白名单直通
+    if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
+        OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+        oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL;
+        return fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaReal, OpenOptions);
+    }
+
+    // 2. 重定向逻辑
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
+    std::wstring relPath;
+    bool isRedirectedRoot = false;
+
+    if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+        isRedirectedRoot = true;
+    }
+
+    // 3. 尝试打开
+    NTSTATUS status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+
+    // 4. [新增] 检查魔数时间戳 (逻辑删除检查)
+    bool isMarkedDeleted = false;
+    if (NT_SUCCESS(status)) {
+        // 检查是否是沙盒内的键
+        std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+        if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+            if (IsKeyMarkedDeleted(*KeyHandle)) {
+                isMarkedDeleted = true;
+                fpNtClose(*KeyHandle);
+                *KeyHandle = NULL;
+                status = STATUS_OBJECT_NAME_NOT_FOUND; // 伪装成找不到
+            }
+        }
+    }
+
+    // 5. 回退逻辑 (Fallback) - 仅当未找到且未被标记删除时
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && !isMarkedDeleted) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        if (canCheckReal) {
+            HANDLE hRealCheck = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 动态计算回退权限
+            ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
+            if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
+            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, fallbackAccess, &oaReal, OpenOptions))) {
+                if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                    // 写权限请求：执行 Copy-on-Write (惰性模式：只创建空键)
+                    std::wstring relPathToCreate;
+                    if (isRedirectedRoot) {
+                        relPathToCreate = relPath;
+                    } else {
+                        relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                        if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
+                    }
+
+                    EnsureRegPathExistsRelative(relPathToCreate);
+
+                    HANDLE hNewKey = NULL;
+                    UNICODE_STRING usCreate;
+                    OBJECT_ATTRIBUTES oaCreate;
+                    RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
+                    InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+                    ULONG disposition;
+                    if (NT_SUCCESS(fpNtCreateKey(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, &disposition))) {
+                        // 惰性 CoW: 这里不需要 CopyRegistryValues
+                        fpNtClose(hNewKey);
+                        status = fpNtOpenKeyEx(KeyHandle, DesiredAccess, &oaModified, OpenOptions);
+                    }
+                } else {
+                    // 只读请求：返回真实句柄
+                    *KeyHandle = hRealCheck;
+                    status = STATUS_SUCCESS;
+
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    auto it = g_RegContextMap.find(*KeyHandle);
+                    if (it != g_RegContextMap.end()) {
+                        if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                        it->second->hRealKey = NULL;
+                        it->second->FullPath = realPathForCheck;
+                        it->second->KeysInitialized = false;
+                        it->second->ValuesInitialized = false;
+                        it->second->SubKeys.clear();
+                        it->second->Values.clear();
+                    } else {
+                        RegContext* ctx = new RegContext();
+                        ctx->hRealKey = NULL;
+                        ctx->FullPath = realPathForCheck;
+                        g_RegContextMap[*KeyHandle] = ctx;
+                    }
+                    return status;
+                }
+                fpNtClose(hRealCheck);
+            }
+        }
+    }
+
+    if (NT_SUCCESS(status)) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        HANDLE hRealTarget = NULL;
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions);
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+            it->second->hRealKey = hRealTarget;
+            it->second->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
+            RegContext* ctx = new RegContext();
+            ctx->hRealKey = hRealTarget;
+            ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            g_RegContextMap[*KeyHandle] = ctx;
+        }
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
+    if (g_IsInHook || !g_HookReg) return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    RecursionGuard guard;
+
+    // 1. 获取当前句柄的真实 NT 路径 (这是唯一真理)
+    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) {
+        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+
+    // 2. 解析出用于合并的 Real/Sandbox 路径
+    std::wstring realPath, sandboxPath;
+    // 注意：这里传入 currentNtPath 避免 GetRegPaths 内部再次调用 GetPathFromHandle
+    // 我们需要稍微修改 GetRegPaths 或者在这里手动处理 为了性能 建议复用 currentNtPath
+    // 这里为了代码改动最小化 我们假设 GetRegPaths 会再次获取路径 或者我们手动实现路径判断逻辑
+    // 为了稳妥 我们先用 currentNtPath 进行缓存校验
+
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    // 3. 检查缓存并校验身份
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex); // 使用写锁 因为可能需要删除过期缓存
+        auto it = g_RegContextMap.find(KeyHandle);
+
+        if (it != g_RegContextMap.end()) {
+            // [关键修复] 检查缓存的路径与当前句柄路径是否一致 (忽略大小写)
+            if (_wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
+                // 句柄被复用了！旧缓存是脏数据 必须清除
+                delete it->second;
+                g_RegContextMap.erase(it);
+                needsBuild = true;
+            } else {
+                ctx = it->second;
+                if (!ctx->KeysInitialized) needsBuild = true;
+            }
+        } else {
+            needsBuild = true;
+        }
+
+        // 如果需要构建 先占位
+        if (needsBuild && ctx == nullptr) {
+            ctx = new RegContext();
+            ctx->FullPath = currentNtPath; // [关键] 绑定当前路径
+            g_RegContextMap[KeyHandle] = ctx;
+        }
+    }
+
+    // 4. 构建合并列表 (无锁操作)
+    if (needsBuild) {
+        if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+            std::map<std::wstring, CachedRegKey> mergedKeys;
+
+            // A. 枚举真实路径
+            EnumerateKeysToMap(realPath, mergedKeys);
+
+            // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
+            if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
+                std::wstring subPath = realPath.substr(34);
+                std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
+                EnumerateKeysToMap(userClassesPath, mergedKeys);
+            }
+
+            // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
+            EnumerateKeysToMap(sandboxPath, mergedKeys);
+
+            // [修正] D. 过滤带魔数时间戳的子键
+            // 注意：这里变量名必须是 mergedKeys (Map<wstring, CachedRegKey>)
+            for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
+                // 检查 CachedRegKey 中的 LastWriteTime
+                if (IsDeleteMark(it->second.LastWriteTime)) {
+                    it = mergedKeys.erase(it); // 从列表中移除
+                } else {
+                    ++it;
+                }
+            }
+
+            // E. 更新上下文
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
+                ctx = it->second;
+                ctx->SubKeys.clear();
+                for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
+                ctx->KeysInitialized = true;
+            }
+        } else {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+                return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+            }
+        }
+    }
+
+    // 5. 从缓存读取数据
+    std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+
+    // 再次校验 ctx 有效性
+    auto it = g_RegContextMap.find(KeyHandle);
+    if (it == g_RegContextMap.end() || _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
+        // 极端并发情况：缓存被删除了
+        return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+    ctx = it->second;
+
+    if (Index >= ctx->SubKeys.size()) return STATUS_NO_MORE_ENTRIES;
+
+    const CachedRegKey& entry = ctx->SubKeys[Index];
+
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+    ULONG classBytes = (ULONG)(entry.Class.length() * sizeof(WCHAR));
+    ULONG requiredSize = 0;
+
+    switch (KeyInformationClass) {
+        case KeyBasicInformation: requiredSize = FIELD_OFFSET(KEY_BASIC_INFORMATION, Name) + nameBytes; break;
+        case KeyNodeInformation:  requiredSize = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes + classBytes; break;
+        case KeyFullInformation:  requiredSize = FIELD_OFFSET(KEY_FULL_INFORMATION, Class) + classBytes; break;
+        case KeyNameInformation:  requiredSize = FIELD_OFFSET(KEY_NAME_INFORMATION, Name) + nameBytes; break;
+        default: return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+    }
+
+    if (ResultLength) *ResultLength = requiredSize;
+    if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
+
+    memset(KeyInformation, 0, Length);
+
+    if (KeyInformationClass == KeyBasicInformation) {
+        PKEY_BASIC_INFORMATION info = (PKEY_BASIC_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+    else if (KeyInformationClass == KeyNodeInformation) {
+        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->NameLength = nameBytes;
+        info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_NODE_INFORMATION, Name) + nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+        if (classBytes > 0) memcpy((BYTE*)info + info->ClassOffset, entry.Class.c_str(), classBytes);
+    }
+    else if (KeyInformationClass == KeyFullInformation) {
+        PKEY_FULL_INFORMATION info = (PKEY_FULL_INFORMATION)KeyInformation;
+        info->LastWriteTime = entry.LastWriteTime;
+        info->TitleIndex = entry.TitleIndex;
+        info->ClassLength = classBytes;
+        info->ClassOffset = FIELD_OFFSET(KEY_FULL_INFORMATION, Class);
+        info->SubKeys = (ULONG)ctx->SubKeys.size();
+        info->Values = (ULONG)ctx->Values.size();
+        if (classBytes > 0) memcpy(info->Class, entry.Class.c_str(), classBytes);
+    }
+    else if (KeyInformationClass == KeyNameInformation) {
+        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)KeyInformation;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass, PVOID KeyValueInformation, ULONG Length, PULONG ResultLength) {
+    if (g_IsInHook || !g_HookReg) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    RecursionGuard guard;
+
+    // 1. 校验身份
+    std::wstring currentNtPath = GetPathFromHandle(KeyHandle);
+    if (currentNtPath.empty()) return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+
+    RegContext* ctx = nullptr;
+    bool needsBuild = false;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            // [关键修复] 忽略大小写比较
+            if (_wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+                needsBuild = true;
+            } else {
+                ctx = it->second;
+                if (!ctx->ValuesInitialized) needsBuild = true;
+            }
+        } else {
+            needsBuild = true;
+        }
+
+        if (needsBuild && ctx == nullptr) {
+            ctx = new RegContext();
+            ctx->FullPath = currentNtPath;
+            g_RegContextMap[KeyHandle] = ctx;
+        }
+    }
+
+    if (needsBuild) {
+        std::wstring realPath, sandboxPath;
+        if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
+            std::map<std::wstring, CachedRegValue> mergedValues;
+            EnumerateValuesToMap(realPath, mergedValues);
+            EnumerateValuesToMap(sandboxPath, mergedValues);
+
+            // [新增] 过滤惰性 CoW 的值墓碑
+            for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
+                if (it->second.Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+                    it = mergedValues.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
+                ctx = it->second;
+                ctx->Values.clear();
+                for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
+                ctx->ValuesInitialized = true;
+            }
+        } else {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                delete it->second;
+                g_RegContextMap.erase(it);
+            }
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
+    }
+
+    std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
+    auto it = g_RegContextMap.find(KeyHandle);
+    if (it == g_RegContextMap.end() || _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
+        return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    }
+    ctx = it->second;
+
+    if (Index >= ctx->Values.size()) return STATUS_NO_MORE_ENTRIES;
+
+    const CachedRegValue& entry = ctx->Values[Index];
+    ULONG nameBytes = (ULONG)(entry.Name.length() * sizeof(WCHAR));
+    ULONG dataBytes = (ULONG)entry.Data.size();
+    ULONG requiredSize = 0;
+
+    // [关键修改] 计算对齐后的 DataOffset
+    ULONG dataOffset = 0;
+
+    switch (KeyValueInformationClass) {
+        case KeyValueBasicInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name) + nameBytes;
+            break;
+        case KeyValueFullInformation:
+            // 计算 Name 结束后的偏移
+            dataOffset = FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name) + nameBytes;
+            // [修复] 强制 4 字节对齐 (DataOffset 必须是 4 的倍数)
+            dataOffset = (dataOffset + 3) & ~3;
+            // 总大小 = 对齐后的偏移 + 数据大小
+            requiredSize = dataOffset + dataBytes;
+            break;
+        case KeyValuePartialInformation:
+            requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + dataBytes;
+            break;
+        default:
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+    }
+
+    if (ResultLength) *ResultLength = requiredSize;
+    if (Length < requiredSize) return STATUS_BUFFER_OVERFLOW;
+
+    memset(KeyValueInformation, 0, Length);
+
+    if (KeyValueInformationClass == KeyValueBasicInformation) {
+        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation;
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->NameLength = nameBytes;
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+    }
+    else if (KeyValueInformationClass == KeyValueFullInformation) {
+        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->NameLength = nameBytes;
+        info->DataLength = dataBytes;
+        // 使用对齐后的偏移
+        info->DataOffset = dataOffset;
+
+        memcpy(info->Name, entry.Name.c_str(), nameBytes);
+
+        if (dataBytes > 0) {
+            // 确保写入位置在缓冲区范围内
+            if (Length >= dataOffset + dataBytes) {
+                memcpy((BYTE*)info + dataOffset, entry.Data.data(), dataBytes);
+            }
+        }
+    }
+    else if (KeyValueInformationClass == KeyValuePartialInformation) {
+        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
+        info->TitleIndex = entry.TitleIndex;
+        info->Type = entry.Type;
+        info->DataLength = dataBytes;
+        if (dataBytes > 0) memcpy(info->Data, entry.Data.data(), dataBytes);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
+    if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
+    RecursionGuard guard;
+
+    // 1. 获取路径判断是否在沙盒内
+    std::wstring path = GetPathFromHandle(KeyHandle);
+    bool isSandboxKey = false;
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxKey = true;
+    }
+
+    // 2. 如果是沙盒内的键 执行“逻辑删除”
+    if (isSandboxKey) {
+        // 检查是否有子键 (如果有子键 标准行为是返回 STATUS_CANNOT_DELETE)
+        // 这里为了简化 假设调用者已经递归删除了子键 或者我们只标记当前键
+        // Sandboxie 的逻辑是：如果还有物理子键 不能标记父键删除
+        // 但为了修复你的问题 我们先实现最简单的标记逻辑
+
+        // 尝试设置时间戳标记为删除
+        NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
+
+        if (status == STATUS_ACCESS_DENIED) {
+            // 如果句柄没有 KEY_SET_VALUE 权限 尝试重新打开
+            HANDLE hWrite = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING emptyStr;
+            RtlInitUnicodeString(&emptyStr, L"");
+            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+
+            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
+                status = SetKeyLastWriteTime(hWrite, true);
+                fpNtClose(hWrite);
+            }
+        }
+
+        // 成功标记后 清除缓存并返回成功
+        if (NT_SUCCESS(status)) {
+            // [新增] 清除该键的非墓碑值 (保留值墓碑以屏蔽真实注册表)
+            CleanNonTombstoneValues(KeyHandle);
+            // [新增] 递归清除子键中的非墓碑值
+            CleanNonTombstoneValuesRecursive(path);
+            InvalidateParentRegContext(path);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    // 3. 如果是真实注册表路径（通过重定向逻辑） 需要在沙盒创建墓碑
+    // (这部分逻辑保持你原有的结构 但创建出来的键要立即打上时间戳标记)
+    if (g_HookReg && g_hAppHive && !isSandboxKey) {
+        std::wstring relPath;
+        if (ShouldRedirectReg(path, relPath)) {
+            EnsureRegPathExistsRelative(relPath);
+
+            HANDLE hSandbox = NULL;
+            UNICODE_STRING usRel;
+            OBJECT_ATTRIBUTES oaSandbox;
+            RtlInitUnicodeString(&usRel, relPath.c_str());
+            InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+            ULONG disposition;
+            // 创建或打开沙盒键
+            if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
+                // [新增] 清除已有非墓碑值 (如果沙盒键已存在)
+                CleanNonTombstoneValues(hSandbox);
+                // 标记为删除
+                SetKeyLastWriteTime(hSandbox, true);
+                fpNtClose(hSandbox);
+
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                // [新增] 递归清除子键中的非墓碑值
+                CleanNonTombstoneValuesRecursive(sandboxPath);
+                InvalidateParentRegContext(sandboxPath);
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+
+    return fpNtDeleteKey(KeyHandle);
+}
+
+// --- [新增] 惰性 CoW 核心：拦截写入 ---
+NTSTATUS NTAPI Detour_NtSetValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, ULONG TitleIndex, ULONG Type, PVOID Data, ULONG DataSize) {
+    if (g_IsInHook || !g_HookReg) return fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+    RecursionGuard guard;
+
+    NTSTATUS status = fpNtSetValueKey(KeyHandle, ValueName, TitleIndex, Type, Data, DataSize);
+
+    // 如果返回拒绝访问 可能是程序拿着只读的真实句柄尝试写入
+    // 我们需要提权重新打开该键（这会触发 Detour_NtOpenKey 重定向到沙盒影子键）
+    if (status == STATUS_ACCESS_DENIED) {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+
+        HANDLE hTemp = NULL;
+        if (NT_SUCCESS(Detour_NtOpenKey(&hTemp, KEY_WRITE, &oa))) {
+            status = fpNtSetValueKey(hTemp, ValueName, TitleIndex, Type, Data, DataSize);
+            fpNtClose(hTemp);
+        }
+    }
+
+    // 写入成功后 使该键的枚举缓存失效
+    if (NT_SUCCESS(status)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            it->second->ValuesInitialized = false;
+            it->second->Values.clear();
+        }
+    }
+    return status;
+}
+
+// --- [新增] 惰性 CoW 核心：拦截删除 ---
+NTSTATUS NTAPI Detour_NtDeleteValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName) {
+    if (g_IsInHook || !g_HookReg) return fpNtDeleteValueKey(KeyHandle, ValueName);
+    RecursionGuard guard;
+
+    NTSTATUS status = fpNtDeleteValueKey(KeyHandle, ValueName);
+
+    HANDLE hWrite = KeyHandle;
+    HANDLE hTemp = NULL;
+
+    // 尝试提权打开
+    if (status == STATUS_ACCESS_DENIED) {
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
+        if (NT_SUCCESS(Detour_NtOpenKey(&hTemp, KEY_WRITE, &oa))) {
+            hWrite = hTemp;
+            status = STATUS_SUCCESS; // 提权成功
+        }
+    }
+
+    // 检查当前操作的句柄是否在沙盒内
+    bool isSandboxHandle = false;
+    std::wstring path = GetPathFromHandle(hWrite);
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxHandle = true;
+    }
+
+    if (isSandboxHandle) {
+        // 沙盒内：写入墓碑屏蔽真实注册表
+        fpNtSetValueKey(hWrite, ValueName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
+        status = STATUS_SUCCESS;
+    } else if (hTemp) {
+        // 真实注册表（白名单）：提权后执行真正的删除
+        status = fpNtDeleteValueKey(hTemp, ValueName);
+    }
+
+    if (hTemp) fpNtClose(hTemp);
+
+    // 更新缓存
+    if (NT_SUCCESS(status)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            it->second->ValuesInitialized = false;
+            it->second->Values.clear();
+        }
+    }
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG TitleIndex,
+    PUNICODE_STRING Class,
+    ULONG CreateOptions,
+    HANDLE TransactionHandle,
+    PULONG Disposition)
+{
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) {
+        return fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+    }
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // --- 1. 白名单检查 ---
+    std::wstring realPathCandidate;
+    bool isSandboxPath = false;
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxPath = true;
+        GetRealFromSandboxPath(fullNtPath, realPathCandidate);
+    } else {
+        realPathCandidate = fullNtPath;
+    }
+
+    // ========== [新增] WOW64 路径重定向修正 ==========
+    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
+    if (fixedRealPath != realPathCandidate) {
+        realPathCandidate = fixedRealPath;
+        if (!isSandboxPath) {
+            fullNtPath = fixedRealPath;
+        } else {
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 需要重新计算沙盒路径 fullNtPath
+            std::wstring relPath;
+            if (ShouldRedirectReg(realPathCandidate, relPath)) {
+                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
+            }
+        }
+    }
+
+    if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
+        OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+        oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL;
+
+        NTSTATUS status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaReal, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+        if (status == STATUS_ACCESS_DENIED) {
+            ACCESS_MASK readOnlyAccess = DesiredAccess & (KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY | READ_CONTROL);
+            if (readOnlyAccess == 0) readOnlyAccess = KEY_READ;
+            status = fpNtOpenKeyTransacted(KeyHandle, readOnlyAccess, &oaReal, TransactionHandle);
+            if (NT_SUCCESS(status) && Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
+        }
+        return status;
+    }
+
+    // --- 2. 重定向逻辑 ---
+    std::wstring relPath;
+    if (ShouldRedirectReg(fullNtPath, relPath)) {
+        EnsureRegPathExistsRelative(relPath);
+        std::wstring targetSandboxFull = g_RegMountPathNt + L"\\" + relPath;
+
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, relPath.c_str());
+        OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+        oaModified.ObjectName = &uStr;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+
+        // 尝试创建/打开沙盒键 (带事务)
+        NTSTATUS status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+
+        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
+        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
+            // 降低目标键及其父键的完整性级别
+            SetLowLabelKeyByName(targetSandboxFull);
+            size_t pos = targetSandboxFull.rfind(L'\\');
+            if (pos != std::wstring::npos) {
+                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
+            }
+            // 重试 (注意：必须包含 TransactionHandle 参数)
+            status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+        }
+
+        if (NT_SUCCESS(status)) {
+			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
+			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+			}
+
+            // [维护操作] 使用非事务句柄进行墓碑复活和初始化
+            HANDLE hMaintenance = NULL;
+            OBJECT_ATTRIBUTES oaMaint;
+            UNICODE_STRING usMaint;
+            RtlInitUnicodeString(&usMaint, targetSandboxFull.c_str());
+            InitializeObjectAttributes(&oaMaint, &usMaint, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            NTSTATUS maintStatus = fpNtOpenKey(&hMaintenance, KEY_ALL_ACCESS, &oaMaint);
+            if (!NT_SUCCESS(maintStatus)) {
+                maintStatus = fpNtOpenKey(&hMaintenance, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaMaint);
+            }
+
+            if (NT_SUCCESS(maintStatus)) {
+                bool isNewKey = false;
+
+                if (IsKeyMarkedDeleted(hMaintenance)) {
+                    // === 复活 (Resurrection) ===
+                    SetKeyLastWriteTime(hMaintenance, false);
+                    ClearSandboxKeyValues(hMaintenance);
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    isNewKey = true;
+                }
+                else {
+                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                        isNewKey = true;
+                    }
+                }
+
+                // 惰性 CoW 初始化：屏蔽真实值
+                if (isNewKey) {
+                    HANDLE hRealCheck = NULL;
+                    OBJECT_ATTRIBUTES oaRealCheck;
+                    UNICODE_STRING usRealCheck;
+                    RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
+                    InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                    // 打开真实键 (非事务 只读检查)
+                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                        ULONG idx = 0, vlen = 0;
+                        BYTE staticValBuf[4096];
+                        BYTE dummyByte = 0;
+
+                        while (true) {
+                            NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
+                            std::vector<BYTE> dynamicValBuf;
+                            PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+
+                            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                                try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                if (!NT_SUCCESS(st)) break;
+                                vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                            } else if (!NT_SUCCESS(st)) {
+                                break;
+                            }
+
+                            UNICODE_STRING vName;
+                            vName.Buffer = vinfo->Name;
+                            vName.Length = (USHORT)vinfo->NameLength;
+                            vName.MaximumLength = (USHORT)vinfo->NameLength;
+
+                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                            idx++;
+                        }
+                        fpNtClose(hRealCheck);
+                    }
+                }
+                fpNtClose(hMaintenance);
+            }
+
+            InvalidateParentRegContext(targetSandboxFull);
+
+            // 更新 Context
+            HANDLE hReal = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, fullNtPath.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(*KeyHandle);
+            if (it != g_RegContextMap.end()) {
+                if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                it->second->hRealKey = hReal;
+                it->second->FullPath = targetSandboxFull;
+                it->second->KeysInitialized = false;
+                it->second->ValuesInitialized = false;
+                it->second->SubKeys.clear();
+                it->second->Values.clear();
+            } else {
+                RegContext* ctx = new RegContext();
+                ctx->FullPath = targetSandboxFull;
+                ctx->hRealKey = hReal;
+                g_RegContextMap[*KeyHandle] = ctx;
+            }
+        }
+        return status;
+    }
+
+    // --- 3. 非重定向路径 ---
+    NTSTATUS status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
+
+    if (NT_SUCCESS(status)) {
+        if (isSandboxPath) {
+             HANDLE hMaint = NULL;
+             OBJECT_ATTRIBUTES oaM;
+             UNICODE_STRING usM;
+             RtlInitUnicodeString(&usM, fullNtPath.c_str());
+             InitializeObjectAttributes(&oaM, &usM, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+             if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
+                 bool needValueTombstones = false;
+                 if (IsKeyMarkedDeleted(hMaint)) {
+                    SetKeyLastWriteTime(hMaint, false);
+                    ClearSandboxKeyValues(hMaint);
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    InvalidateParentRegContext(fullNtPath);
+                    needValueTombstones = true;
+                 }
+                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    needValueTombstones = true;
+                 }
+
+                 if (needValueTombstones) {
+                    std::wstring realPathForTombstone;
+                    if (GetRealFromSandboxPath(fullNtPath, realPathForTombstone)) {
+                        HANDLE hRealCheck = NULL;
+                        OBJECT_ATTRIBUTES oaRealCheck;
+                        UNICODE_STRING usRealCheck;
+                        RtlInitUnicodeString(&usRealCheck, realPathForTombstone.c_str());
+                        InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                            ULONG idx = 0, vlen = 0;
+                            BYTE staticValBuf[4096];
+                            BYTE dummyByte = 0;
+                            while (true) {
+                                NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
+                                std::vector<BYTE> dynamicValBuf;
+                                PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+                                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                                    try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                    st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                    if (!NT_SUCCESS(st)) break;
+                                    vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                                } else if (!NT_SUCCESS(st)) {
+                                    break;
+                                }
+                                UNICODE_STRING vName;
+                                vName.Buffer = vinfo->Name;
+                                vName.Length = (USHORT)vinfo->NameLength;
+                                vName.MaximumLength = (USHORT)vinfo->NameLength;
+                                fpNtSetValueKey(hMaint, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                                idx++;
+                            }
+                            fpNtClose(hRealCheck);
+                        }
+                    }
+                 }
+                 fpNtClose(hMaint);
+             }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it == g_RegContextMap.end()) {
+            RegContext* ctx = new RegContext();
+            ctx->FullPath = fullNtPath;
+            ctx->hRealKey = NULL;
+            g_RegContextMap[*KeyHandle] = ctx;
+        }
+    }
+
+    return status;
+}
+
+NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, HANDLE TransactionHandle) {
+    if (g_IsInHook || !g_hAppHive || g_CurrentUserSidPath.empty()) return fpNtOpenKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes, TransactionHandle);
+    RecursionGuard guard;
+
+    std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+    std::wstring realPathCandidate;
+    bool isSandboxPath = false;
+
+    if (!g_RegMountPathNt.empty() && _wcsnicmp(fullNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+        isSandboxPath = true;
+        GetRealFromSandboxPath(fullNtPath, realPathCandidate);
+    } else {
+        realPathCandidate = fullNtPath;
+    }
+
+    // ========== [新增] WOW64 路径重定向修正 ==========
+    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
+    if (fixedRealPath != realPathCandidate) {
+        realPathCandidate = fixedRealPath;
+        if (!isSandboxPath) {
+            fullNtPath = fixedRealPath;
+        } else {
+            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
+            // 需要重新计算沙盒路径 fullNtPath
+            std::wstring relPath;
+            if (ShouldRedirectReg(realPathCandidate, relPath)) {
+                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
+            }
+        }
+    }
+
+    // 白名单直通
+    if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
+        OBJECT_ATTRIBUTES oaReal = *ObjectAttributes;
+        oaReal.ObjectName = &usReal;
+        oaReal.RootDirectory = NULL;
+        return fpNtOpenKeyTransacted(KeyHandle, DesiredAccess, &oaReal, TransactionHandle);
+    }
+
+    // 重定向逻辑
+    OBJECT_ATTRIBUTES oaModified = *ObjectAttributes;
+    UNICODE_STRING usRedirected;
+    std::wstring relPath;
+    bool isRedirectedRoot = false;
+
+    if (!isSandboxPath && ShouldRedirectReg(fullNtPath, relPath)) {
+        RtlInitUnicodeString(&usRedirected, relPath.c_str());
+        oaModified.ObjectName = &usRedirected;
+        oaModified.RootDirectory = (HANDLE)g_hAppHive;
+        isRedirectedRoot = true;
+    }
+
+    // 尝试打开 (带事务)
+    NTSTATUS status = fpNtOpenKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TransactionHandle);
+
+    if (NT_SUCCESS(status)) {
+        std::wstring openedPath = GetPathFromHandle(*KeyHandle);
+        if (!openedPath.empty() && _wcsnicmp(openedPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+            if (IsKeyMarkedDeleted(*KeyHandle)) {
+                fpNtClose(*KeyHandle);
+                *KeyHandle = NULL;
+                status = STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+        }
+    }
+
+    // 回退逻辑 (Fallback)
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        if (canCheckReal) {
+            HANDLE hRealCheck = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
+            if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
+            // 检查真实键 (非事务 只读)
+            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal))) {
+                if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
+                    // 写权限请求：执行 Copy-on-Write
+                    std::wstring relPathToCreate;
+                    if (isRedirectedRoot) {
+                        relPathToCreate = relPath;
+                    } else {
+                        relPathToCreate = fullNtPath.substr(g_RegMountPathNt.length());
+                        if (!relPathToCreate.empty() && relPathToCreate[0] == L'\\') relPathToCreate = relPathToCreate.substr(1);
+                    }
+
+                    EnsureRegPathExistsRelative(relPathToCreate);
+
+                    HANDLE hNewKey = NULL;
+                    UNICODE_STRING usCreate;
+                    OBJECT_ATTRIBUTES oaCreate;
+                    RtlInitUnicodeString(&usCreate, relPathToCreate.c_str());
+                    InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
+
+                    ULONG disposition;
+                    // 创建影子键 (带事务)
+                    if (NT_SUCCESS(fpNtCreateKeyTransacted(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, TransactionHandle, &disposition))) {
+                        fpNtClose(hNewKey);
+                        status = fpNtOpenKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TransactionHandle);
+                    }
+                } else {
+                    // 只读请求：返回真实句柄 (非事务)
+                    *KeyHandle = hRealCheck;
+                    status = STATUS_SUCCESS;
+
+                    std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                    auto it = g_RegContextMap.find(*KeyHandle);
+                    if (it != g_RegContextMap.end()) {
+                        if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+                        it->second->hRealKey = NULL;
+                        it->second->FullPath = realPathForCheck;
+                        it->second->KeysInitialized = false;
+                        it->second->ValuesInitialized = false;
+                        it->second->SubKeys.clear();
+                        it->second->Values.clear();
+                    } else {
+                        RegContext* ctx = new RegContext();
+                        ctx->hRealKey = NULL;
+                        ctx->FullPath = realPathForCheck;
+                        ctx->KeysInitialized = false;
+                        ctx->ValuesInitialized = false;
+                        g_RegContextMap[*KeyHandle] = ctx;
+                    }
+                    return status;
+                }
+                fpNtClose(hRealCheck);
+            }
+        }
+    }
+
+    // 更新上下文缓存
+    if (NT_SUCCESS(status)) {
+        std::wstring realPathForCheck;
+        bool canCheckReal = false;
+        if (isRedirectedRoot) {
+            realPathForCheck = fullNtPath;
+            canCheckReal = true;
+        } else if (GetRealFromSandboxPath(fullNtPath, realPathForCheck)) {
+            canCheckReal = true;
+        }
+
+        HANDLE hRealTarget = NULL;
+        if (canCheckReal) {
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+        }
+
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(*KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
+            it->second->hRealKey = hRealTarget;
+            it->second->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            it->second->KeysInitialized = false;
+            it->second->ValuesInitialized = false;
+            it->second->SubKeys.clear();
+            it->second->Values.clear();
+        } else {
+            RegContext* ctx = new RegContext();
+            ctx->hRealKey = hRealTarget;
+            ctx->FullPath = isRedirectedRoot ? (g_RegMountPathNt + L"\\" + relPath) : fullNtPath;
+            g_RegContextMap[*KeyHandle] = ctx;
+        }
+    }
+
+    return status;
+}
+
+// --- [新增] 现代软件多值查询 Hook (复用单值查询逻辑以支持墓碑和回退) ---
+NTSTATUS NTAPI Detour_NtQueryMultipleValueKey(
+    HANDLE KeyHandle,
+    PKEY_VALUE_ENTRY ValueEntries,
+    ULONG EntryCount,
+    PVOID ValueBuffer,
+    PULONG BufferLength,
+    PULONG RequiredBufferLength
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount, ValueBuffer, BufferLength, RequiredBufferLength);
+    RecursionGuard guard;
+
+    ULONG totalRequiredSize = 0;
+    NTSTATUS finalStatus = STATUS_SUCCESS;
+    ULONG currentOffset = 0;
+
+    std::vector<BYTE> tempBuf(4096);
+
+    for (ULONG i = 0; i < EntryCount; i++) {
+        PKEY_VALUE_ENTRY entry = &ValueEntries[i];
+
+        ULONG resultLength = 0;
+        // 复用 Detour_NtQueryValueKey 自动处理墓碑值、真实注册表回退和 FakeACP
+        NTSTATUS status = Detour_NtQueryValueKey(
+            KeyHandle,
+            entry->ValueName,
+            KeyValuePartialInformation,
+            tempBuf.data(),
+            (ULONG)tempBuf.size(),
+            &resultLength
+        );
+
+        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+            tempBuf.resize(resultLength);
+            status = Detour_NtQueryValueKey(
+                KeyHandle,
+                entry->ValueName,
+                KeyValuePartialInformation,
+                tempBuf.data(),
+                (ULONG)tempBuf.size(),
+                &resultLength
+            );
+        }
+
+        if (NT_SUCCESS(status)) {
+            PKEY_VALUE_PARTIAL_INFORMATION partialInfo = (PKEY_VALUE_PARTIAL_INFORMATION)tempBuf.data();
+
+            entry->Type = partialInfo->Type;
+            entry->DataLength = partialInfo->DataLength;
+
+            if (BufferLength && currentOffset + partialInfo->DataLength <= *BufferLength) {
+                entry->DataOffset = currentOffset;
+                if (ValueBuffer) {
+                    memcpy((PUCHAR)ValueBuffer + currentOffset, partialInfo->Data, partialInfo->DataLength);
+                }
+                currentOffset += partialInfo->DataLength;
+
+                // 强制 4 字节对齐
+                currentOffset = (currentOffset + 3) & ~3;
+            } else {
+                finalStatus = STATUS_BUFFER_OVERFLOW;
+            }
+            // 累加所需大小 包括对齐
+            totalRequiredSize += partialInfo->DataLength;
+            totalRequiredSize = (totalRequiredSize + 3) & ~3;
+        } else {
+            // 如果任何一个值找不到 整体返回 STATUS_OBJECT_NAME_NOT_FOUND
+            finalStatus = STATUS_OBJECT_NAME_NOT_FOUND;
+            entry->DataLength = 0;
+            entry->DataOffset = 0;
+            entry->Type = 0;
+        }
+    }
+
+    if (RequiredBufferLength) {
+        *RequiredBufferLength = totalRequiredSize;
+    }
+
+    return finalStatus;
+}
+
+// --- [新增] 注册表变更通知 Hook (解决回退真实句柄无法收到沙盒变更的问题) ---
+NTSTATUS NTAPI Detour_NtNotifyChangeKey(
+    HANDLE KeyHandle,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    RecursionGuard guard;
+
+    HANDLE hTargetKey = KeyHandle;
+    std::wstring relPath;
+    std::wstring path = GetPathFromHandle(KeyHandle);
+
+    // 如果当前句柄指向真实注册表 且属于应重定向的路径 说明它是只读回退句柄
+    // 我们需要将其重定向到沙盒影子键 以便程序能收到沙盒内的变更通知
+    if (!path.empty() && ShouldRedirectReg(path, relPath)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(KeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (!it->second->hMonitorKey) {
+                EnsureRegPathExistsRelative(relPath);
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, sandboxPath.c_str());
+                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                HANDLE hMonitor = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hMonitor, KEY_NOTIFY, &oa))) {
+                    it->second->hMonitorKey = hMonitor;
+                } else {
+                    ULONG disp;
+                    if (NT_SUCCESS(fpNtCreateKey(&hMonitor, KEY_NOTIFY, &oa, 0, NULL, 0, &disp))) {
+                        it->second->hMonitorKey = hMonitor;
+                    }
+                }
+            }
+            if (it->second->hMonitorKey) {
+                hTargetKey = it->second->hMonitorKey;
+            }
+        }
+    }
+
+    return fpNtNotifyChangeKey(hTargetKey, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+}
+
+NTSTATUS NTAPI Detour_NtNotifyChangeMultipleKeys(
+    HANDLE MasterKeyHandle,
+    ULONG Count,
+    POBJECT_ATTRIBUTES SlaveObjects,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+) {
+    if (g_IsInHook || !g_HookReg) return fpNtNotifyChangeMultipleKeys(MasterKeyHandle, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    RecursionGuard guard;
+
+    HANDLE hTargetKey = MasterKeyHandle;
+    std::wstring relPath;
+    std::wstring path = GetPathFromHandle(MasterKeyHandle);
+
+    if (!path.empty() && ShouldRedirectReg(path, relPath)) {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(MasterKeyHandle);
+        if (it != g_RegContextMap.end()) {
+            if (!it->second->hMonitorKey) {
+                EnsureRegPathExistsRelative(relPath);
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                OBJECT_ATTRIBUTES oa;
+                UNICODE_STRING us;
+                RtlInitUnicodeString(&us, sandboxPath.c_str());
+                InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                HANDLE hMonitor = NULL;
+                if (NT_SUCCESS(fpNtOpenKey(&hMonitor, KEY_NOTIFY, &oa))) {
+                    it->second->hMonitorKey = hMonitor;
+                } else {
+                    ULONG disp;
+                    if (NT_SUCCESS(fpNtCreateKey(&hMonitor, KEY_NOTIFY, &oa, 0, NULL, 0, &disp))) {
+                        it->second->hMonitorKey = hMonitor;
+                    }
+                }
+            }
+            if (it->second->hMonitorKey) {
+                hTargetKey = it->second->hMonitorKey;
+            }
+        }
+    }
+
+    return fpNtNotifyChangeMultipleKeys(hTargetKey, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+}
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
@@ -3733,49 +6971,79 @@ NTSTATUS NTAPI Detour_NtQueryObject(
     ULONG Length,
     PULONG ReturnLength
 ) {
-    // 调用原始函数
+    // 1. 调用原始函数
     NTSTATUS status = fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
 
-    // 仅处理成功且为 ObjectNameInformation 的情况
+    // 2. 仅处理成功且为 ObjectNameInformation (1) 的情况
+    // 注意：ObjectAllInformation (3) 返回的是全局类型统计 不包含当前对象的路径 因此无需伪装
     if (NT_SUCCESS(status) && ObjectInformationClass == ObjectNameInformation && ObjectInformation) {
 
         POBJECT_NAME_INFORMATION pNameInfo = (POBJECT_NAME_INFORMATION)ObjectInformation;
+
+        // 确保缓冲区包含有效的 Name 结构且 Name 不为空
         if (pNameInfo->Name.Buffer && pNameInfo->Name.Length > 0) {
 
-            // 获取当前返回的路径 (设备路径格式)
-            // 例如: \Device\HarddiskVolume2\Sandbox\C\Windows\System32\notepad.exe
             std::wstring currentPath(pNameInfo->Name.Buffer, pNameInfo->Name.Length / sizeof(wchar_t));
+            std::wstring spoofedPath;
+            bool needSpoof = false;
 
-            // 检查是否以沙盒设备路径开头
-            if (!g_SandboxDevicePath.empty() &&
-                currentPath.size() > g_SandboxDevicePath.size() &&
-                _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+            // ---------------------------------------------------------
+            // A. 注册表对象伪装 (配合 g_RegMountPathNt)
+            // ---------------------------------------------------------
+            if (!g_RegMountPathNt.empty() &&
+                _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
 
-                // 检查分隔符 确保匹配完整目录
-                // currentPath[devLen] 应该是 '\' 后面跟着盘符 'C' 再后面是 '\'
+                // 反推真实路径
+                std::wstring realRegPath;
+                if (GetRealFromSandboxPath(currentPath, realRegPath)) {
+                    spoofedPath = realRegPath;
+                    needSpoof = true;
+                }
+            }
+            // ---------------------------------------------------------
+            // B. 文件对象伪装 (配合 g_SandboxDevicePath)
+            // ---------------------------------------------------------
+            else if (!g_SandboxDevicePath.empty() &&
+                     currentPath.size() > g_SandboxDevicePath.size() &&
+                     _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
+
                 size_t devLen = g_SandboxDevicePath.size();
-                if (currentPath[devLen] == L'\\' && currentPath[devLen + 2] == L'\\') {
-
-                    wchar_t driveLetter = currentPath[devLen + 1]; // 'C'
+                // 检查格式 ...\C\...
+                if (currentPath[devLen] == L'\\' && currentPath.length() > devLen + 2 && currentPath[devLen + 2] == L'\\') {
+                    wchar_t driveLetter = currentPath[devLen + 1];
                     std::wstring realDevicePrefix = GetDevicePathByDrive(driveLetter);
 
                     if (!realDevicePrefix.empty()) {
-                        // 构造欺骗后的路径
-                        // \Device\HarddiskVolume1 + \Windows\System32\notepad.exe
-                        std::wstring spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
+                        spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
+                        needSpoof = true;
+                    }
+                }
+            }
 
-                        // 检查缓冲区是否足够 (通常欺骗后的路径比沙盒路径短 所以是安全的)
-                        if (spoofedPath.length() * sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
+            // ---------------------------------------------------------
+            // C. 执行伪装并修正 ReturnLength
+            // ---------------------------------------------------------
+            if (needSpoof && !spoofedPath.empty()) {
+                USHORT newByteLength = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
 
-                            // 原地修改缓冲区
-                            memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
-                            pNameInfo->Name.Length = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
+                // 检查缓冲区是否足够 (通常伪装后的路径比沙盒路径短 所以是安全的)
+                if (newByteLength <= pNameInfo->Name.MaximumLength) {
 
-                            // 确保 NULL 结尾 (虽然 UNICODE_STRING 不强制 但为了安全)
-                            if (pNameInfo->Name.Length + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
-                                pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
-                            }
-                        }
+                    // 1. 覆盖路径数据
+                    memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), newByteLength);
+                    pNameInfo->Name.Length = newByteLength;
+
+                    // 2. 确保 NULL 结尾 (安全防御)
+                    if (newByteLength + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
+                        pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
+                    }
+
+                    // 3. [关键] 修正 ReturnLength
+                    // 很多程序(如.NET)会检查 ReturnLength 是否与实际数据匹配
+                    if (ReturnLength) {
+                        // 计算实际需要的总大小：结构体头 + 字符串长度 + NULL结尾
+                        ULONG actualSize = sizeof(OBJECT_NAME_INFORMATION) + newByteLength + sizeof(wchar_t);
+                        *ReturnLength = actualSize;
                     }
                 }
             }
@@ -3839,68 +7107,6 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
                     memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
                     pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
-                }
-            }
-        }
-    }
-
-    return status;
-}
-
-// --- [新增] 注册表伪造核心 ---
-NTSTATUS NTAPI Detour_NtQueryValueKey(
-    HANDLE KeyHandle,
-    PUNICODE_STRING ValueName,
-    KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    PVOID KeyValueInformation,
-    ULONG Length,
-    PULONG ResultLength
-) {
-    // 1. 调用原始函数
-    NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
-
-    // 2. 如果查询成功且启用了区域伪造
-    if (NT_SUCCESS(status) && g_FakeACP != 0 && ValueName && ValueName->Buffer) {
-
-        // 3. 检查是否查询的是 ACP 或 OEMCP
-        // 注意：为了性能 这里只比较 ValueName
-        // 严格来说应该检查 KeyHandle 是否指向 Control\Nls\CodePage 但在 HookDLL 中维护句柄映射太重了
-        // 由于 ACP/OEMCP 名字很特殊 误伤概率极低
-
-        bool isACP = (_wcsnicmp(ValueName->Buffer, L"ACP", 3) == 0 && ValueName->Length == 6);
-        bool isOEMCP = (_wcsnicmp(ValueName->Buffer, L"OEMCP", 5) == 0 && ValueName->Length == 10);
-
-        if (isACP || isOEMCP) {
-            const std::wstring& fakeVal = isACP ? g_FakeACPStr : g_FakeOEMCPStr;
-            ULONG fakeDataSize = (ULONG)((fakeVal.length() + 1) * sizeof(wchar_t));
-
-            // 处理 PartialInformation (最常用的查询方式)
-            if (KeyValueInformationClass == KeyValuePartialInformation) {
-                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
-
-                // 检查缓冲区是否足够
-                if (Length >= FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize) {
-                    info->Type = REG_SZ;
-                    info->DataLength = fakeDataSize;
-                    memcpy(info->Data, fakeVal.c_str(), fakeDataSize);
-                    // DebugLog(L"RegHook: Spoofed %s -> %s", ValueName->Buffer, fakeVal.c_str());
-                } else {
-                    status = STATUS_BUFFER_OVERFLOW;
-                    if (ResultLength) *ResultLength = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + fakeDataSize;
-                }
-            }
-            // 处理 FullInformation (部分程序使用)
-            else if (KeyValueInformationClass == KeyValueFullInformation) {
-                PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)KeyValueInformation;
-                ULONG dataOffset = info->DataOffset;
-
-                if (Length >= dataOffset + fakeDataSize) {
-                    info->Type = REG_SZ;
-                    info->DataLength = fakeDataSize;
-                    memcpy((BYTE*)info + dataOffset, fakeVal.c_str(), fakeDataSize);
-                } else {
-                    status = STATUS_BUFFER_OVERFLOW;
-                    if (ResultLength) *ResultLength = dataOffset + fakeDataSize;
                 }
             }
         }
@@ -4157,7 +7363,7 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 清理 Context
+    // 清理 DirContext
     {
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
@@ -4167,7 +7373,24 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 调用原始 NtClose
+    // 清理 RegContext
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+        auto it = g_RegContextMap.find(Handle);
+        if (it != g_RegContextMap.end()) {
+            // [新增] 关闭缓存的真实句柄
+            if (it->second->hRealKey) {
+                fpNtClose(it->second->hRealKey);
+            }
+            // [新增] 关闭监视句柄
+            if (it->second->hMonitorKey) {
+                fpNtClose(it->second->hMonitorKey);
+            }
+            delete it->second;
+            g_RegContextMap.erase(it);
+        }
+    }
+
     return fpNtClose(Handle);
 }
 
@@ -5723,7 +8946,14 @@ BOOL CreateProcessInternal(
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-                        DebugLog(L"ChildHook: Direct Injection Success (%d-bit) -> PID %d", currentArch, pPI->dwProcessId);
+                        // [关键修复] 同架构注入也需要等待就绪事件
+                        std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+                        HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+                        if (hEvent) {
+							// 等待子进程初始化完成 最多等待 5 秒
+							WaitForSingleObject(hEvent, 5000);
+							CloseHandle(hEvent);
+                        }
 
                         // [修改] 顺便注入第三方 DLL (增加架构检查)
                         for (const auto& extraDll : g_ExtraDlls) {
@@ -5782,7 +9012,14 @@ BOOL CreateProcessInternal(
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-            }
+				// [建议] 即使是 IPC 请求 也在这里等一下
+				std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+				HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+				if (hEvent) {
+					WaitForSingleObject(hEvent, 5000);
+					CloseHandle(hEvent);
+				}
+			}
 
         } else {
             // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
@@ -6550,14 +9787,19 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
-    // 1. 刷新设备映射
-    RefreshDeviceMap();
-
-    // [新增] 提前获取 ntdll 句柄和 NtResumeProcess
+    // [关键修复] 提前获取 ntdll 句柄和所有通用函数指针
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
         fpNtResumeProcess = (P_NtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
+        // 无论何种模式 都初始化 NtQueryObject 因为路径解析依赖它
+        fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+
+        // [修复] 无论何种模式 都初始化 NtClose
+        fpNtClose = (P_NtClose)GetProcAddress(hNtdll, "NtClose");
     }
+
+    // 1. 刷新设备映射
+    RefreshDeviceMap();
 
     wchar_t buffer[MAX_PATH] = { 0 };
 
@@ -6580,6 +9822,65 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (GetEnvironmentVariableW(L"YAP_HOOK_FILE", buffer, MAX_PATH) > 0) {
         g_HookMode = _wtoi(buffer);
         // 注意：这里允许 g_HookMode 为 0
+    }
+
+    // 读取 YAP_HOOK_REG 配置
+    wchar_t regBuffer[64] = { 0 };
+    if (GetEnvironmentVariableW(L"YAP_HOOK_REG", regBuffer, 64) > 0) {
+        g_HookReg = (_wtoi(regBuffer) == 1);
+    }
+
+    if (g_HookReg && hNtdll) {
+        // 1. 获取 RtlFormatCurrentUserKeyPath 函数地址
+        fpRtlFormatCurrentUserKeyPath = (P_RtlFormatCurrentUserKeyPath)GetProcAddress(hNtdll, "RtlFormatCurrentUserKeyPath");
+
+        if (fpRtlFormatCurrentUserKeyPath) {
+            UNICODE_STRING userKeyPath;
+            if (NT_SUCCESS(fpRtlFormatCurrentUserKeyPath(&userKeyPath))) {
+                g_CurrentUserSidPath.assign(userKeyPath.Buffer, userKeyPath.Length / sizeof(WCHAR));
+                DebugLog(L"RegHook: CurrentUser = %s", g_CurrentUserSidPath.c_str());
+            }
+        }
+
+        // 2. [修改] 连接到由启动器挂载的注册表键
+        // 不再使用 RegLoadAppKey 而是打开已挂载的键
+        // 启动器会将挂载点名称写入 YAP_HOOK_REGPATH 环境变量
+        wchar_t mountPointBuf[256] = { 0 };
+        if (GetEnvironmentVariableW(L"YAP_HOOK_REGPATH", mountPointBuf, 256) > 0) {
+            // 构造 NT 路径: \REGISTRY\USER\<MountPointName>
+            std::wstring mountPath = L"\\REGISTRY\\USER\\" + std::wstring(mountPointBuf);
+
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, mountPath.c_str());
+
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 使用 NtOpenKey 打开挂载点
+            // 需要 MAXIMUM_ALLOWED 或 KEY_ALL_ACCESS 以便后续创建子键
+            NTSTATUS status = 0;
+            // 尝试获取 NtOpenKey 指针 (如果尚未获取)
+            if (!fpNtOpenKey) fpNtOpenKey = (P_NtOpenKey)GetProcAddress(hNtdll, "NtOpenKey");
+
+            if (fpNtOpenKey) {
+                status = fpNtOpenKey(reinterpret_cast<PHANDLE>(&g_hAppHive), KEY_ALL_ACCESS, &oa);
+            } else {
+                status = STATUS_NOT_SUPPORTED;
+            }
+
+            if (NT_SUCCESS(status)) {
+                // [新增] 保存挂载点路径供后续判断使用
+                g_RegMountPathNt = mountPath;
+                DebugLog(L"RegHook: Connected to mounted hive at %s", mountPath.c_str());
+                // 注意：Hive 的初始化（创建 Machine/User 子键）现在由启动器在创建 Hive 文件时完成
+            } else {
+                DebugLog(L"RegHook: Failed to open mounted hive %s, status %x", mountPath.c_str(), status);
+                g_hAppHive = NULL;
+            }
+        } else {
+             DebugLog(L"RegHook: YAP_HOOK_REGPATH not set, registry redirection disabled.");
+             g_hAppHive = NULL;
+        }
     }
 
     // [新增] 读取子进程挂钩配置
@@ -6953,16 +10254,20 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 分组挂钩逻辑
     // =======================================================
 
+    // [修改] 公共基础 Hook：NtQueryObject
+    // 只要启用了 文件重定向 OR 虚拟盘符 OR 注册表重定向
+    // 就必须挂钩 NtQueryObject 以进行路径伪装 (防止通过句柄反查到沙盒路径)
+    if (hNtdll && (g_HookMode > 0 || g_VirtualCdDrive != 0 || g_HookReg)) {
+        void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
+        if (pNtQueryObject) {
+            // MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址(Trampoline)
+            // 这样 GetPathFromHandle 内部调用 fpNtQueryObject 时依然能正常工作
+            MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+        }
+    }
+
     // --- 组 A: 文件系统 Hook ---
     if (hNtdll) {
-        // 1. 预先初始化必要的函数指针
-        // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
-        // 如果 g_HookMode=0 我们不会挂钩 NtQueryObject 因此必须手动获取其原始地址
-        // 否则 fpNtQueryObject 为 NULL 会导致崩溃
-        if (fpNtQueryObject == NULL) {
-            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
-        }
-
         // [修改] 启用文件重定向挂钩的条件
         // 1. hookfile > 0 (常规重定向)
         // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
@@ -6977,10 +10282,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
-
-            // 挂钩 NtQueryObject (用于路径伪装)
-            // 注意：MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址
-            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             // [新增] 挂钩 NtCreateNamedPipeFile
             void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
@@ -7200,16 +10501,9 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hKernel32, "GetSystemDefaultUILanguage"), &Detour_GetSystemDefaultUILanguage, reinterpret_cast<LPVOID*>(&fpGetSystemDefaultUILanguage));
         }
 
-        // [新增] 注册表 Hook (NtQueryValueKey)
         if (hNtdll) {
-            // 注意：如果之前在文件系统 Hook 中已经获取了 fpNtQueryValueKey 这里直接使用
-            // 如果没有 需要 GetProcAddress
-            void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
-            if (pNtQueryValueKey) {
-                MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
-                MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
-                MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
-            }
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlMultiByteToUnicodeN"), &Detour_RtlMultiByteToUnicodeN, reinterpret_cast<LPVOID*>(&fpRtlMultiByteToUnicodeN));
+            MH_CreateHook(GetProcAddress(hNtdll, "RtlUnicodeToMultiByteN"), &Detour_RtlUnicodeToMultiByteN, reinterpret_cast<LPVOID*>(&fpRtlUnicodeToMultiByteN));
         }
 
         // [新增] 资源加载 Hook
@@ -7370,6 +10664,77 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQuerySystemTime = (void*)GetProcAddress(hNtdll, "NtQuerySystemTime");
             if (pNtQuerySystemTime) {
                 MH_CreateHook(pNtQuerySystemTime, &Detour_NtQuerySystemTime, reinterpret_cast<LPVOID*>(&fpNtQuerySystemTime));
+            }
+        }
+    }
+
+    // --- 组 L: 注册表重定向 Hook (仅当 YAP_HOOK_REG=1 时启用) ---
+    if (g_HookReg && hNtdll) {
+        void* pNtCreateKey      = (void*)GetProcAddress(hNtdll, "NtCreateKey");
+        void* pNtOpenKey        = (void*)GetProcAddress(hNtdll, "NtOpenKey");
+        void* pNtOpenKeyEx      = (void*)GetProcAddress(hNtdll, "NtOpenKeyEx");
+        void* pNtDeleteKey      = (void*)GetProcAddress(hNtdll, "NtDeleteKey");
+        void* pNtRenameKey = (void*)GetProcAddress(hNtdll, "NtRenameKey");
+        void* pNtSetValueKey = (void*)GetProcAddress(hNtdll, "NtSetValueKey");
+        void* pNtDeleteValueKey = (void*)GetProcAddress(hNtdll, "NtDeleteValueKey");
+
+        fpNtQueryKey = (P_NtQueryKey)GetProcAddress(hNtdll, "NtQueryKey");
+        fpNtSetInformationKey = (P_NtSetInformationKey)GetProcAddress(hNtdll, "NtSetInformationKey");
+
+        if (pNtSetValueKey) MH_CreateHook(pNtSetValueKey, &Detour_NtSetValueKey, reinterpret_cast<LPVOID*>(&fpNtSetValueKey));
+        if (pNtDeleteValueKey) MH_CreateHook(pNtDeleteValueKey, &Detour_NtDeleteValueKey, reinterpret_cast<LPVOID*>(&fpNtDeleteValueKey));
+        if (pNtCreateKey)     MH_CreateHook(pNtCreateKey,     &Detour_NtCreateKey,     reinterpret_cast<LPVOID*>(&fpNtCreateKey));
+        if (pNtOpenKey)       MH_CreateHook(pNtOpenKey,       &Detour_NtOpenKey,       reinterpret_cast<LPVOID*>(&fpNtOpenKey));
+        if (pNtOpenKeyEx)     MH_CreateHook(pNtOpenKeyEx,     &Detour_NtOpenKeyEx,     reinterpret_cast<LPVOID*>(&fpNtOpenKeyEx));
+        if (pNtDeleteKey)     MH_CreateHook(pNtDeleteKey,     &Detour_NtDeleteKey,     reinterpret_cast<LPVOID*>(&fpNtDeleteKey));
+        if (pNtRenameKey) MH_CreateHook(pNtRenameKey, &Detour_NtRenameKey, reinterpret_cast<LPVOID*>(&fpNtRenameKey));
+
+        void* pNtEnumerateKey = (void*)GetProcAddress(hNtdll, "NtEnumerateKey");
+        if (pNtEnumerateKey) {
+            MH_CreateHook(pNtEnumerateKey, &Detour_NtEnumerateKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateKey));
+        }
+
+        void* pNtEnumerateValueKey = (void*)GetProcAddress(hNtdll, "NtEnumerateValueKey");
+        if (pNtEnumerateValueKey) {
+            MH_CreateHook(pNtEnumerateValueKey, &Detour_NtEnumerateValueKey, reinterpret_cast<LPVOID*>(&fpNtEnumerateValueKey));
+        }
+
+        // [新增] 注册表多值查询与变更通知 Hook
+        void* pNtQueryMultipleValueKey = (void*)GetProcAddress(hNtdll, "NtQueryMultipleValueKey");
+        if (pNtQueryMultipleValueKey) {
+            MH_CreateHook(pNtQueryMultipleValueKey, &Detour_NtQueryMultipleValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryMultipleValueKey));
+        }
+
+        void* pNtNotifyChangeKey = (void*)GetProcAddress(hNtdll, "NtNotifyChangeKey");
+        if (pNtNotifyChangeKey) {
+            MH_CreateHook(pNtNotifyChangeKey, &Detour_NtNotifyChangeKey, reinterpret_cast<LPVOID*>(&fpNtNotifyChangeKey));
+        }
+
+        void* pNtNotifyChangeMultipleKeys = (void*)GetProcAddress(hNtdll, "NtNotifyChangeMultipleKeys");
+        if (pNtNotifyChangeMultipleKeys) {
+            MH_CreateHook(pNtNotifyChangeMultipleKeys, &Detour_NtNotifyChangeMultipleKeys, reinterpret_cast<LPVOID*>(&fpNtNotifyChangeMultipleKeys));
+        }
+
+        // [新增] 事务注册表 Hook
+        void* pNtCreateKeyTransacted = (void*)GetProcAddress(hNtdll, "NtCreateKeyTransacted");
+        if (pNtCreateKeyTransacted) {
+            MH_CreateHook(pNtCreateKeyTransacted, &Detour_NtCreateKeyTransacted, reinterpret_cast<LPVOID*>(&fpNtCreateKeyTransacted));
+        }
+
+        void* pNtOpenKeyTransacted = (void*)GetProcAddress(hNtdll, "NtOpenKeyTransacted");
+        if (pNtOpenKeyTransacted) {
+            MH_CreateHook(pNtOpenKeyTransacted, &Detour_NtOpenKeyTransacted, reinterpret_cast<LPVOID*>(&fpNtOpenKeyTransacted));
+        }
+    }
+
+    // --- [新增] 组 M: 共享注册表查询 Hook (统一处理) ---
+    // 只要启用了 区域伪装(FakeACP) 或者 注册表重定向(HookReg) 就需要挂钩 NtQueryValueKey
+    if ((g_FakeACP != 0 || g_HookReg) && hNtdll) {
+        // 防止重复挂钩的防御性检查
+        if (fpNtQueryValueKey == NULL) {
+            void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
+            if (pNtQueryValueKey) {
+                MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
             }
         }
     }

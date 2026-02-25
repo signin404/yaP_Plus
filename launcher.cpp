@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <winternl.h>
+#include  <aclapi.h>
+#include  <sddl.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -313,6 +315,8 @@ struct LauncherThreadData {
     std::atomic<bool>* isBackupWorking = nullptr;
 	DWORD launcherPid;
     std::wstring pipeName;
+    std::wstring regMountName; // [新增] 传递挂载名称用于卸载
+    std::wstring hivePath;     // [新增] 传递文件路径用于清理日志
 };
 
 // --- 提取嵌入资源的辅助函数 ---
@@ -3002,6 +3006,43 @@ void UnloadTemporaryFonts() {
     PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
 }
 
+// --- [新增] 注册表 Hive 管理辅助函数 ---
+// 计算 Hive 挂载名称 (基于启动器名称)
+std::wstring GetHiveMountName(const std::wstring& launcherName) {
+    return L"YapHookReg_" + launcherName;
+}
+
+// 确保 Hive 文件存在且有效 (如果不存在则创建并初始化)
+bool EnsureHiveFileExists(const std::wstring& hivePath) {
+    if (PathFileExistsW(hivePath.c_str())) return true;
+
+    // 创建一个临时 Key 用于构建 Hive 结构
+    HKEY hTempKey;
+    std::wstring tempKeyName = L"YapHookTempHive_" + std::to_wstring(GetCurrentProcessId());
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, tempKeyName.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hTempKey, NULL) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    // 初始化基础结构 (Machine 和 User 根键)
+    HKEY hSub;
+    if (RegCreateKeyW(hTempKey, L"Machine", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"User", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    // [新增] 初始化额外的根键映射目录
+    if (RegCreateKeyW(hTempKey, L"Classes", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"Users", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    if (RegCreateKeyW(hTempKey, L"Config", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+
+    // 保存到文件 (需要 SeBackupPrivilege 已在 EnableAllPrivileges 中启用)
+    // 注意：RegSaveKey 要求目标文件不存在
+    LSTATUS status = RegSaveKeyW(hTempKey, hivePath.c_str(), NULL);
+
+    RegCloseKey(hTempKey);
+    SHDeleteKeyW(HKEY_CURRENT_USER, tempKeyName.c_str());
+
+    return (status == ERROR_SUCCESS);
+}
+
 // --- Process Management Functions ---
 
 // Helper for single-instance wait
@@ -5084,6 +5125,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         SetEnvironmentVariableW(L"YAP_HOOK_TIME", hookTimeVal.c_str());
     }
 
+    // --- [新增] 解析 hookreg 配置 (注册表重定向) ---
+    std::wstring hookRegVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookreg");
+
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
     std::wstring extraDllsEnv;
     for (const auto& dll : thirdPartyDlls) {
@@ -5098,7 +5142,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     // [修改] 启用 Hook 的条件 (针对当前进程)
     // 只有当需要文件重定向、网络拦截、伪装等核心功能时 才认为当前进程需要 "Hook"
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || !hookRegVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     // [新增] 解析 multiple 配置
     std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
@@ -5413,6 +5457,35 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // 传入 iniContent 以支持智能 Path 变量清理
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid, data->iniContent);
 
+    // [新增] 卸载注册表 Hive
+    if (!data->regMountName.empty()) {
+        // 尝试卸载 Hive
+        // 注意：如果子进程尚未完全退出或有句柄泄露 RegUnLoadKeyW 可能会失败
+        // 这是正常的系统行为 (Lazy Unload) 系统会在所有句柄关闭后最终卸载它
+
+        // [修改] 添加重试机制：如果卸载失败 每隔1秒重试1次 总共重试10次
+        for (int retry = 0; retry <= 10; ++retry) {
+            LSTATUS status = RegUnLoadKeyW(HKEY_USERS, data->regMountName.c_str());
+            if (status == ERROR_SUCCESS) {
+                break; // 卸载成功 跳出重试循环
+            }
+
+            if (retry < 10) {
+                Sleep(1000); // 卸载失败 等待 1 秒后重试
+            }
+            // 如果 retry == 10 依然失败 循环将自然结束 放弃卸载并继续执行后续操作
+        }
+
+        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)
+        if (!data->hivePath.empty()) {
+            wchar_t hiveDir[MAX_PATH];
+            wcscpy_s(hiveDir, MAX_PATH, data->hivePath.c_str());
+            PathRemoveFileSpecW(hiveDir);
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat.*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat{*");
+        }
+    }
+
     DeleteFileW(data->tempFilePath.c_str());
 
     // [修改] 删除已释放的 DLL 文件
@@ -5426,12 +5499,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     return 0;
 }
 
-// --- [新增] 获取确定性的管道名称 (基于唯一标识符的哈希) ---
-std::wstring GetDeterministicPipeName(const std::wstring& uniqueId) {
-    std::hash<std::wstring> hasher;
-    size_t hash = hasher(uniqueId);
-    // kPipeNamePrefix 定义在 IpcCommon.h 中 通常为 L"\\\\.\\pipe\\YapLauncherPipe_"
-    return kPipeNamePrefix + std::to_wstring(hash);
+// --- [修改] 获取确定性的管道名称 (基于启动器名称) ---
+std::wstring GetDeterministicPipeName(const std::wstring& launcherName) {
+    return L"\\\\.\\pipe\\YapLauncherPipe_" + launcherName;
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
@@ -5538,6 +5608,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
     PathRemoveExtensionW(launcherBaseName);
+    variables[L"LAUNCHERNAME"] = launcherBaseName; // 新增：保存启动器名称供后续使用
+    variables[L"YAPNAME"] = launcherBaseName;      // [新增] 启动器名称 (不含 .exe)
+
     wchar_t appBaseName[MAX_PATH] = L"";
     if (!appPathRaw.empty()) {
         wcscpy_s(appBaseName, PathFindFileNameW(appPathRaw.c_str()));
@@ -5545,8 +5618,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     std::wstring mutexName = L"Global\\" + std::wstring(launcherBaseName) + L"_" + std::wstring(appBaseName);
 
-    // [新增] 计算确定性的管道名称 供所有实例使用
-    std::wstring sharedPipeName = GetDeterministicPipeName(mutexName);
+    // [修改] 计算确定性的管道名称 供所有实例使用 (基于启动器名称)
+    std::wstring sharedPipeName = GetDeterministicPipeName(launcherBaseName);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -5698,6 +5771,70 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             tempFile.close();
         }
 
+        // --- [新增] 提前解析并挂载注册表配置单元 (支持 [Before] 写入) ---
+        std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
+        std::wstring regMountName;
+        std::wstring hivePath;
+
+        if (!hookRegVal.empty()) {
+            SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+
+            std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
+            std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
+
+            hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+            if (!finalHookPath.empty()) {
+                 hivePath = finalHookPath + L"\\YapHookReg.dat";
+            }
+
+            regMountName = GetHiveMountName(launcherBaseName);
+
+            wchar_t parentDir[MAX_PATH];
+            wcscpy_s(parentDir, MAX_PATH, hivePath.c_str());
+            PathRemoveFileSpecW(parentDir);
+            SHCreateDirectoryExW(NULL, parentDir, NULL);
+
+            if (EnsureHiveFileExists(hivePath)) {
+                HKEY hTest;
+                if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_READ, &hTest) == ERROR_SUCCESS) {
+                    RegCloseKey(hTest);
+                } else {
+                    RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
+
+                    // 将已挂载的注册表配置单元设置为 Low Integrity（含继承标志）
+                    {
+                        PSECURITY_DESCRIPTOR pSD = nullptr;
+                        // OICI 使完整性标签向下继承到子键和子值
+                        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                                L"S:(ML;OICI;NW;;;LW)",
+                                SDDL_REVISION_1,
+                                &pSD,
+                                nullptr))
+                        {
+                            PACL pSacl       = nullptr;
+                            BOOL saclPresent = FALSE;
+                            BOOL saclDefault = FALSE;
+                            if (GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefault) && saclPresent)
+                            {
+                                std::wstring fullKeyPath = L"USERS\\" + regMountName;
+                                SetNamedSecurityInfoW(
+                                    const_cast<LPWSTR>(fullKeyPath.c_str()),
+                                    SE_REGISTRY_KEY,
+                                    LABEL_SECURITY_INFORMATION,
+                                    nullptr, nullptr, nullptr,
+                                    pSacl);
+                            }
+                            LocalFree(pSD);
+                        }
+                    }
+                }
+                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
+            }
+        } else {
+            SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+            SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
+        }
+
         // <-- [新增] 为 [Before] 阶段的操作定义受信任的PID（仅限启动器自身）
         std::set<DWORD> beforeTrustedPids;
         beforeTrustedPids.insert(GetCurrentProcessId());
@@ -5734,6 +5871,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         threadData.isBackupWorking = &isBackupWorking;
 		threadData.launcherPid = launcherPid;
         threadData.pipeName = sharedPipeName;
+        threadData.regMountName = regMountName;
+        threadData.hivePath = hivePath;
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
@@ -5828,6 +5967,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookFontVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfont");
             std::wstring hookTimeVal = GetValueFromIniContent(iniContent, L"Hook", L"hooktime");
             std::wstring hookChildVal = GetValueFromIniContent(iniContent, L"Hook", L"hookchild");
+            std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
 
             if (hookChildVal.empty()) hookChildVal = L"1";
 
@@ -5938,6 +6078,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 SetEnvironmentVariableW(L"YAP_HOOK_TIME", NULL);
             }
 
+            // --- [新增] 条件设置：hookreg ---
+            if (!hookRegVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+                // 为多实例计算并设置挂载路径环境变量
+                std::wstring regMountName = GetHiveMountName(launcherBaseName);
+                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+                SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
+            }
+
             // 处理字体路径 (必须像第一实例那样解析成绝对路径)
             if (!hookFontVal.empty()) {
                 std::wstring resolvedFontPath = ResolveToAbsolutePath(ExpandVariables(hookFontVal, variables), variables);
@@ -5958,7 +6109,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             bool needHook = (_wtoi(hookFileVal.c_str()) > 0 || _wtoi(netBlockVal.c_str()) > 0 ||
                              !hookVolumeIdVal.empty() || !hookCdVal.empty() ||
                              !hookLocaleVal.empty() || !hookFontVal.empty() ||
-                             !hookTimeVal.empty() || hasThirdPartyDlls);
+                             !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);
 
             if (!needHook) {
                 LaunchApplication(iniContent, variables);

@@ -41,9 +41,9 @@ Just copy and paste to create portable software.
 - [x] Unicode support
 - [x] Wait for process
 - [x] Scheduled backup
-- [x] Load temporary fonts
 - [x] Create hard links
 - [x] Create firewall rules
+- [x] Load temporary fonts
 - [x] Hide console program window
 - [x] Detect foreground and suspend background processes
 - [x] File write format encoding detection
@@ -53,6 +53,7 @@ Just copy and paste to create portable software.
 - [x] Check the parent process or path and terminate the process
 - [x] Traverse subdirectories and delete files/directories
 - [x] (Experimental) Hook Redirect File Operations
+- [x] (Experimental) Hook Redirect Registry Operations
 - [x] (Experimental) Hook Falsifying system language
 - [x] (Experimental) Hook Falsifying system time
 - [x] (Experimental) Hook Forged volume serial number
