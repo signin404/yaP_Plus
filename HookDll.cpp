@@ -4661,7 +4661,6 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
         if (NT_SUCCESS(status)) {
             // [维护操作] 使用非事务句柄进行墓碑复活和初始化
-            // 理由：沙盒结构修复应独立于用户事务，且避免跨Hive事务问题
             HANDLE hMaintenance = NULL;
             OBJECT_ATTRIBUTES oaMaint;
             UNICODE_STRING usMaint;
@@ -4697,7 +4696,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                     RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
                     InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-                    // 打开真实键 (非事务，只读检查)
+                    // 打开真实键 (非事务 只读检查)
                     if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                         ULONG idx = 0, vlen = 0;
                         BYTE staticValBuf[4096];
@@ -4794,15 +4793,21 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                         RtlInitUnicodeString(&usRealCheck, realPathForTombstone.c_str());
                         InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
                         if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
-                            // ... (省略重复的枚举代码，与上面相同) ...
-                            // 简略版：执行值墓碑填充
                             ULONG idx = 0, vlen = 0;
                             BYTE staticValBuf[4096];
                             BYTE dummyByte = 0;
                             while (true) {
                                 NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
-                                if (!NT_SUCCESS(st)) break; // 简化处理
+                                std::vector<BYTE> dynamicValBuf;
                                 PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+                                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+                                    try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                    st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                    if (!NT_SUCCESS(st)) break;
+                                    vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                                } else if (!NT_SUCCESS(st)) {
+                                    break;
+                                }
                                 UNICODE_STRING vName;
                                 vName.Buffer = vinfo->Name;
                                 vName.Length = (USHORT)vinfo->NameLength;
@@ -4905,7 +4910,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
             ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
-            // 检查真实键 (非事务，只读)
+            // 检查真实键 (非事务 只读)
             if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal))) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
@@ -4926,15 +4931,13 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
                     InitializeObjectAttributes(&oaCreate, &usCreate, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
                     ULONG disposition;
-                    // 创建影子键 (带事务，如果可能)
+                    // 创建影子键 (带事务)
                     if (NT_SUCCESS(fpNtCreateKeyTransacted(&hNewKey, KEY_READ | KEY_WRITE, &oaCreate, 0, NULL, 0, TransactionHandle, &disposition))) {
                         fpNtClose(hNewKey);
                         status = fpNtOpenKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TransactionHandle);
                     }
                 } else {
-                    // 只读请求：返回真实句柄 (非事务，因为跨Hive事务通常不支持)
-                    // 注意：如果调用者强制要求事务一致性，这里返回非事务句柄可能会导致后续操作失败
-                    // 但对于沙盒读取回退，这是最兼容的做法。
+                    // 只读请求：返回真实句柄 (非事务)
                     *KeyHandle = hRealCheck;
                     status = STATUS_SUCCESS;
 
@@ -4944,11 +4947,16 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
                         if (it->second->hRealKey) fpNtClose(it->second->hRealKey);
                         it->second->hRealKey = NULL;
                         it->second->FullPath = realPathForCheck;
-                        // ... 清理缓存 ...
+                        it->second->KeysInitialized = false;
+                        it->second->ValuesInitialized = false;
+                        it->second->SubKeys.clear();
+                        it->second->Values.clear();
                     } else {
                         RegContext* ctx = new RegContext();
                         ctx->hRealKey = NULL;
                         ctx->FullPath = realPathForCheck;
+                        ctx->KeysInitialized = false;
+                        ctx->ValuesInitialized = false;
                         g_RegContextMap[*KeyHandle] = ctx;
                     }
                     return status;
@@ -4958,7 +4966,7 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
         }
     }
 
-    // 更新上下文缓存 (与 Detour_NtOpenKey 相同)
+    // 更新上下文缓存
     if (NT_SUCCESS(status)) {
         std::wstring realPathForCheck;
         bool canCheckReal = false;
@@ -5021,7 +5029,7 @@ NTSTATUS NTAPI Detour_NtQueryMultipleValueKey(
         PKEY_VALUE_ENTRY entry = &ValueEntries[i];
 
         ULONG resultLength = 0;
-        // 复用 Detour_NtQueryValueKey，自动处理墓碑值、真实注册表回退和 FakeACP
+        // 复用 Detour_NtQueryValueKey 自动处理墓碑值、真实注册表回退和 FakeACP
         NTSTATUS status = Detour_NtQueryValueKey(
             KeyHandle,
             entry->ValueName,
@@ -5061,11 +5069,11 @@ NTSTATUS NTAPI Detour_NtQueryMultipleValueKey(
             } else {
                 finalStatus = STATUS_BUFFER_OVERFLOW;
             }
-            // 累加所需大小，包括对齐
+            // 累加所需大小 包括对齐
             totalRequiredSize += partialInfo->DataLength;
             totalRequiredSize = (totalRequiredSize + 3) & ~3;
         } else {
-            // 如果任何一个值找不到，整体返回 STATUS_OBJECT_NAME_NOT_FOUND
+            // 如果任何一个值找不到 整体返回 STATUS_OBJECT_NAME_NOT_FOUND
             finalStatus = STATUS_OBJECT_NAME_NOT_FOUND;
             entry->DataLength = 0;
             entry->DataOffset = 0;
@@ -5100,8 +5108,8 @@ NTSTATUS NTAPI Detour_NtNotifyChangeKey(
     std::wstring relPath;
     std::wstring path = GetPathFromHandle(KeyHandle);
 
-    // 如果当前句柄指向真实注册表，且属于应重定向的路径，说明它是只读回退句柄
-    // 我们需要将其重定向到沙盒影子键，以便程序能收到沙盒内的变更通知
+    // 如果当前句柄指向真实注册表 且属于应重定向的路径 说明它是只读回退句柄
+    // 我们需要将其重定向到沙盒影子键 以便程序能收到沙盒内的变更通知
     if (!path.empty() && ShouldRedirectReg(path, relPath)) {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
