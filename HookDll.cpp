@@ -2838,8 +2838,8 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
 
     // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
     // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
-    if (contains(L"_classes\\") ||
-		(lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
+    // if (contains(L"_classes\\") ||
+		// (lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
 
     // 2. 音频与多媒体
     if (contains(L"mmdevices")) return true;
@@ -2937,7 +2937,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // 4. 匹配 HKLM
     if (_wcsnicmp(fullNtPath.c_str(), prefixMachine.c_str(), prefixMachine.length()) == 0) {
         // [新增] 排除 SOFTWARE\Classes (虽然上面 IsSystemCriticalRegPath 已经处理了 双重保险)
-        if (ContainsCaseInsensitive(fullNtPath, L"\\SOFTWARE\\Classes")) return false;
+        // if (ContainsCaseInsensitive(fullNtPath, L"\\SOFTWARE\\Classes")) return false;
 
         std::wstring sub = fullNtPath.substr(prefixMachine.length());
         if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
