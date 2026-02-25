@@ -2626,6 +2626,8 @@ std::wstring FixRegPathWow64(const std::wstring& path) {
 }
 
 // --- [新增] 沙盒墓碑机制 ---
+// 用于标记"已被虚拟删除"的特殊值名
+static const wchar_t* YAPBOX_TOMBSTONE_VALUE = L"_YapBoxDeleted";
 
 // 在沙盒键上设置墓碑标记
 void SetSandboxTombstone(HANDLE hSandboxKey) {
