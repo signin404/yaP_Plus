@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winternl.h>
+#include <sddl.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -5799,6 +5800,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 } else {
                     RegLoadKeyW(HKEY_USERS, regMountName.c_str(), hivePath.c_str());
                 }
+
+                // [新增] 将挂载的注册表配置单元设置为 Low Integrity 并包含继承标志
+                PSECURITY_DESCRIPTOR pSD = NULL;
+                if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;OICI;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+                    HKEY hKey;
+                    // 需要 KEY_ALL_ACCESS (包含 WRITE_OWNER/WRITE_DAC) 以及 ACCESS_SYSTEM_SECURITY 来修改 SACL
+                    if (RegOpenKeyExW(HKEY_USERS, regMountName.c_str(), 0, KEY_ALL_ACCESS | ACCESS_SYSTEM_SECURITY, &hKey) == ERROR_SUCCESS) {
+                        RegSetKeySecurity(hKey, LABEL_SECURITY_INFORMATION, pSD);
+                        RegCloseKey(hKey);
+                    }
+                    LocalFree(pSD);
+                }
+
                 SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", regMountName.c_str());
             }
         } else {
