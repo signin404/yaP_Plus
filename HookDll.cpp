@@ -3519,63 +3519,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
                     InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaRealCheck))) {
+                    // [修复] 恢复 KEY_ENUMERATE_SUB_KEYS 权限，防止部分系统拒绝访问
+                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
                         ULONG idx = 0, vlen = 0;
-                        BYTE staticValBuf[4096];
-                        BYTE dummyByte = 0;
-
-                        while (true) {
-                            NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
-                            
-                            std::vector<BYTE> dynamicValBuf;
-                            PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
-
-                            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
-                                try { dynamicValBuf.resize(vlen); } catch(...) { break; }
-                                st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
-                                if (!NT_SUCCESS(st)) break;
-                                vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
-                            } else if (!NT_SUCCESS(st)) {
-                                break;
-                            }
-
-                            UNICODE_STRING vName;
-                            vName.Buffer = vinfo->Name;
-                            vName.Length = (USHORT)vinfo->NameLength;
-                            vName.MaximumLength = (USHORT)vinfo->NameLength;
-
-                            // [修正] 在沙盒键中写入正确类型的值墓碑
-                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
-                            
-                            idx++;
-                        }
-                        fpNtClose(hRealCheck);
-                    }
-
-                    // 3. 重置时间戳，完成复活
-                    SetKeyLastWriteTime(hMaintenance, false);
-                    
-                    // 4. 标记为“新建”
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                }
-                else {
-                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                        isNewKey = true;
-                    }
-                }
-
-                // [核心] 惰性 CoW 初始化：屏蔽真实值
-                if (isNewKey && !isResurrected) {
-                    HANDLE hRealCheck = NULL;
-                    OBJECT_ATTRIBUTES oaRealCheck;
-                    UNICODE_STRING usRealCheck;
-                    RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
-                    InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaRealCheck))) {
-                        ULONG idx = 0, vlen = 0;
-                        BYTE staticValBuf[4096];
-                        BYTE dummyByte = 0;
+                        // [修复] 强制内存对齐，防止 0xc0000005 崩溃
+                        alignas(KEY_VALUE_BASIC_INFORMATION) BYTE staticValBuf[4096];
                         
                         while (true) {
                             NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
@@ -3597,8 +3545,59 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                             vName.Length = (USHORT)vinfo->NameLength;
                             vName.MaximumLength = (USHORT)vinfo->NameLength;
 
-                            // [修正] 在沙盒键中写入正确类型的值墓碑
-                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, &dummyByte, 0);
+                            // [修复] Data 传入 NULL 而不是 &dummyByte，防止内核参数校验引发 0xc0000005
+                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
+                            
+                            idx++;
+                        }
+                        fpNtClose(hRealCheck);
+                    }
+
+                    // 3. 最后将 新项 的墓碑标记清除
+                    SetKeyLastWriteTime(hMaintenance, false);
+                    
+                    // 4. 标记为“新建”
+                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                }
+                else {
+                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                        isNewKey = true;
+                    }
+                }
+
+                // [核心] 惰性 CoW 初始化：屏蔽真实值
+                if (isNewKey && !isResurrected) {
+                    HANDLE hRealCheck = NULL;
+                    OBJECT_ATTRIBUTES oaRealCheck;
+                    UNICODE_STRING usRealCheck;
+                    RtlInitUnicodeString(&usRealCheck, fullNtPath.c_str());
+                    InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                        ULONG idx = 0, vlen = 0;
+                        alignas(KEY_VALUE_BASIC_INFORMATION) BYTE staticValBuf[4096];
+                        
+                        while (true) {
+                            NTSTATUS st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, staticValBuf, sizeof(staticValBuf), &vlen);
+                            
+                            std::vector<BYTE> dynamicValBuf;
+                            PKEY_VALUE_BASIC_INFORMATION vinfo = (PKEY_VALUE_BASIC_INFORMATION)staticValBuf;
+
+                            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) { 
+                                try { dynamicValBuf.resize(vlen); } catch(...) { break; }
+                                st = fpNtEnumerateValueKey(hRealCheck, idx, KeyValueBasicInformation, dynamicValBuf.data(), vlen, &vlen);
+                                if (!NT_SUCCESS(st)) break;
+                                vinfo = (PKEY_VALUE_BASIC_INFORMATION)dynamicValBuf.data();
+                            } else if (!NT_SUCCESS(st)) {
+                                break;
+                            }
+
+                            UNICODE_STRING vName;
+                            vName.Buffer = vinfo->Name;
+                            vName.Length = (USHORT)vinfo->NameLength;
+                            vName.MaximumLength = (USHORT)vinfo->NameLength;
+
+                            fpNtSetValueKey(hMaintenance, &vName, 0, YAPBOX_VALUE_TOMBSTONE_TYPE, NULL, 0);
                             
                             idx++;
                         }
