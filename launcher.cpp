@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <winternl.h>
+#include  <aclapi.h>
+#include  <sddl.h>
 #include <string>
 #include <vector>
 #include <fstream>
