@@ -5027,12 +5027,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     std::wstring hookFileVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookfile");
     int hookMode = _wtoi(hookFileVal.c_str());
 
-    // [修改] 解析网络拦截/转发配置
+    // [新增] 解析网络拦截配置
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooknet");
-    bool blockNetwork = false;
-    // 只要配置不为空，且不为 "0"，就启用网络挂钩
-    if (!netBlockVal.empty() && netBlockVal != L"0") {
-        blockNetwork = true;
+    int netBlockMode = _wtoi(netBlockVal.c_str());
+    // 只要配置不为空且不为 "0"，就启用网络挂钩
+    bool blockNetwork = (!netBlockVal.empty() && netBlockVal != L"0");
+    if (blockNetwork) {
         SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
     }
 
