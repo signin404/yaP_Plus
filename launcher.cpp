@@ -5029,7 +5029,8 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     // [新增] 解析网络拦截配置
     std::wstring netBlockVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hooknet");
-    bool blockNetwork = (!netBlockVal.empty() && netBlockVal != L"0");
+    int netBlockMode = _wtoi(netBlockVal.c_str());
+    bool blockNetwork = (netBlockMode > 0); // 只要大于0就启用网络挂钩
 
     // 2. 解析 hookchild (提前)
     std::wstring hookChildVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookchild");
@@ -5202,7 +5203,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
-        SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
+        SetEnvironmentVariableW(L"YAP_HOOK_NET", std::to_wstring(netBlockMode).c_str());
 
         SetEnvironmentVariableW(L"YAP_HOOK_CHILD", hookChildVal.c_str());
         if (!childHookNamesVar.empty()) {
@@ -5951,10 +5952,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
-            if (hookFileVal.empty()) hookFileVal = L"0";
+            if (hookFileVal.empty()) hookFileVal = L"0"; // 确保不为空
 
             std::wstring netBlockVal = GetValueFromIniContent(iniContent, L"Hook", L"hooknet");
-            if (netBlockVal.empty()) netBlockVal = L"0";
+            if (netBlockVal.empty()) netBlockVal = L"0"; // 确保不为空
 
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
@@ -6105,7 +6106,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 3. 判断是否需要 Hook 流程
-            bool needHook = (_wtoi(hookFileVal.c_str()) > 0 || (!netBlockVal.empty() && netBlockVal != L"0") ||
+            bool needHook = (_wtoi(hookFileVal.c_str()) > 0 || _wtoi(netBlockVal.c_str()) > 0 ||
                              !hookVolumeIdVal.empty() || !hookCdVal.empty() ||
                              !hookLocaleVal.empty() || !hookFontVal.empty() ||
                              !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);

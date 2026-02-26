@@ -752,20 +752,9 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
-typedef BOOL(WINAPI* PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
-PFN_WinHttpSetOption fpWinHttpSetOption = NULL;
-typedef HINTERNET(WINAPI* PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-PFN_WinHttpOpen fpWinHttpOpen = NULL;
-typedef BOOL(WINAPI* PFN_InternetSetOptionA)(HINTERNET, DWORD, LPVOID, DWORD);
-PFN_InternetSetOptionA fpInternetSetOptionA = NULL;
-typedef BOOL(WINAPI* PFN_InternetSetOptionW)(HINTERNET, DWORD, LPVOID, DWORD);
-PFN_InternetSetOptionW fpInternetSetOptionW = NULL;
-typedef HINTERNET(WINAPI* PFN_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD);
-PFN_InternetOpenA fpInternetOpenA = NULL;
-typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-PFN_InternetOpenW fpInternetOpenW = NULL;
-typedef BOOL(WINAPI* PFN_WinHttpGetIEProxyConfigForCurrentUser)(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*);
-PFN_WinHttpGetIEProxyConfigForCurrentUser fpWinHttpGetIEProxyConfigForCurrentUser = NULL;
+// --- [新增] CreateProcessInternalW 定义 ---
+// 这是 Windows 内核层创建进程的统一入口，所有 CreateProcess* 系列函数最终都调用它
+typedef BOOL(WINAPI* PCreateProcessInternalW)(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken);
 
 typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
@@ -1182,11 +1171,6 @@ std::wstring g_ProgramDataNt;
 std::wstring g_ProgramDataNtShort;
 std::wstring g_PublicNt;
 
-// --- 新增代理转发全局变量 ---
-bool g_EnableForward = false;
-std::wstring g_ProxyStringW;
-std::string g_ProxyStringA;
-
 // --- 光驱伪装相关全局变量 ---
 std::wstring g_HookCdPath;      // 真实路径 (DOS): Z:\Other\ISO
 std::wstring g_HookCdNtPath;    // 真实路径 (NT): \??\Z:\Other\ISO
@@ -1349,6 +1333,7 @@ P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
 P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
+PCreateProcessInternalW fpCreateProcessInternalW = NULL;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -9061,36 +9046,31 @@ BOOL CreateProcessInternal(
 
 // --- 具体钩子实现 ---
 
-BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-    DWORD lastErr = GetLastError();
-    BOOL res = CreateProcessInternal(fpCreateProcessW, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, false);
-    SetLastError(lastErr);
-    return res;
-}
-
-BOOL WINAPI Detour_CreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-    DWORD lastErr = GetLastError();
-    BOOL res = CreateProcessInternal(fpCreateProcessA, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, true);
-    SetLastError(lastErr);
-    return res;
-}
-
-BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+// --- [新增/替换] 统一拦截 CreateProcessInternalW ---
+BOOL WINAPI Detour_CreateProcessInternalW(
+    HANDLE hToken,
+    LPCWSTR lpApplicationName,
+    LPWSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    PHANDLE hNewToken
+) {
+    if (g_IsInHook) {
+        return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+    }
     RecursionGuard guard;
 
+    // 1. 路径重定向逻辑 (移植自原 Detour_CreateProcessAsUserW)
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
+    
+    // 获取目标路径并尝试重定向
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
@@ -9100,143 +9080,54 @@ BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName
     LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
     LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
 
-    if(!redirectedExe.empty()) DebugLog(L"AsUser Redirect EXE: %s", redirectedExe.c_str());
-    if(!redirectedDir.empty()) DebugLog(L"AsUser Redirect DIR: %s", redirectedDir.c_str());
+    if (!redirectedExe.empty()) DebugLog(L"Internal Redirect EXE: %s", redirectedExe.c_str());
+    if (!redirectedDir.empty()) DebugLog(L"Internal Redirect DIR: %s", redirectedDir.c_str());
 
+    // 2. 注入准备逻辑
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+    
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED; // 强制挂起以便注入
 
-    BOOL result = fpCreateProcessAsUserW(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
+    // 3. 调用原底层函数
+    BOOL result = fpCreateProcessInternalW(
+        hToken, 
+        finalAppName, 
+        lpCommandLine, // 注意：通常不需要修改命令行，除非路径包含空格且作为参数传递
+        lpProcessAttributes, 
+        lpThreadAttributes, 
+        bInheritHandles, 
+        newCreationFlags, 
+        lpEnvironment, 
+        finalCurDir, 
+        lpStartupInfo, 
+        pPI, 
+        hNewToken
+    );
 
+    // 4. 注入与恢复逻辑
     if (result) {
+        // 重新获取实际创建的进程路径（防止重定向逻辑未覆盖到的情况）
+        // 注意：这里简单使用 targetExe，更严谨的做法是使用 GetProcessImageFileName 获取 pPI->hProcess 的路径
         if (ShouldHookChildProcess(targetExe)) {
             RequestInjectionFromLauncher(pPI->dwProcessId);
         } else {
             DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
         }
 
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
-    return result;
-}
-
-BOOL WINAPI Detour_CreateProcessAsUserA(HANDLE hToken, LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessAsUserA(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    std::wstring exePathW = AnsiToWide(lpApplicationName);
-    std::wstring cmdLineW = AnsiToWide(lpCommandLine);
-    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
-    std::wstring curDirW = AnsiToWide(lpCurrentDirectory);
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
-
-    std::string ansiExe, ansiDir;
-    LPCSTR finalAppName = lpApplicationName;
-    LPCSTR finalCurDir = lpCurrentDirectory;
-
-    if (!redirectedExe.empty()) {
-        ansiExe = WideToAnsi(redirectedExe.c_str());
-        finalAppName = ansiExe.c_str();
-    }
-    if (!redirectedDir.empty()) {
-        ansiDir = WideToAnsi(redirectedDir.c_str());
-        finalCurDir = ansiDir.c_str();
-    }
-
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result = fpCreateProcessAsUserA(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
-
-    if (result) {
-        if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
-        } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        // 如果调用者原本没要求挂起，我们现在恢复它
+        if (!callerWantedSuspended) {
+            ResumeThread(pPI->hThread);
         }
 
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
-    return result;
-}
-
-BOOL WINAPI Detour_CreateProcessWithTokenW(HANDLE hToken, DWORD dwLogonFlags, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessWithTokenW(hToken, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
-    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
-    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
-    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
-
-    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
-    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
-
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result = fpCreateProcessWithTokenW(hToken, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
-
-    if (result) {
-        if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
-        } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+        // 清理本地 PI
+        if (!lpProcessInformation) { 
+            CloseHandle(localPI.hProcess); 
+            CloseHandle(localPI.hThread); 
         }
-
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
     }
-    return result;
-}
 
-BOOL WINAPI Detour_CreateProcessWithLogonW(LPCWSTR lpUsername, LPCWSTR lpDomain, LPCWSTR lpPassword, DWORD dwLogonFlags, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
-    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
-    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
-    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
-
-    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
-    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
-
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result = fpCreateProcessWithLogonW(lpUsername, lpDomain, lpPassword, dwLogonFlags, finalAppName, lpCommandLine, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
-
-    if (result) {
-        if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
-        } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
-        }
-
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
     return result;
 }
 
@@ -9359,59 +9250,6 @@ UINT WINAPI Detour_WinExec(LPCSTR lpCmdLine, UINT uCmdShow) {
 }
 
 // --- Winsock Hooks ---
-
-// 辅助：解析 YAP_HOOK_NET 配置
-void ParseProxyConfig(const wchar_t* configStr) {
-    std::wstring cfg(configStr);
-
-    // 使用 " :: " 作为分隔符，避免与 IPv6 地址内部的 "::" 冲突
-    size_t pos1 = cfg.find(L" :: ");
-    if (pos1 != std::wstring::npos) {
-        size_t pos2 = cfg.find(L" :: ", pos1 + 4);
-        if (pos2 != std::wstring::npos) {
-            g_EnableForward = true;
-            g_BlockNetwork = 1; // 启用转发时，底层直连公网的 raw socket 默认拦截
-
-            std::wstring ip = cfg.substr(0, pos1);
-            std::wstring port = cfg.substr(pos1 + 4, pos2 - pos1 - 4);
-            std::wstring protocol = cfg.substr(pos2 + 4);
-
-            // 去除两端空格
-            auto trim =[](std::wstring& s) {
-                if (s.empty()) return;
-                s.erase(0, s.find_first_not_of(L" \t"));
-                if (!s.empty()) s.erase(s.find_last_not_of(L" \t") + 1);
-            };
-            trim(ip);
-            trim(port);
-            trim(protocol);
-
-            // 如果是 IPv6 地址且没有方括号，则添加方括号 (WinINet/WinHTTP 规范)
-            std::wstring formattedIp = ip;
-            if (ip.find(L':') != std::wstring::npos && ip.front() != L'[') {
-                formattedIp = L"[" + ip + L"]";
-            }
-
-            // 构造代理字符串
-            if (protocol == L"socks5" || protocol == L"socks") {
-                g_ProxyStringW = L"socks=" + formattedIp + L":" + port;
-            } else {
-                g_ProxyStringW = L"http=" + formattedIp + L":" + port;
-            }
-
-            // 转换为 ANSI 字符串备用
-            int size_needed = WideCharToMultiByte(CP_ACP, 0, g_ProxyStringW.c_str(), -1, NULL, 0, NULL, NULL);
-            if (size_needed > 0) {
-                g_ProxyStringA.resize(size_needed - 1);
-                WideCharToMultiByte(CP_ACP, 0, g_ProxyStringW.c_str(), -1, &g_ProxyStringA[0], size_needed - 1, NULL, NULL);
-            }
-            return;
-        }
-    }
-
-    // 如果没有匹配到转发格式，则按原有逻辑解析为 1 或 2
-    g_BlockNetwork = _wtoi(configStr);
-}
 
 // 辅助：判断是否为内网/私有 IP 地址
 bool IsIntranetIp32(ULONG ipNetworkOrder) {
@@ -9542,7 +9380,7 @@ int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
         return fpConnect(s, name, namelen);
     }
     // 拦截公网 IP
-    SetLastError(ERROR_ACCESS_DENIED);
+    WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
 
@@ -9550,7 +9388,7 @@ int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen,
     if (IsIntranetAddress(name)) {
         return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
-    SetLastError(ERROR_ACCESS_DENIED);
+    WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
 
@@ -9559,7 +9397,7 @@ int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const st
     if (IsIntranetAddress(to)) {
         return fpSendTo(s, buf, len, flags, to, tolen);
     }
-    SetLastError(ERROR_ACCESS_DENIED);
+    WSASetLastError(WSAEACCES);
     return SOCKET_ERROR;
 }
 
@@ -9571,7 +9409,7 @@ int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, L
             if (IsIntranetAddress(lpTo)) {
                 return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
             }
-            SetLastError(ERROR_ACCESS_DENIED);
+            WSASetLastError(WSAEACCES);
             return SOCKET_ERROR;
         }
         // 如果 lpTo 为空（已连接的 UDP 套接字） 通常在 connect 时已检查过 放行
@@ -9581,7 +9419,7 @@ int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, L
 
 // --- WinINet 拦截 ---
 HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName, INTERNET_PORT nServerPort, LPCWSTR lpszUserName, LPCWSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         if (!IsIntranetHost(lpszServerName)) {
             SetLastError(ERROR_ACCESS_DENIED);
             return NULL;
@@ -9592,7 +9430,7 @@ HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServer
 
 // --- WinINet ANSI 拦截 ---
 HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerName, INTERNET_PORT nServerPort, LPCSTR lpszUserName, LPCSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         // 转换为 Wide 字符串进行检查
         std::wstring serverNameW = AnsiToWide(lpszServerName);
         if (!IsIntranetHost(serverNameW.c_str())) {
@@ -9605,7 +9443,7 @@ HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerN
 
 // --- InternetOpenUrl (Unicode) 拦截 ---
 HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         std::wstring host = GetHostFromUrl(lpszUrl);
         // 如果解析不出主机名 或者主机名不是内网 则拦截
         if (host.empty() || !IsIntranetHost(host.c_str())) {
@@ -9618,7 +9456,7 @@ HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, L
 
 // --- InternetOpenUrl (ANSI) 拦截 ---
 HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         std::wstring urlW = AnsiToWide(lpszUrl);
         std::wstring host = GetHostFromUrl(urlW.c_str());
         if (host.empty() || !IsIntranetHost(host.c_str())) {
@@ -9660,7 +9498,7 @@ struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
 
 // --- WinHTTP 拦截 ---
 HINTERNET WINAPI Detour_WinHttpConnect(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         if (!IsIntranetHost(pswzServerName)) {
             SetLastError(ERROR_ACCESS_DENIED);
             return NULL;
@@ -9749,7 +9587,7 @@ BOOL PASCAL Detour_ConnectEx(
     }
 
     // 如果是外网 拦截
-    SetLastError(ERROR_ACCESS_DENIED);
+    WSASetLastError(WSAEACCES);
     return FALSE;
 }
 
@@ -9797,7 +9635,7 @@ BOOL WSAAPI Detour_WSAConnectByNameW(SOCKET s, LPWSTR nodename, LPWSTR servicena
     // 简单策略：如果启用了阻断 直接检查 nodename 是否为内网主机
     if (g_BlockNetwork) {
         if (!IsIntranetHost(nodename)) {
-            SetLastError(ERROR_ACCESS_DENIED);
+            WSASetLastError(WSAEACCES);
             return FALSE;
         }
     }
@@ -9824,7 +9662,7 @@ BOOL WSAAPI Detour_WSAConnectByList(
             // 只要发现有一个地址不是内网地址 就拒绝整个连接请求
             // 这是最安全的策略 防止程序尝试连接列表中的公网 IP
             if (!IsIntranetAddress(pAddr)) {
-                SetLastError(ERROR_ACCESS_DENIED);
+                WSASetLastError(WSAEACCES);
                 return FALSE;
             }
         }
@@ -9832,82 +9670,6 @@ BOOL WSAAPI Detour_WSAConnectByList(
 
     // 如果所有地址都是内网地址（或未开启拦截） 则放行
     return fpWSAConnectByList(s, SocketAddressList, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, timeout, Reserved);
-}
-
-// --- WinINet Open 拦截 (强制注入代理) ---
-HINTERNET WINAPI Detour_InternetOpenW(LPCWSTR lpszAgent, DWORD dwAccessType, LPCWSTR lpszProxy, LPCWSTR lpszProxyBypass, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = INTERNET_OPEN_TYPE_PROXY;
-        lpszProxy = g_ProxyStringW.c_str();
-        lpszProxyBypass = L"localhost;127.*;10.*;172.16.*;192.168.*"; // 内网直连
-    }
-    return fpInternetOpenW(lpszAgent, dwAccessType, lpszProxy, lpszProxyBypass, dwFlags);
-}
-
-HINTERNET WINAPI Detour_InternetOpenA(LPCSTR lpszAgent, DWORD dwAccessType, LPCSTR lpszProxy, LPCSTR lpszProxyBypass, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = INTERNET_OPEN_TYPE_PROXY;
-        lpszProxy = g_ProxyStringA.c_str();
-        lpszProxyBypass = "localhost;127.*;10.*;172.16.*;192.168.*";
-    }
-    return fpInternetOpenA(lpszAgent, dwAccessType, lpszProxy, lpszProxyBypass, dwFlags);
-}
-
-// --- WinINet SetOption 拦截 (防止程序动态清空代理) ---
-BOOL WINAPI Detour_InternetSetOptionW(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && (dwOption == INTERNET_OPTION_PROXY || dwOption == INTERNET_OPTION_PER_CONNECTION_OPTION)) {
-        return TRUE; // 欺骗程序修改成功
-    }
-    return fpInternetSetOptionW(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
-BOOL WINAPI Detour_InternetSetOptionA(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && (dwOption == INTERNET_OPTION_PROXY || dwOption == INTERNET_OPTION_PER_CONNECTION_OPTION)) {
-        return TRUE;
-    }
-    return fpInternetSetOptionA(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
-// --- WinHTTP Open 拦截 ---
-HINTERNET WINAPI Detour_WinHttpOpen(LPCWSTR pszAgentW, DWORD dwAccessType, LPCWSTR pszProxyW, LPCWSTR pszProxyBypassW, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
-        pszProxyW = g_ProxyStringW.c_str();
-        pszProxyBypassW = L"localhost;127.*;10.*;172.16.*;192.168.*";
-    }
-    return fpWinHttpOpen(pszAgentW, dwAccessType, pszProxyW, pszProxyBypassW, dwFlags);
-}
-
-// --- WinHTTP SetOption 拦截 ---
-BOOL WINAPI Detour_WinHttpSetOption(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && dwOption == WINHTTP_OPTION_PROXY) {
-        return TRUE;
-    }
-    return fpWinHttpSetOption(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
-// --- WinHTTP 代理查询 Hook (专治浏览器) ---
-BOOL WINAPI Detour_WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG* pProxyConfig) {
-    if (g_EnableForward && pProxyConfig) {
-        pProxyConfig->fAutoDetect = FALSE;
-        pProxyConfig->lpszAutoConfigUrl = NULL;
-
-        // 必须使用 GlobalAlloc 分配内存，浏览器底层会调用 GlobalFree 释放
-        size_t len = (g_ProxyStringW.length() + 1) * sizeof(wchar_t);
-        pProxyConfig->lpszProxy = (LPWSTR)GlobalAlloc(GPTR, len);
-        if (pProxyConfig->lpszProxy) {
-            wcscpy_s(pProxyConfig->lpszProxy, g_ProxyStringW.length() + 1, g_ProxyStringW.c_str());
-        }
-
-        const wchar_t* bypass = L"localhost;127.*;10.*;172.16.*;192.168.*";
-        size_t bypassLen = (wcslen(bypass) + 1) * sizeof(wchar_t);
-        pProxyConfig->lpszProxyBypass = (LPWSTR)GlobalAlloc(GPTR, bypassLen);
-        if (pProxyConfig->lpszProxyBypass) {
-            wcscpy_s(pProxyConfig->lpszProxyBypass, wcslen(bypass) + 1, bypass);
-        }
-        return TRUE;
-    }
-    return fpWinHttpGetIEProxyConfigForCurrentUser(pProxyConfig);
 }
 
 // --- 初始化 ---
@@ -10480,8 +10242,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
     if (g_HookChild) {
-        MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
-        MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
+        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+        if (!hKernelBase) hKernelBase = GetModuleHandleW(L"kernel32.dll");
+
+        if (hKernelBase) {
+            void* pCreateProcessInternalW = (void*)GetProcAddress(hKernelBase, "CreateProcessInternalW");
+            if (pCreateProcessInternalW) {
+                MH_CreateHook(pCreateProcessInternalW, &Detour_CreateProcessInternalW, reinterpret_cast<LPVOID*>(&fpCreateProcessInternalW));
+                DebugLog(L"Hooked CreateProcessInternalW");
+            } else {
+                DebugLog(L"Failed to find CreateProcessInternalW");
+            }
+        }
 
         // [新增] 挂钩 WinExec
         // 很多老程序(VB6/Delphi)使用此 API 启动子进程
@@ -10500,18 +10272,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pShellExecuteExW) {
                 MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
             }
-        }
-
-        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-        if (hAdvapi32) {
-            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
@@ -10558,29 +10318,23 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pIcmpSendEcho2Ex) MH_CreateHook(pIcmpSendEcho2Ex, &Detour_IcmpSendEcho2Ex, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2Ex));
             if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
         }
-
         // 3. [新增] WinINet Hooks
         HMODULE hWinInet = LoadLibraryW(L"wininet.dll");
         if (hWinInet) {
-            // 原有 Connect & OpenUrl Hooks
+            // 原有 Unicode Connect
             void* pInternetConnectW = (void*)GetProcAddress(hWinInet, "InternetConnectW");
             if (pInternetConnectW) MH_CreateHook(pInternetConnectW, &Detour_InternetConnectW, reinterpret_cast<LPVOID*>(&fpInternetConnectW));
+
+            // [新增] ANSI Connect
             void* pInternetConnectA = (void*)GetProcAddress(hWinInet, "InternetConnectA");
             if (pInternetConnectA) MH_CreateHook(pInternetConnectA, &Detour_InternetConnectA, reinterpret_cast<LPVOID*>(&fpInternetConnectA));
+
+            // [新增] InternetOpenUrl W & A
             void* pInternetOpenUrlW = (void*)GetProcAddress(hWinInet, "InternetOpenUrlW");
             if (pInternetOpenUrlW) MH_CreateHook(pInternetOpenUrlW, &Detour_InternetOpenUrlW, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlW));
+
             void* pInternetOpenUrlA = (void*)GetProcAddress(hWinInet, "InternetOpenUrlA");
             if (pInternetOpenUrlA) MH_CreateHook(pInternetOpenUrlA, &Detour_InternetOpenUrlA, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlA));
-
-            // [新增] Open & SetOption Hooks
-            void* pInternetOpenW = (void*)GetProcAddress(hWinInet, "InternetOpenW");
-            if (pInternetOpenW) MH_CreateHook(pInternetOpenW, &Detour_InternetOpenW, reinterpret_cast<LPVOID*>(&fpInternetOpenW));
-            void* pInternetOpenA = (void*)GetProcAddress(hWinInet, "InternetOpenA");
-            if (pInternetOpenA) MH_CreateHook(pInternetOpenA, &Detour_InternetOpenA, reinterpret_cast<LPVOID*>(&fpInternetOpenA));
-            void* pInternetSetOptionW = (void*)GetProcAddress(hWinInet, "InternetSetOptionW");
-            if (pInternetSetOptionW) MH_CreateHook(pInternetSetOptionW, &Detour_InternetSetOptionW, reinterpret_cast<LPVOID*>(&fpInternetSetOptionW));
-            void* pInternetSetOptionA = (void*)GetProcAddress(hWinInet, "InternetSetOptionA");
-            if (pInternetSetOptionA) MH_CreateHook(pInternetSetOptionA, &Detour_InternetSetOptionA, reinterpret_cast<LPVOID*>(&fpInternetSetOptionA));
         }
 
         // 4. [新增] WinHTTP Hooks
@@ -10588,18 +10342,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hWinHttp) {
             void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
             if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
-
-            // [新增] 挂钩代理查询 API
-            void* pWinHttpGetIEProxyConfigForCurrentUser = (void*)GetProcAddress(hWinHttp, "WinHttpGetIEProxyConfigForCurrentUser");
-            if (pWinHttpGetIEProxyConfigForCurrentUser) {
-                MH_CreateHook(pWinHttpGetIEProxyConfigForCurrentUser, &Detour_WinHttpGetIEProxyConfigForCurrentUser, reinterpret_cast<LPVOID*>(&fpWinHttpGetIEProxyConfigForCurrentUser));
-            }
-
-            // [新增] Open & SetOption Hooks
-            void* pWinHttpOpen = (void*)GetProcAddress(hWinHttp, "WinHttpOpen");
-            if (pWinHttpOpen) MH_CreateHook(pWinHttpOpen, &Detour_WinHttpOpen, reinterpret_cast<LPVOID*>(&fpWinHttpOpen));
-            void* pWinHttpSetOption = (void*)GetProcAddress(hWinHttp, "WinHttpSetOption");
-            if (pWinHttpSetOption) MH_CreateHook(pWinHttpSetOption, &Detour_WinHttpSetOption, reinterpret_cast<LPVOID*>(&fpWinHttpSetOption));
         }
     }
 
