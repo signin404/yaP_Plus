@@ -8800,6 +8800,55 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
+// --- [新增] 命令行修复辅助函数 ---
+// 判断是否为批处理文件 (.bat, .cmd)
+bool IsBatchFile(const std::wstring& path) {
+    if (path.length() < 4) return false;
+    std::wstring ext = path.substr(path.length() - 4);
+    // 转小写比较
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    return (ext == L".bat" || ext == L".cmd");
+}
+
+// 移植自 Sandboxie 的 Proc_FixBatchCommandLine
+// 功能：从原始命令行中提取参数，并拼接到新的可执行文件路径后面
+std::wstring FixBatchCommandLine(LPCWSTR newExePath, LPWSTR oldCommandLine) {
+    if (!oldCommandLine || !newExePath) return L"";
+
+    std::wstring cmdLine = oldCommandLine;
+
+    // 跳过开头的空格
+    size_t firstChar = cmdLine.find_first_not_of(L" \t");
+    if (firstChar == std::wstring::npos) return L""; // 只有空格
+
+    std::wstring args = L"";
+
+    // 解析原始命令行，分离出参数部分
+    if (cmdLine[firstChar] == L'\"') {
+        // 情况 1: 原命令行是引用的，例如 "C:\Path\To\Script.bat" arg1 arg2
+        size_t endQuote = cmdLine.find(L'\"', firstChar + 1);
+        if (endQuote != std::wstring::npos) {
+            // 参数从引号后面开始
+            args = cmdLine.substr(endQuote + 1);
+        }
+    } else {
+        // 情况 2: 原命令行未引用，例如 C:\Path\To\Script.bat arg1 arg2
+        size_t firstSpace = cmdLine.find(L' ', firstChar);
+        if (firstSpace != std::wstring::npos) {
+            // 参数从第一个空格开始
+            args = cmdLine.substr(firstSpace);
+        }
+    }
+
+    // 重建命令行： "NewPath.bat" arguments
+    std::wstring newCmdLine = L"\"";
+    newCmdLine += newExePath;
+    newCmdLine += L"\"";
+    newCmdLine += args;
+
+    return newCmdLine;
+}
+
 // --- 具体钩子实现 ---
 
 // --- [新增/替换] 统一拦截 CreateProcessInternalW ---
