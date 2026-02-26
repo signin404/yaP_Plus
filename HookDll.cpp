@@ -764,6 +764,8 @@ typedef HINTERNET(WINAPI* PFN_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWOR
 PFN_InternetOpenA fpInternetOpenA = NULL;
 typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
 PFN_InternetOpenW fpInternetOpenW = NULL;
+typedef BOOL(WINAPI* PFN_WinHttpGetIEProxyConfigForCurrentUser)(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*);
+PFN_WinHttpGetIEProxyConfigForCurrentUser fpWinHttpGetIEProxyConfigForCurrentUser = NULL;
 
 typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
@@ -9540,7 +9542,7 @@ int WSAAPI Detour_connect(SOCKET s, const struct sockaddr* name, int namelen) {
         return fpConnect(s, name, namelen);
     }
     // 拦截公网 IP
-    WSASetLastError(WSAEACCES);
+    SetLastError(ERROR_ACCESS_DENIED);
     return SOCKET_ERROR;
 }
 
@@ -9548,7 +9550,7 @@ int WSAAPI Detour_WSAConnect(SOCKET s, const struct sockaddr* name, int namelen,
     if (IsIntranetAddress(name)) {
         return fpWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
-    WSASetLastError(WSAEACCES);
+    SetLastError(ERROR_ACCESS_DENIED);
     return SOCKET_ERROR;
 }
 
@@ -9557,7 +9559,7 @@ int WSAAPI Detour_sendto(SOCKET s, const char* buf, int len, int flags, const st
     if (IsIntranetAddress(to)) {
         return fpSendTo(s, buf, len, flags, to, tolen);
     }
-    WSASetLastError(WSAEACCES);
+    SetLastError(ERROR_ACCESS_DENIED);
     return SOCKET_ERROR;
 }
 
@@ -9569,7 +9571,7 @@ int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, L
             if (IsIntranetAddress(lpTo)) {
                 return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
             }
-            WSASetLastError(WSAEACCES);
+            SetLastError(ERROR_ACCESS_DENIED);
             return SOCKET_ERROR;
         }
         // 如果 lpTo 为空（已连接的 UDP 套接字） 通常在 connect 时已检查过 放行
@@ -9747,7 +9749,7 @@ BOOL PASCAL Detour_ConnectEx(
     }
 
     // 如果是外网 拦截
-    WSASetLastError(WSAEACCES);
+    SetLastError(ERROR_ACCESS_DENIED);
     return FALSE;
 }
 
@@ -9795,7 +9797,7 @@ BOOL WSAAPI Detour_WSAConnectByNameW(SOCKET s, LPWSTR nodename, LPWSTR servicena
     // 简单策略：如果启用了阻断 直接检查 nodename 是否为内网主机
     if (g_BlockNetwork) {
         if (!IsIntranetHost(nodename)) {
-            WSASetLastError(WSAEACCES);
+            SetLastError(ERROR_ACCESS_DENIED);
             return FALSE;
         }
     }
@@ -9822,7 +9824,7 @@ BOOL WSAAPI Detour_WSAConnectByList(
             // 只要发现有一个地址不是内网地址 就拒绝整个连接请求
             // 这是最安全的策略 防止程序尝试连接列表中的公网 IP
             if (!IsIntranetAddress(pAddr)) {
-                WSASetLastError(WSAEACCES);
+                SetLastError(ERROR_ACCESS_DENIED);
                 return FALSE;
             }
         }
@@ -9882,6 +9884,30 @@ BOOL WINAPI Detour_WinHttpSetOption(HINTERNET hInternet, DWORD dwOption, LPVOID 
         return TRUE;
     }
     return fpWinHttpSetOption(hInternet, dwOption, lpBuffer, dwBufferLength);
+}
+
+// --- WinHTTP 代理查询 Hook (专治浏览器) ---
+BOOL WINAPI Detour_WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG* pProxyConfig) {
+    if (g_EnableForward && pProxyConfig) {
+        pProxyConfig->fAutoDetect = FALSE;
+        pProxyConfig->lpszAutoConfigUrl = NULL;
+
+        // 必须使用 GlobalAlloc 分配内存，浏览器底层会调用 GlobalFree 释放
+        size_t len = (g_ProxyStringW.length() + 1) * sizeof(wchar_t);
+        pProxyConfig->lpszProxy = (LPWSTR)GlobalAlloc(GPTR, len);
+        if (pProxyConfig->lpszProxy) {
+            wcscpy_s(pProxyConfig->lpszProxy, g_ProxyStringW.length() + 1, g_ProxyStringW.c_str());
+        }
+
+        const wchar_t* bypass = L"localhost;127.*;10.*;172.16.*;192.168.*";
+        size_t bypassLen = (wcslen(bypass) + 1) * sizeof(wchar_t);
+        pProxyConfig->lpszProxyBypass = (LPWSTR)GlobalAlloc(GPTR, bypassLen);
+        if (pProxyConfig->lpszProxyBypass) {
+            wcscpy_s(pProxyConfig->lpszProxyBypass, wcslen(bypass) + 1, bypass);
+        }
+        return TRUE;
+    }
+    return fpWinHttpGetIEProxyConfigForCurrentUser(pProxyConfig);
 }
 
 // --- 初始化 ---
@@ -10562,6 +10588,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hWinHttp) {
             void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
             if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
+
+            // [新增] 挂钩代理查询 API
+            void* pWinHttpGetIEProxyConfigForCurrentUser = (void*)GetProcAddress(hWinHttp, "WinHttpGetIEProxyConfigForCurrentUser");
+            if (pWinHttpGetIEProxyConfigForCurrentUser) {
+                MH_CreateHook(pWinHttpGetIEProxyConfigForCurrentUser, &Detour_WinHttpGetIEProxyConfigForCurrentUser, reinterpret_cast<LPVOID*>(&fpWinHttpGetIEProxyConfigForCurrentUser));
+            }
 
             // [新增] Open & SetOption Hooks
             void* pWinHttpOpen = (void*)GetProcAddress(hWinHttp, "WinHttpOpen");
