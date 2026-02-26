@@ -885,20 +885,6 @@ typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
 // 原始 NtClose 指针 (需要 Hook 它来清理内存)
 typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
 
-// --- WinINet Open 拦截 (强制注入代理) ---
-typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-typedef HINTERNET(WINAPI* PFN_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD);
-
-// --- WinINet SetOption 拦截 (防止程序动态清空代理) ---
-typedef BOOL(WINAPI* PFN_InternetSetOptionW)(HINTERNET, DWORD, LPVOID, DWORD);
-typedef BOOL(WINAPI* PFN_InternetSetOptionA)(HINTERNET, DWORD, LPVOID, DWORD);
-
-// --- WinHTTP Open 拦截 ---
-typedef HINTERNET(WINAPI* PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-
-// --- WinHTTP SetOption 拦截 ---
-typedef BOOL(WINAPI* PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
-
 // 命令行处理工具集
 namespace CmdUtils {
 
@@ -1123,14 +1109,6 @@ std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 
 std::map<HANDLE, RegContext*> g_RegContextMap;
 std::shared_mutex g_RegContextMutex;
 
-
-// --- 新增代理转发全局变量 ---
-bool g_EnableForward = false;
-SOCKADDR_STORAGE g_ProxyAddr = { 0 };
-int g_ProxyAddrLen = 0;
-std::wstring g_ProxyStringW; // 用于 WinINet/WinHTTP，例如 L"socks=127.0.0.1:2080" 或 L"http=127.0.0.1:2080"
-std::string g_ProxyStringA;
-
 // 缓存的 NT 路径
 std::wstring g_LauncherDirNt;
 std::wstring g_UserProfileNt;
@@ -1303,12 +1281,6 @@ P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
 P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
-PFN_InternetOpenW fpInternetOpenW = NULL;
-PFN_InternetOpenA fpInternetOpenA = NULL;
-PFN_InternetSetOptionW fpInternetSetOptionW = NULL;
-PFN_InternetSetOptionA fpInternetSetOptionA = NULL;
-PFN_WinHttpOpen fpWinHttpOpen = NULL;
-PFN_WinHttpSetOption fpWinHttpSetOption = NULL
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -9320,59 +9292,6 @@ UINT WINAPI Detour_WinExec(LPCSTR lpCmdLine, UINT uCmdShow) {
 
 // --- Winsock Hooks ---
 
-// 辅助：解析 YAP_HOOK_NET 配置
-void ParseProxyConfig(const wchar_t* configStr) {
-    std::wstring cfg(configStr);
-
-    // 使用 " :: " 作为分隔符，避免与 IPv6 地址内部的 "::" 冲突
-    size_t pos1 = cfg.find(L" :: ");
-    if (pos1 != std::wstring::npos) {
-        size_t pos2 = cfg.find(L" :: ", pos1 + 4);
-        if (pos2 != std::wstring::npos) {
-            g_EnableForward = true;
-            g_BlockNetwork = 1; // 启用转发时，底层直连公网的 raw socket 默认拦截
-
-            std::wstring ip = cfg.substr(0, pos1);
-            std::wstring port = cfg.substr(pos1 + 4, pos2 - pos1 - 4);
-            std::wstring protocol = cfg.substr(pos2 + 4);
-
-            // 去除两端空格
-            auto trim =[](std::wstring& s) {
-                if (s.empty()) return;
-                s.erase(0, s.find_first_not_of(L" \t"));
-                if (!s.empty()) s.erase(s.find_last_not_of(L" \t") + 1);
-            };
-            trim(ip);
-            trim(port);
-            trim(protocol);
-
-            // 如果是 IPv6 地址且没有方括号，则添加方括号 (WinINet/WinHTTP 规范)
-            std::wstring formattedIp = ip;
-            if (ip.find(L':') != std::wstring::npos && ip.front() != L'[') {
-                formattedIp = L"[" + ip + L"]";
-            }
-
-            // 构造代理字符串
-            if (protocol == L"socks5" || protocol == L"socks") {
-                g_ProxyStringW = L"socks=" + formattedIp + L":" + port;
-            } else {
-                g_ProxyStringW = L"http=" + formattedIp + L":" + port;
-            }
-
-            // 转换为 ANSI 字符串备用
-            int size_needed = WideCharToMultiByte(CP_ACP, 0, g_ProxyStringW.c_str(), -1, NULL, 0, NULL, NULL);
-            if (size_needed > 0) {
-                g_ProxyStringA.resize(size_needed - 1);
-                WideCharToMultiByte(CP_ACP, 0, g_ProxyStringW.c_str(), -1, &g_ProxyStringA[0], size_needed - 1, NULL, NULL);
-            }
-            return;
-        }
-    }
-
-    // 如果没有匹配到转发格式，则按原有逻辑解析为 1 或 2
-    g_BlockNetwork = _wtoi(configStr);
-}
-
 // 辅助：判断是否为内网/私有 IP 地址
 bool IsIntranetIp32(ULONG ipNetworkOrder) {
     // 将网络字节序转换为主机字节序以便比较
@@ -9541,7 +9460,7 @@ int WSAAPI Detour_WSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, L
 
 // --- WinINet 拦截 ---
 HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName, INTERNET_PORT nServerPort, LPCWSTR lpszUserName, LPCWSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         if (!IsIntranetHost(lpszServerName)) {
             SetLastError(ERROR_ACCESS_DENIED);
             return NULL;
@@ -9552,7 +9471,7 @@ HINTERNET WINAPI Detour_InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServer
 
 // --- WinINet ANSI 拦截 ---
 HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerName, INTERNET_PORT nServerPort, LPCSTR lpszUserName, LPCSTR lpszPassword, DWORD dwService, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         // 转换为 Wide 字符串进行检查
         std::wstring serverNameW = AnsiToWide(lpszServerName);
         if (!IsIntranetHost(serverNameW.c_str())) {
@@ -9565,7 +9484,7 @@ HINTERNET WINAPI Detour_InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerN
 
 // --- InternetOpenUrl (Unicode) 拦截 ---
 HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, LPCWSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         std::wstring host = GetHostFromUrl(lpszUrl);
         // 如果解析不出主机名 或者主机名不是内网 则拦截
         if (host.empty() || !IsIntranetHost(host.c_str())) {
@@ -9578,7 +9497,7 @@ HINTERNET WINAPI Detour_InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl, L
 
 // --- InternetOpenUrl (ANSI) 拦截 ---
 HINTERNET WINAPI Detour_InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl, LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags, DWORD_PTR dwContext) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         std::wstring urlW = AnsiToWide(lpszUrl);
         std::wstring host = GetHostFromUrl(urlW.c_str());
         if (host.empty() || !IsIntranetHost(host.c_str())) {
@@ -9620,7 +9539,7 @@ struct hostent* WSAAPI Detour_gethostbyname(const char* name) {
 
 // --- WinHTTP 拦截 ---
 HINTERNET WINAPI Detour_WinHttpConnect(HINTERNET hSession, LPCWSTR pswzServerName, INTERNET_PORT nServerPort, DWORD dwReserved) {
-    if (g_BlockNetwork && !g_EnableForward) {
+    if (g_BlockNetwork) {
         if (!IsIntranetHost(pswzServerName)) {
             SetLastError(ERROR_ACCESS_DENIED);
             return NULL;
@@ -9794,59 +9713,6 @@ BOOL WSAAPI Detour_WSAConnectByList(
     return fpWSAConnectByList(s, SocketAddressList, LocalAddressLength, LocalAddress, RemoteAddressLength, RemoteAddress, timeout, Reserved);
 }
 
-// 代理注入 Hooks
-// --- WinINet Open 拦截 (强制注入代理) ---
-HINTERNET WINAPI Detour_InternetOpenW(LPCWSTR lpszAgent, DWORD dwAccessType, LPCWSTR lpszProxy, LPCWSTR lpszProxyBypass, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = INTERNET_OPEN_TYPE_PROXY;
-        lpszProxy = g_ProxyStringW.c_str();
-        lpszProxyBypass = L"localhost;127.*;10.*;172.16.*;192.168.*"; // 内网直连
-    }
-    return fpInternetOpenW(lpszAgent, dwAccessType, lpszProxy, lpszProxyBypass, dwFlags);
-}
-
-HINTERNET WINAPI Detour_InternetOpenA(LPCSTR lpszAgent, DWORD dwAccessType, LPCSTR lpszProxy, LPCSTR lpszProxyBypass, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = INTERNET_OPEN_TYPE_PROXY;
-        lpszProxy = g_ProxyStringA.c_str();
-        lpszProxyBypass = "localhost;127.*;10.*;172.16.*;192.168.*";
-    }
-    return fpInternetOpenA(lpszAgent, dwAccessType, lpszProxy, lpszProxyBypass, dwFlags);
-}
-
-// --- WinINet SetOption 拦截 (防止程序动态清空代理) ---
-BOOL WINAPI Detour_InternetSetOptionW(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && (dwOption == INTERNET_OPTION_PROXY || dwOption == INTERNET_OPTION_PER_CONNECTION_OPTION)) {
-        return TRUE; // 欺骗程序修改成功
-    }
-    return fpInternetSetOptionW(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
-BOOL WINAPI Detour_InternetSetOptionA(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && (dwOption == INTERNET_OPTION_PROXY || dwOption == INTERNET_OPTION_PER_CONNECTION_OPTION)) {
-        return TRUE;
-    }
-    return fpInternetSetOptionA(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
-// --- WinHTTP Open 拦截 ---
-HINTERNET WINAPI Detour_WinHttpOpen(LPCWSTR pszAgentW, DWORD dwAccessType, LPCWSTR pszProxyW, LPCWSTR pszProxyBypassW, DWORD dwFlags) {
-    if (g_EnableForward) {
-        dwAccessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
-        pszProxyW = g_ProxyStringW.c_str();
-        pszProxyBypassW = L"localhost;127.*;10.*;172.16.*;192.168.*";
-    }
-    return fpWinHttpOpen(pszAgentW, dwAccessType, pszProxyW, pszProxyBypassW, dwFlags);
-}
-
-// --- WinHTTP SetOption 拦截 ---
-BOOL WINAPI Detour_WinHttpSetOption(HINTERNET hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength) {
-    if (g_EnableForward && dwOption == WINHTTP_OPTION_PROXY) {
-        return TRUE;
-    }
-    return fpWinHttpSetOption(hInternet, dwOption, lpBuffer, dwBufferLength);
-}
-
 // --- 初始化 ---
 
 // 辅助函数：获取 NT 格式的短路径
@@ -10002,10 +9868,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // [修改] 读取网络拦截/转发开关
-    wchar_t netBuffer[256];
-    if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 256) > 0) {
-        ParseProxyConfig(netBuffer); // 使用新的解析函数
+    // [新增] 读取网络拦截开关
+    wchar_t netBuffer[64];
+    if (GetEnvironmentVariableW(L"YAP_HOOK_NET", netBuffer, 64) > 0) {
+        g_BlockNetwork = _wtoi(netBuffer);
     }
 
     // [新增] 读取 hookvolumeid 配置
@@ -10452,8 +10318,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- 组 C: 网络 Hook ---
-    if (g_BlockNetwork || g_EnableForward) {
+    // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
+    if (g_BlockNetwork) {
         // 1. Winsock Hooks (TCP/UDP/DNS)
         HMODULE hWinsock = LoadLibraryW(L"ws2_32.dll");
         if (hWinsock) {
@@ -10495,28 +10361,23 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pIcmpSendEcho2Ex) MH_CreateHook(pIcmpSendEcho2Ex, &Detour_IcmpSendEcho2Ex, reinterpret_cast<LPVOID*>(&fpIcmpSendEcho2Ex));
             if (pIcmp6SendEcho2) MH_CreateHook(pIcmp6SendEcho2, &Detour_Icmp6SendEcho2, reinterpret_cast<LPVOID*>(&fpIcmp6SendEcho2));
         }
-
         // 3. [新增] WinINet Hooks
         HMODULE hWinInet = LoadLibraryW(L"wininet.dll");
         if (hWinInet) {
+            // 原有 Unicode Connect
             void* pInternetConnectW = (void*)GetProcAddress(hWinInet, "InternetConnectW");
             if (pInternetConnectW) MH_CreateHook(pInternetConnectW, &Detour_InternetConnectW, reinterpret_cast<LPVOID*>(&fpInternetConnectW));
+
+            // [新增] ANSI Connect
             void* pInternetConnectA = (void*)GetProcAddress(hWinInet, "InternetConnectA");
             if (pInternetConnectA) MH_CreateHook(pInternetConnectA, &Detour_InternetConnectA, reinterpret_cast<LPVOID*>(&fpInternetConnectA));
+
+            // [新增] InternetOpenUrl W & A
             void* pInternetOpenUrlW = (void*)GetProcAddress(hWinInet, "InternetOpenUrlW");
             if (pInternetOpenUrlW) MH_CreateHook(pInternetOpenUrlW, &Detour_InternetOpenUrlW, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlW));
+
             void* pInternetOpenUrlA = (void*)GetProcAddress(hWinInet, "InternetOpenUrlA");
             if (pInternetOpenUrlA) MH_CreateHook(pInternetOpenUrlA, &Detour_InternetOpenUrlA, reinterpret_cast<LPVOID*>(&fpInternetOpenUrlA));
-
-            // [新增] Open & SetOption Hooks
-            void* pInternetOpenW = (void*)GetProcAddress(hWinInet, "InternetOpenW");
-            if (pInternetOpenW) MH_CreateHook(pInternetOpenW, &Detour_InternetOpenW, reinterpret_cast<LPVOID*>(&fpInternetOpenW));
-            void* pInternetOpenA = (void*)GetProcAddress(hWinInet, "InternetOpenA");
-            if (pInternetOpenA) MH_CreateHook(pInternetOpenA, &Detour_InternetOpenA, reinterpret_cast<LPVOID*>(&fpInternetOpenA));
-            void* pInternetSetOptionW = (void*)GetProcAddress(hWinInet, "InternetSetOptionW");
-            if (pInternetSetOptionW) MH_CreateHook(pInternetSetOptionW, &Detour_InternetSetOptionW, reinterpret_cast<LPVOID*>(&fpInternetSetOptionW));
-            void* pInternetSetOptionA = (void*)GetProcAddress(hWinInet, "InternetSetOptionA");
-            if (pInternetSetOptionA) MH_CreateHook(pInternetSetOptionA, &Detour_InternetSetOptionA, reinterpret_cast<LPVOID*>(&fpInternetSetOptionA));
         }
 
         // 4. [新增] WinHTTP Hooks
@@ -10524,12 +10385,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         if (hWinHttp) {
             void* pWinHttpConnect = (void*)GetProcAddress(hWinHttp, "WinHttpConnect");
             if (pWinHttpConnect) MH_CreateHook(pWinHttpConnect, &Detour_WinHttpConnect, reinterpret_cast<LPVOID*>(&fpWinHttpConnect));
-
-            // [新增] Open & SetOption Hooks
-            void* pWinHttpOpen = (void*)GetProcAddress(hWinHttp, "WinHttpOpen");
-            if (pWinHttpOpen) MH_CreateHook(pWinHttpOpen, &Detour_WinHttpOpen, reinterpret_cast<LPVOID*>(&fpWinHttpOpen));
-            void* pWinHttpSetOption = (void*)GetProcAddress(hWinHttp, "WinHttpSetOption");
-            if (pWinHttpSetOption) MH_CreateHook(pWinHttpSetOption, &Detour_WinHttpSetOption, reinterpret_cast<LPVOID*>(&fpWinHttpSetOption));
         }
     }
 
