@@ -5033,6 +5033,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // 只要配置不为空，且不为 "0"，就启用网络挂钩
     if (!netBlockVal.empty() && netBlockVal != L"0") {
         blockNetwork = true;
+        SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
     }
 
     // 2. 解析 hookchild (提前)
