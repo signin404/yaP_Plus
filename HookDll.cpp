@@ -59,6 +59,10 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+#ifndef SE_SELF_RELATIVE
+#define SE_SELF_RELATIVE 0x8000
+#endif
+
 // 定义缓解策略常量 (防止旧版 SDK 缺少定义)
 #ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
 #define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
@@ -364,6 +368,16 @@ typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
     ULONG BufferSize,
     BOOLEAN Asynchronous
 );
+
+typedef struct _SECURITY_DESCRIPTOR_RELATIVE {
+    BYTE Revision;
+    BYTE Sbz1;
+    SECURITY_DESCRIPTOR_CONTROL Control;
+    DWORD Owner;
+    DWORD Group;
+    DWORD Sacl;
+    DWORD Dacl;
+} SECURITY_DESCRIPTOR_RELATIVE, *PISECURITY_DESCRIPTOR_RELATIVE;
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -9082,15 +9096,16 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     LPPROCESS_INFORMATION lpProcessInformation,
     PHANDLE hNewToken
 ) {
+    // 0. 防止递归调用
     if (g_IsInHook) {
         return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
     }
     RecursionGuard guard;
 
-    // 1. 路径重定向逻辑 (移植自原 Detour_CreateProcessAsUserW)
+    // 1. 路径重定向逻辑
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
-
+    
     // 获取目标路径并尝试重定向
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
@@ -9101,40 +9116,95 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
     LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
 
-    if (!redirectedExe.empty()) DebugLog(L"Internal Redirect EXE: %s", redirectedExe.c_str());
-    if (!redirectedDir.empty()) DebugLog(L"Internal Redirect DIR: %s", redirectedDir.c_str());
+    if (!redirectedExe.empty()) DebugLog(L"CreateProcess Redirect EXE: %s", redirectedExe.c_str());
+    if (!redirectedDir.empty()) DebugLog(L"CreateProcess Redirect DIR: %s", redirectedDir.c_str());
 
-    // 2. 注入准备逻辑
+    // 2. 安全描述符修复 (移植自 proc.c.txt)
+    // 防止因 Owner 字段导致 STATUS_INVALID_OWNER 错误
+    void* SaveOwnerProcess = NULL;
+    void* SaveOwnerThread = NULL;
+
+    // 处理进程安全描述符
+    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            SECURITY_DESCRIPTOR_RELATIVE* rel = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
+            SaveOwnerProcess = (void*)(ULONG_PTR)rel->Owner;
+            if (SaveOwnerProcess) rel->Owner = 0;
+        } else {
+            SaveOwnerProcess = sd->Owner;
+            if (SaveOwnerProcess) sd->Owner = NULL;
+        }
+    }
+
+    // 处理线程安全描述符
+    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            SECURITY_DESCRIPTOR_RELATIVE* rel = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
+            SaveOwnerThread = (void*)(ULONG_PTR)rel->Owner;
+            if (SaveOwnerThread) rel->Owner = 0;
+        } else {
+            SaveOwnerThread = sd->Owner;
+            if (SaveOwnerThread) sd->Owner = NULL;
+        }
+    }
+
+    // 3. 注入准备 (强制挂起)
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-
+    
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED; // 强制挂起以便注入
 
-    // 3. 调用原底层函数
+    // 4. 调用原底层函数
     BOOL result = fpCreateProcessInternalW(
-        hToken,
-        finalAppName,
-        lpCommandLine, // 注意：通常不需要修改命令行，除非路径包含空格且作为参数传递
-        lpProcessAttributes,
-        lpThreadAttributes,
-        bInheritHandles,
-        newCreationFlags,
-        lpEnvironment,
-        finalCurDir,
-        lpStartupInfo,
-        pPI,
+        hToken, 
+        finalAppName, 
+        lpCommandLine, 
+        lpProcessAttributes, 
+        lpThreadAttributes, 
+        bInheritHandles, 
+        newCreationFlags, 
+        lpEnvironment, 
+        finalCurDir, 
+        lpStartupInfo, 
+        pPI, 
         hNewToken
     );
+    
+    DWORD lastErr = GetLastError(); // 保存错误码
 
-    // 4. 注入与恢复逻辑
+    // 5. 恢复安全描述符 Owner
+    if (SaveOwnerProcess) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerProcess;
+        } else {
+            sd->Owner = SaveOwnerProcess;
+        }
+    }
+
+    if (SaveOwnerThread) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerThread;
+        } else {
+            sd->Owner = SaveOwnerThread;
+        }
+    }
+
+    // 6. 注入与恢复逻辑
     if (result) {
-        // 重新获取实际创建的进程路径（防止重定向逻辑未覆盖到的情况）
-        // 注意：这里简单使用 targetExe，更严谨的做法是使用 GetProcessImageFileName 获取 pPI->hProcess 的路径
-        if (ShouldHookChildProcess(targetExe)) {
+        // 检查是否需要注入子进程
+        // 注意：如果进行了重定向，targetExe 可能是旧路径，redirectedExe 是新路径
+        // 建议判断逻辑覆盖两者，或者根据业务需求调整
+        LPCWSTR checkPath = redirectedExe.empty() ? targetExe.c_str() : redirectedExe.c_str();
+
+        if (ShouldHookChildProcess(checkPath)) {
             RequestInjectionFromLauncher(pPI->dwProcessId);
         } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
+            DebugLog(L"ChildHook: Skipped PID %d (Not in whitelist)", pPI->dwProcessId);
         }
 
         // 如果调用者原本没要求挂起，我们现在恢复它
@@ -9142,13 +9212,14 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             ResumeThread(pPI->hThread);
         }
 
-        // 清理本地 PI
-        if (!lpProcessInformation) {
-            CloseHandle(localPI.hProcess);
-            CloseHandle(localPI.hThread);
+        // 清理本地 PI 句柄
+        if (!lpProcessInformation) { 
+            CloseHandle(localPI.hProcess); 
+            CloseHandle(localPI.hThread); 
         }
     }
 
+    SetLastError(lastErr); // 恢复错误码
     return result;
 }
 
