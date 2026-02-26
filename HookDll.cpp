@@ -752,6 +752,19 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef BOOL(WINAPI* PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
+PFN_WinHttpSetOption fpWinHttpSetOption = NULL;
+typedef HINTERNET(WINAPI* PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+PFN_WinHttpOpen fpWinHttpOpen = NULL;
+typedef BOOL(WINAPI* PFN_InternetSetOptionA)(HINTERNET, DWORD, LPVOID, DWORD);
+PFN_InternetSetOptionA fpInternetSetOptionA = NULL;
+typedef BOOL(WINAPI* PFN_InternetSetOptionW)(HINTERNET, DWORD, LPVOID, DWORD);
+PFN_InternetSetOptionW fpInternetSetOptionW = NULL;
+typedef HINTERNET(WINAPI* PFN_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD);
+PFN_InternetOpenA fpInternetOpenA = NULL;
+typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+PFN_InternetOpenW fpInternetOpenW = NULL;
+
 typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* P_NtCreateKey)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
