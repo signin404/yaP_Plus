@@ -300,74 +300,6 @@
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
 
-// --- WinINet Open 拦截 (强制注入代理) ---
-typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-PFN_InternetOpenW fpInternetOpenW = NULL;
-typedef HINTERNET(WINAPI* PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-PFN_WinHttpOpen fpWinHttpOpen = NULL;
-
-// --- WinINet SetOption 拦截 ---
-typedef BOOL(WINAPI* PFN_InternetSetOptionW)(HINTERNET, DWORD, LPVOID, DWORD);
-PFN_InternetSetOptionW fpInternetSetOptionW = NULL;
-typedef BOOL(WINAPI* PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
-PFN_WinHttpSetOption fpWinHttpSetOption = NULL;
-
-// --- [新增] 事务注册表相关函数指针 ---
-typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(
-    PHANDLE KeyHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    ULONG TitleIndex,
-    PUNICODE_STRING Class,
-    ULONG CreateOptions,
-    HANDLE TransactionHandle,
-    PULONG Disposition
-);
-
-typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(
-    PHANDLE KeyHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    HANDLE TransactionHandle
-);
-
-typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
-    HANDLE KeyHandle,
-    PKEY_VALUE_ENTRY ValueEntries,
-    ULONG EntryCount,
-    PVOID ValueBuffer,
-    PULONG BufferLength,
-    PULONG RequiredBufferLength
-);
-
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(
-    HANDLE KeyHandle,
-    HANDLE Event,
-    PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    ULONG CompletionFilter,
-    BOOLEAN WatchTree,
-    PVOID Buffer,
-    ULONG BufferSize,
-    BOOLEAN Asynchronous
-);
-
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
-    HANDLE MasterKeyHandle,
-    ULONG Count,
-    POBJECT_ATTRIBUTES SlaveObjects,
-    HANDLE Event,
-    PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    ULONG CompletionFilter,
-    BOOLEAN WatchTree,
-    PVOID Buffer,
-    ULONG BufferSize,
-    BOOLEAN Asynchronous
-);
-
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
 } KEY_WRITE_TIME_INFORMATION, *PKEY_WRITE_TIME_INFORMATION;
@@ -799,6 +731,14 @@ typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID
 typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
+
+// --- [新增] 事务注册表相关函数指针 ---
+typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, HANDLE TransactionHandle, PULONG Disposition);
+typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, HANDLE TransactionHandle);
+typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(HANDLE KeyHandle, PKEY_VALUE_ENTRY ValueEntries, ULONG EntryCount, PVOID ValueBuffer, PULONG BufferLength, PULONG RequiredBufferLength);
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(HANDLE KeyHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(HANDLE MasterKeyHandle, ULONG Count, POBJECT_ATTRIBUTES SlaveObjects, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
+
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
@@ -944,6 +884,20 @@ typedef UINT(WINAPI* P_WinExec)(LPCSTR, UINT);
 
 // 原始 NtClose 指针 (需要 Hook 它来清理内存)
 typedef NTSTATUS(NTAPI* P_NtClose)(HANDLE);
+
+// --- WinINet Open 拦截 (强制注入代理) ---
+typedef HINTERNET(WINAPI* PFN_InternetOpenW)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET(WINAPI* PFN_InternetOpenA)(LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD);
+
+// --- WinINet SetOption 拦截 (防止程序动态清空代理) ---
+typedef BOOL(WINAPI* PFN_InternetSetOptionW)(HINTERNET, DWORD, LPVOID, DWORD);
+typedef BOOL(WINAPI* PFN_InternetSetOptionA)(HINTERNET, DWORD, LPVOID, DWORD);
+
+// --- WinHTTP Open 拦截 ---
+typedef HINTERNET(WINAPI* PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+
+// --- WinHTTP SetOption 拦截 ---
+typedef BOOL(WINAPI* PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
 
 // 命令行处理工具集
 namespace CmdUtils {
@@ -1349,6 +1303,12 @@ P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
 P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
+PFN_InternetOpenW fpInternetOpenW = NULL;
+PFN_InternetOpenA fpInternetOpenA = NULL;
+PFN_InternetSetOptionW fpInternetSetOptionW = NULL;
+PFN_InternetSetOptionA fpInternetSetOptionA = NULL;
+PFN_WinHttpOpen fpWinHttpOpen = NULL;
+PFN_WinHttpSetOption fpWinHttpSetOption = NULL
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
