@@ -59,6 +59,15 @@
 // 1. 常量和宏补全
 // -----------------------------------------------------------
 
+// 定义缓解策略常量 (防止旧版 SDK 缺少定义)
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+
+// 策略位：BlockNonMicrosoftBinaries (第44位)
+// 0x100000000000ull
+#define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (0x00000001ui64 << 44)
+
 // [新增] 辅助宏：计算对齐
 #define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 
@@ -752,6 +761,17 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+// --- [新增] UpdateProcThreadAttribute 定义 ---
+typedef BOOL (WINAPI *PUpdateProcThreadAttribute)(
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+    DWORD dwFlags,
+    DWORD_PTR Attribute,
+    PVOID lpValue,
+    SIZE_T cbSize,
+    PVOID lpPreviousValue,
+    PSIZE_T lpReturnSize
+);
+
 // --- [新增] CreateProcessInternalW 定义 ---
 // 这是 Windows 内核层创建进程的统一入口，所有 CreateProcess* 系列函数最终都调用它
 typedef BOOL(WINAPI* PCreateProcessInternalW)(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken);
@@ -1334,6 +1354,7 @@ P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
 PCreateProcessInternalW fpCreateProcessInternalW = NULL;
+PUpdateProcThreadAttribute fpUpdateProcThreadAttribute = NULL;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -9069,7 +9090,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     // 1. 路径重定向逻辑 (移植自原 Detour_CreateProcessAsUserW)
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
-    
+
     // 获取目标路径并尝试重定向
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
@@ -9086,23 +9107,23 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     // 2. 注入准备逻辑
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    
+
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED; // 强制挂起以便注入
 
     // 3. 调用原底层函数
     BOOL result = fpCreateProcessInternalW(
-        hToken, 
-        finalAppName, 
+        hToken,
+        finalAppName,
         lpCommandLine, // 注意：通常不需要修改命令行，除非路径包含空格且作为参数传递
-        lpProcessAttributes, 
-        lpThreadAttributes, 
-        bInheritHandles, 
-        newCreationFlags, 
-        lpEnvironment, 
-        finalCurDir, 
-        lpStartupInfo, 
-        pPI, 
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        newCreationFlags,
+        lpEnvironment,
+        finalCurDir,
+        lpStartupInfo,
+        pPI,
         hNewToken
     );
 
@@ -9122,13 +9143,46 @@ BOOL WINAPI Detour_CreateProcessInternalW(
         }
 
         // 清理本地 PI
-        if (!lpProcessInformation) { 
-            CloseHandle(localPI.hProcess); 
-            CloseHandle(localPI.hThread); 
+        if (!lpProcessInformation) {
+            CloseHandle(localPI.hProcess);
+            CloseHandle(localPI.hThread);
         }
     }
 
     return result;
+}
+
+// --- [新增] 拦截 UpdateProcThreadAttribute 以移除 DLL 签名限制 ---
+BOOL WINAPI Detour_UpdateProcThreadAttribute(
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+    DWORD dwFlags,
+    DWORD_PTR Attribute,
+    PVOID lpValue,
+    SIZE_T cbSize,
+    PVOID lpPreviousValue,
+    PSIZE_T lpReturnSize
+) {
+    // 如果已经在 Hook 内部，直接调用原函数
+    if (g_IsInHook) {
+        return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
+    }
+    RecursionGuard guard;
+
+    // 检查是否为缓解策略属性 (0x00020007)
+    if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && lpValue != NULL && cbSize >= sizeof(DWORD64)) {
+        DWORD64* policy = (DWORD64*)lpValue;
+
+        // 检查是否开启了 "Block Non-Microsoft Binaries"
+        if (*policy & PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON) {
+
+            DebugLog(L"MitigationBypass: Removing BlockNonMicrosoftBinaries policy from child process.");
+
+            // 核心逻辑：移除该标志位
+            *policy &= ~PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+        }
+    }
+
+    return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
 }
 
 DWORD WINAPI Detour_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags) {
@@ -10259,6 +10313,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // 很多老程序(VB6/Delphi)使用此 API 启动子进程
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         if (hKernel32) {
+            void* pUpdateProcThreadAttribute = (void*)GetProcAddress(hKernel32, "UpdateProcThreadAttribute");
+            if (pUpdateProcThreadAttribute) {
+                MH_CreateHook(pUpdateProcThreadAttribute, &Detour_UpdateProcThreadAttribute, reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
+                DebugLog(L"Hooked UpdateProcThreadAttribute");
+            }
+
             void* pWinExec = (void*)GetProcAddress(hKernel32, "WinExec");
             if (pWinExec) {
                 MH_CreateHook(pWinExec, &Detour_WinExec, reinterpret_cast<LPVOID*>(&fpWinExec));
