@@ -753,6 +753,24 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+// [新增] 定义 CreateProcessInternalW 函数指针
+typedef BOOL (WINAPI *P_CreateProcessInternalW)(
+    HANDLE hToken,
+    LPCWSTR lpApplicationName,
+    LPWSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    PHANDLE hNewToken
+);
+
+P_CreateProcessInternalW fpCreateProcessInternalW = nullptr;
+
 typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(
     LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
     DWORD dwFlags,
@@ -8789,99 +8807,82 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
-// [新增] 检查是否为 Windows 错误报告进程 (崩溃处理)
-bool IsWerFaultProcess(const std::wstring& exePath) {
-    if (exePath.length() >= 12) {
-        std::wstring lowerPath = exePath;
-        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
-        // 匹配 WerFault.exe 或 wermgr.exe
-        if (lowerPath.find(L"werfault.exe") != std::wstring::npos ||
-            lowerPath.find(L"wermgr.exe") != std::wstring::npos) {
-            return true;
-        }
+// --- 具体钩子实现 ---
+
+BOOL WINAPI Detour_UpdateProcThreadAttribute(
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+    DWORD dwFlags,
+    DWORD_PTR Attribute,
+    PVOID lpValue,
+    SIZE_T cbSize,
+    PVOID lpPreviousValue,
+    PSIZE_T lpReturnSize)
+{
+    // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值为 0x20007
+    // 这个属性用于设置进程创建时的安全缓解策略
+    if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && cbSize >= sizeof(DWORD64)) {
+
+        DWORD64* policy = (DWORD64*)lpValue;
+
+        // 关键操作: 移除“阻止加载非微软签名的二进制文件”的策略
+        // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (1ui64 << 44)
+        // 我们通过位运算将其对应的标志位清零
+        *policy &= ~(0x00000001ui64 << 44);
+
+        DebugLog(L"MitigationPolicy: Removed BLOCK_NON_MICROSOFT_BINARIES flag.");
     }
-    return false;
+
+    // 调用原始的 UpdateProcThreadAttribute 函数
+    return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
 }
 
-// [新增] 修复批处理文件的命令行 (批处理处理)
-// 确保重定向后的批处理路径被正确加上双引号，并与原参数拼接
-std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
-    std::wstring fixedCmd = L"\"" + exePath + L"\"";
-
-    if (originalCmdLine.empty()) {
-        return fixedCmd;
+BOOL WINAPI Detour_SetProcessMitigationPolicy(
+    PROCESS_MITIGATION_POLICY MitigationPolicy,
+    PVOID lpBuffer,
+    SIZE_T dwLength)
+{
+    // ProcessDynamicCodePolicy 的值为 8
+    // 此策略一旦启用，会禁止进程创建动态代码或修改现有可执行代码，这会导致Hook失败
+    if (MitigationPolicy == ProcessDynamicCodePolicy) {
+        DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(ProcessDynamicCodePolicy).");
+        // 直接返回 TRUE，假装成功设置，但不调用原始函数，从而阻止该策略生效
+        return TRUE;
     }
 
-    // 寻找原命令行的参数部分 (跳过 argv[0])
-    const wchar_t* ptr = originalCmdLine.c_str();
-    while (*ptr == L' ') ptr++; // 跳过前导空格
-
-    if (*ptr == L'\"') {
-        ptr++;
-        while (*ptr && *ptr != L'\"') ptr++;
-        if (*ptr == L'\"') ptr++;
-    } else {
-        while (*ptr && *ptr != L' ') ptr++;
-    }
-
-    // 追加剩余的参数
-    if (*ptr) {
-        fixedCmd += ptr;
-    }
-
-    return fixedCmd;
+    // 对于其他策略，正常调用原始函数
+    return fpSetProcessMitigationPolicy(MitigationPolicy, lpBuffer, dwLength);
 }
 
-// 统一的处理逻辑模板
-template<typename Func, typename CharType>
-BOOL CreateProcessInternal(
-    Func originalFunc,
-    const CharType* lpApplicationName,
-    CharType* lpCommandLine,
+// [新增] 终极核心 Hook：拦截 CreateProcessInternalW
+BOOL WINAPI Detour_CreateProcessInternalW(
+    HANDLE hToken,
+    LPCWSTR lpApplicationName,
+    LPWSTR lpCommandLine,
     LPSECURITY_ATTRIBUTES lpProcessAttributes,
     LPSECURITY_ATTRIBUTES lpThreadAttributes,
     BOOL bInheritHandles,
     DWORD dwCreationFlags,
     LPVOID lpEnvironment,
-    const CharType* lpCurrentDirectory,
-    LPVOID lpStartupInfo,
+    LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation,
-    bool isAnsi
-) {
-    // 1. 输入参数转换为 Wide String 以便统一处理
-    std::wstring exePathW;
-    if (isAnsi && lpApplicationName) exePathW = AnsiToWide((LPCSTR)lpApplicationName);
-    else exePathW = (lpApplicationName) ? (LPCWSTR)lpApplicationName : L"";
+    PHANDLE hNewToken) 
+{
+    // 防止重入
+    if (g_IsInHook) return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+    RecursionGuard guard;
 
-    std::wstring cmdLineW;
-    if (isAnsi && lpCommandLine) cmdLineW = AnsiToWide((LPCSTR)lpCommandLine);
-    else cmdLineW = (lpCommandLine) ? (LPCWSTR)lpCommandLine : L"";
+    std::wstring exePathW = lpApplicationName ? lpApplicationName : L"";
+    std::wstring cmdLineW = lpCommandLine ? lpCommandLine : L"";
 
-    // 2. 路径重定向逻辑 (Portable Mode)
-    // 获取目标 EXE 路径 (优先用 lpApplicationName 没有则解析命令行)
+    // 1. 路径重定向逻辑
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-
-    // 尝试重定向 EXE 路径
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
 
-    // 尝试重定向工作目录
-    std::wstring curDirW;
-    if (isAnsi && lpCurrentDirectory) curDirW = AnsiToWide((LPCSTR)lpCurrentDirectory);
-    else curDirW = (lpCurrentDirectory) ? (LPCWSTR)lpCurrentDirectory : L"";
-
+    std::wstring curDirW = lpCurrentDirectory ? lpCurrentDirectory : L"";
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
-    // 3. Chromium 命令行智能处理 (--single-argument, --disable-features 合并)
-    // 这里可以定义需要强制注入的额外参数 目前留空
-    std::vector<std::wstring> extraArgs;
-
-    // 如果 cmdLineW 为空且 lpApplicationName 不为空 CreateProcess 会用 lpApplicationName 作为命令行
-    // 但为了处理 Feature Flags 我们主要关注显式传入的 cmdLineW
-    if (!cmdLineW.empty()) {
-        cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
-    }
-
-    //[新增] 批处理文件 (.bat / .cmd) 识别逻辑
+    // 2. 批处理文件 (.bat / .cmd) 识别逻辑 (已移植)
     bool isBatchFile = false;
     if (targetExe.length() >= 4) {
         std::wstring ext = targetExe.substr(targetExe.length() - 4);
@@ -8892,129 +8893,97 @@ BOOL CreateProcessInternal(
     }
 
     if (isBatchFile) {
-        // 确定当前使用的 EXE 路径 (重定向后的或原始的)
         std::wstring activeExe = redirectedExe.empty() ? targetExe : redirectedExe;
-
-        // 修复命令行：将路径用双引号包裹并拼上参数
         cmdLineW = FixBatchCommandLine(activeExe, cmdLineW);
-        DebugLog(L"CreateProcess: Fixed batch command line -> %s", cmdLineW.c_str());
     }
 
-    // 4. 准备最终参数
-    const void* finalAppName = lpApplicationName;
-    const void* finalCurDir = lpCurrentDirectory;
-
-    // 用于保持生命周期的容器
-    std::string ansiExe, ansiDir, ansiCmd;
+    // 3. 准备最终参数
+    LPCWSTR finalAppName = lpApplicationName;
+    LPCWSTR finalCurDir = lpCurrentDirectory;
     std::vector<wchar_t> wideCmdBuffer;
-    std::vector<char> ansiCmdBuffer;
-    void* finalCmdLinePtr = nullptr;
+    LPWSTR finalCmdLinePtr = nullptr;
 
-    // 处理 EXE 路径替换
     if (!redirectedExe.empty()) {
-        DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-
-        if (!isBatchFile) {
-            // 普通 EXE 正常替换 lpApplicationName
-            if (isAnsi) {
-                ansiExe = WideToAnsi(redirectedExe.c_str());
-                finalAppName = ansiExe.c_str();
-            } else {
-                finalAppName = redirectedExe.c_str();
-            }
-        } else {
-            // 关键修复：如果是批处理文件，lpApplicationName 必须强制为 NULL
-            // 否则 CreateProcess 会返回 ERROR_BAD_EXE_FORMAT (193)
-            finalAppName = nullptr;
-        }
+        finalAppName = isBatchFile ? nullptr : redirectedExe.c_str();
     } else if (isBatchFile) {
-        // 即使没有重定向，只要是批处理，也强制置空
-        finalAppName = nullptr;
+        finalAppName = nullptr; // 批处理必须置空
     }
 
-    // 处理工作目录替换
     if (!redirectedDir.empty()) {
-        DebugLog(L"CreateProcess Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
-        if (isAnsi) {
-            ansiDir = WideToAnsi(redirectedDir.c_str());
-            finalCurDir = ansiDir.c_str();
-        } else {
-            finalCurDir = redirectedDir.c_str();
-        }
+        finalCurDir = redirectedDir.c_str();
     }
 
-    // 处理命令行 (CreateProcess 要求命令行缓冲区可写)
-    if (isAnsi) {
-        ansiCmd = WideToAnsi(cmdLineW.c_str());
-        // 复制到可写缓冲区
-        ansiCmdBuffer.assign(ansiCmd.begin(), ansiCmd.end());
-        ansiCmdBuffer.push_back('\0');
-        finalCmdLinePtr = ansiCmdBuffer.data();
-    } else {
-        // 复制到可写缓冲区
+    if (!cmdLineW.empty()) {
+        // Chromium 命令行智能处理
+        std::vector<std::wstring> extraArgs;
+        cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
+
         wideCmdBuffer.assign(cmdLineW.begin(), cmdLineW.end());
         wideCmdBuffer.push_back(L'\0');
         finalCmdLinePtr = wideCmdBuffer.data();
     }
 
-    // 5. 准备注入相关的标志位
+    // 4. 处理 CREATE_SUSPENDED 和 安全描述符 Bug (Sandboxie 移植)
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-
-    // 检查调用者是否本来就想挂起进程
+    
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    // 强制挂起以便注入
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
-    // 6. 调用原始函数
-    BOOL result;
-    if (isAnsi) {
-        result = ((P_CreateProcessA)originalFunc)(
-            (LPCSTR)finalAppName,
-            (LPSTR)finalCmdLinePtr,
-            lpProcessAttributes,
-            lpThreadAttributes,
-            bInheritHandles,
-            newCreationFlags,
-            lpEnvironment,
-            (LPCSTR)finalCurDir,
-            (LPSTARTUPINFOA)lpStartupInfo,
-            pPI
-        );
-    } else {
-        result = ((P_CreateProcessW)originalFunc)(
-            (LPCWSTR)finalAppName,
-            (LPWSTR)finalCmdLinePtr,
-            lpProcessAttributes,
-            lpThreadAttributes,
-            bInheritHandles,
-            newCreationFlags,
-            lpEnvironment,
-            (LPCWSTR)finalCurDir,
-            (LPSTARTUPINFOW)lpStartupInfo,
-            pPI
-        );
+    // [移植] 暂存并清空 Owner，防止 CREATE_SUSPENDED 导致 STATUS_INVALID_OWNER
+    void* SaveOwnerProcess = nullptr;
+    void* SaveOwnerThread = nullptr;
+
+    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            SaveOwnerProcess = (void*)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
+            if (SaveOwnerProcess) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
+        } else {
+            SaveOwnerProcess = sd->Owner;
+            if (SaveOwnerProcess) sd->Owner = NULL;
+        }
     }
 
-    // 7. 注入与恢复
+    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) {
+            SaveOwnerThread = (void*)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
+            if (SaveOwnerThread) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
+        } else {
+            SaveOwnerThread = sd->Owner;
+            if (SaveOwnerThread) sd->Owner = NULL;
+        }
+    }
+
+    // 5. 调用真正的底层函数
+    BOOL result = fpCreateProcessInternalW(
+        hToken, finalAppName, finalCmdLinePtr, lpProcessAttributes, lpThreadAttributes,
+        bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI, hNewToken
+    );
+
+    // 6. 恢复安全描述符的 Owner
+    if (SaveOwnerProcess) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerProcess;
+        else sd->Owner = SaveOwnerProcess;
+    }
+    if (SaveOwnerThread) {
+        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
+        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerThread;
+        else sd->Owner = SaveOwnerThread;
+    }
+
+    // 7. 注入与恢复逻辑
     if (result) {
-
-        // [新增] 崩溃处理：过滤 Windows 错误报告进程
+        // [移植] 过滤 Windows 错误报告进程，防止无限崩溃死循环
         if (IsWerFaultProcess(targetExe)) {
-            DebugLog(L"ChildHook: Ignored WerFault.exe to prevent crash loops -> PID %d", pPI->dwProcessId);
-
-            // 绝对不注入 WerFault，直接恢复线程让其正常收集崩溃信息或退出
-            if (!callerWantedSuspended) {
-                ResumeThread(pPI->hThread);
-            }
-            if (!lpProcessInformation) {
-                CloseHandle(localPI.hProcess);
-                CloseHandle(localPI.hThread);
-            }
+            if (!callerWantedSuspended) ResumeThread(pPI->hThread);
+            if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
             return result;
         }
 
-        // 检查白名单 (hookchildname)
+        // 检查白名单并执行注入
         if (ShouldHookChildProcess(targetExe)) {
 
             // [修正] 获取当前进程架构
@@ -9129,176 +9098,20 @@ BOOL CreateProcessInternal(
 				}
 			}
 
-        } else {
-            // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
         }
 
+        // 恢复线程
         if (!callerWantedSuspended) {
             ResumeThread(pPI->hThread);
         }
 
-        // 清理内部使用的结构
+        // 清理句柄
         if (!lpProcessInformation) {
             CloseHandle(localPI.hProcess);
             CloseHandle(localPI.hThread);
         }
     }
 
-    return result;
-}
-
-// --- 具体钩子实现 ---
-
-BOOL WINAPI Detour_UpdateProcThreadAttribute(
-    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
-    DWORD dwFlags,
-    DWORD_PTR Attribute,
-    PVOID lpValue,
-    SIZE_T cbSize,
-    PVOID lpPreviousValue,
-    PSIZE_T lpReturnSize)
-{
-    // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值为 0x20007
-    // 这个属性用于设置进程创建时的安全缓解策略
-    if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && cbSize >= sizeof(DWORD64)) {
-
-        DWORD64* policy = (DWORD64*)lpValue;
-
-        // 关键操作: 移除“阻止加载非微软签名的二进制文件”的策略
-        // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (1ui64 << 44)
-        // 我们通过位运算将其对应的标志位清零
-        *policy &= ~(0x00000001ui64 << 44);
-
-        DebugLog(L"MitigationPolicy: Removed BLOCK_NON_MICROSOFT_BINARIES flag.");
-    }
-
-    // 调用原始的 UpdateProcThreadAttribute 函数
-    return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
-}
-
-BOOL WINAPI Detour_SetProcessMitigationPolicy(
-    PROCESS_MITIGATION_POLICY MitigationPolicy,
-    PVOID lpBuffer,
-    SIZE_T dwLength)
-{
-    // ProcessDynamicCodePolicy 的值为 8
-    // 此策略一旦启用，会禁止进程创建动态代码或修改现有可执行代码，这会导致Hook失败
-    if (MitigationPolicy == ProcessDynamicCodePolicy) {
-        DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(ProcessDynamicCodePolicy).");
-        // 直接返回 TRUE，假装成功设置，但不调用原始函数，从而阻止该策略生效
-        return TRUE;
-    }
-
-    // 对于其他策略，正常调用原始函数
-    return fpSetProcessMitigationPolicy(MitigationPolicy, lpBuffer, dwLength);
-}
-
-BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-    DWORD lastErr = GetLastError();
-    BOOL res = CreateProcessInternal(fpCreateProcessW, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, false);
-    SetLastError(lastErr);
-    return res;
-}
-
-BOOL WINAPI Detour_CreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-    DWORD lastErr = GetLastError();
-    BOOL res = CreateProcessInternal(fpCreateProcessA, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, true);
-    SetLastError(lastErr);
-    return res;
-}
-
-BOOL WINAPI Detour_CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessAsUserW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
-    std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
-    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
-    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
-
-    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
-    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
-
-    if(!redirectedExe.empty()) DebugLog(L"AsUser Redirect EXE: %s", redirectedExe.c_str());
-    if(!redirectedDir.empty()) DebugLog(L"AsUser Redirect DIR: %s", redirectedDir.c_str());
-
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result = fpCreateProcessAsUserW(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
-
-    if (result) {
-        if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
-        } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
-        }
-
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
-    return result;
-}
-
-BOOL WINAPI Detour_CreateProcessAsUserA(HANDLE hToken, LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
-    LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation) {
-    if (g_IsInHook) return fpCreateProcessAsUserA(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    RecursionGuard guard;
-
-    std::wstring exePathW = AnsiToWide(lpApplicationName);
-    std::wstring cmdLineW = AnsiToWide(lpCommandLine);
-    std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
-    std::wstring curDirW = AnsiToWide(lpCurrentDirectory);
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
-
-    std::string ansiExe, ansiDir;
-    LPCSTR finalAppName = lpApplicationName;
-    LPCSTR finalCurDir = lpCurrentDirectory;
-
-    if (!redirectedExe.empty()) {
-        ansiExe = WideToAnsi(redirectedExe.c_str());
-        finalAppName = ansiExe.c_str();
-    }
-    if (!redirectedDir.empty()) {
-        ansiDir = WideToAnsi(redirectedDir.c_str());
-        finalCurDir = ansiDir.c_str();
-    }
-
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    BOOL result = fpCreateProcessAsUserA(hToken, finalAppName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI);
-
-    if (result) {
-        if (ShouldHookChildProcess(targetExe)) {
-            RequestInjectionFromLauncher(pPI->dwProcessId);
-        } else {
-            DebugLog(L"ChildHook: Skipped %s (Not in whitelist)", targetExe.c_str());
-        }
-
-        if (!callerWantedSuspended) ResumeThread(pPI->hThread);
-        if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
-    }
     return result;
 }
 
@@ -10483,14 +10296,26 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
     if (g_HookChild) {
-        MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
-        MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
-
-        // [新增] 挂钩进程缓解策略相关函数
-        // 这些函数通常位于 kernelbase.dll 或 kernel32.dll
+        // [新增] 动态查找 CreateProcessInternalW
         HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
-        if (!hKernelBase) {
-            hKernelBase = GetModuleHandleW(L"kernel32.dll");
+        void* pCreateProcessInternalW = nullptr;
+        
+        if (hKernelBase) {
+            pCreateProcessInternalW = (void*)GetProcAddress(hKernelBase, "CreateProcessInternalW");
+        }
+        
+        // 如果 kernelbase.dll 中没有，回退到 kernel32.dll 查找
+        if (!pCreateProcessInternalW) {
+            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+            if (hKernel32) {
+                pCreateProcessInternalW = (void*)GetProcAddress(hKernel32, "CreateProcessInternalW");
+            }
+        }
+
+        // 挂钩底层核心 API
+        if (pCreateProcessInternalW) {
+            MH_CreateHook(pCreateProcessInternalW, &Detour_CreateProcessInternalW, reinterpret_cast<LPVOID*>(&fpCreateProcessInternalW));
+            DebugLog(L"Hooked CreateProcessInternalW successfully.");
         }
 
         if (hKernelBase) {
@@ -10524,18 +10349,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pShellExecuteExW) {
                 MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
             }
-        }
-
-        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-        if (hAdvapi32) {
-            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
