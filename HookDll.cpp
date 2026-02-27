@@ -8804,6 +8804,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     LPPROCESS_INFORMATION lpProcessInformation,
     PHANDLE hNewToken
 ) {
+    // 0. 防止递归调用
     if (g_IsInHook) {
         return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
     }
@@ -8811,25 +8812,42 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     DWORD lastErr = GetLastError();
 
     // 1. 路径重定向逻辑 (Portable Mode)
+    // 注意：lpApplicationName 可能为 NULL，此时 exe 路径在 lpCommandLine 的第一个 token
     std::wstring exePathW = lpApplicationName ? lpApplicationName : L"";
     std::wstring cmdLineW = lpCommandLine ? lpCommandLine : L"";
 
+    // 解析目标 EXE 路径
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
+    
+    // 尝试重定向 EXE
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
-
+    
+    // 尝试重定向工作目录
     std::wstring curDirW = lpCurrentDirectory ? lpCurrentDirectory : L"";
     std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
 
-    // 2. Chromium 命令行智能处理
+    // 2. Chromium/Firefox 命令行处理 (如果需要)
     std::vector<std::wstring> extraArgs;
     if (!cmdLineW.empty()) {
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
     }
 
     // 3. 准备最终参数
-    LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
-    LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
+    // [关键修正]：只有在确实发生了重定向时，才替换 lpApplicationName
+    // 如果原 lpApplicationName 为 NULL 且未重定向，必须保持为 NULL，让系统去解析命令行
+    LPCWSTR finalAppName = lpApplicationName;
+    if (!redirectedExe.empty()) {
+        finalAppName = redirectedExe.c_str();
+        DebugLog(L"Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
+    }
 
+    LPCWSTR finalCurDir = lpCurrentDirectory;
+    if (!redirectedDir.empty()) {
+        finalCurDir = redirectedDir.c_str();
+        DebugLog(L"Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
+    }
+
+    // 处理命令行缓冲区 (CreateProcess 需要可写内存)
     std::vector<wchar_t> wideCmdBuffer;
     LPWSTR finalCmdLinePtr = lpCommandLine;
     if (!cmdLineW.empty()) {
@@ -8838,67 +8856,38 @@ BOOL WINAPI Detour_CreateProcessInternalW(
         finalCmdLinePtr = wideCmdBuffer.data();
     }
 
-    if (!redirectedExe.empty()) DebugLog(L"CreateProcessInternalW Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-    if (!redirectedDir.empty()) DebugLog(L"CreateProcessInternalW Redirect DIR: %s -> %s", curDirW.c_str(), redirectedDir.c_str());
-
-    // 4.[移植 Sandboxie 特性] 修复强制挂起时的安全描述符 (Owner) 冲突 BUG
-    // 如果调用者指定了 Owner，强制附加 CREATE_SUSPENDED 会导致 STATUS_INVALID_OWNER 错误
-    PVOID SaveOwnerProcess = nullptr;
-    PVOID SaveOwnerThread = nullptr;
-
-    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SaveOwnerProcess = (PVOID)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
-            if (SaveOwnerProcess) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
-        } else {
-            SaveOwnerProcess = sd->Owner;
-            if (SaveOwnerProcess) sd->Owner = NULL;
-        }
-    }
-    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SaveOwnerThread = (PVOID)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
-            if (SaveOwnerThread) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
-        } else {
-            SaveOwnerThread = sd->Owner;
-            if (SaveOwnerThread) sd->Owner = NULL;
-        }
-    }
-
-    // 5. 准备注入相关的标志位
+    // 4. 准备注入相关的标志位
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
 
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
-    // 6. 调用底层真实 API
+    // [已删除] Sandboxie 的 Security Descriptor Owner 修复代码
+    // Firefox 对 lpProcessAttributes 非常敏感，修改它会导致沙盒校验失败(白屏)
+
+    // 5. 调用底层真实 API
     BOOL result = fpCreateProcessInternalW(
-        hToken, finalAppName, finalCmdLinePtr,
-        lpProcessAttributes, lpThreadAttributes, bInheritHandles,
-        newCreationFlags, lpEnvironment, finalCurDir,
-        lpStartupInfo, pPI, hNewToken
+        hToken, 
+        finalAppName, 
+        finalCmdLinePtr,
+        lpProcessAttributes, 
+        lpThreadAttributes, 
+        bInheritHandles,
+        newCreationFlags, 
+        lpEnvironment, 
+        finalCurDir,
+        lpStartupInfo, 
+        pPI, 
+        hNewToken
     );
 
-    // 7. [移植 Sandboxie 特性] 恢复安全描述符的 Owner
-    if (SaveOwnerProcess) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerProcess;
-        else sd->Owner = SaveOwnerProcess;
-    }
-    if (SaveOwnerThread) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerThread;
-        else sd->Owner = SaveOwnerThread;
-    }
-
-    // 8. 注入与恢复逻辑 (保留你原有的优秀跨架构注入逻辑)
+    // 6. 注入与恢复逻辑
     if (result) {
+        // 检查白名单
         if (ShouldHookChildProcess(targetExe)) {
             
-            // [新增] 过滤 WerFault.exe (Windows 错误报告)，防止注入崩溃导致的无限死循环
+            // [保留] 过滤 WerFault.exe 防止死循环
             if (wcsstr(targetExe.c_str(), L"WerFault.exe") != nullptr) {
                 if (!callerWantedSuspended) ResumeThread(pPI->hThread);
                 if (!lpProcessInformation) { CloseHandle(localPI.hProcess); CloseHandle(localPI.hThread); }
@@ -8906,6 +8895,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
                 return result;
             }
 
+            // 获取架构信息
             #ifdef _WIN64
             int currentArch = 64;
             #else
@@ -8913,24 +8903,28 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             #endif
 
             int targetArch = GetPeArchitecture(targetExe);
-            if (targetArch == 0) targetArch = currentArch;
+            if (targetArch == 0) targetArch = currentArch; // 无法读取时假设同架构
 
+            // 准备路径
             std::wstring dllDir = GetCurrentDllDir();
             std::wstring targetDllPath;
             if (!dllDir.empty()) {
                 targetDllPath = (targetArch == 64) ? (dllDir + L"\\YapHook64.dll") : (dllDir + L"\\YapHook32.dll");
             }
             std::wstring injectorPath = dllDir + L"\\YapInjector32.exe";
+            
             bool injected = false;
 
             // --- 策略 A: 同架构直接注入 ---
             if (currentArch == targetArch && !targetDllPath.empty() && GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                     injected = true;
+                    // 等待握手
                     std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
                     HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
                     if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
 
+                    // 注入额外 DLL
                     for (const auto& extraDll : g_ExtraDlls) {
                         if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
                         int dllArch = GetPeArchitecture(extraDll);
@@ -8962,10 +8956,12 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             }
         }
 
+        // 如果调用者本来没想挂起，我们现在恢复它
         if (!callerWantedSuspended) {
             ResumeThread(pPI->hThread);
         }
 
+        // 清理内部结构
         if (!lpProcessInformation) {
             CloseHandle(localPI.hProcess);
             CloseHandle(localPI.hThread);
