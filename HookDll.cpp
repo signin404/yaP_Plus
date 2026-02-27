@@ -8899,50 +8899,6 @@ BOOL CreateProcessInternal(
     // 强制挂起以便注入
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
-    // [新增] 安全描述符 (Security Descriptor) 修复逻辑
-    void* saveOwnerProcess = nullptr;
-    void* saveOwnerThread = nullptr;
-
-    // 1. 处理进程安全描述符
-    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd) {
-            if (sd->Control & SE_SELF_RELATIVE) {
-                // 自相对描述符 (Owner 是偏移量)
-                SECURITY_DESCRIPTOR_RELATIVE* relSd = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-                if (relSd->Owner != 0) {
-                    saveOwnerProcess = (void*)(ULONG_PTR)relSd->Owner; // 暂存偏移量
-                    relSd->Owner = 0; // 清空
-                }
-            } else {
-                // 绝对描述符 (Owner 是指针)
-                if (sd->Owner != NULL) {
-                    saveOwnerProcess = sd->Owner; // 暂存指针
-                    sd->Owner = NULL; // 清空
-                }
-            }
-        }
-    }
-
-    // 2. 处理线程安全描述符
-    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd) {
-            if (sd->Control & SE_SELF_RELATIVE) {
-                SECURITY_DESCRIPTOR_RELATIVE* relSd = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-                if (relSd->Owner != 0) {
-                    saveOwnerThread = (void*)(ULONG_PTR)relSd->Owner;
-                    relSd->Owner = 0;
-                }
-            } else {
-                if (sd->Owner != NULL) {
-                    saveOwnerThread = sd->Owner;
-                    sd->Owner = NULL;
-                }
-            }
-        }
-    }
-
     // 6. 调用原始函数
     BOOL result;
     if (isAnsi) {
@@ -8971,26 +8927,6 @@ BOOL CreateProcessInternal(
             (LPSTARTUPINFOW)lpStartupInfo,
             pPI
         );
-    }
-
-    // 恢复进程安全描述符 Owner
-    if (saveOwnerProcess) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)saveOwnerProcess;
-        } else {
-            sd->Owner = saveOwnerProcess;
-        }
-    }
-
-    // 恢复线程安全描述符 Owner
-    if (saveOwnerThread) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)saveOwnerThread;
-        } else {
-            sd->Owner = saveOwnerThread;
-        }
     }
 
     // 7. 注入与恢复
