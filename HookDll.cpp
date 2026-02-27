@@ -7285,17 +7285,8 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 1. 优化 DirContext 清理
-    bool foundDir = false;
+    // 清理 Context
     {
-        // 先使用共享锁（读锁），允许多线程并发查询，极速通过
-        std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
-        if (g_DirContextMap.find(Handle) != g_DirContextMap.end()) {
-            foundDir = true;
-        }
-    }
-    if (foundDir) {
-        // 只有确认存在时，才获取排他锁（写锁）进行删除
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
         if (it != g_DirContextMap.end()) {
@@ -7304,29 +7295,7 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 2. 优化 RegContext 清理
-    bool foundReg = false;
-    {
-        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-        if (g_RegContextMap.find(Handle) != g_RegContextMap.end()) {
-            foundReg = true;
-        }
-    }
-    if (foundReg) {
-        std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
-        auto it = g_RegContextMap.find(Handle);
-        if (it != g_RegContextMap.end()) {
-            if (it->second->hRealKey) {
-                fpNtClose(it->second->hRealKey);
-            }
-            if (it->second->hMonitorKey) {
-                fpNtClose(it->second->hMonitorKey);
-            }
-            delete it->second;
-            g_RegContextMap.erase(it);
-        }
-    }
-
+    // 调用原始 NtClose
     return fpNtClose(Handle);
 }
 
