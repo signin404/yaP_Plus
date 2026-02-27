@@ -22,6 +22,7 @@
 #include <set>
 #include <sddl.h>
 #include <aclapi.h>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -8794,6 +8795,82 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
+// 辅助函数1：获取远程进程中模块的句柄
+HMODULE GetRemoteModuleHandle(HANDLE hProcess, const std::wstring& moduleName) {
+    MODULEENTRY32W me32;
+    me32.dwSize = sizeof(MODULEENTRY32W);
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(hProcess));
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+
+    HMODULE hModule = NULL;
+    if (Module32FirstW(hSnapshot, &me32)) {
+        do {
+            if (_wcsicmp(me32.szModule, moduleName.c_str()) == 0) {
+                hModule = me32.hModule;
+                break;
+            }
+        } while (Module32NextW(hSnapshot, &me32));
+    }
+
+    CloseHandle(hSnapshot);
+    return hModule;
+}
+
+// 辅助函数2：获取远程进程中导出函数的地址
+FARPROC GetRemoteProcAddress(HANDLE hProcess, HMODULE hModule, const char* procName) {
+    if (!hProcess || !hModule || !procName) {
+        return NULL;
+    }
+
+    // 1. 读取远程进程的 PE 头
+    BYTE buffer[4096];
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(hProcess, hModule, buffer, sizeof(buffer), &bytesRead)) {
+        return NULL;
+    }
+
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)buffer;
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((BYTE*)pDosHeader + pDosHeader->e_lfanew);
+
+    // 2. 找到导出表
+    IMAGE_DATA_DIRECTORY* pExportDir = &pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (pExportDir->Size == 0) {
+        return NULL;
+    }
+
+    // 3. 读取导出表
+    IMAGE_EXPORT_DIRECTORY* pExportTable = (IMAGE_EXPORT_DIRECTORY*)malloc(pExportDir->Size);
+    if (!ReadProcessMemory(hProcess, (LPCVOID)((BYTE*)hModule + pExportDir->VirtualAddress), pExportTable, pExportDir->Size, &bytesRead)) {
+        free(pExportTable);
+        return NULL;
+    }
+
+    // 4. 查找函数
+    DWORD* pAddressOfFunctions = (DWORD*)((BYTE*)hModule + pExportTable->AddressOfFunctions);
+    DWORD* pAddressOfNames = (DWORD*)((BYTE*)hModule + pExportTable->AddressOfNames);
+    WORD* pAddressOfNameOrdinals = (WORD*)((BYTE*)hModule + pExportTable->AddressOfNameOrdinals);
+
+    FARPROC procAddress = NULL;
+    for (DWORD i = 0; i < pExportTable->NumberOfNames; ++i) {
+        char currentProcName[256];
+        if (ReadProcessMemory(hProcess, (LPCVOID)((BYTE*)hModule + pAddressOfNames[i]), currentProcName, sizeof(currentProcName), &bytesRead)) {
+            if (strcmp(currentProcName, procName) == 0) {
+                DWORD functionRVA;
+                if (ReadProcessMemory(hProcess, &pAddressOfFunctions[pAddressOfNameOrdinals[i]], &functionRVA, sizeof(DWORD), &bytesRead)) {
+                    procAddress = (FARPROC)((BYTE*)hModule + functionRVA);
+                }
+                break;
+            }
+        }
+    }
+
+    free(pExportTable);
+    return procAddress;
+}
+
 // --- 具体钩子实现 ---
 
 BOOL WINAPI Detour_UpdateProcThreadAttribute(
@@ -8949,18 +9026,31 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             bool injected = false;
 
             // --- 策略 A: 同架构直接注入 ---
-            if (currentArch == targetArch && !targetDllPath.empty() && GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
-                    injected = true;
-                    std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-                    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-                    if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
+        if (currentArch == targetArch && !targetDllPath.empty() && GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            
+            // 第一步：加载 DLL
+            if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
+                
+                // 等待 DLL 加载完成
+                Sleep(100); 
 
-                    for (const auto& extraDll : g_ExtraDlls) {
-                        if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-                        int dllArch = GetPeArchitecture(extraDll);
-                        if (dllArch != 0 && dllArch != targetArch) continue;
-                        InjectDllDirectly(pPI->hProcess, extraDll);
+                // 从路径中提取文件名
+                std::wstring dllFileName = targetDllPath.substr(targetDllPath.find_last_of(L"\\/") + 1);
+
+                // 获取远程 DLL 模块句柄
+                HMODULE hRemoteDll = GetRemoteModuleHandle(pPI->hProcess, dllFileName);
+                if (hRemoteDll) {
+                    // 获取导出函数 Initialize 的地址
+                    FARPROC pInitialize = GetRemoteProcAddress(pPI->hProcess, hRemoteDll, "Initialize");
+                    if (pInitialize) {
+                        // 第二步：创建远程线程调用 Initialize
+                        HANDLE hInitThread = CreateRemoteThread(pPI->hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pInitialize, NULL, 0, NULL);
+                        if (hInitThread) {
+                            WaitForSingleObject(hInitThread, INFINITE); // 等待 Hook 初始化完成
+                            CloseHandle(hInitThread);
+                            injected = true;
+                            DebugLog(L"Two-step injection successful for PID %d", pPI->dwProcessId);
+                        }
                     }
                 }
             }
@@ -10623,10 +10713,24 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD dwReason, LPVOID reserved) {
     if (dwReason == DLL_PROCESS_ATTACH) {
+        // 只做最少、最安全的操作
         DisableThreadLibraryCalls(hinst);
-        CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
     } else if (dwReason == DLL_PROCESS_DETACH) {
-        MH_Uninitialize();
+        // 注意：在 DLL_PROCESS_DETACH 中调用 MH_Uninitialize 也是不安全的
+        // 最好在程序退出时通过一个专门的卸载函数来处理
     }
     return TRUE;
+}
+
+// [新增] 创建一个导出函数，用于执行真正的初始化
+// 这个函数会在 DLL 加载完成后，在加载器锁之外被安全地调用
+extern "C" __declspec(dllexport) DWORD WINAPI Initialize() {
+    // 在这里创建线程是 100% 安全的
+    HANDLE hThread = CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
+    if (hThread) {
+        // 可以选择等待线程结束，或者直接返回
+        WaitForSingleObject(hThread, INFINITE);
+        CloseHandle(hThread);
+    }
+    return 0;
 }
