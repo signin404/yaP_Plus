@@ -691,7 +691,6 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
-
 typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags, DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize);
 typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
 
@@ -10500,8 +10499,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
         // 2. KernelBase / Kernel32 组 (缓解策略与 WinExec)
         const wchar_t* kBase = GetModuleHandleW(L"kernelbase.dll") ? L"kernelbase.dll" : L"kernel32.dll";
-        HookApi(kBase, "UpdateProcThreadAttribute",  &Detour_UpdateProcThreadAttribute,  reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
-        HookApi(kBase, "SetProcessMitigationPolicy", &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
+        //HookApi(kBase, "UpdateProcThreadAttribute",  &Detour_UpdateProcThreadAttribute,  reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
+        //HookApi(kBase, "SetProcessMitigationPolicy", &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
         HookApi(L"kernel32.dll", "WinExec",          &Detour_WinExec,                    reinterpret_cast<LPVOID*>(&fpWinExec));
 
         // 3. Shell32 组
