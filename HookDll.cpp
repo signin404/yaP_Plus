@@ -9075,12 +9075,17 @@ BOOL WINAPI Detour_CreateProcessInternalW(
                 HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
                 if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
             }
+			
+        // 如果注入成功，再处理额外 DLL 和握手事件
+        if (injected) {
+            std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+            HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+            if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
+			
         }
 
 if (!callerWantedSuspended) {
     ResumeThread(pPI->hThread);
-    // [新增] 给主线程一点时间来释放加载器锁
-    Sleep(200); 
 }
 
         if (!lpProcessInformation) {
