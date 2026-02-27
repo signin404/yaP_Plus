@@ -8807,6 +8807,49 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
+// [新增] 检查是否为 Windows 错误报告进程 (崩溃处理)
+bool IsWerFaultProcess(const std::wstring& exePath) {
+    if (exePath.length() >= 12) {
+        std::wstring lowerPath = exePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+        // 匹配 WerFault.exe 或 wermgr.exe
+        if (lowerPath.find(L"werfault.exe") != std::wstring::npos || 
+            lowerPath.find(L"wermgr.exe") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// [新增] 修复批处理文件的命令行 (批处理处理)
+// 确保重定向后的批处理路径被正确加上双引号，并与原参数拼接
+std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
+    std::wstring fixedCmd = L"\"" + exePath + L"\"";
+    
+    if (originalCmdLine.empty()) {
+        return fixedCmd;
+    }
+
+    // 寻找原命令行的参数部分 (跳过 argv[0])
+    const wchar_t* ptr = originalCmdLine.c_str();
+    while (*ptr == L' ') ptr++; // 跳过前导空格
+    
+    if (*ptr == L'\"') {
+        ptr++;
+        while (*ptr && *ptr != L'\"') ptr++;
+        if (*ptr == L'\"') ptr++;
+    } else {
+        while (*ptr && *ptr != L' ') ptr++;
+    }
+    
+    // 追加剩余的参数
+    if (*ptr) {
+        fixedCmd += ptr;
+    }
+    
+    return fixedCmd;
+}
+
 // --- 具体钩子实现 ---
 
 BOOL WINAPI Detour_UpdateProcThreadAttribute(
@@ -10318,6 +10361,13 @@ DWORD WINAPI InitHookThread(LPVOID) {
             DebugLog(L"Hooked CreateProcessInternalW successfully.");
         }
 
+        // [新增] 挂钩进程缓解策略相关函数
+        // 这些函数通常位于 kernelbase.dll 或 kernel32.dll
+        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+        if (!hKernelBase) {
+            hKernelBase = GetModuleHandleW(L"kernel32.dll");
+        }
+
         if (hKernelBase) {
             // 挂钩 UpdateProcThreadAttribute
             void* pUpdateProcThreadAttribute = (void*)GetProcAddress(hKernelBase, "UpdateProcThreadAttribute");
@@ -10349,6 +10399,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pShellExecuteExW) {
                 MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
             }
+        }
+
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
+            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
         }
     }
 
