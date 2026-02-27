@@ -1157,35 +1157,6 @@ struct TimeRecursionGuard {
     ~TimeRecursionGuard() { g_InTimeHook = false; }
 };
 
-//[修改] 直接定义并自动初始化全局架构标志
-inline bool InitIsWin64() {
-#ifdef _WIN64
-    return true; // 64位编译环境下 系统必然是64位
-#else
-    BOOL isWow64 = FALSE;
-    // 32位编译环境下 如果当前是Wow64进程 说明系统是64位
-    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
-        return isWow64 != FALSE;
-    }
-    return false;
-#endif
-}
-
-inline bool InitIsWow64Process() {
-#ifdef _WIN64
-    return false; // 64位进程本身不是Wow64进程
-#else
-    BOOL isWow64 = FALSE;
-    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
-        return isWow64 != FALSE;
-    }
-    return false;
-#endif
-}
-
-bool g_IsWin64 = InitIsWin64();
-bool g_IsWow64Process = InitIsWow64Process();
-
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
 P_IcmpSendEcho fpIcmpSendEcho = NULL;
@@ -2875,7 +2846,7 @@ std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess
 // ========== [新增] 权限与降权 (Low Integrity) 支持 ==========
 // 检查当前进程是否是受限令牌 (Low Integrity / AppContainer)
 bool IsRestrictedToken() {
-    // 如果函数指针未初始化，尝试加载
+    // 如果函数指针未初始化 尝试加载
     if (!fpGetTokenInformation) {
         HMODULE hAdvapi = GetModuleHandleW(L"advapi32.dll");
         if (!hAdvapi) hAdvapi = LoadLibraryW(L"advapi32.dll");
@@ -2917,7 +2888,7 @@ bool IsRestrictedToken() {
 
 // 降低指定注册表键的完整性级别 (Mandatory Integrity Control) 为 Low
 bool SetLowLabelKeyByName(const std::wstring& ntPath) {
-    // 如果函数指针未初始化，尝试加载
+    // 如果函数指针未初始化 尝试加载
     if (!fpConvertStringSecurityDescriptorToSecurityDescriptorW || !fpSetSecurityInfo) {
         HMODULE hAdvapi = GetModuleHandleW(L"advapi32.dll");
         if (!hAdvapi) hAdvapi = LoadLibraryW(L"advapi32.dll");
@@ -7353,14 +7324,14 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
     // 1. 优化 DirContext 清理
     bool foundDir = false;
     {
-        // 先使用共享锁（读锁），允许多线程并发查询，极速通过
+        // 先使用共享锁（读锁） 允许多线程并发查询 极速通过
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
         if (g_DirContextMap.find(Handle) != g_DirContextMap.end()) {
             foundDir = true;
         }
     }
     if (foundDir) {
-        // 只有确认存在时，才获取排他锁（写锁）进行删除
+        // 只有确认存在时 才获取排他锁（写锁）进行删除
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
         if (it != g_DirContextMap.end()) {
@@ -9097,14 +9068,14 @@ BOOL CreateProcessInternal(
             // 32->32 或 64->64：直接在父进程内存中操作 无需 IPC
             if (currentArch == targetArch && !targetDllPath.empty()) {
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    
-                    //[关键修复] 必须在注入前创建 Event，防止子进程跑得太快导致 OpenEvent 失败
+
+                    //[关键修复] 必须在注入前创建 Event 防止子进程跑得太快导致 OpenEvent 失败
                     std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
                     HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
 
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-                        
+
                         if (hEvent) {
                             // 等待子进程初始化完成 最多等待 5 秒
                             WaitForSingleObject(hEvent, 5000);
@@ -9122,8 +9093,8 @@ BOOL CreateProcessInternal(
                     } else {
                         DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
                     }
-                    
-                    // 无论成功失败，最后关闭句柄
+
+                    // 无论成功失败 最后关闭句柄
                     if (hEvent) CloseHandle(hEvent);
                 }
             }
@@ -9159,13 +9130,13 @@ BOOL CreateProcessInternal(
             // --- 策略 C: IPC 回退 (仅当上述都失败时) ---
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
-                
+
                 //[关键修复] 同样必须在请求前创建 Event
                 std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
                 HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-                
+
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-                
+
                 if (hEvent) {
                     WaitForSingleObject(hEvent, 5000);
                     CloseHandle(hEvent);
