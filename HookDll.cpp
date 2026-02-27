@@ -8873,6 +8873,24 @@ FARPROC GetRemoteProcAddress(HANDLE hProcess, HMODULE hModule, const char* procN
 
 // --- 具体钩子实现 ---
 
+BOOL WINAPI Detour_UpdateProcThreadAttribute(
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags,
+    DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize,
+    PVOID lpPreviousValue, PSIZE_T lpReturnSize)
+{
+    // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值是 0x20007
+    if (Attribute == 0x00020007 && cbSize >= sizeof(DWORD64)) {
+        DWORD64* policy = (DWORD64*)lpValue;
+        // 找到并移除“禁止加载非微软签名的二进制文件”的策略
+        // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (1ui64 << 44)
+        if (*policy & (1ui64 << 44)) {
+            DebugLog(L"Mitigation Policy Found: BlockNonMicrosoftBinaries. Removing it.");
+            *policy &= ~(1ui64 << 44);
+        }
+    }
+    return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
+}
+
 BOOL WINAPI Detour_CreateProcessInternalW(
     HANDLE hToken,
     LPCWSTR lpApplicationName,
