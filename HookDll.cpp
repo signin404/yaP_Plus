@@ -8789,6 +8789,49 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
+// [新增] 检查是否为 Windows 错误报告进程 (崩溃处理)
+bool IsWerFaultProcess(const std::wstring& exePath) {
+    if (exePath.length() >= 12) {
+        std::wstring lowerPath = exePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+        // 匹配 WerFault.exe 或 wermgr.exe
+        if (lowerPath.find(L"werfault.exe") != std::wstring::npos ||
+            lowerPath.find(L"wermgr.exe") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// [新增] 修复批处理文件的命令行 (批处理处理)
+// 确保重定向后的批处理路径被正确加上双引号，并与原参数拼接
+std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
+    std::wstring fixedCmd = L"\"" + exePath + L"\"";
+
+    if (originalCmdLine.empty()) {
+        return fixedCmd;
+    }
+
+    // 寻找原命令行的参数部分 (跳过 argv[0])
+    const wchar_t* ptr = originalCmdLine.c_str();
+    while (*ptr == L' ') ptr++; // 跳过前导空格
+
+    if (*ptr == L'\"') {
+        ptr++;
+        while (*ptr && *ptr != L'\"') ptr++;
+        if (*ptr == L'\"') ptr++;
+    } else {
+        while (*ptr && *ptr != L' ') ptr++;
+    }
+
+    // 追加剩余的参数
+    if (*ptr) {
+        fixedCmd += ptr;
+    }
+
+    return fixedCmd;
+}
+
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -8838,6 +8881,25 @@ BOOL CreateProcessInternal(
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
     }
 
+    //[新增] 批处理文件 (.bat / .cmd) 识别逻辑
+    bool isBatchFile = false;
+    if (targetExe.length() >= 4) {
+        std::wstring ext = targetExe.substr(targetExe.length() - 4);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext == L".bat" || ext == L".cmd") {
+            isBatchFile = true;
+        }
+    }
+
+    if (isBatchFile) {
+        // 确定当前使用的 EXE 路径 (重定向后的或原始的)
+        std::wstring activeExe = redirectedExe.empty() ? targetExe : redirectedExe;
+
+        // 修复命令行：将路径用双引号包裹并拼上参数
+        cmdLineW = FixBatchCommandLine(activeExe, cmdLineW);
+        DebugLog(L"CreateProcess: Fixed batch command line -> %s", cmdLineW.c_str());
+    }
+
     // 4. 准备最终参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
@@ -8851,12 +8913,23 @@ BOOL CreateProcessInternal(
     // 处理 EXE 路径替换
     if (!redirectedExe.empty()) {
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-        if (isAnsi) {
-            ansiExe = WideToAnsi(redirectedExe.c_str());
-            finalAppName = ansiExe.c_str();
+
+        if (!isBatchFile) {
+            // 普通 EXE 正常替换 lpApplicationName
+            if (isAnsi) {
+                ansiExe = WideToAnsi(redirectedExe.c_str());
+                finalAppName = ansiExe.c_str();
+            } else {
+                finalAppName = redirectedExe.c_str();
+            }
         } else {
-            finalAppName = redirectedExe.c_str();
+            // 关键修复：如果是批处理文件，lpApplicationName 必须强制为 NULL
+            // 否则 CreateProcess 会返回 ERROR_BAD_EXE_FORMAT (193)
+            finalAppName = nullptr;
         }
+    } else if (isBatchFile) {
+        // 即使没有重定向，只要是批处理，也强制置空
+        finalAppName = nullptr;
     }
 
     // 处理工作目录替换
@@ -8925,6 +8998,22 @@ BOOL CreateProcessInternal(
 
     // 7. 注入与恢复
     if (result) {
+
+        // [新增] 崩溃处理：过滤 Windows 错误报告进程
+        if (IsWerFaultProcess(targetExe)) {
+            DebugLog(L"ChildHook: Ignored WerFault.exe to prevent crash loops -> PID %d", pPI->dwProcessId);
+
+            // 绝对不注入 WerFault，直接恢复线程让其正常收集崩溃信息或退出
+            if (!callerWantedSuspended) {
+                ResumeThread(pPI->hThread);
+            }
+            if (!lpProcessInformation) {
+                CloseHandle(localPI.hProcess);
+                CloseHandle(localPI.hThread);
+            }
+            return result;
+        }
+
         // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
 
@@ -9072,7 +9161,7 @@ BOOL WINAPI Detour_UpdateProcThreadAttribute(
     // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值为 0x20007
     // 这个属性用于设置进程创建时的安全缓解策略
     if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && cbSize >= sizeof(DWORD64)) {
-        
+
         DWORD64* policy = (DWORD64*)lpValue;
 
         // 关键操作: 移除“阻止加载非微软签名的二进制文件”的策略
