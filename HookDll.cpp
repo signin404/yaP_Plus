@@ -8813,7 +8813,7 @@ bool IsWerFaultProcess(const std::wstring& exePath) {
         std::wstring lowerPath = exePath;
         std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
         // 匹配 WerFault.exe 或 wermgr.exe
-        if (lowerPath.find(L"werfault.exe") != std::wstring::npos || 
+        if (lowerPath.find(L"werfault.exe") != std::wstring::npos ||
             lowerPath.find(L"wermgr.exe") != std::wstring::npos) {
             return true;
         }
@@ -8825,7 +8825,7 @@ bool IsWerFaultProcess(const std::wstring& exePath) {
 // 确保重定向后的批处理路径被正确加上双引号，并与原参数拼接
 std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
     std::wstring fixedCmd = L"\"" + exePath + L"\"";
-    
+
     if (originalCmdLine.empty()) {
         return fixedCmd;
     }
@@ -8833,7 +8833,7 @@ std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring
     // 寻找原命令行的参数部分 (跳过 argv[0])
     const wchar_t* ptr = originalCmdLine.c_str();
     while (*ptr == L' ') ptr++; // 跳过前导空格
-    
+
     if (*ptr == L'\"') {
         ptr++;
         while (*ptr && *ptr != L'\"') ptr++;
@@ -8841,12 +8841,12 @@ std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring
     } else {
         while (*ptr && *ptr != L' ') ptr++;
     }
-    
+
     // 追加剩余的参数
     if (*ptr) {
         fixedCmd += ptr;
     }
-    
+
     return fixedCmd;
 }
 
@@ -8909,7 +8909,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     LPCWSTR lpCurrentDirectory,
     LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation,
-    PHANDLE hNewToken) 
+    PHANDLE hNewToken)
 {
     // 防止重入
     if (g_IsInHook) return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
@@ -8969,7 +8969,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     // 4. 处理 CREATE_SUSPENDED 和 安全描述符 Bug (Sandboxie 移植)
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-    
+
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
@@ -10339,20 +10339,19 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
     if (g_HookChild) {
-        // [新增] 动态查找 CreateProcessInternalW
+        // 统一声明用到的句柄，避免重复定义
         HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
         void* pCreateProcessInternalW = nullptr;
-        
+
+        // [1] 查找 CreateProcessInternalW
         if (hKernelBase) {
             pCreateProcessInternalW = (void*)GetProcAddress(hKernelBase, "CreateProcessInternalW");
         }
-        
+
         // 如果 kernelbase.dll 中没有，回退到 kernel32.dll 查找
-        if (!pCreateProcessInternalW) {
-            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-            if (hKernel32) {
-                pCreateProcessInternalW = (void*)GetProcAddress(hKernel32, "CreateProcessInternalW");
-            }
+        if (!pCreateProcessInternalW && hKernel32) {
+            pCreateProcessInternalW = (void*)GetProcAddress(hKernel32, "CreateProcessInternalW");
         }
 
         // 挂钩底层核心 API
@@ -10361,30 +10360,25 @@ DWORD WINAPI InitHookThread(LPVOID) {
             DebugLog(L"Hooked CreateProcessInternalW successfully.");
         }
 
-        // [新增] 挂钩进程缓解策略相关函数
-        // 这些函数通常位于 kernelbase.dll 或 kernel32.dll
-        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
-        if (!hKernelBase) {
-            hKernelBase = GetModuleHandleW(L"kernel32.dll");
-        }
+        // [2] 挂钩进程缓解策略相关函数
+        // 逻辑：如果获取不到 kernelbase，则尝试 kernel32
+        HMODULE hMitigationMod = hKernelBase ? hKernelBase : hKernel32;
 
-        if (hKernelBase) {
+        if (hMitigationMod) {
             // 挂钩 UpdateProcThreadAttribute
-            void* pUpdateProcThreadAttribute = (void*)GetProcAddress(hKernelBase, "UpdateProcThreadAttribute");
+            void* pUpdateProcThreadAttribute = (void*)GetProcAddress(hMitigationMod, "UpdateProcThreadAttribute");
             if (pUpdateProcThreadAttribute) {
                 MH_CreateHook(pUpdateProcThreadAttribute, &Detour_UpdateProcThreadAttribute, reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
             }
 
             // 挂钩 SetProcessMitigationPolicy
-            void* pSetProcessMitigationPolicy = (void*)GetProcAddress(hKernelBase, "SetProcessMitigationPolicy");
+            void* pSetProcessMitigationPolicy = (void*)GetProcAddress(hMitigationMod, "SetProcessMitigationPolicy");
             if (pSetProcessMitigationPolicy) {
                 MH_CreateHook(pSetProcessMitigationPolicy, &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
             }
         }
 
-        // [新增] 挂钩 WinExec
-        // 很多老程序(VB6/Delphi)使用此 API 启动子进程
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        // [3] 挂钩 WinExec
         if (hKernel32) {
             void* pWinExec = (void*)GetProcAddress(hKernel32, "WinExec");
             if (pWinExec) {
@@ -10392,7 +10386,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
-        // [新增] 挂钩 ShellExecuteExW
+        // [4] 挂钩 ShellExecuteExW
         HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
         if (hShell32) {
             void* pShellExecuteExW = (void*)GetProcAddress(hShell32, "ShellExecuteExW");
@@ -10401,12 +10395,18 @@ DWORD WINAPI InitHookThread(LPVOID) {
             }
         }
 
+        // [5] 挂钩 Token 相关进程创建
         HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
         if (hAdvapi32) {
             void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            if (pCreateProcessWithTokenW) {
+                MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            }
+
             void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
+            if (pCreateProcessWithLogonW) {
+                MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
+            }
         }
     }
 
