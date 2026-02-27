@@ -8987,9 +8987,11 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             }
         }
 
-        if (!callerWantedSuspended) {
-            ResumeThread(pPI->hThread);
-        }
+if (!callerWantedSuspended) {
+    ResumeThread(pPI->hThread);
+    // [新增] 给主线程一点时间来释放加载器锁
+    Sleep(200); 
+}
 
         if (!lpProcessInformation) {
             CloseHandle(localPI.hProcess);
