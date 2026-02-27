@@ -691,6 +691,19 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+// --- 安全与降权相关函数指针 (动态加载以加快注入速度) ---
+typedef BOOL(WINAPI* P_ConvertStringSecurityDescriptorToSecurityDescriptorW)(LPCWSTR, DWORD, PSECURITY_DESCRIPTOR*, PULONG);
+typedef DWORD(WINAPI* P_SetSecurityInfo)(HANDLE, SE_OBJECT_TYPE, SECURITY_INFORMATION, PSID, PSID, PACL, PACL);
+typedef BOOL(WINAPI* P_GetTokenInformation)(HANDLE, TOKEN_INFORMATION_CLASS, LPVOID, DWORD, PDWORD);
+typedef PDWORD(WINAPI* P_GetSidSubAuthority)(PSID, DWORD);
+typedef PUCHAR(WINAPI* P_GetSidSubAuthorityCount)(PSID);
+
+P_ConvertStringSecurityDescriptorToSecurityDescriptorW fpConvertStringSecurityDescriptorToSecurityDescriptorW = NULL;
+P_SetSecurityInfo fpSetSecurityInfo = NULL;
+P_GetTokenInformation fpGetTokenInformation = NULL;
+P_GetSidSubAuthority fpGetSidSubAuthority = NULL;
+P_GetSidSubAuthorityCount fpGetSidSubAuthorityCount = NULL;
+
 typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags, DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize);
 typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
 
@@ -2863,22 +2876,35 @@ std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess
 // ========== [新增] 权限与降权 (Low Integrity) 支持 ==========
 // 检查当前进程是否是受限令牌 (Low Integrity / AppContainer)
 bool IsRestrictedToken() {
+    // 如果函数指针未初始化，尝试加载
+    if (!fpGetTokenInformation) {
+        HMODULE hAdvapi = GetModuleHandleW(L"advapi32.dll");
+        if (!hAdvapi) hAdvapi = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi) {
+            fpGetTokenInformation = (P_GetTokenInformation)GetProcAddress(hAdvapi, "GetTokenInformation");
+            fpGetSidSubAuthority = (P_GetSidSubAuthority)GetProcAddress(hAdvapi, "GetSidSubAuthority");
+            fpGetSidSubAuthorityCount = (P_GetSidSubAuthorityCount)GetProcAddress(hAdvapi, "GetSidSubAuthorityCount");
+        }
+    }
+
+    if (!fpGetTokenInformation || !fpGetSidSubAuthority || !fpGetSidSubAuthorityCount) return false;
+
     HANDLE hToken;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
         DWORD isRestricted = 0;
         DWORD len = 0;
-        if (GetTokenInformation(hToken, TokenIsRestricted, &isRestricted, sizeof(isRestricted), &len) && isRestricted) {
+        if (fpGetTokenInformation(hToken, TokenIsRestricted, &isRestricted, sizeof(isRestricted), &len) && isRestricted) {
             CloseHandle(hToken);
             return true;
         }
 
         PTOKEN_MANDATORY_LABEL pTIL = NULL;
-        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
+        fpGetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
         if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
             pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(LPTR, len);
-            if (pTIL && GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
-                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid,
-                    (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
+            if (pTIL && fpGetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
+                DWORD dwIntegrityLevel = *fpGetSidSubAuthority(pTIL->Label.Sid,
+                    (DWORD)(UCHAR)(*fpGetSidSubAuthorityCount(pTIL->Label.Sid)-1));
                 LocalFree(pTIL);
                 CloseHandle(hToken);
                 return dwIntegrityLevel < SECURITY_MANDATORY_MEDIUM_RID;
@@ -2892,24 +2918,34 @@ bool IsRestrictedToken() {
 
 // 降低指定注册表键的完整性级别 (Mandatory Integrity Control) 为 Low
 bool SetLowLabelKeyByName(const std::wstring& ntPath) {
+    // 如果函数指针未初始化，尝试加载
+    if (!fpConvertStringSecurityDescriptorToSecurityDescriptorW || !fpSetSecurityInfo) {
+        HMODULE hAdvapi = GetModuleHandleW(L"advapi32.dll");
+        if (!hAdvapi) hAdvapi = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi) {
+            fpConvertStringSecurityDescriptorToSecurityDescriptorW = (P_ConvertStringSecurityDescriptorToSecurityDescriptorW)GetProcAddress(hAdvapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW");
+            fpSetSecurityInfo = (P_SetSecurityInfo)GetProcAddress(hAdvapi, "SetSecurityInfo");
+        }
+    }
+
+    if (!fpConvertStringSecurityDescriptorToSecurityDescriptorW || !fpSetSecurityInfo) return false;
+
     HANDLE hKey = NULL;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
     RtlInitUnicodeString(&us, ntPath.c_str());
     InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // 尝试以 WRITE_OWNER | WRITE_DAC 权限打开
     if (NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY, &oa)) ||
         NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC, &oa))) {
 
         PSECURITY_DESCRIPTOR pSD = NULL;
-        // S:(ML;;NW;;;LW) 表示 Low Mandatory Level
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
+        if (fpConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
             PACL pSacl = NULL;
             BOOL saclPresent = FALSE, saclDefaulted = FALSE;
             GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
 
-            DWORD res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
+            DWORD res = fpSetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
             LocalFree(pSD);
             fpNtClose(hKey);
             return res == ERROR_SUCCESS;
