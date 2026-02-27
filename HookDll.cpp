@@ -10351,6 +10351,10 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (g_IpcPipeName[0] == L'\0') {
         if (GetEnvironmentVariableW(L"YAP_IPC_PIPE", buffer, MAX_PATH) > 0) wcscpy_s(g_IpcPipeName, MAX_PATH, buffer);
     }
+    // [新增] 补齐启动器目录的环境变量回退
+    if (g_LauncherDir[0] == L'\0') {
+        if (GetEnvironmentVariableW(L"YAP_LAUNCHER_DIR", buffer, MAX_PATH) > 0) wcscpy_s(g_LauncherDir, MAX_PATH, buffer);
+    }
 
     // 检查根目录是否获取成功
     if (g_SandboxRoot[0] == L'\0') {

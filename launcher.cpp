@@ -5202,6 +5202,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         if (!finalHookPath.empty()) {
             SetEnvironmentVariableW(L"YAP_HOOK_PATH", finalHookPath.c_str());
         }
+        SetEnvironmentVariableW(L"YAP_LAUNCHER_DIR", g_LauncherDir.c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_FILE", std::to_wstring(hookMode).c_str());
         SetEnvironmentVariableW(L"YAP_HOOK_NET", std::to_wstring(netBlockMode).c_str());
 
@@ -6035,6 +6036,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
 
             // 2. [关键修复] 为后续实例设置完整环境变量 确保子进程继承
+            SetEnvironmentVariableW(L"YAP_LAUNCHER_DIR", g_LauncherDir.c_str());
             SetEnvironmentVariableW(L"YAP_IPC_PIPE", sharedPipeName.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_FILE", hookFileVal.c_str());
             SetEnvironmentVariableW(L"YAP_HOOK_NET", netBlockVal.c_str());
