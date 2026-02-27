@@ -8871,122 +8871,128 @@ BOOL WINAPI Detour_CreateProcessInternalW(
     }
     RecursionGuard guard;
 
-    // 1. 路径重定向逻辑 (保留你的逻辑，但无需 ANSI 转换)
+    // ---------------------------------------------------------
+    // 1. 路径重定向逻辑
+    // ---------------------------------------------------------
     std::wstring exePathW = (LPCWSTR)lpApplicationName ? (LPCWSTR)lpApplicationName : L"";
     std::wstring cmdLineW = (LPWSTR)lpCommandLine ? (LPWSTR)lpCommandLine : L"";
 
     // 获取目标 EXE 路径
     std::wstring targetExe = GetTargetExePath(exePathW.c_str(), (LPWSTR)cmdLineW.c_str());
-    // 尝试重定向 EXE
+    
+    // [优化] 提前判断是否需要 Hook，如果不需要 Hook 且不需要重定向，直接放行
+    // 这对 Firefox 这种频繁创建子进程的程序性能和稳定性至关重要
+    bool needRedirect = false;
     std::wstring redirectedExe = TryRedirectDosPath(targetExe.c_str(), false);
+    std::wstring redirectedDir;
+    
+    if (!redirectedExe.empty()) {
+        needRedirect = true;
+    } else {
+        // 如果没重定向 EXE，检查是否重定向目录
+        std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
+        redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+        if (!redirectedDir.empty()) needRedirect = true;
+    }
 
-    // 尝试重定向工作目录
-    std::wstring curDirW = (LPCWSTR)lpCurrentDirectory ? (LPCWSTR)lpCurrentDirectory : L"";
-    std::wstring redirectedDir = TryRedirectDosPath(curDirW.c_str(), true);
+    // 检查是否在白名单中 (需要注入)
+    // 注意：这里用 targetExe (原路径) 或 redirectedExe (新路径) 都可以，取决于你的配置习惯
+    // 建议：如果发生了重定向，用新路径检查；否则用原路径
+    LPCWSTR checkPath = redirectedExe.empty() ? targetExe.c_str() : redirectedExe.c_str();
+    bool shouldInject = ShouldHookChildProcess(checkPath);
 
-    // 2. 命令行处理 (合并你的 Chromium 逻辑 + Sandboxie 批处理修复)
+    // 如果既不需要重定向，也不需要注入，直接调用原函数，不做任何干扰
+    // [关键] 这能解决 Firefox 很多莫名其妙的白屏问题
+    if (!needRedirect && !shouldInject) {
+        return fpCreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+    }
+
+    // ---------------------------------------------------------
+    // 2. 准备参数
+    // ---------------------------------------------------------
+    
+    // 命令行处理
     std::vector<std::wstring> extraArgs;
     if (!cmdLineW.empty()) {
-        // 保留你的 Chromium 参数处理
+        // 仅当确实需要修改命令行参数时才处理 (防止破坏 Firefox 的 IPC 参数)
+        // 如果你的 CmdUtils 逻辑不够健壮，建议对 Firefox 跳过此步
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
     }
 
-    // 准备最终参数
+    // 批处理修复
+    if (!redirectedExe.empty() && IsBatchFile(redirectedExe)) {
+        cmdLineW = FixBatchCommandLine(redirectedExe.c_str(), (LPWSTR)cmdLineW.c_str());
+    }
+
     LPCWSTR finalAppName = redirectedExe.empty() ? lpApplicationName : redirectedExe.c_str();
     LPCWSTR finalCurDir = redirectedDir.empty() ? lpCurrentDirectory : redirectedDir.c_str();
 
-    // 命令行缓冲区 (CreateProcessInternalW 需要可写内存)
-    std::wstring finalCmdLineStr = cmdLineW;
-
-    // [Sandboxie 移植] 如果重定向了且是 .bat/.cmd，修复命令行
-    if (!redirectedExe.empty() && IsBatchFile(redirectedExe)) {
-        finalCmdLineStr = FixBatchCommandLine(redirectedExe.c_str(), (LPWSTR)cmdLineW.c_str());
+    // [关键] 构建可写的命令行缓冲区
+    // CreateProcessInternalW 可能会修改该缓冲区，必须保证它是可写的且以 NULL 结尾
+    std::vector<wchar_t> cmdBuffer;
+    if (!cmdLineW.empty()) {
+        cmdBuffer.assign(cmdLineW.begin(), cmdLineW.end());
+        cmdBuffer.push_back(L'\0');
     }
-
-    // 转换为可写缓冲区
-    std::vector<wchar_t> cmdBuffer(finalCmdLineStr.begin(), finalCmdLineStr.end());
-    cmdBuffer.push_back(L'\0');
     LPWSTR finalCmdLinePtr = cmdBuffer.empty() ? NULL : cmdBuffer.data();
 
-    if (!redirectedExe.empty()) DebugLog(L"Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-
-    // 3. 安全描述符修复 (Sandboxie 移植 - 关键稳定性修复)
-    void* SaveOwnerProcess = NULL;
-    void* SaveOwnerThread = NULL;
-
-    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SECURITY_DESCRIPTOR_RELATIVE* rel = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-            SaveOwnerProcess = (void*)(ULONG_PTR)rel->Owner;
-            if (SaveOwnerProcess) rel->Owner = 0;
-        } else {
-            SaveOwnerProcess = sd->Owner;
-            if (SaveOwnerProcess) sd->Owner = NULL;
-        }
-    }
-    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SECURITY_DESCRIPTOR_RELATIVE* rel = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-            SaveOwnerThread = (void*)(ULONG_PTR)rel->Owner;
-            if (SaveOwnerThread) rel->Owner = 0;
-        } else {
-            SaveOwnerThread = sd->Owner;
-            if (SaveOwnerThread) sd->Owner = NULL;
-        }
+    if (needRedirect) {
+        DebugLog(L"Redirect: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
     }
 
-    // 4. 注入准备 (强制挂起)
+    // ---------------------------------------------------------
+    // 3. [移除] 安全描述符修复 (Security Descriptor Fix)
+    // ---------------------------------------------------------
+    // 警告：不要在 Firefox/Chrome 中使用 Sandboxie 的 Owner 修复逻辑。
+    // 它们使用受限 Token，修改 SD 会导致内核校验失败或崩溃。
+    // 代码已删除。
+
+    // ---------------------------------------------------------
+    // 4. 注入准备
+    // ---------------------------------------------------------
     PROCESS_INFORMATION localPI = { 0 };
     LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-
+    
     BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+    DWORD newCreationFlags = dwCreationFlags;
 
-    // 5. 调用原始底层函数
+    // 仅当需要注入时，才强制挂起
+    if (shouldInject) {
+        newCreationFlags |= CREATE_SUSPENDED;
+    }
+
+    // ---------------------------------------------------------
+    // 5. 调用底层函数
+    // ---------------------------------------------------------
     BOOL result = fpCreateProcessInternalW(
-        hToken,
-        finalAppName,
-        finalCmdLinePtr,
-        lpProcessAttributes,
-        lpThreadAttributes,
-        bInheritHandles,
-        newCreationFlags,
-        lpEnvironment,
-        finalCurDir,
-        lpStartupInfo,
-        pPI,
+        hToken, 
+        finalAppName, 
+        finalCmdLinePtr, 
+        lpProcessAttributes, 
+        lpThreadAttributes, 
+        bInheritHandles, 
+        newCreationFlags, 
+        lpEnvironment, 
+        finalCurDir, 
+        lpStartupInfo, 
+        pPI, 
         hNewToken
     );
-
+    
     DWORD lastErr = GetLastError();
 
-    // 6. 恢复安全描述符 (Sandboxie 移植)
-    if (SaveOwnerProcess) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerProcess;
-        else sd->Owner = SaveOwnerProcess;
-    }
-    if (SaveOwnerThread) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerThread;
-        else sd->Owner = SaveOwnerThread;
-    }
-
-    // 7. 注入逻辑
+    // ---------------------------------------------------------
+    // 6. 注入与恢复
+    // ---------------------------------------------------------
     if (result) {
-        // 使用重定向后的路径或原路径进行白名单检查
-        LPCWSTR checkPath = redirectedExe.empty() ? targetExe.c_str() : redirectedExe.c_str();
-
-        if (ShouldHookChildProcess(checkPath)) {
-
+        if (shouldInject) {
+            // [保留你的架构检测和注入逻辑]
             #ifdef _WIN64
             int currentArch = 64;
             #else
             int currentArch = 32;
             #endif
-            int targetArch = GetPeArchitecture(checkPath); // 使用 checkPath 而不是 targetExe
+            int targetArch = GetPeArchitecture(checkPath);
             if (targetArch == 0) targetArch = currentArch;
 
             std::wstring dllDir = GetCurrentDllDir();
@@ -9002,10 +9008,10 @@ BOOL WINAPI Detour_CreateProcessInternalW(
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-                        // 等待事件
+                        // 等待事件 (Firefox 启动极快，这里等待一下有助于稳定)
                         std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
                         HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-                        if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
+                        if (hEvent) { WaitForSingleObject(hEvent, 2000); CloseHandle(hEvent); } // 缩短等待时间
 
                         // 注入额外 DLL
                         for (const auto& extraDll : g_ExtraDlls) {
@@ -9018,7 +9024,7 @@ BOOL WINAPI Detour_CreateProcessInternalW(
                 }
             }
 
-            // --- 策略 B: 异架构直接调用注入器 (64->32) ---
+            // --- 策略 B: 异架构 (64->32) ---
             if (!injected && currentArch == 64 && targetArch == 32 && !targetDllPath.empty()) {
                 if (GetFileAttributesW(injectorPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
                     if (InjectCrossArchAndWait(pPI->dwProcessId, targetDllPath, injectorPath)) {
@@ -9036,15 +9042,11 @@ BOOL WINAPI Detour_CreateProcessInternalW(
             // --- 策略 C: IPC 回退 ---
             if (!injected) {
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-                // 建议加上等待
-                std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-                HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-                if (hEvent) { WaitForSingleObject(hEvent, 5000); CloseHandle(hEvent); }
             }
         }
 
-        // 恢复线程
-        if (!callerWantedSuspended) {
+        // [关键] 只有当我们强制添加了 SUSPENDED 且调用者原本没要求 SUSPENDED 时，才恢复线程
+        if (shouldInject && !callerWantedSuspended) {
             ResumeThread(pPI->hThread);
         }
 
