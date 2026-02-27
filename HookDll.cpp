@@ -8966,56 +8966,12 @@ BOOL WINAPI Detour_CreateProcessInternalW(
         finalCmdLinePtr = wideCmdBuffer.data();
     }
 
-    // 4. 处理 CREATE_SUSPENDED 和 安全描述符 Bug (Sandboxie 移植)
-    PROCESS_INFORMATION localPI = { 0 };
-    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
-
-    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
-    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
-
-    // [移植] 暂存并清空 Owner，防止 CREATE_SUSPENDED 导致 STATUS_INVALID_OWNER
-    void* SaveOwnerProcess = nullptr;
-    void* SaveOwnerThread = nullptr;
-
-    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SaveOwnerProcess = (void*)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
-            if (SaveOwnerProcess) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
-        } else {
-            SaveOwnerProcess = sd->Owner;
-            if (SaveOwnerProcess) sd->Owner = NULL;
-        }
-    }
-
-    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            SaveOwnerThread = (void*)(ULONG_PTR)((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner;
-            if (SaveOwnerThread) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = 0;
-        } else {
-            SaveOwnerThread = sd->Owner;
-            if (SaveOwnerThread) sd->Owner = NULL;
-        }
-    }
 
     // 5. 调用真正的底层函数
     BOOL result = fpCreateProcessInternalW(
         hToken, finalAppName, finalCmdLinePtr, lpProcessAttributes, lpThreadAttributes,
         bInheritHandles, newCreationFlags, lpEnvironment, finalCurDir, lpStartupInfo, pPI, hNewToken
     );
-
-    // 6. 恢复安全描述符的 Owner
-    if (SaveOwnerProcess) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerProcess;
-        else sd->Owner = SaveOwnerProcess;
-    }
-    if (SaveOwnerThread) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)SaveOwnerThread;
-        else sd->Owner = SaveOwnerThread;
-    }
 
     // 7. 注入与恢复逻辑
     if (result) {
