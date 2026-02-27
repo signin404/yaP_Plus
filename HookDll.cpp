@@ -8966,6 +8966,14 @@ BOOL WINAPI Detour_CreateProcessInternalW(
         finalCmdLinePtr = wideCmdBuffer.data();
     }
 
+    // 4. 处理 CREATE_SUSPENDED 和 安全描述符 Bug (Sandboxie 移植)
+    PROCESS_INFORMATION localPI = { 0 };
+    LPPROCESS_INFORMATION pPI = lpProcessInformation ? lpProcessInformation : &localPI;
+
+    BOOL callerWantedSuspended = (dwCreationFlags & CREATE_SUSPENDED);
+    DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
+
+
 
     // 5. 调用真正的底层函数
     BOOL result = fpCreateProcessInternalW(
