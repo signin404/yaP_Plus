@@ -3112,12 +3112,12 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
 
     // 1. Classes (COM 组件) - 核心修复
     // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
-    // if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
+    if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
 
     // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
     // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
-    // if (contains(L"_classes\\") ||
-		// (lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
+    if (contains(L"_classes\\") ||
+		(lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
 
     // 2. 音频与多媒体
     if (contains(L"mmdevices")) return true;
@@ -5830,6 +5830,40 @@ bool NtPathExists(const std::wstring& ntPath) {
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
+// [新增] 初始化管道前缀 (在 InitHookThread 中调用)
+void InitPipeVirtualization() {
+    DWORD sessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+
+    // 生成唯一前缀 格式: YapBox_<SessionId>_
+    // 这样不同 Session 的沙盒不会冲突 且与真实管道区分开
+    wchar_t buf[64];
+    swprintf_s(buf, L"YapBox_%08x_", sessionId);
+    g_PipePrefix = buf;
+}
+
+// [新增] 计算虚拟化管道路径
+// 输入: \Device\NamedPipe\MyPipe
+// 输出: \Device\NamedPipe\YapBox_00000001_MyPipe
+bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
+    const std::wstring pipeDevice = L"\\Device\\NamedPipe\\";
+
+    // 检查是否为命名管道路径
+    if (fullNtPath.size() > pipeDevice.size() &&
+        _wcsnicmp(fullNtPath.c_str(), pipeDevice.c_str(), pipeDevice.size()) == 0) {
+
+        std::wstring pipeName = fullNtPath.substr(pipeDevice.size());
+
+        // 检查是否已经被虚拟化 (防止重复添加前缀)
+        if (pipeName.find(g_PipePrefix) == 0) return false;
+
+        // 构造虚拟化路径
+        outBoxedPath = pipeDevice + g_PipePrefix + pipeName;
+        return true;
+    }
+    return false;
+}
+
 // [新增] 虚拟光驱路径重定向辅助类 (RAII)
 class VirtualCdRedirector {
 public:
@@ -5934,6 +5968,45 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 1. 路径解析与规范化 (后续原有逻辑)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 命名管道客户端虚拟化
+    std::wstring boxedPipePath;
+    if (GetBoxedPipePath(fullNtPath, boxedPipePath)) {
+        // 这是一个管道路径 我们需要决定是连接到沙盒内的虚拟管道 还是直通系统管道
+
+        // 1. 检查沙盒内是否存在该虚拟管道
+        // 使用 NtQueryAttributesFile 探测 避免产生连接副作用
+        OBJECT_ATTRIBUTES oaPipe;
+        UNICODE_STRING usPipe;
+        FILE_BASIC_INFORMATION basicInfo;
+
+        RtlInitUnicodeString(&usPipe, boxedPipePath.c_str());
+        InitializeObjectAttributes(&oaPipe, &usPipe, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        // 注意：对于管道 NtQueryAttributesFile 可能返回 STATUS_SUCCESS 或其他状态
+        // 只要不是 Object Name Not Found 就说明管道存在
+        NTSTATUS probeStatus = fpNtQueryAttributesFile(&oaPipe, &basicInfo);
+
+        if (probeStatus != STATUS_OBJECT_NAME_NOT_FOUND && probeStatus != STATUS_OBJECT_PATH_NOT_FOUND) {
+            // 沙盒内存在同名管道 (由本沙盒内的进程创建) 优先连接它
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, boxedPipePath.c_str());
+
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            DebugLog(L"Pipe: Connected to Virtualized Pipe %s", boxedPipePath.c_str());
+            return status;
+        }
+        // 如果沙盒内不存在 则放行 允许连接到真实的系统管道 (如 RPC, SCM 等)
+    }
 
     // 兼容性补丁区域 (Pre-Call)
 
@@ -7105,6 +7178,45 @@ int WINAPI Detour_EnumFontFamiliesW(HDC hdc, LPCWSTR lpszFamily, FONTENUMPROCW l
         return fpEnumFontFamiliesW(hdc, lpszFamily, ProxyEnumFontFamExProc, (LPARAM)&ctx);
     }
     return fpEnumFontFamiliesW(hdc, lpszFamily, lpEnumFontFamProc, lParam);
+}
+
+// [新增] Hook NtCreateNamedPipeFile (用于创建管道服务端)
+NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, ULONG NamedPipeType, ULONG ReadMode,
+    ULONG CompletionMode, ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout)
+{
+    if (g_IsInHook) return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+    RecursionGuard guard;
+
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring boxedPath;
+
+    // 如果是创建管道 强制重定向到虚拟化名称
+    // 这样沙盒内创建的管道对外部不可见 且不会与系统服务冲突
+    if (GetBoxedPipePath(rawNtPath, boxedPath)) {
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, boxedPath.c_str());
+
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+        // 替换为绝对路径 忽略 RootDirectory
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        NTSTATUS status = fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+
+        if (NT_SUCCESS(status)) {
+            DebugLog(L"Pipe: Virtualized Server %s -> %s", rawNtPath.c_str(), boxedPath.c_str());
+        }
+        return status;
+    }
+
+    return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
 // [新增] 拦截 GetLogicalDrives (位掩码)
@@ -9670,6 +9782,8 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
+    // [新增] 初始化管道前缀
+    InitPipeVirtualization();
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
@@ -10168,6 +10282,12 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+
+            // [新增] 挂钩 NtCreateNamedPipeFile
+            void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
+            if (pNtCreateNamedPipeFile) {
+                MH_CreateHook(pNtCreateNamedPipeFile, &Detour_NtCreateNamedPipeFile, reinterpret_cast<LPVOID*>(&fpNtCreateNamedPipeFile));
+            }
 
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
