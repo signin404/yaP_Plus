@@ -8926,41 +8926,35 @@ BOOL CreateProcessInternal(
             // --- 策略 A: 同架构直接注入 (极速) ---
             // 32->32 或 64->64：直接在父进程内存中操作 无需 IPC
             if (currentArch == targetArch && !targetDllPath.empty()) {
-                // 检查文件是否存在 避免无效注入
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    
+                    //[关键修复] 必须在注入前创建 Event，防止子进程跑得太快导致 OpenEvent 失败
+                    std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+                    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-                        // [关键修复] 同架构注入也需要等待就绪事件
-                        std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-                        HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+                        
                         if (hEvent) {
-							// 等待子进程初始化完成 最多等待 5 秒
-							WaitForSingleObject(hEvent, 5000);
-							CloseHandle(hEvent);
+                            // 等待子进程初始化完成 最多等待 5 秒
+                            WaitForSingleObject(hEvent, 5000);
                         }
 
-                        // [修改] 顺便注入第三方 DLL (增加架构检查)
+                        // 顺便注入第三方 DLL (增加架构检查)
                         for (const auto& extraDll : g_ExtraDlls) {
-                            // 1. 检查文件是否存在
                             if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-
-                            // 2. [新增] 检查 DLL 架构是否与目标进程匹配
                             int dllArch = GetPeArchitecture(extraDll);
-
-                            // 如果无法读取架构(0)或架构不匹配 则跳过
-                            if (dllArch != 0 && dllArch != targetArch) {
-                                continue;
-                            }
-
-                            // 3. 执行注入
+                            if (dllArch != 0 && dllArch != targetArch) continue;
                             if (InjectDllDirectly(pPI->hProcess, extraDll)) {
                                 DebugLog(L"ChildHook: Extra DLL Injected -> %s", extraDll.c_str());
                             }
                         }
-
                     } else {
                         DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
                     }
+                    
+                    // 无论成功失败，最后关闭句柄
+                    if (hEvent) CloseHandle(hEvent);
                 }
             }
 
@@ -8995,15 +8989,18 @@ BOOL CreateProcessInternal(
             // --- 策略 C: IPC 回退 (仅当上述都失败时) ---
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
+                
+                //[关键修复] 同样必须在请求前创建 Event
+                std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+                HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+                
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-				// [建议] 即使是 IPC 请求 也在这里等一下
-				std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-				HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-				if (hEvent) {
-					WaitForSingleObject(hEvent, 5000);
-					CloseHandle(hEvent);
-				}
-			}
+                
+                if (hEvent) {
+                    WaitForSingleObject(hEvent, 5000);
+                    CloseHandle(hEvent);
+                }
+            }
 
         } else {
             // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
