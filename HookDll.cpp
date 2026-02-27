@@ -202,7 +202,6 @@
 #define FileAllInformation ((FILE_INFORMATION_CLASS)18)
 #endif
 
-// 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
 #endif
@@ -211,8 +210,6 @@
 #define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
 #endif
 
-// 2. 补充 FILE_INFORMATION_CLASS 枚举值
-// winternl.h 通常只定义了部分值 这里使用宏强制补充
 #ifndef FileDirectoryInformation
 #define FileDirectoryInformation ((FILE_INFORMATION_CLASS)1)
 #endif
@@ -300,62 +297,6 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
-
-// --- [新增] 事务注册表相关函数指针 ---
-typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(
-    PHANDLE KeyHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    ULONG TitleIndex,
-    PUNICODE_STRING Class,
-    ULONG CreateOptions,
-    HANDLE TransactionHandle,
-    PULONG Disposition
-);
-
-typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(
-    PHANDLE KeyHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    HANDLE TransactionHandle
-);
-
-typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
-    HANDLE KeyHandle,
-    PKEY_VALUE_ENTRY ValueEntries,
-    ULONG EntryCount,
-    PVOID ValueBuffer,
-    PULONG BufferLength,
-    PULONG RequiredBufferLength
-);
-
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(
-    HANDLE KeyHandle,
-    HANDLE Event,
-    PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    ULONG CompletionFilter,
-    BOOLEAN WatchTree,
-    PVOID Buffer,
-    ULONG BufferSize,
-    BOOLEAN Asynchronous
-);
-
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
-    HANDLE MasterKeyHandle,
-    ULONG Count,
-    POBJECT_ATTRIBUTES SlaveObjects,
-    HANDLE Event,
-    PIO_APC_ROUTINE ApcRoutine,
-    PVOID ApcContext,
-    PIO_STATUS_BLOCK IoStatusBlock,
-    ULONG CompletionFilter,
-    BOOLEAN WatchTree,
-    PVOID Buffer,
-    ULONG BufferSize,
-    BOOLEAN Asynchronous
-);
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -691,7 +632,6 @@ typedef struct _FILE_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_BOTH_DIR_INFORMATION, *PFILE_BOTH_DIR_INFORMATION;
 
-// FILE_DIRECTORY_INFORMATION 结构体
 typedef struct _FILE_DIRECTORY_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -706,7 +646,6 @@ typedef struct _FILE_DIRECTORY_INFORMATION {
     WCHAR FileName[1];
 } FILE_DIRECTORY_INFORMATION, *PFILE_DIRECTORY_INFORMATION;
 
-// FILE_ID_BOTH_DIR_INFORMATION 结构体
 typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -725,7 +664,6 @@ typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
 
-// [新增] 补充缺失的目录信息结构体
 typedef struct _FILE_NAMES_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -753,21 +691,16 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
-typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(
-    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
-    DWORD dwFlags,
-    DWORD_PTR Attribute,
-    PVOID lpValue,
-    SIZE_T cbSize,
-    PVOID lpPreviousValue,
-    PSIZE_T lpReturnSize
-);
 
-typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(
-    PROCESS_MITIGATION_POLICY MitigationPolicy,
-    PVOID lpBuffer,
-    SIZE_T dwLength
-);
+typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags, DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize);
+typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
+
+// --- [新增] 事务注册表相关函数指针 ---
+typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, HANDLE TransactionHandle, PULONG Disposition);
+typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, HANDLE TransactionHandle);
+typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(HANDLE KeyHandle, PKEY_VALUE_ENTRY ValueEntries, ULONG EntryCount, PVOID ValueBuffer, PULONG BufferLength, PULONG RequiredBufferLength);
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(HANDLE KeyHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(HANDLE MasterKeyHandle, ULONG Count, POBJECT_ATTRIBUTES SlaveObjects, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
 
 typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
@@ -804,6 +737,7 @@ typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID
 typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
+
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
@@ -8804,7 +8738,7 @@ bool IsWerFaultProcess(const std::wstring& exePath) {
 }
 
 // [新增] 修复批处理文件的命令行 (批处理处理)
-// 确保重定向后的批处理路径被正确加上双引号，并与原参数拼接
+// 确保重定向后的批处理路径被正确加上双引号 并与原参数拼接
 std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
     std::wstring fixedCmd = L"\"" + exePath + L"\"";
 
@@ -8923,12 +8857,12 @@ BOOL CreateProcessInternal(
                 finalAppName = redirectedExe.c_str();
             }
         } else {
-            // 关键修复：如果是批处理文件，lpApplicationName 必须强制为 NULL
+            // 关键修复：如果是批处理文件 lpApplicationName 必须强制为 NULL
             // 否则 CreateProcess 会返回 ERROR_BAD_EXE_FORMAT (193)
             finalAppName = nullptr;
         }
     } else if (isBatchFile) {
-        // 即使没有重定向，只要是批处理，也强制置空
+        // 即使没有重定向 只要是批处理 也强制置空
         finalAppName = nullptr;
     }
 
@@ -9067,7 +9001,7 @@ BOOL CreateProcessInternal(
         if (IsWerFaultProcess(targetExe)) {
             DebugLog(L"ChildHook: Ignored WerFault.exe to prevent crash loops -> PID %d", pPI->dwProcessId);
 
-            // 绝对不注入 WerFault，直接恢复线程让其正常收集崩溃信息或退出
+            // 绝对不注入 WerFault 直接恢复线程让其正常收集崩溃信息或退出
             if (!callerWantedSuspended) {
                 ResumeThread(pPI->hThread);
             }
@@ -9246,14 +9180,14 @@ BOOL WINAPI Detour_SetProcessMitigationPolicy(
     SIZE_T dwLength)
 {
     // ProcessDynamicCodePolicy 的值为 8
-    // 此策略一旦启用，会禁止进程创建动态代码或修改现有可执行代码，这会导致Hook失败
+    // 此策略一旦启用 会禁止进程创建动态代码或修改现有可执行代码 这会导致Hook失败
     if (MitigationPolicy == ProcessDynamicCodePolicy) {
         DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(ProcessDynamicCodePolicy).");
-        // 直接返回 TRUE，假装成功设置，但不调用原始函数，从而阻止该策略生效
+        // 直接返回 TRUE 假装成功设置 但不调用原始函数 从而阻止该策略生效
         return TRUE;
     }
 
-    // 对于其他策略，正常调用原始函数
+    // 对于其他策略 正常调用原始函数
     return fpSetProcessMitigationPolicy(MitigationPolicy, lpBuffer, dwLength);
 }
 
@@ -10545,62 +10479,39 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
+    // --- 组 B: 进程创建 Hook ---
     if (g_HookChild) {
+        // 定义一个辅助 Lambda 减少重复的 GetProcAddress 和 MH_CreateHook 逻辑
+        auto HookApi = [](const wchar_t* moduleName, const char* funcName, LPVOID detour, LPVOID* original) {
+            HMODULE hMod = GetModuleHandleW(moduleName);
+            if (!hMod) hMod = LoadLibraryW(moduleName); // 如果没加载则尝试加载
+            if (hMod) {
+                void* pFunc = (void*)GetProcAddress(hMod, funcName);
+                if (pFunc) {
+                    return MH_CreateHook(pFunc, detour, original) == MH_OK;
+                }
+            }
+            return false;
+        };
+
+        // 1. 直接链接的 API (Kernel32)
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
-        // [新增] 挂钩进程缓解策略相关函数
-        // 这些函数通常位于 kernelbase.dll 或 kernel32.dll
-        HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
-        if (!hKernelBase) {
-            hKernelBase = GetModuleHandleW(L"kernel32.dll");
-        }
+        // 2. KernelBase / Kernel32 组 (缓解策略与 WinExec)
+        const wchar_t* kBase = GetModuleHandleW(L"kernelbase.dll") ? L"kernelbase.dll" : L"kernel32.dll";
+        HookApi(kBase, "UpdateProcThreadAttribute",  &Detour_UpdateProcThreadAttribute,  reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
+        HookApi(kBase, "SetProcessMitigationPolicy", &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
+        HookApi(L"kernel32.dll", "WinExec",          &Detour_WinExec,                    reinterpret_cast<LPVOID*>(&fpWinExec));
 
-        if (hKernelBase) {
-            // 挂钩 UpdateProcThreadAttribute
-            void* pUpdateProcThreadAttribute = (void*)GetProcAddress(hKernelBase, "UpdateProcThreadAttribute");
-            if (pUpdateProcThreadAttribute) {
-                MH_CreateHook(pUpdateProcThreadAttribute, &Detour_UpdateProcThreadAttribute, reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
-            }
+        // 3. Shell32 组
+        HookApi(L"shell32.dll", "ShellExecuteExW",   &Detour_ShellExecuteExW,            reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
 
-            // 挂钩 SetProcessMitigationPolicy
-            void* pSetProcessMitigationPolicy = (void*)GetProcAddress(hKernelBase, "SetProcessMitigationPolicy");
-            if (pSetProcessMitigationPolicy) {
-                MH_CreateHook(pSetProcessMitigationPolicy, &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
-            }
-        }
-
-        // [新增] 挂钩 WinExec
-        // 很多老程序(VB6/Delphi)使用此 API 启动子进程
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            void* pWinExec = (void*)GetProcAddress(hKernel32, "WinExec");
-            if (pWinExec) {
-                MH_CreateHook(pWinExec, &Detour_WinExec, reinterpret_cast<LPVOID*>(&fpWinExec));
-            }
-        }
-
-        // [新增] 挂钩 ShellExecuteExW
-        HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
-        if (hShell32) {
-            void* pShellExecuteExW = (void*)GetProcAddress(hShell32, "ShellExecuteExW");
-            if (pShellExecuteExW) {
-                MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
-            }
-        }
-
-        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
-        if (hAdvapi32) {
-            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
-            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
-            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
-            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
-            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
-        }
+        // 4. Advapi32 组
+        HookApi(L"advapi32.dll", "CreateProcessAsUserW",    &Detour_CreateProcessAsUserW,    reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
+        HookApi(L"advapi32.dll", "CreateProcessAsUserA",    &Detour_CreateProcessAsUserA,    reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
+        HookApi(L"advapi32.dll", "CreateProcessWithTokenW", &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+        HookApi(L"advapi32.dll", "CreateProcessWithLogonW", &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
     }
 
     // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
