@@ -5781,40 +5781,6 @@ bool NtPathExists(const std::wstring& ntPath) {
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
-// [新增] 初始化管道前缀 (在 InitHookThread 中调用)
-void InitPipeVirtualization() {
-    DWORD sessionId = 0;
-    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
-
-    // 生成唯一前缀 格式: YapBox_<SessionId>_
-    // 这样不同 Session 的沙盒不会冲突 且与真实管道区分开
-    wchar_t buf[64];
-    swprintf_s(buf, L"YapBox_%08x_", sessionId);
-    g_PipePrefix = buf;
-}
-
-// [新增] 计算虚拟化管道路径
-// 输入: \Device\NamedPipe\MyPipe
-// 输出: \Device\NamedPipe\YapBox_00000001_MyPipe
-bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
-    const std::wstring pipeDevice = L"\\Device\\NamedPipe\\";
-
-    // 检查是否为命名管道路径
-    if (fullNtPath.size() > pipeDevice.size() &&
-        _wcsnicmp(fullNtPath.c_str(), pipeDevice.c_str(), pipeDevice.size()) == 0) {
-
-        std::wstring pipeName = fullNtPath.substr(pipeDevice.size());
-
-        // 检查是否已经被虚拟化 (防止重复添加前缀)
-        if (pipeName.find(g_PipePrefix) == 0) return false;
-
-        // 构造虚拟化路径
-        outBoxedPath = pipeDevice + g_PipePrefix + pipeName;
-        return true;
-    }
-    return false;
-}
-
 // [新增] 虚拟光驱路径重定向辅助类 (RAII)
 class VirtualCdRedirector {
 public:
