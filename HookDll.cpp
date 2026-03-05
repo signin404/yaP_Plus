@@ -2664,6 +2664,17 @@ bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& 
         outType = REG_DWORD; outData = 0; return true;
     }
 
+    // ========== [新增] 4. 现代应用 (UWP/RT) 防御性伪造 ==========
+    // 阻止 Win32 进程获取 UWP 包信息，防止其误入现代应用代码分支导致死锁或崩溃
+    if (proc == L"chrome.exe" || proc == L"msedge.exe" || proc == L"firefox.exe" || proc == L"dllhost.exe") {
+        if (_wcsicmp(valueName.c_str(), L"PackageId") == 0 ||
+            _wcsicmp(valueName.c_str(), L"PackageFamilyName") == 0 ||
+            _wcsicmp(valueName.c_str(), L"AppUserModelId") == 0) {
+            outType = 0xFFFFFFFF; // 特殊标记：强制隐藏
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -3108,6 +3119,35 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     // 路径形如 \REGISTRY\A\... 必须直通 否则现代应用无法运行
     if (lowerPath.compare(0, 13, L"\\registry\\a\\") == 0) return true;
 
+    return false;
+}
+
+// [新增] 针对特定进程的防御性路径拦截 (UWP/RT 兼容性)
+// 移植自 Sandboxie Com_IsClosedRT 逻辑
+bool IsDefensiveSpoofPath(const std::wstring& fullNtPath) {
+    const std::wstring& proc = GetCurrentProcessNameLower();
+
+    // 仅针对容易因 UWP API 崩溃的浏览器或代理进程
+    if (proc == L"chrome.exe" || proc == L"msedge.exe" || proc == L"firefox.exe" || proc == L"dllhost.exe") {
+        std::wstring lowerPath = fullNtPath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+        // 1. 拦截 AppModel 注册表树 (阻止 Win32 程序读取 UWP 状态)
+        if (lowerPath.find(L"\\currentversion\\appmodel") != std::wstring::npos) {
+            return true;
+        }
+
+        // 2. 拦截特定的 RT 类注册 (对应 Sandboxie 的 Com_IsClosedRT)
+        // Windows.System.Launcher: Chrome 查不到会正常回退，查到但 COM 权限不足会直接崩溃
+        if (lowerPath.find(L"windows.system.launcher") != std::wstring::npos) {
+            return true;
+        }
+
+        // Windows.UI.Notifications.ToastNotificationManager: 容易导致死锁
+        if (lowerPath.find(L"toastnotificationmanager") != std::wstring::npos) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -3580,6 +3620,11 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
         ULONG fakeType = REG_DWORD;
 
         if (TryGetAppCompatValue(queryName, fakeData, fakeType)) {
+            // [新增] 处理强制隐藏标记
+            if (fakeType == 0xFFFFFFFF) {
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+
             ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD);
 
             if (ResultLength) *ResultLength = requiredSize;
@@ -3805,6 +3850,11 @@ NTSTATUS NTAPI Detour_NtCreateKey(
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    if (IsDefensiveSpoofPath(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     // --- 1. 白名单检查 (保持不变) ---
     std::wstring realPathCandidate;
@@ -4113,6 +4163,11 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
     // 1. 解析完整路径
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
+    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    if (IsDefensiveSpoofPath(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     // 2. 检查是否为沙盒路径并获取真实路径候选
     bool isSandboxPath = false;
     std::wstring realPathCandidate;
@@ -4316,6 +4371,12 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
 
     // 1. 解析路径与白名单检查
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    if (IsDefensiveSpoofPath(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
 
@@ -5009,6 +5070,11 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
 
+    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    if (IsDefensiveSpoofPath(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     // --- 1. 白名单检查 ---
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
@@ -5289,6 +5355,12 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
     RecursionGuard guard;
 
     std::wstring fullNtPath = ResolveRegPathFromAttr(ObjectAttributes);
+
+    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    if (IsDefensiveSpoofPath(fullNtPath)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     std::wstring realPathCandidate;
     bool isSandboxPath = false;
 
