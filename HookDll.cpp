@@ -130,8 +130,12 @@
 #define STATUS_KEY_DELETED ((NTSTATUS)0xC000017C)
 #endif
 
+#ifndef KeyCachedInformation
+#define KeyCachedInformation 4
+#endif
+
 #ifndef KeyFlagsInformation
-#define KeyFlagsInformation ((KEY_INFORMATION_CLASS)9)
+#define KeyFlagsInformation 9
 #endif
 
 #ifndef STATUS_SUCCESS
