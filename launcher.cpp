@@ -3024,14 +3024,30 @@ bool EnsureHiveFileExists(const std::wstring& hivePath) {
         return false;
     }
 
-    // 初始化基础结构 (Machine 和 User 根键)
+    // [修改] 预创建基础 COM 键和核心骨架
+    // 移植自 Sandboxie Key_CreateBaseKeys 确保 COM 和 Explorer 相关的深层路径存在
+    // 这样可以避免惰性 CoW 在首次打开深层子键时因为父键不存在而失败
+    const wchar_t* baseKeys[] = {
+        // HKLM 基础骨架
+        L"Machine\\System",
+        L"Machine\\Software\\Classes", // COM 核心
+        L"Machine\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+
+        // HKCU 基础骨架
+        L"User\\Software\\Classes",    // COM 核心 (用户层)
+        L"User\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+
+        // HKU 根
+        L"Users"
+    };
+
     HKEY hSub;
-    if (RegCreateKeyW(hTempKey, L"Machine", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
-    if (RegCreateKeyW(hTempKey, L"User", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
-    // [新增] 初始化额外的根键映射目录
-    if (RegCreateKeyW(hTempKey, L"Classes", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
-    if (RegCreateKeyW(hTempKey, L"Users", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
-    if (RegCreateKeyW(hTempKey, L"Config", &hSub) == ERROR_SUCCESS) RegCloseKey(hSub);
+    for (const wchar_t* keyPath : baseKeys) {
+        // RegCreateKeyW 会递归创建不存在的父键
+        if (RegCreateKeyW(hTempKey, keyPath, &hSub) == ERROR_SUCCESS) {
+            RegCloseKey(hSub);
+        }
+    }
 
     // 保存到文件 (需要 SeBackupPrivilege 已在 EnableAllPrivileges 中启用)
     // 注意：RegSaveKey 要求目标文件不存在

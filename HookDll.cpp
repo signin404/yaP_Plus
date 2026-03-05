@@ -2665,7 +2665,7 @@ bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& 
     }
 
     // ========== [新增] 4. 现代应用 (UWP/RT) 防御性伪造 ==========
-    // 阻止 Win32 进程获取 UWP 包信息，防止其误入现代应用代码分支导致死锁或崩溃
+    // 阻止 Win32 进程获取 UWP 包信息 防止其误入现代应用代码分支导致死锁或崩溃
     if (proc == L"chrome.exe" || proc == L"msedge.exe" || proc == L"firefox.exe" || proc == L"dllhost.exe") {
         if (_wcsicmp(valueName.c_str(), L"PackageId") == 0 ||
             _wcsicmp(valueName.c_str(), L"PackageFamilyName") == 0 ||
@@ -2740,7 +2740,7 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     if (pathLen == 0) return L"";
     szPath[pathLen] = L'\0';
 
-    // ========== [优化] 路径规范化 (就地小写转换，避免 std::transform 拷贝) ==========
+    // ========== [优化] 路径规范化 (就地小写转换 避免 std::transform 拷贝) ==========
     WCHAR szLower[2048];
     for (size_t i = 0; i < pathLen; ++i) {
         szLower[i] = towlower(szPath[i]);
@@ -2790,7 +2790,7 @@ std::wstring GetNameFromHandle(HANDLE hKey) {
         PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)stackBuf;
         return std::wstring(info->Name, info->NameLength / sizeof(WCHAR));
     }
-    // 只有当路径极长导致栈内存不足时，才回退到堆分配
+    // 只有当路径极长导致栈内存不足时 才回退到堆分配
     else if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
         std::vector<BYTE> heapBuf(len + 2);
         if (NT_SUCCESS(fpNtQueryKey(hKey, KeyNameInformation, heapBuf.data(), len, &len))) {
@@ -3045,12 +3045,6 @@ bool GetRealFromSandboxPath(const std::wstring& sandboxPath, std::wstring& outRe
     else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
         outReal = g_CurrentUserSidPath + sub.substr(4);
     }
-    else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
-    }
-    else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
-        outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
-    }
     else {
         return false;
     }
@@ -3082,7 +3076,7 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     size_t len = path.length();
     if (len == 0 || len >= 1024) return false; // 异常超长路径直接放行
 
-    // [优化] 使用栈内存进行小写转换，避免 std::wstring 拷贝和 std::transform
+    // [优化] 使用栈内存进行小写转换 避免 std::wstring 拷贝和 std::transform
     WCHAR szLower[1024];
     for (size_t i = 0; i < len; ++i) {
         szLower[i] = towlower(path[i]);
@@ -3093,15 +3087,6 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     auto contains = [&](const wchar_t* sub) {
         return wcsstr(szLower, sub) != nullptr;
     };
-
-    // 1. Classes (COM 组件) - 核心修复
-    // 匹配 \Software\Classes 和 \Software\Wow6432Node\Classes
-    // if (contains(L"\\software\\classes") || contains(L"\\software\\wow6432node\\classes")) return true;
-
-    // [新增] 每用户 COM 类配置单元 \REGISTRY\USER\SID_Classes (Vista+ HKCR 合并视图)
-    // 路径形如 \REGISTRY\USER\S-1-5-21-xxx_Classes\CLSID\...
-    // if (contains(L"_classes\\") ||
-		// (lowerPath.length() >= 8 && lowerPath.compare(lowerPath.length() - 8, 8, L"_classes") == 0)) return true;
 
     // 2. 音频与多媒体
     if (contains(L"mmdevices")) return true;
@@ -3160,7 +3145,7 @@ bool IsDefensiveSpoofPath(const std::wstring& fullNtPath) {
         }
 
         // 2. 拦截特定的 RT 类注册 (对应 Sandboxie 的 Com_IsClosedRT)
-        // Windows.System.Launcher: Chrome 查不到会正常回退，查到但 COM 权限不足会直接崩溃
+        // Windows.System.Launcher: Chrome 查不到会正常回退 查到但 COM 权限不足会直接崩溃
         if (lowerPath.find(L"windows.system.launcher") != std::wstring::npos) {
             return true;
         }
@@ -3189,29 +3174,7 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
     // 定义各根键的 NT 路径前缀
     std::wstring prefixMachine = L"\\REGISTRY\\MACHINE";
     std::wstring prefixUser = g_CurrentUserSidPath;
-    // std::wstring prefixClasses = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
     std::wstring prefixUsersRoot = L"\\REGISTRY\\USER";
-    std::wstring prefixConfig = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
-
-    /*
-    // 1. 匹配 HKCR (优先级高于 HKLM)
-    if (_wcsnicmp(fullNtPath.c_str(), prefixClasses.c_str(), prefixClasses.length()) == 0) {
-        std::wstring sub = fullNtPath.substr(prefixClasses.length());
-        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
-        relPathOut = L"Classes";
-        if (!sub.empty()) relPathOut += L"\\" + sub;
-        return true;
-    }
-    */
-
-    // 2. 匹配 HKCC
-    if (_wcsnicmp(fullNtPath.c_str(), prefixConfig.c_str(), prefixConfig.length()) == 0) {
-        std::wstring sub = fullNtPath.substr(prefixConfig.length());
-        if (!sub.empty() && sub[0] == L'\\') sub = sub.substr(1);
-        relPathOut = L"Config";
-        if (!sub.empty()) relPathOut += L"\\" + sub;
-        return true;
-    }
 
     // 3. 匹配 HKCU
     if (_wcsnicmp(fullNtPath.c_str(), prefixUser.c_str(), prefixUser.length()) == 0) {
@@ -3351,12 +3314,6 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
         else if (_wcsicmp(sub.c_str(), L"User") == 0 || _wcsnicmp(sub.c_str(), L"User\\", 5) == 0) {
             outReal = g_CurrentUserSidPath + sub.substr(4);
         }
-        else if (_wcsicmp(sub.c_str(), L"Classes") == 0 || _wcsnicmp(sub.c_str(), L"Classes\\", 8) == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes" + sub.substr(7);
-        }
-        else if (_wcsicmp(sub.c_str(), L"Config") == 0 || _wcsnicmp(sub.c_str(), L"Config\\", 7) == 0) {
-            outReal = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current" + sub.substr(6);
-        }
         else {
             return false;
         }
@@ -3406,7 +3363,7 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
 
             // ========== [新增] 修复 HKCU\Software\Classes 的枚举名称 ==========
             // 如果当前枚举的父路径是 \REGISTRY\USER\SID\Software
-            // 且子键名称包含 _Classes，强制将其改写为 "Classes"
+            // 且子键名称包含 _Classes 强制将其改写为 "Classes"
             if (name.length() > 8 && name.compare(name.length() - 8, 8, L"_Classes") == 0) {
                 std::wstring lowerParent = path;
                 std::transform(lowerParent.begin(), lowerParent.end(), lowerParent.begin(), towlower);
@@ -3491,7 +3448,7 @@ HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
     // 只读打开
     NTSTATUS status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa);
 
-    //[新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
+    //[新增] WOW64 视图穿透：如果 32 位程序找不到键 尝试强制读取 64 位视图
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
         status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oa);
     }
@@ -4327,7 +4284,7 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
 
             NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal);
 
-            // [新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
+            // [新增] WOW64 视图穿透：如果 32 位程序找不到键 尝试强制读取 64 位视图
             if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process && !(fallbackAccess & KEY_WOW64_64KEY)) {
                 realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess | KEY_WOW64_64KEY, &oaReal);
             }
@@ -4968,7 +4925,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         // ========== [新增] COM 根键删除保护 ==========
         std::wstring realPathForCheck;
         if (GetRealFromSandboxPath(path, realPathForCheck) && IsProtectedCOMKey(realPathForCheck)) {
-            // 拒绝删除核心 COM 目录，防止沙盒内系统组件大面积瘫痪
+            // 拒绝删除核心 COM 目录 防止沙盒内系统组件大面积瘫痪
             return STATUS_ACCESS_DENIED;
         }
 
@@ -5808,8 +5765,8 @@ NTSTATUS NTAPI Detour_NtNotifyChangeMultipleKeys(
     NTSTATUS status = fpNtNotifyChangeMultipleKeys(hTargetKey, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
 
     // ========== [新增] 修复沙盒内同 Hive 监控冲突 ==========
-    // 如果内核抱怨参数无效，且存在从属监控对象 (SlaveObjects)，说明触发了同 Hive 冲突
-    // 解决办法：丢弃从属对象，仅监控主对象 (这足以让 Explorer 正常工作)
+    // 如果内核抱怨参数无效 且存在从属监控对象 (SlaveObjects) 说明触发了同 Hive 冲突
+    // 解决办法：丢弃从属对象 仅监控主对象 (这足以让 Explorer 正常工作)
     if (status == STATUS_INVALID_PARAMETER && Count > 0) {
         status = fpNtNotifyChangeMultipleKeys(hTargetKey, 0, NULL, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
     }
