@@ -126,6 +126,18 @@
 #define KEY_WOW64_64KEY 0x0100
 #endif
 
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH      ((NTSTATUS)0xC0000004L)
+#endif
+
+#ifndef STATUS_KEY_DELETED
+#define STATUS_KEY_DELETED               ((NTSTATUS)0xC000017CL)
+#endif
+
+#ifndef KeyCachedInformation
+#define KeyCachedInformation (KEY_INFORMATION_CLASS)4
+#endif
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #endif
@@ -297,6 +309,17 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+typedef struct _KEY_CACHED_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG TitleIndex;
+    ULONG SubKeys;
+    ULONG MaxNameLen;
+    ULONG Values;
+    ULONG MaxValueNameLen;
+    ULONG MaxValueDataLen;
+    ULONG NameLength;
+} KEY_CACHED_INFORMATION, *PKEY_CACHED_INFORMATION;
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
