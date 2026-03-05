@@ -126,6 +126,14 @@
 #define KEY_WOW64_64KEY 0x0100
 #endif
 
+#ifndef STATUS_KEY_DELETED
+#define STATUS_KEY_DELETED ((NTSTATUS)0xC000017C)
+#endif
+
+#ifndef KeyCachedInformation
+#define KeyCachedInformation (KEY_INFORMATION_CLASS)4
+#endif
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #endif
@@ -297,6 +305,17 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+typedef struct _KEY_CACHED_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         SubKeys;
+    ULONG         MaxNameLen;
+    ULONG         Values;
+    ULONG         MaxValueNameLen;
+    ULONG         MaxValueDataLen;
+    ULONG         NameLength;
+} KEY_CACHED_INFORMATION, *PKEY_CACHED_INFORMATION;
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -5108,12 +5127,12 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     RecursionGuard guard;
 
     // 1. 基础信息查询：检查逻辑删除标记 (墓碑)
-    if (KeyInformationClass == KeyBasicInformation || 
-        KeyInformationClass == KeyNodeInformation || 
+    if (KeyInformationClass == KeyBasicInformation ||
+        KeyInformationClass == KeyNodeInformation ||
         KeyInformationClass == KeyFlagsInformation) {
-        
+
         NTSTATUS status = fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
-        
+
         // 即使缓冲区溢出，LastWriteTime 通常也是有效的（位于结构体头部）
         if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
             // 所有这些结构体的第一个成员都是 LARGE_INTEGER LastWriteTime
@@ -5151,7 +5170,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
         PKEY_NAME_INFORMATION pInfo = (PKEY_NAME_INFORMATION)KeyInformation;
         pInfo->NameLength = (ULONG)(spoofedPath.length() * sizeof(WCHAR));
         memcpy(pInfo->Name, spoofedPath.c_str(), pInfo->NameLength);
-        
+
         return STATUS_SUCCESS;
     }
 
@@ -5201,7 +5220,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
                     EnumerateKeysToMap(g_CurrentUserSidPath + L"\\Software\\Classes" + subPath, mergedKeys);
                 }
                 EnumerateKeysToMap(sandboxPath, mergedKeys);
-                
+
                 // 过滤子键墓碑
                 for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
                     if (IsDeleteMark(it->second.LastWriteTime)) it = mergedKeys.erase(it);
@@ -5268,12 +5287,12 @@ NTSTATUS NTAPI Detour_NtQueryKey(
             ULONG reqSize = sizeof(KEY_FULL_INFORMATION); // ClassOffset 动态计算，这里简化处理
             // 注意：如果 ClassLength > 0，需要额外空间。但通常 RegQueryInfoKey 第一次调用只传 NULL 或小 buffer
             // 只要返回的统计数据正确，程序会再次分配内存。这里我们主要保证统计字段正确。
-            
+
             if (ResultLength) *ResultLength = reqSize + maxClassLen;
             if (Length < reqSize) return STATUS_BUFFER_TOO_SMALL;
 
             PKEY_FULL_INFORMATION pInfo = (PKEY_FULL_INFORMATION)KeyInformation;
-            
+
             // 获取 LastWriteTime (使用当前句柄的，或者取最大的子键时间？通常取当前键的即可)
             // 为了简单，调用一次原始函数获取 LastWriteTime
             {
@@ -5289,15 +5308,15 @@ NTSTATUS NTAPI Detour_NtQueryKey(
             pInfo->TitleIndex = 0;
             pInfo->ClassOffset = -1;
             pInfo->ClassLength = 0; // 暂不处理 Class 字符串回填，只处理长度统计
-            
+
             pInfo->SubKeys = (ULONG)ctx->SubKeys.size();
             pInfo->MaxNameLen = maxSubKeyNameLen;
             pInfo->MaxClassLen = maxClassLen;
-            
+
             pInfo->Values = (ULONG)ctx->Values.size();
             pInfo->MaxValueNameLen = maxValueNameLen;
             pInfo->MaxValueDataLen = maxValueDataLen;
-            
+
             return STATUS_SUCCESS;
         }
         else if (KeyInformationClass == KeyCachedInformation) {
@@ -5306,7 +5325,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
             if (Length < reqSize) return STATUS_BUFFER_TOO_SMALL;
 
             PKEY_CACHED_INFORMATION pInfo = (PKEY_CACHED_INFORMATION)KeyInformation;
-            
+
             // 同样获取 LastWriteTime
             {
                 KEY_BASIC_INFORMATION kbi;
