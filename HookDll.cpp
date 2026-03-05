@@ -3416,7 +3416,14 @@ HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
     // 只读打开
-    if (NT_SUCCESS(fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+    NTSTATUS status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa);
+
+    //[新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+        status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oa);
+    }
+
+    if (NT_SUCCESS(status)) {
         return hReal;
     }
     return NULL;
@@ -3549,28 +3556,6 @@ NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
 
     // 需要 KEY_SET_VALUE 权限
     return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
-}
-
-// [新增] 尝试打开对应的真实键 (用于读取回退)
-HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
-    HANDLE hReal = NULL;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uStr;
-    RtlInitUnicodeString(&uStr, realPath.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    // 只读打开
-    NTSTATUS status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa);
-
-    //[新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
-    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
-        status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oa);
-    }
-
-    if (NT_SUCCESS(status)) {
-        return hReal;
-    }
-    return NULL;
 }
 
 // --- 注册表 NT API Hook 实现 ---
