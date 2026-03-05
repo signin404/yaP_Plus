@@ -3551,6 +3551,28 @@ NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
     return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
 
+// [新增] 尝试打开对应的真实键 (用于读取回退)
+HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
+    HANDLE hReal = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, realPath.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 只读打开
+    NTSTATUS status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa);
+
+    //[新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+        status = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oa);
+    }
+
+    if (NT_SUCCESS(status)) {
+        return hReal;
+    }
+    return NULL;
+}
+
 // --- 注册表 NT API Hook 实现 ---
 NTSTATUS NTAPI Detour_NtQueryValueKey(
     HANDLE KeyHandle,
@@ -3930,7 +3952,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                     InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
                     // 打开真实键
-                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                    NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck);
+
+                    //[新增] WOW64 视图穿透：确保 32 位程序能正确屏蔽 64 位视图中的真实值
+                    if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                        realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaRealCheck);
+                    }
+
+                    if (NT_SUCCESS(realStatus)) {
                         ULONG idx = 0, vlen = 0;
                         BYTE staticValBuf[4096]; // 使用栈内存
                         BYTE dummyByte = 0;
@@ -3978,7 +4007,12 @@ NTSTATUS NTAPI Detour_NtCreateKey(
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            NTSTATUS ctxStatus = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            //[新增] WOW64 视图穿透：确保 Context 缓存能正确绑定到 64 位真实键
+            if (ctxStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaReal);
+            }
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
@@ -4035,7 +4069,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         UNICODE_STRING usRealCheck;
                         RtlInitUnicodeString(&usRealCheck, realPathForTombstone.c_str());
                         InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+
+                        NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck);
+                        // [新增] WOW64 视图穿透
+                        if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                            realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaRealCheck);
+                        }
+
+                        if (NT_SUCCESS(realStatus)) {
                             ULONG idx = 0, vlen = 0;
                             BYTE staticValBuf[4096];
                             BYTE dummyByte = 0;
@@ -4177,7 +4218,14 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal))) {
+            NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal);
+
+            // [新增] WOW64 视图穿透：如果 32 位程序找不到键，尝试强制读取 64 位视图
+            if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process && !(fallbackAccess & KEY_WOW64_64KEY)) {
+                realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess | KEY_WOW64_64KEY, &oaReal);
+            }
+
+            if (NT_SUCCESS(realStatus)) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
                     std::wstring relPathToCreate;
@@ -4248,7 +4296,12 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            NTSTATUS ctxStatus = fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            // [新增] WOW64 视图穿透
+            if (ctxStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaReal);
+            }
         }
 
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
@@ -4368,7 +4421,14 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
             ACCESS_MASK fallbackAccess = DesiredAccess & ~(KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | DELETE | WRITE_DAC | WRITE_OWNER);
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
-            if (NT_SUCCESS(fpNtOpenKeyEx(&hRealCheck, fallbackAccess, &oaReal, OpenOptions))) {
+            NTSTATUS realStatus = fpNtOpenKeyEx(&hRealCheck, fallbackAccess, &oaReal, OpenOptions);
+
+            // [新增] WOW64 视图穿透
+            if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process && !(fallbackAccess & KEY_WOW64_64KEY)) {
+                realStatus = fpNtOpenKeyEx(&hRealCheck, fallbackAccess | KEY_WOW64_64KEY, &oaReal, OpenOptions);
+            }
+
+            if (NT_SUCCESS(realStatus)) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write (惰性模式：只创建空键)
                     std::wstring relPathToCreate;
@@ -4438,7 +4498,12 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions);
+
+            NTSTATUS ctxStatus = fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal, OpenOptions);
+            // [新增] WOW64 视图穿透
+            if (ctxStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                fpNtOpenKeyEx(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaReal, OpenOptions);
+            }
         }
 
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
@@ -5076,7 +5141,14 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                     InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
                     // 打开真实键 (非事务 只读检查)
-                    if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+                    NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck);
+
+                    // [新增] WOW64 视图穿透
+                    if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                        realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaRealCheck);
+                    }
+
+                    if (NT_SUCCESS(realStatus)) {
                         ULONG idx = 0, vlen = 0;
                         BYTE staticValBuf[4096];
                         BYTE dummyByte = 0;
@@ -5117,7 +5189,12 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, fullNtPath.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            NTSTATUS ctxStatus = fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            // [新增] WOW64 视图穿透
+            if (ctxStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                fpNtOpenKey(&hReal, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaReal);
+            }
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(*KeyHandle);
@@ -5171,7 +5248,14 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                         UNICODE_STRING usRealCheck;
                         RtlInitUnicodeString(&usRealCheck, realPathForTombstone.c_str());
                         InitializeObjectAttributes(&oaRealCheck, &usRealCheck, OBJ_CASE_INSENSITIVE, NULL, NULL);
-                        if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck))) {
+
+                        NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaRealCheck);
+                        // [新增] WOW64 视图穿透
+                        if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                            realStatus = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaRealCheck);
+                        }
+
+                        if (NT_SUCCESS(realStatus)) {
                             ULONG idx = 0, vlen = 0;
                             BYTE staticValBuf[4096];
                             BYTE dummyByte = 0;
@@ -5306,7 +5390,14 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
             if (fallbackAccess == 0) fallbackAccess = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
 
             // 检查真实键 (非事务 只读)
-            if (NT_SUCCESS(fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal))) {
+            NTSTATUS realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess, &oaReal);
+
+            // [新增] WOW64 视图穿透
+            if (realStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process && !(fallbackAccess & KEY_WOW64_64KEY)) {
+                realStatus = fpNtOpenKey(&hRealCheck, fallbackAccess | KEY_WOW64_64KEY, &oaReal);
+            }
+
+            if (NT_SUCCESS(realStatus)) {
                 if (IS_REG_WRITE_ACCESS(DesiredAccess)) {
                     // 写权限请求：执行 Copy-on-Write
                     std::wstring relPathToCreate;
@@ -5378,7 +5469,12 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
             UNICODE_STRING usReal;
             RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
             InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
-            fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+
+            NTSTATUS ctxStatus = fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, &oaReal);
+            // [新增] WOW64 视图穿透
+            if (ctxStatus == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                fpNtOpenKey(&hRealTarget, KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &oaReal);
+            }
         }
 
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
