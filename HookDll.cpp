@@ -2680,106 +2680,121 @@ bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& 
 
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
-    std::wstring fullPath;
+    WCHAR szPath[2048];
+    size_t pathLen = 0;
+    szPath[0] = L'\0';
 
     // 1. 解析 RootDirectory
     if (attr->RootDirectory) {
-        // 检查预定义句柄 (强制转换为 ULONG_PTR 比较)
         ULONG_PTR rootHandle = (ULONG_PTR)attr->RootDirectory;
 
         if (rootHandle == (ULONG_PTR)HKEY_CURRENT_USER) {
-             fullPath = g_CurrentUserSidPath;
+            pathLen = g_CurrentUserSidPath.length();
+            if (pathLen < 2048) wmemcpy(szPath, g_CurrentUserSidPath.c_str(), pathLen);
         }
         else if (rootHandle == (ULONG_PTR)HKEY_LOCAL_MACHINE) {
-             fullPath = L"\\REGISTRY\\MACHINE";
+            pathLen = 19; wmemcpy(szPath, L"\\REGISTRY\\MACHINE", pathLen);
         }
         else if (rootHandle == (ULONG_PTR)HKEY_CLASSES_ROOT) {
-             // HKCR 是合并视图 但在 NT 路径中通常映射到 Machine Classes
-             // 或者让系统去处理 但这里我们需要一个基准路径
-             fullPath = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+            pathLen = 34; wmemcpy(szPath, L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", pathLen);
         }
         else if (rootHandle == (ULONG_PTR)HKEY_USERS) {
-             fullPath = L"\\REGISTRY\\USER";
+            pathLen = 14; wmemcpy(szPath, L"\\REGISTRY\\USER", pathLen);
         }
         else if (rootHandle == (ULONG_PTR)HKEY_CURRENT_CONFIG) {
-             fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current";
+            pathLen = 60; wmemcpy(szPath, L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", pathLen);
         }
         else {
-            // 普通句柄 查询对象名称
             if (fpNtQueryObject) {
-                ULONG len = 0;
-                fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
-                if (len > 0) {
-                    std::vector<BYTE> buffer(len + 2); // +2 防止溢出
-                    if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, buffer.data(), len, &len))) {
-                        POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buffer.data();
-                        if (nameInfo->Name.Buffer) {
-                            fullPath.assign(nameInfo->Name.Buffer, nameInfo->Name.Length / sizeof(WCHAR));
+                // [优化] 使用栈内存替代 std::vector<BYTE>
+                BYTE queryBuf[1024];
+                ULONG retLen = 0;
+                if (NT_SUCCESS(fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, queryBuf, sizeof(queryBuf), &retLen))) {
+                    POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)queryBuf;
+                    if (nameInfo->Name.Buffer) {
+                        pathLen = nameInfo->Name.Length / sizeof(WCHAR);
+                        if (pathLen < 2048) {
+                            wmemcpy(szPath, nameInfo->Name.Buffer, pathLen);
+                        } else {
+                            pathLen = 0; // 防御性截断
                         }
                     }
                 }
             }
         }
 
-        if (!fullPath.empty() && fullPath.back() != L'\\') {
-            fullPath += L'\\';
+        if (pathLen > 0 && pathLen < 2048 && szPath[pathLen - 1] != L'\\') {
+            szPath[pathLen++] = L'\\';
         }
     }
 
     // 2. 拼接 ObjectName
     if (attr->ObjectName && attr->ObjectName->Buffer) {
-        fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
-    }
-
-    // ========== [新增] 路径规范化 (移植自 Sandboxie) ==========
-    if (!fullPath.empty()) {
-        std::wstring lowerPath = fullPath;
-        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-
-        // 1. 统一 ControlSetXXX 为 CurrentControlSet
-        // 匹配 \registry\machine\system\controlset001 等 (前缀长度 35)
-        if (lowerPath.compare(0, 35, L"\\registry\\machine\\system\\controlset") == 0 && lowerPath.length() >= 38) {
-            // 确保后面 3 个字符是数字 (例如 001, 002)
-            if (iswdigit(fullPath[35]) && iswdigit(fullPath[36]) && iswdigit(fullPath[37])) {
-                fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet" + fullPath.substr(38);
-                // 更新 lowerPath 以供后续匹配
-                lowerPath = fullPath;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-            }
-        }
-
-        // 2. 统一 \REGISTRY\USER\CURRENT 为 当前用户 SID
-        // 匹配 \registry\user\current (前缀长度 23)
-        if (lowerPath.compare(0, 23, L"\\registry\\user\\current") == 0) {
-            // 确保是完整路径节点 (末尾 或者以 \ 继续)
-            if (lowerPath.length() == 23 || lowerPath[23] == L'\\') {
-                fullPath = g_CurrentUserSidPath + fullPath.substr(23);
-                lowerPath = fullPath;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-            }
-        }
-
-        // 3. WinSxS (SideBySide) 重定向 (Vista+)
-        // 匹配 \registry\machine\software\microsoft\windows\currentversion\sidebyside (前缀长度 70)
-        if (lowerPath.compare(0, 70, L"\\registry\\machine\\software\\microsoft\\windows\\currentversion\\sidebyside") == 0) {
-            if (lowerPath.length() == 70 || lowerPath[70] == L'\\') {
-                fullPath = L"\\REGISTRY\\MACHINE\\COMPONENTS" + fullPath.substr(70);
-            }
+        size_t objLen = attr->ObjectName->Length / sizeof(WCHAR);
+        if (pathLen + objLen < 2048) {
+            wmemcpy(szPath + pathLen, attr->ObjectName->Buffer, objLen);
+            pathLen += objLen;
         }
     }
 
-    return fullPath;
+    if (pathLen == 0) return L"";
+    szPath[pathLen] = L'\0';
+
+    // ========== [优化] 路径规范化 (就地小写转换，避免 std::transform 拷贝) ==========
+    WCHAR szLower[2048];
+    for (size_t i = 0; i < pathLen; ++i) {
+        szLower[i] = towlower(szPath[i]);
+    }
+    szLower[pathLen] = L'\0';
+
+    // 1. 统一 ControlSetXXX 为 CurrentControlSet
+    if (pathLen >= 38 && wcsncmp(szLower, L"\\registry\\machine\\system\\controlset", 35) == 0) {
+        if (iswdigit(szPath[35]) && iswdigit(szPath[36]) && iswdigit(szPath[37])) {
+            std::wstring finalPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet";
+            finalPath.append(szPath + 38, pathLen - 38);
+            return finalPath;
+        }
+    }
+
+    // 2. 统一 \REGISTRY\USER\CURRENT 为 当前用户 SID
+    if (pathLen >= 23 && wcsncmp(szLower, L"\\registry\\user\\current", 23) == 0) {
+        if (pathLen == 23 || szPath[23] == L'\\') {
+            std::wstring finalPath = g_CurrentUserSidPath;
+            finalPath.append(szPath + 23, pathLen - 23);
+            return finalPath;
+        }
+    }
+
+    // 3. WinSxS (SideBySide) 重定向
+    if (pathLen >= 70 && wcsncmp(szLower, L"\\registry\\machine\\software\\microsoft\\windows\\currentversion\\sidebyside", 70) == 0) {
+        if (pathLen == 70 || szPath[70] == L'\\') {
+            std::wstring finalPath = L"\\REGISTRY\\MACHINE\\COMPONENTS";
+            finalPath.append(szPath + 70, pathLen - 70);
+            return finalPath;
+        }
+    }
+
+    return std::wstring(szPath, pathLen);
 }
 
 // [新增] 辅助函数：通过句柄获取内核解析后的真实 NT 路径
 std::wstring GetNameFromHandle(HANDLE hKey) {
     if (!hKey || !fpNtQueryKey) return L"";
+
+    // [优化] 优先使用栈内存 (1024 字节足以容纳绝大多数注册表路径)
+    BYTE stackBuf[1024];
     ULONG len = 0;
-    NTSTATUS st = fpNtQueryKey(hKey, KeyNameInformation, NULL, 0, &len);
-    if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL || len > 0) {
-        std::vector<BYTE> buf(len + 2);
-        if (NT_SUCCESS(fpNtQueryKey(hKey, KeyNameInformation, buf.data(), len, &len))) {
-            PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)buf.data();
+    NTSTATUS st = fpNtQueryKey(hKey, KeyNameInformation, stackBuf, sizeof(stackBuf), &len);
+
+    if (NT_SUCCESS(st)) {
+        PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)stackBuf;
+        return std::wstring(info->Name, info->NameLength / sizeof(WCHAR));
+    }
+    // 只有当路径极长导致栈内存不足时，才回退到堆分配
+    else if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) {
+        std::vector<BYTE> heapBuf(len + 2);
+        if (NT_SUCCESS(fpNtQueryKey(hKey, KeyNameInformation, heapBuf.data(), len, &len))) {
+            PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)heapBuf.data();
             return std::wstring(info->Name, info->NameLength / sizeof(WCHAR));
         }
     }
@@ -3064,12 +3079,19 @@ void InvalidateParentRegContext(const std::wstring& sandboxKeyPath) {
 
 // [新增] 检查注册表路径是否在白名单中 (需要直通真实注册表)
 bool IsSystemCriticalRegPath(const std::wstring& path) {
-    std::wstring lowerPath = path;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+    size_t len = path.length();
+    if (len == 0 || len >= 1024) return false; // 异常超长路径直接放行
 
-    // 辅助 lambda：检查是否包含关键词
+    // [优化] 使用栈内存进行小写转换，避免 std::wstring 拷贝和 std::transform
+    WCHAR szLower[1024];
+    for (size_t i = 0; i < len; ++i) {
+        szLower[i] = towlower(path[i]);
+    }
+    szLower[len] = L'\0';
+
+    // 辅助 lambda：检查是否包含关键词 (使用 C 风格 wcsstr 极速匹配)
     auto contains = [&](const wchar_t* sub) {
-        return lowerPath.find(sub) != std::wstring::npos;
+        return wcsstr(szLower, sub) != nullptr;
     };
 
     // 1. Classes (COM 组件) - 核心修复
@@ -3117,7 +3139,7 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     // ==========[新增] AppHive 直通 (移植自 Sandboxie) ==========
     // 9. AppHive (UWP/Centennial 私有配置单元)
     // 路径形如 \REGISTRY\A\... 必须直通 否则现代应用无法运行
-    if (lowerPath.compare(0, 13, L"\\registry\\a\\") == 0) return true;
+    if (len >= 13 && wcsncmp(szLower, L"\\registry\\a\\", 13) == 0) return true;
 
     return false;
 }
