@@ -3404,6 +3404,17 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
             PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf.data();
             std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
 
+            // ========== [新增] 修复 HKCU\Software\Classes 的枚举名称 ==========
+            // 如果当前枚举的父路径是 \REGISTRY\USER\SID\Software
+            // 且子键名称包含 _Classes，强制将其改写为 "Classes"
+            if (name.length() > 8 && name.compare(name.length() - 8, 8, L"_Classes") == 0) {
+                std::wstring lowerParent = path;
+                std::transform(lowerParent.begin(), lowerParent.end(), lowerParent.begin(), towlower);
+                if (lowerParent.find(L"\\software") != std::wstring::npos) {
+                    name = L"Classes";
+                }
+            }
+
             CachedRegKey entry;
             entry.Name = name;
             entry.LastWriteTime = info->LastWriteTime;
@@ -3603,6 +3614,40 @@ void CleanNonTombstoneValuesRecursive(const std::wstring& sandboxPath) {
     }
 
     fpNtClose(hKey);
+}
+
+// [新增] 检查是否为受保护的 COM 根键 (禁止在沙盒中被标记为删除)
+bool IsProtectedCOMKey(const std::wstring& path) {
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    // 提取相对路径 (去掉 \registry\machine 或 \registry\user\sid)
+    const wchar_t* pSub = nullptr;
+    if (lowerPath.compare(0, 17, L"\\registry\\machine") == 0) {
+        pSub = lowerPath.c_str() + 17;
+    } else if (lowerPath.compare(0, g_CurrentUserSidPath.length(), g_CurrentUserSidPath) == 0) {
+        pSub = lowerPath.c_str() + g_CurrentUserSidPath.length();
+    } else {
+        return false;
+    }
+
+    if (!pSub) return false;
+
+    // 匹配受保护的 COM 关键目录
+    const wchar_t* protectedPaths[] = {
+        L"\\software\\classes",
+        L"\\software\\classes\\clsid",
+        L"\\software\\classes\\typelib",
+        L"\\software\\classes\\interface",
+        L"\\software\\wow6432node",
+        L"\\software\\classes\\wow6432node"
+    };
+
+    for (const auto& p : protectedPaths) {
+        if (wcscmp(pSub, p) == 0) return true;
+    }
+
+    return false;
 }
 
 // 设置键的时间戳（用于标记删除或复活）
@@ -4651,13 +4696,6 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             // A. 枚举真实路径
             EnumerateKeysToMap(realPath, mergedKeys);
 
-            // B. HKCR 特殊合并 (HKLM\Software\Classes + HKCU\Software\Classes)
-            if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
-                std::wstring subPath = realPath.substr(34);
-                std::wstring userClassesPath = g_CurrentUserSidPath + L"\\Software\\Classes" + subPath;
-                EnumerateKeysToMap(userClassesPath, mergedKeys);
-            }
-
             // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
             EnumerateKeysToMap(sandboxPath, mergedKeys);
 
@@ -4926,6 +4964,13 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         // 这里为了简化 假设调用者已经递归删除了子键 或者我们只标记当前键
         // Sandboxie 的逻辑是：如果还有物理子键 不能标记父键删除
         // 但为了修复你的问题 我们先实现最简单的标记逻辑
+
+        // ========== [新增] COM 根键删除保护 ==========
+        std::wstring realPathForCheck;
+        if (GetRealFromSandboxPath(path, realPathForCheck) && IsProtectedCOMKey(realPathForCheck)) {
+            // 拒绝删除核心 COM 目录，防止沙盒内系统组件大面积瘫痪
+            return STATUS_ACCESS_DENIED;
+        }
 
         // 尝试设置时间戳标记为删除
         NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
@@ -5760,7 +5805,16 @@ NTSTATUS NTAPI Detour_NtNotifyChangeMultipleKeys(
         }
     }
 
-    return fpNtNotifyChangeMultipleKeys(hTargetKey, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    NTSTATUS status = fpNtNotifyChangeMultipleKeys(hTargetKey, Count, SlaveObjects, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+
+    // ========== [新增] 修复沙盒内同 Hive 监控冲突 ==========
+    // 如果内核抱怨参数无效，且存在从属监控对象 (SlaveObjects)，说明触发了同 Hive 冲突
+    // 解决办法：丢弃从属对象，仅监控主对象 (这足以让 Explorer 正常工作)
+    if (status == STATUS_INVALID_PARAMETER && Count > 0) {
+        status = fpNtNotifyChangeMultipleKeys(hTargetKey, 0, NULL, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous);
+    }
+
+    return status;
 }
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
