@@ -3598,9 +3598,9 @@ bool IsProtectedCOMKey(const std::wstring& path) {
     // 1. 检查 HKLM
     if (lowerPath.compare(0, 17, L"\\registry\\machine") == 0) {
         pSub = lowerPath.c_str() + 17;
-    } 
+    }
     // 2. 检查 HKCU (修复：使用 _wcsnicmp 忽略 g_CurrentUserSidPath 的大小写)
-    else if (g_CurrentUserSidPath.length() > 0 && 
+    else if (g_CurrentUserSidPath.length() > 0 &&
              _wcsnicmp(lowerPath.c_str(), g_CurrentUserSidPath.c_str(), g_CurrentUserSidPath.length()) == 0) {
         pSub = lowerPath.c_str() + g_CurrentUserSidPath.length();
     } else {
@@ -4948,17 +4948,17 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             return STATUS_ACCESS_DENIED;
         }
 
-        // [核心修复] 无论如何，先获取一个有完全权限的句柄
+        // [核心修复] 无论如何 先获取一个有完全权限的句柄
         HANDLE hWrite = NULL;
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING emptyStr;
         RtlInitUnicodeString(&emptyStr, L"");
         InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
 
-        // 尝试以 ALL_ACCESS 打开，如果失败则降级
+        // 尝试以 ALL_ACCESS 打开 如果失败则降级
         if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_ALL_ACCESS, &oa))) {
             if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
-                 // 如果连基本权限都无法获取，则放弃逻辑删除，执行物理删除
+                 // 如果连基本权限都无法获取 则放弃逻辑删除 执行物理删除
                  return fpNtDeleteKey(KeyHandle);
             }
         }
@@ -4974,19 +4974,19 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
         if (NT_SUCCESS(status)) {
             InvalidateParentRegContext(path);
-            return STATUS_SUCCESS; // 明确返回成功，阻止后续的 fpNtDeleteKey
+            return STATUS_SUCCESS; // 明确返回成功 阻止后续的 fpNtDeleteKey
         }
-        // 如果设置墓碑失败，则回退到物理删除
+        // 如果设置墓碑失败 则回退到物理删除
         return fpNtDeleteKey(KeyHandle);
     }
 
-    // 分支 2: 句柄指向真实键，我们需要在沙盒中创建墓碑
+    // 分支 2: 句柄指向真实键 我们需要在沙盒中创建墓碑
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
         // [新增] 关键修复：防止对真实 COM 根键进行逻辑删除
         if (IsProtectedCOMKey(path)) {
             return STATUS_ACCESS_DENIED;
         }
-		
+
         std::wstring relPath;
         if (ShouldRedirectReg(path, relPath)) {
             EnsureRegPathExistsRelative(relPath);
@@ -4999,9 +4999,9 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
             ULONG disposition;
             if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
-                // [核心修复] 同样，先清理，再标记
+                // [核心修复] 同样 先清理 再标记
                 CleanNonTombstoneValues(hSandbox);
-                
+
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
                 CleanNonTombstoneValuesRecursive(sandboxPath);
 
@@ -5135,7 +5135,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
 
         NTSTATUS status = fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
 
-        // 即使缓冲区溢出，LastWriteTime 通常也是有效的（位于结构体头部）
+        // 即使缓冲区溢出 LastWriteTime 通常也是有效的（位于结构体头部）
         if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
             // 所有这些结构体的第一个成员都是 LARGE_INTEGER LastWriteTime
             if (IsDeleteMark(*(LARGE_INTEGER*)KeyInformation)) {
@@ -5153,7 +5153,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
         std::wstring spoofedPath = currentPath;
         bool needSpoof = false;
 
-        // 如果是沙盒路径，反推真实路径
+        // 如果是沙盒路径 反推真实路径
         if (!g_RegMountPathNt.empty() && _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
             std::wstring realPath;
             if (GetRealFromSandboxPath(currentPath, realPath)) {
@@ -5253,7 +5253,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
                     ctx->ValuesInitialized = true;
                 }
             } else {
-                // 无法获取路径，回退到原始调用
+                // 无法获取路径 回退到原始调用
                 return fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
             }
         }
@@ -5286,17 +5286,17 @@ NTSTATUS NTAPI Detour_NtQueryKey(
 
         // --- 3.3 填充输出结构 ---
         if (KeyInformationClass == KeyFullInformation) {
-            ULONG reqSize = sizeof(KEY_FULL_INFORMATION); // ClassOffset 动态计算，这里简化处理
-            // 注意：如果 ClassLength > 0，需要额外空间。但通常 RegQueryInfoKey 第一次调用只传 NULL 或小 buffer
-            // 只要返回的统计数据正确，程序会再次分配内存。这里我们主要保证统计字段正确。
+            ULONG reqSize = sizeof(KEY_FULL_INFORMATION); // ClassOffset 动态计算 这里简化处理
+            // 注意：如果 ClassLength > 0 需要额外空间但通常 RegQueryInfoKey 第一次调用只传 NULL 或小 buffer
+            // 只要返回的统计数据正确 程序会再次分配内存这里我们主要保证统计字段正确
 
             if (ResultLength) *ResultLength = reqSize + maxClassLen;
             if (Length < reqSize) return STATUS_BUFFER_TOO_SMALL;
 
             PKEY_FULL_INFORMATION pInfo = (PKEY_FULL_INFORMATION)KeyInformation;
 
-            // 获取 LastWriteTime (使用当前句柄的，或者取最大的子键时间？通常取当前键的即可)
-            // 为了简单，调用一次原始函数获取 LastWriteTime
+            // 获取 LastWriteTime (使用当前句柄的 或者取最大的子键时间？通常取当前键的即可)
+            // 为了简单 调用一次原始函数获取 LastWriteTime
             {
                 KEY_BASIC_INFORMATION kbi;
                 ULONG kbiLen;
@@ -5309,7 +5309,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
 
             pInfo->TitleIndex = 0;
             pInfo->ClassOffset = -1;
-            pInfo->ClassLength = 0; // 暂不处理 Class 字符串回填，只处理长度统计
+            pInfo->ClassLength = 0; // 暂不处理 Class 字符串回填 只处理长度统计
 
             pInfo->SubKeys = (ULONG)ctx->SubKeys.size();
             pInfo->MaxNameLen = maxSubKeyNameLen;
@@ -6473,7 +6473,10 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             } else if (realExists) {
                 shouldRedirect = false;
             } else {
-                shouldRedirect = true;
+                // [修复] 如果文件在两边都不存在，且非写操作，保持原路径
+                // 这样 NtCreateFile 会返回 STATUS_OBJECT_NAME_NOT_FOUND (而不是 PATH_NOT_FOUND)
+                // 这对于 cmd.exe 搜索命令至关重要 (尝试 ping -> 失败 -> 尝试 ping.exe)
+                shouldRedirect = false;
             }
         }
 
