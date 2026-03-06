@@ -6473,10 +6473,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             } else if (realExists) {
                 shouldRedirect = false;
             } else {
-                // [修复] 如果文件在两边都不存在，且非写操作，保持原路径
-                // 这样 NtCreateFile 会返回 STATUS_OBJECT_NAME_NOT_FOUND (而不是 PATH_NOT_FOUND)
-                // 这对于 cmd.exe 搜索命令至关重要 (尝试 ping -> 失败 -> 尝试 ping.exe)
-                shouldRedirect = false;
+                shouldRedirect = true;
             }
         }
 
@@ -7060,6 +7057,9 @@ NTSTATUS HandleDirectoryQuery(
         // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
+            ctx->CurrentIndex = 0; // [BUG FIX] 切换 Pattern 时必须重置索引，否则对同一
+                                   // 句柄依次搜索不同扩展名（ping.COM→ping.EXE）时，
+                                   // CurrentIndex 停在上次末尾，新 Pattern 的匹配项被跳过
         }
         // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
