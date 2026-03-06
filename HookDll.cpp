@@ -4937,6 +4937,13 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
     // 分支 1: 句柄指向沙盒键
     if (isSandboxKey) {
+        // ========== [恢复] COM 根键删除保护 ==========
+        std::wstring realPathForCheck;
+        if (GetRealFromSandboxPath(path, realPathForCheck) && IsProtectedCOMKey(realPathForCheck)) {
+            // 拒绝删除核心 COM 目录 防止沙盒内系统组件大面积瘫痪
+            return STATUS_ACCESS_DENIED;
+        }
+
         // [核心修复] 无论如何，先获取一个有完全权限的句柄
         HANDLE hWrite = NULL;
         OBJECT_ATTRIBUTES oa;
