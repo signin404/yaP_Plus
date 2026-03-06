@@ -3593,11 +3593,15 @@ bool IsProtectedCOMKey(const std::wstring& path) {
     std::wstring lowerPath = path;
     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
 
-    // 提取相对路径 (去掉 \registry\machine 或 \registry\user\sid)
     const wchar_t* pSub = nullptr;
+
+    // 1. 检查 HKLM
     if (lowerPath.compare(0, 17, L"\\registry\\machine") == 0) {
         pSub = lowerPath.c_str() + 17;
-    } else if (lowerPath.compare(0, g_CurrentUserSidPath.length(), g_CurrentUserSidPath) == 0) {
+    } 
+    // 2. 检查 HKCU (修复：使用 _wcsnicmp 忽略 g_CurrentUserSidPath 的大小写)
+    else if (g_CurrentUserSidPath.length() > 0 && 
+             _wcsnicmp(lowerPath.c_str(), g_CurrentUserSidPath.c_str(), g_CurrentUserSidPath.length()) == 0) {
         pSub = lowerPath.c_str() + g_CurrentUserSidPath.length();
     } else {
         return false;
@@ -4978,6 +4982,11 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
     // 分支 2: 句柄指向真实键，我们需要在沙盒中创建墓碑
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
+        // [新增] 关键修复：防止对真实 COM 根键进行逻辑删除
+        if (IsProtectedCOMKey(path)) {
+            return STATUS_ACCESS_DENIED;
+        }
+		
         std::wstring relPath;
         if (ShouldRedirectReg(path, relPath)) {
             EnsureRegPathExistsRelative(relPath);
