@@ -1479,81 +1479,6 @@ void InitSystemWhitelist() {
     }
 }
 
-// 修改 IsPathVisible 函数
-bool IsPathVisible(const std::wstring& fullNtPath) {
-    // 1. 沙盒内的路径始终可见
-    std::wstring sandboxPrefix = L"\\??\\" + std::wstring(g_SandboxRoot);
-    if (ContainsCaseInsensitive(fullNtPath, sandboxPrefix)) return true;
-
-    // 2. 检查是否为系统盘
-    // [修复] 规范化系统盘路径进行比较，防止格式不一致 (\Device\... vs \??\...)
-    std::wstring systemDriveNtNorm = g_SystemDriveNt;
-    if (!systemDriveNtNorm.empty() && systemDriveNtNorm.find(L"\\Device\\") == 0) {
-        systemDriveNtNorm = DevicePathToNtPath(systemDriveNtNorm);
-    }
-
-    if (!systemDriveNtNorm.empty() && fullNtPath.find(systemDriveNtNorm) == 0) {
-        // 根目录可见 (\??\C: 或 \??\C:\)
-        if (fullNtPath.length() == systemDriveNtNorm.length() ||
-           (fullNtPath.length() == systemDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
-            return true;
-        }
-
-        // 检查白名单
-        for (const auto& whitePath : g_SystemWhitelist) {
-            // 检查是否是白名单路径本身或其子路径
-            if (fullNtPath.size() >= whitePath.size()) {
-                if (_wcsnicmp(fullNtPath.c_str(), whitePath.c_str(), whitePath.size()) == 0) {
-                    // 确保匹配完整路径段
-                    if (fullNtPath.size() == whitePath.size() || fullNtPath[whitePath.size()] == L'\\') {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false; // 系统盘其他路径隐藏
-    }
-
-    // 3. 检查是否为启动器所在盘
-    // [修复] 同样规范化启动器盘路径
-    std::wstring launcherDriveNtNorm = g_LauncherDriveNt;
-    if (!launcherDriveNtNorm.empty() && launcherDriveNtNorm.find(L"\\Device\\") == 0) {
-        launcherDriveNtNorm = DevicePathToNtPath(launcherDriveNtNorm);
-    }
-
-    if (!launcherDriveNtNorm.empty() && fullNtPath.find(launcherDriveNtNorm) == 0) {
-        // 根目录可见
-        if (fullNtPath.length() == launcherDriveNtNorm.length() ||
-           (fullNtPath.length() == launcherDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
-            return true;
-        }
-
-        // 逻辑：启动器目录及其子目录可见 + 到根目录的路径可见
-        if (fullNtPath.size() >= g_LauncherDirNt.size()) {
-            if (_wcsnicmp(fullNtPath.c_str(), g_LauncherDirNt.c_str(), g_LauncherDirNt.size()) == 0) {
-                if (fullNtPath.size() == g_LauncherDirNt.size() || fullNtPath[g_LauncherDirNt.size()] == L'\\') {
-                    return true;
-                }
-            }
-        }
-
-        if (g_LauncherDirNt.size() > fullNtPath.size()) {
-            if (_wcsnicmp(g_LauncherDirNt.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
-                if (g_LauncherDirNt[fullNtPath.size()] == L'\\') {
-                    return true;
-                }
-            }
-        }
-
-        return false; // 启动器盘其他路径隐藏
-    }
-
-    // 4. 其他分区
-    // [修复] 修正逻辑：既然 NtCreateFile 允许读取/执行其他分区的文件，
-    // 目录枚举也应可见，否则会导致 SearchPath (ping, test) 找不到文件。
-    return true; 
-}
-
 // 定义目录项结构 用于缓存
 struct CachedDirEntry {
     std::wstring FileName;
@@ -2496,10 +2421,16 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
     if (ContainsCaseInsensitive(fullNtPath, sandboxPrefix)) return true;
 
     // 2. 检查是否为系统盘
-    if (!g_SystemDriveNt.empty() && fullNtPath.find(g_SystemDriveNt) == 0) {
+    // [修复] 规范化系统盘路径进行比较，防止格式不一致 (\Device\... vs \??\...)
+    std::wstring systemDriveNtNorm = g_SystemDriveNt;
+    if (!systemDriveNtNorm.empty() && systemDriveNtNorm.find(L"\\Device\\") == 0) {
+        systemDriveNtNorm = DevicePathToNtPath(systemDriveNtNorm);
+    }
+
+    if (!systemDriveNtNorm.empty() && fullNtPath.find(systemDriveNtNorm) == 0) {
         // 根目录可见 (\??\C: 或 \??\C:\)
-        if (fullNtPath.length() == g_SystemDriveNt.length() ||
-           (fullNtPath.length() == g_SystemDriveNt.length() + 1 && fullNtPath.back() == L'\\')) {
+        if (fullNtPath.length() == systemDriveNtNorm.length() ||
+           (fullNtPath.length() == systemDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
             return true;
         }
 
@@ -2519,15 +2450,20 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
     }
 
     // 3. 检查是否为启动器所在盘
-    if (!g_LauncherDriveNt.empty() && fullNtPath.find(g_LauncherDriveNt) == 0) {
+    // [修复] 同样规范化启动器盘路径
+    std::wstring launcherDriveNtNorm = g_LauncherDriveNt;
+    if (!launcherDriveNtNorm.empty() && launcherDriveNtNorm.find(L"\\Device\\") == 0) {
+        launcherDriveNtNorm = DevicePathToNtPath(launcherDriveNtNorm);
+    }
+
+    if (!launcherDriveNtNorm.empty() && fullNtPath.find(launcherDriveNtNorm) == 0) {
         // 根目录可见
-        if (fullNtPath.length() == g_LauncherDriveNt.length() ||
-           (fullNtPath.length() == g_LauncherDriveNt.length() + 1 && fullNtPath.back() == L'\\')) {
+        if (fullNtPath.length() == launcherDriveNtNorm.length() ||
+           (fullNtPath.length() == launcherDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
             return true;
         }
 
         // 逻辑：启动器目录及其子目录可见 + 到根目录的路径可见
-        // 情况 A: 访问的是启动器目录或其子目录
         if (fullNtPath.size() >= g_LauncherDirNt.size()) {
             if (_wcsnicmp(fullNtPath.c_str(), g_LauncherDirNt.c_str(), g_LauncherDirNt.size()) == 0) {
                 if (fullNtPath.size() == g_LauncherDirNt.size() || fullNtPath[g_LauncherDirNt.size()] == L'\\') {
@@ -2536,7 +2472,6 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
             }
         }
 
-        // 情况 B: 访问的是启动器目录的父级路径
         if (g_LauncherDirNt.size() > fullNtPath.size()) {
             if (_wcsnicmp(g_LauncherDirNt.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
                 if (g_LauncherDirNt[fullNtPath.size()] == L'\\') {
@@ -2548,8 +2483,10 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
         return false; // 启动器盘其他路径隐藏
     }
 
-    // 4. 其他分区 -> 隐藏
-    return false;
+    // 4. 其他分区
+    // [修复] 修正逻辑：既然 NtCreateFile 允许读取/执行其他分区的文件，
+    // 目录枚举也应可见，否则会导致 SearchPath (ping, test) 找不到文件。
+    return true; 
 }
 
 // [修改] 检查路径是否需要重定向
