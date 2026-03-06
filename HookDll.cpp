@@ -1466,13 +1466,92 @@ void InitSystemWhitelist() {
 
     for (const auto& dir : dirs) {
         std::wstring path = g_SystemDriveNt + L"\\" + dir;
+        // [修复] 统一路径格式：确保白名单路径为 \??\C:\... 格式，以便与 fullNtPath 匹配
+        path = DevicePathToNtPath(path);
         g_SystemWhitelist.push_back(path);
     }
 
     for (const auto& file : files) {
         std::wstring path = g_SystemDriveNt + L"\\" + file;
+        // [修复] 统一路径格式
+        path = DevicePathToNtPath(path);
         g_SystemWhitelist.push_back(path);
     }
+}
+
+// 修改 IsPathVisible 函数
+bool IsPathVisible(const std::wstring& fullNtPath) {
+    // 1. 沙盒内的路径始终可见
+    std::wstring sandboxPrefix = L"\\??\\" + std::wstring(g_SandboxRoot);
+    if (ContainsCaseInsensitive(fullNtPath, sandboxPrefix)) return true;
+
+    // 2. 检查是否为系统盘
+    // [修复] 规范化系统盘路径进行比较，防止格式不一致 (\Device\... vs \??\...)
+    std::wstring systemDriveNtNorm = g_SystemDriveNt;
+    if (!systemDriveNtNorm.empty() && systemDriveNtNorm.find(L"\\Device\\") == 0) {
+        systemDriveNtNorm = DevicePathToNtPath(systemDriveNtNorm);
+    }
+
+    if (!systemDriveNtNorm.empty() && fullNtPath.find(systemDriveNtNorm) == 0) {
+        // 根目录可见 (\??\C: 或 \??\C:\)
+        if (fullNtPath.length() == systemDriveNtNorm.length() ||
+           (fullNtPath.length() == systemDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
+            return true;
+        }
+
+        // 检查白名单
+        for (const auto& whitePath : g_SystemWhitelist) {
+            // 检查是否是白名单路径本身或其子路径
+            if (fullNtPath.size() >= whitePath.size()) {
+                if (_wcsnicmp(fullNtPath.c_str(), whitePath.c_str(), whitePath.size()) == 0) {
+                    // 确保匹配完整路径段
+                    if (fullNtPath.size() == whitePath.size() || fullNtPath[whitePath.size()] == L'\\') {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false; // 系统盘其他路径隐藏
+    }
+
+    // 3. 检查是否为启动器所在盘
+    // [修复] 同样规范化启动器盘路径
+    std::wstring launcherDriveNtNorm = g_LauncherDriveNt;
+    if (!launcherDriveNtNorm.empty() && launcherDriveNtNorm.find(L"\\Device\\") == 0) {
+        launcherDriveNtNorm = DevicePathToNtPath(launcherDriveNtNorm);
+    }
+
+    if (!launcherDriveNtNorm.empty() && fullNtPath.find(launcherDriveNtNorm) == 0) {
+        // 根目录可见
+        if (fullNtPath.length() == launcherDriveNtNorm.length() ||
+           (fullNtPath.length() == launcherDriveNtNorm.length() + 1 && fullNtPath.back() == L'\\')) {
+            return true;
+        }
+
+        // 逻辑：启动器目录及其子目录可见 + 到根目录的路径可见
+        if (fullNtPath.size() >= g_LauncherDirNt.size()) {
+            if (_wcsnicmp(fullNtPath.c_str(), g_LauncherDirNt.c_str(), g_LauncherDirNt.size()) == 0) {
+                if (fullNtPath.size() == g_LauncherDirNt.size() || fullNtPath[g_LauncherDirNt.size()] == L'\\') {
+                    return true;
+                }
+            }
+        }
+
+        if (g_LauncherDirNt.size() > fullNtPath.size()) {
+            if (_wcsnicmp(g_LauncherDirNt.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
+                if (g_LauncherDirNt[fullNtPath.size()] == L'\\') {
+                    return true;
+                }
+            }
+        }
+
+        return false; // 启动器盘其他路径隐藏
+    }
+
+    // 4. 其他分区
+    // [修复] 修正逻辑：既然 NtCreateFile 允许读取/执行其他分区的文件，
+    // 目录枚举也应可见，否则会导致 SearchPath (ping, test) 找不到文件。
+    return true; 
 }
 
 // 定义目录项结构 用于缓存
@@ -6407,6 +6486,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 重定向逻辑
 
     std::wstring targetNtPath;
+    bool isMode3Hidden = false; // [新增] 追踪 Mode 3 隐藏状态 用于 post-call 补偿
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
@@ -6423,6 +6503,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
+				isMode3Hidden = true; // [新增] 记录该文件被策略隐藏（物理存在）
             }
         }
 
@@ -6437,8 +6518,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 // 目录内容合并由 NtQueryDirectoryFile 处理
                 shouldRedirect = false;
             } else {
-                // [修复] 都不存在，不重定向
-                // 避免因沙盒父目录缺失返回 PATH_NOT_FOUND 导致命令搜索终止
+                // 都不存在 重定向到沙盒以报错
                 shouldRedirect = false;
             }
         } else if (isWrite) {
@@ -6446,7 +6526,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                // 真实存在但沙盒没有 -> 执行写时复制
+                // 真实存在但沙盒没有 -> 执行写时复制 (CoW)
                 bool isDeleteOnClose = (CreateOptions & FILE_DELETE_ON_CLOSE) != 0;
 
                 // [修改] 处理 CoW 返回值
@@ -6460,53 +6540,20 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                     return STATUS_ACCESS_DENIED;
                 } else {
                     // 迁移失败 (可能是文件被锁)
-                    // 强制重定向 让 NtCreateFile 在沙盒路径上失败
+                    // 强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
                     shouldRedirect = true;
                 }
             } else {
-                // [修复] 都不存在时的逻辑细化
-                // 判断意图：是 "创建新文件" 还是 "打开现有文件"
-                bool isExplicitCreate = (CreateDisposition == FILE_CREATE ||
-                                         CreateDisposition == FILE_SUPERSEDE ||
-                                         CreateDisposition == FILE_OVERWRITE_IF ||
-                                         CreateDisposition == FILE_OPEN_IF);
-
-                if (isExplicitCreate) {
-                    // 意图为创建 -> 重定向到沙盒创建
-                    shouldRedirect = true;
-                } else {
-                    // 意图为打开 (FILE_OPEN, FILE_OVERWRITE) -> 文件必须存在
-                    // 真实文件不存在，不应重定向(避免路径未找到)，直接让系统返回 NAME_NOT_FOUND
-                    shouldRedirect = false;
-                }
+                // 都不存在 (新建文件)
+                shouldRedirect = true;
             }
         } else {
             // 文件只读访问
             if (sandboxExists) {
-                // [修复] 解决不带扩展名的命令无法运行的问题
-                // 如果真实文件不存在，但沙盒存在，检查是否为空文件(垃圾残留)
-                // 如果是空文件，忽略它，避免阻断命令搜索 (如 ping -> ping.exe)
-                if (!realExists) {
-                    std::wstring sandboxDos = NtPathToDosPath(targetNtPath);
-                    WIN32_FILE_ATTRIBUTE_DATA data;
-                    if (GetFileAttributesExW(sandboxDos.c_str(), GetFileExInfoStandard, &data)) {
-                        // 如果是空文件(非目录)，视为无效残留
-                        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                            data.nFileSizeHigh == 0 && data.nFileSizeLow == 0) {
-                            shouldRedirect = false; // 忽略沙盒空文件
-                        } else {
-                            shouldRedirect = true;  // 存在有效数据，重定向
-                        }
-                    } else {
-                        shouldRedirect = true; // 属性获取失败，保守重定向
-                    }
-                } else {
-                    shouldRedirect = true; // 真实文件也存在，重定向(覆盖模式)
-                }
+                shouldRedirect = true;
             } else if (realExists) {
                 shouldRedirect = false;
             } else {
-                // 都不存在，不重定向，让系统返回 NAME_NOT_FOUND
                 shouldRedirect = false;
             }
         }
@@ -6534,6 +6581,14 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     // 调用原始函数
     NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+   // [新增] Mode 3 补偿: 文件物理存在但被可见性策略隐藏
+   // 由于不再将"两者都不存在"重定向到沙盒 需要在此拦截原始函数的成功返回
+   if (isMode3Hidden && NT_SUCCESS(status)) {
+       fpNtClose(*FileHandle);
+       *FileHandle = NULL;
+       return STATUS_OBJECT_NAME_NOT_FOUND;
+   }
 
     // 兼容性补丁区域 (Post-Call / Retry)
 
@@ -7091,6 +7146,9 @@ NTSTATUS HandleDirectoryQuery(
         // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
+            ctx->CurrentIndex = 0; // [BUG FIX] 切换 Pattern 时必须重置索引，否则对同一
+                                   // 句柄依次搜索不同扩展名（ping.COM→ping.EXE）时，
+                                   // CurrentIndex 停在上次末尾，新 Pattern 的匹配项被跳过
         }
         // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
