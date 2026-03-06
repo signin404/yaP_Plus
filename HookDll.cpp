@@ -6407,7 +6407,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 重定向逻辑
 
     std::wstring targetNtPath;
-    bool isMode3Hidden = false; // [新增] 追踪 Mode 3 隐藏状态 用于 post-call 补偿
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
@@ -6424,7 +6423,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
-				isMode3Hidden = true; // [新增] 记录该文件被策略隐藏（物理存在）
             }
         }
 
@@ -6439,7 +6437,8 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 // 目录内容合并由 NtQueryDirectoryFile 处理
                 shouldRedirect = false;
             } else {
-                // 都不存在 重定向到沙盒以报错
+                // [修复] 都不存在，不重定向
+                // 避免因沙盒父目录缺失返回 PATH_NOT_FOUND 导致命令搜索终止
                 shouldRedirect = false;
             }
         } else if (isWrite) {
@@ -6447,7 +6446,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             if (sandboxExists) {
                 shouldRedirect = true;
             } else if (realExists) {
-                // 真实存在但沙盒没有 -> 执行写时复制 (CoW)
+                // 真实存在但沙盒没有 -> 执行写时复制
                 bool isDeleteOnClose = (CreateOptions & FILE_DELETE_ON_CLOSE) != 0;
 
                 // [修改] 处理 CoW 返回值
@@ -6461,20 +6460,53 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                     return STATUS_ACCESS_DENIED;
                 } else {
                     // 迁移失败 (可能是文件被锁)
-                    // 强制重定向 让 NtCreateFile 在沙盒路径上失败 (Object Not Found)
+                    // 强制重定向 让 NtCreateFile 在沙盒路径上失败
                     shouldRedirect = true;
                 }
             } else {
-                // 都不存在 (新建文件)
-                shouldRedirect = true;
+                // [修复] 都不存在时的逻辑细化
+                // 判断意图：是 "创建新文件" 还是 "打开现有文件"
+                bool isExplicitCreate = (CreateDisposition == FILE_CREATE ||
+                                         CreateDisposition == FILE_SUPERSEDE ||
+                                         CreateDisposition == FILE_OVERWRITE_IF ||
+                                         CreateDisposition == FILE_OPEN_IF);
+
+                if (isExplicitCreate) {
+                    // 意图为创建 -> 重定向到沙盒创建
+                    shouldRedirect = true;
+                } else {
+                    // 意图为打开 (FILE_OPEN, FILE_OVERWRITE) -> 文件必须存在
+                    // 真实文件不存在，不应重定向(避免路径未找到)，直接让系统返回 NAME_NOT_FOUND
+                    shouldRedirect = false;
+                }
             }
         } else {
             // 文件只读访问
             if (sandboxExists) {
-                shouldRedirect = true;
+                // [修复] 解决不带扩展名的命令无法运行的问题
+                // 如果真实文件不存在，但沙盒存在，检查是否为空文件(垃圾残留)
+                // 如果是空文件，忽略它，避免阻断命令搜索 (如 ping -> ping.exe)
+                if (!realExists) {
+                    std::wstring sandboxDos = NtPathToDosPath(targetNtPath);
+                    WIN32_FILE_ATTRIBUTE_DATA data;
+                    if (GetFileAttributesExW(sandboxDos.c_str(), GetFileExInfoStandard, &data)) {
+                        // 如果是空文件(非目录)，视为无效残留
+                        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                            data.nFileSizeHigh == 0 && data.nFileSizeLow == 0) {
+                            shouldRedirect = false; // 忽略沙盒空文件
+                        } else {
+                            shouldRedirect = true;  // 存在有效数据，重定向
+                        }
+                    } else {
+                        shouldRedirect = true; // 属性获取失败，保守重定向
+                    }
+                } else {
+                    shouldRedirect = true; // 真实文件也存在，重定向(覆盖模式)
+                }
             } else if (realExists) {
                 shouldRedirect = false;
             } else {
+                // 都不存在，不重定向，让系统返回 NAME_NOT_FOUND
                 shouldRedirect = false;
             }
         }
@@ -6502,14 +6534,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     // 调用原始函数
     NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-
-   // [新增] Mode 3 补偿: 文件物理存在但被可见性策略隐藏
-   // 由于不再将"两者都不存在"重定向到沙盒 需要在此拦截原始函数的成功返回
-   if (isMode3Hidden && NT_SUCCESS(status)) {
-       fpNtClose(*FileHandle);
-       *FileHandle = NULL;
-       return STATUS_OBJECT_NAME_NOT_FOUND;
-   }
 
     // 兼容性补丁区域 (Post-Call / Retry)
 
@@ -7067,9 +7091,6 @@ NTSTATUS HandleDirectoryQuery(
         // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
-            ctx->CurrentIndex = 0; // [BUG FIX] 切换 Pattern 时必须重置索引，否则对同一
-                                   // 句柄依次搜索不同扩展名（ping.COM→ping.EXE）时，
-                                   // CurrentIndex 停在上次末尾，新 Pattern 的匹配项被跳过
         }
         // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
