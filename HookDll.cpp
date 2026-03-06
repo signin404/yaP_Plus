@@ -4929,57 +4929,47 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
     if (g_IsInHook) return fpNtDeleteKey(KeyHandle);
     RecursionGuard guard;
 
-    // 1. 获取路径判断是否在沙盒内
     std::wstring path = GetPathFromHandle(KeyHandle);
     bool isSandboxKey = false;
     if (!g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
         isSandboxKey = true;
     }
 
-    // 2. 如果是沙盒内的键 执行“逻辑删除”
+    // 分支 1: 句柄指向沙盒键
     if (isSandboxKey) {
-        // 检查是否有子键 (如果有子键 标准行为是返回 STATUS_CANNOT_DELETE)
-        // 这里为了简化 假设调用者已经递归删除了子键 或者我们只标记当前键
-        // Sandboxie 的逻辑是：如果还有物理子键 不能标记父键删除
-        // 但为了修复你的问题 我们先实现最简单的标记逻辑
+        // [核心修复] 无论如何，先获取一个有完全权限的句柄
+        HANDLE hWrite = NULL;
+        OBJECT_ATTRIBUTES oa;
+        UNICODE_STRING emptyStr;
+        RtlInitUnicodeString(&emptyStr, L"");
+        InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
 
-        // ========== [新增] COM 根键删除保护 ==========
-        std::wstring realPathForCheck;
-        if (GetRealFromSandboxPath(path, realPathForCheck) && IsProtectedCOMKey(realPathForCheck)) {
-            // 拒绝删除核心 COM 目录 防止沙盒内系统组件大面积瘫痪
-            return STATUS_ACCESS_DENIED;
-        }
-
-        // 尝试设置时间戳标记为删除
-        NTSTATUS status = SetKeyLastWriteTime(KeyHandle, true);
-
-        if (status == STATUS_ACCESS_DENIED) {
-            // 如果句柄没有 KEY_SET_VALUE 权限 尝试重新打开
-            HANDLE hWrite = NULL;
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING emptyStr;
-            RtlInitUnicodeString(&emptyStr, L"");
-            InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
-
-            if (NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE, &oa))) {
-                status = SetKeyLastWriteTime(hWrite, true);
-                fpNtClose(hWrite);
+        // 尝试以 ALL_ACCESS 打开，如果失败则降级
+        if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_ALL_ACCESS, &oa))) {
+            if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
+                 // 如果连基本权限都无法获取，则放弃逻辑删除，执行物理删除
+                 return fpNtDeleteKey(KeyHandle);
             }
         }
 
-        // 成功标记后 清除缓存并返回成功
+        // [核心修复] 步骤 1: 清理所有非墓碑值和子键
+        CleanNonTombstoneValues(hWrite);
+        CleanNonTombstoneValuesRecursive(path); // 确保子键也被清理
+
+        // [核心修复] 步骤 2: 设置键墓碑
+        NTSTATUS status = SetKeyLastWriteTime(hWrite, true);
+
+        fpNtClose(hWrite); // 关闭我们自己打开的句柄
+
         if (NT_SUCCESS(status)) {
-            // [新增] 清除该键的非墓碑值 (保留值墓碑以屏蔽真实注册表)
-            CleanNonTombstoneValues(KeyHandle);
-            // [新增] 递归清除子键中的非墓碑值
-            CleanNonTombstoneValuesRecursive(path);
             InvalidateParentRegContext(path);
-            return STATUS_SUCCESS;
+            return STATUS_SUCCESS; // 明确返回成功，阻止后续的 fpNtDeleteKey
         }
+        // 如果设置墓碑失败，则回退到物理删除
+        return fpNtDeleteKey(KeyHandle);
     }
 
-    // 3. 如果是真实注册表路径（通过重定向逻辑） 需要在沙盒创建墓碑
-    // (这部分逻辑保持你原有的结构 但创建出来的键要立即打上时间戳标记)
+    // 分支 2: 句柄指向真实键，我们需要在沙盒中创建墓碑
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
         std::wstring relPath;
         if (ShouldRedirectReg(path, relPath)) {
@@ -4992,23 +4982,23 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
             ULONG disposition;
-            // 创建或打开沙盒键
             if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
-                // [新增] 清除已有非墓碑值 (如果沙盒键已存在)
+                // [核心修复] 同样，先清理，再标记
                 CleanNonTombstoneValues(hSandbox);
-                // 标记为删除
+                
+                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+                CleanNonTombstoneValuesRecursive(sandboxPath);
+
                 SetKeyLastWriteTime(hSandbox, true);
                 fpNtClose(hSandbox);
 
-                std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
-                // [新增] 递归清除子键中的非墓碑值
-                CleanNonTombstoneValuesRecursive(sandboxPath);
                 InvalidateParentRegContext(sandboxPath);
-                return STATUS_SUCCESS;
+                return STATUS_SUCCESS; // 明确返回成功
             }
         }
     }
 
+    // 默认回退到原始函数
     return fpNtDeleteKey(KeyHandle);
 }
 
