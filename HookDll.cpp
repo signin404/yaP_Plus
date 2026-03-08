@@ -3307,6 +3307,11 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     return false;
 }
 
+// 检查时间戳是否为删除标记
+bool IsDeleteMark(const LARGE_INTEGER& li) {
+    return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
+}
+
 // [新增] 获取句柄对应的真实路径和沙盒路径
 bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
     std::wstring keyPath = GetPathFromHandle(hKey);
@@ -3547,11 +3552,6 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
         if (!relPath.empty() && relPath[0] == L'\\') relPath = relPath.substr(1);
         EnsureRegPathExistsRelative(relPath);
     }
-}
-
-// 检查时间戳是否为删除标记
-bool IsDeleteMark(const LARGE_INTEGER& li) {
-    return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
 }
 
 // 检查键是否被标记为删除
