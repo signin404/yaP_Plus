@@ -3174,50 +3174,6 @@ bool IsDefensiveSpoofPath(const std::wstring& fullNtPath) {
     return false;
 }
 
-// ========== [新增] 地狱级键合并短路 Hack ==========
-// 针对 Spybot S&D 等软件在 ZoneMap\Domains 下写入数万个子键导致的合并卡顿
-bool IsHeavyKeyAndEmptyInSandbox(const std::wstring& currentNtPath) {
-    if (currentNtPath.length() < 60) return false;
-
-    // 快速查找特征字符串 (忽略大小写)
-    auto contains_ignore_case =[](const std::wstring& str, const wchar_t* sub) {
-        auto it = std::search(
-            str.begin(), str.end(),
-            sub, sub + wcslen(sub),[](wchar_t ch1, wchar_t ch2) { return towlower(ch1) == towlower(ch2); }
-        );
-        return it != str.end();
-    };
-
-    // 检查是否是 ZoneMap\Domains 键或其子键
-    if (contains_ignore_case(currentNtPath, L"\\Internet Settings\\ZoneMap\\Domains")) {
-
-        // 如果当前路径已经是沙盒路径 说明沙盒里有这个键 必须走合并
-        if (!g_RegMountPathNt.empty() &&
-            _wcsnicmp(currentNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
-            return false;
-        }
-
-        // 当前是真实路径 检查沙盒中是否建立了对应的影子键
-        std::wstring relPath;
-        if (ShouldRedirectReg(currentNtPath, relPath)) {
-            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
-            HANDLE hTest = NULL;
-            OBJECT_ATTRIBUTES oa;
-            UNICODE_STRING us;
-            RtlInitUnicodeString(&us, sandboxPath.c_str());
-            InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-            // 尝试打开沙盒键 (仅查询权限 极快)
-            if (NT_SUCCESS(fpNtOpenKey(&hTest, KEY_QUERY_VALUE, &oa))) {
-                fpNtClose(hTest);
-                return false; // 沙盒中存在 不能短路
-            }
-            return true; // 沙盒中不存在 可以安全短路！
-        }
-    }
-    return false;
-}
-
 // 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
@@ -3277,6 +3233,50 @@ bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut)
         return true;
     }
 
+    return false;
+}
+
+// ========== [新增] 地狱级键合并短路 Hack ==========
+// 针对 Spybot S&D 等软件在 ZoneMap\Domains 下写入数万个子键导致的合并卡顿
+bool IsHeavyKeyAndEmptyInSandbox(const std::wstring& currentNtPath) {
+    if (currentNtPath.length() < 60) return false;
+
+    // 快速查找特征字符串 (忽略大小写)
+    auto contains_ignore_case =[](const std::wstring& str, const wchar_t* sub) {
+        auto it = std::search(
+            str.begin(), str.end(),
+            sub, sub + wcslen(sub),[](wchar_t ch1, wchar_t ch2) { return towlower(ch1) == towlower(ch2); }
+        );
+        return it != str.end();
+    };
+
+    // 检查是否是 ZoneMap\Domains 键或其子键
+    if (contains_ignore_case(currentNtPath, L"\\Internet Settings\\ZoneMap\\Domains")) {
+
+        // 如果当前路径已经是沙盒路径 说明沙盒里有这个键 必须走合并
+        if (!g_RegMountPathNt.empty() &&
+            _wcsnicmp(currentNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+            return false;
+        }
+
+        // 当前是真实路径 检查沙盒中是否建立了对应的影子键
+        std::wstring relPath;
+        if (ShouldRedirectReg(currentNtPath, relPath)) {
+            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+            HANDLE hTest = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, sandboxPath.c_str());
+            InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 尝试打开沙盒键 (仅查询权限 极快)
+            if (NT_SUCCESS(fpNtOpenKey(&hTest, KEY_QUERY_VALUE, &oa))) {
+                fpNtClose(hTest);
+                return false; // 沙盒中存在 不能短路
+            }
+            return true; // 沙盒中不存在 可以安全短路！
+        }
+    }
     return false;
 }
 
