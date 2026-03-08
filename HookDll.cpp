@@ -3312,6 +3312,43 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     return false;
 }
 
+// 设置键的时间戳（用于标记删除或复活）
+NTSTATUS SetKeyTombstone(HANDLE hKey, bool isDelete) {
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
+    
+    if (isDelete) {
+        DWORD dummy = 0; // 数据内容不重要
+        // 创建特殊值
+        return fpNtSetValueKey(hKey, &uName, 0, YAPBOX_KEY_TOMBSTONE_TYPE, &dummy, sizeof(dummy));
+    } else {
+        // 复活：删除特殊值
+        return fpNtDeleteValueKey(hKey, &uName);
+    }
+}
+
+// 检查键是否被标记为删除
+bool IsKeyMarkedDeleted(HANDLE hKey) {
+    if (!hKey) return false;
+    
+    // 使用栈内存查询，避免分配
+    BYTE buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 64];
+    UNICODE_STRING uName;
+    RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
+    ULONG len = 0;
+
+    // 查询 _YapDel 值
+    NTSTATUS st = fpNtQueryValueKey(hKey, &uName, KeyValuePartialInformation, buf, sizeof(buf), &len);
+    if (NT_SUCCESS(st)) {
+        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        // 检查类型是否匹配
+        if (info->Type == YAPBOX_KEY_TOMBSTONE_TYPE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 检查时间戳是否为删除标记
 bool IsDeleteMark(const LARGE_INTEGER& li) {
     return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
@@ -3591,28 +3628,6 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     }
 }
 
-// 检查键是否被标记为删除
-bool IsKeyMarkedDeleted(HANDLE hKey) {
-    if (!hKey) return false;
-    
-    // 使用栈内存查询，避免分配
-    BYTE buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 64];
-    UNICODE_STRING uName;
-    RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
-    ULONG len = 0;
-
-    // 查询 _YapDel 值
-    NTSTATUS st = fpNtQueryValueKey(hKey, &uName, KeyValuePartialInformation, buf, sizeof(buf), &len);
-    if (NT_SUCCESS(st)) {
-        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
-        // 检查类型是否匹配
-        if (info->Type == YAPBOX_KEY_TOMBSTONE_TYPE) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // --- [新增] 清除键中的所有非墓碑值 (保留 YAPBOX_VALUE_TOMBSTONE_TYPE 值墓碑) ---
 void CleanNonTombstoneValues(HANDLE hKey) {
     if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
@@ -3739,21 +3754,6 @@ bool IsProtectedCOMKey(const std::wstring& path) {
     }
 
     return false;
-}
-
-// 设置键的时间戳（用于标记删除或复活）
-NTSTATUS SetKeyTombstone(HANDLE hKey, bool isDelete) {
-    UNICODE_STRING uName;
-    RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
-    
-    if (isDelete) {
-        DWORD dummy = 0; // 数据内容不重要
-        // 创建特殊值
-        return fpNtSetValueKey(hKey, &uName, 0, YAPBOX_KEY_TOMBSTONE_TYPE, &dummy, sizeof(dummy));
-    } else {
-        // 复活：删除特殊值
-        return fpNtDeleteValueKey(hKey, &uName);
-    }
 }
 
 // --- 注册表 NT API Hook 实现 ---
@@ -4256,7 +4256,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                  bool needValueTombstones = false;
                  if (IsKeyMarkedDeleted(hMaint)) {
                     // === 复活 (Resurrection) ===
-                    SetKeyLastWriteTime(hMaint, false);
+                    SetKeyTombstone(hMaint, false);
                     ClearSandboxKeyValues(hMaint);
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                     InvalidateParentRegContext(fullNtPath);
@@ -5682,7 +5682,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
              if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
                  bool needValueTombstones = false;
                  if (IsKeyMarkedDeleted(hMaint)) {
-                    SetKeyLastWriteTime(hMaint, false);
+                    SetKeyTombstone(hMaint, false);
                     ClearSandboxKeyValues(hMaint);
                     if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
                     InvalidateParentRegContext(fullNtPath);
