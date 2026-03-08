@@ -1992,22 +1992,9 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     if (ntPath.empty()) return ntPath;
 
-    // 1. [新增] 统一将设备路径转换为 \??\ 格式
-    // 这一步至关重要，确保后续逻辑处理的都是统一的 NT 路径格式
-    std::wstring standardizedPath = ntPath;
-    if (ntPath.find(L"\\Device\\") == 0) {
-        standardizedPath = DevicePathToNtPath(ntPath);
-    }
-
-    // 2. 转换为 DOS 路径用于解析重解析点
-    // 此时 standardizedPath 应该是 \??\C:\... 格式
-    std::wstring currentPath = NtPathToDosPath(standardizedPath);
-    
-    // [修复] 如果转换失败（例如设备路径未映射），返回原始路径或转换后的路径
-    // 避免传入空字符串给 FindFirstFile
-    if (currentPath.empty()) {
-        return standardizedPath;
-    }
+    // 1. 转换为 DOS 路径
+    std::wstring currentPath = NtPathToDosPath(ntPath);
+    if (currentPath.empty()) return ntPath;
 
     std::wstring pathToCheck = currentPath;
     std::wstring suffix = L"";
@@ -2015,7 +2002,7 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
     // 防止无限循环
     int maxDepth = 32;
 
-    // 3. 逐层向上检查是否存在重解析点
+    // 2. 逐层向上检查是否存在重解析点
     while (maxDepth-- > 0) {
         // 尝试获取当前路径组件的重解析目标
         // 如果是普通文件/目录或不存在 返回空字符串
@@ -2049,7 +2036,7 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         else suffix = component + L"\\" + suffix;
     }
 
-    // 4. 转回 NT 路径
+    // 3. 转回 NT 路径
     // 如果解析出了 Z:\aaa\1.txt 这里返回 \??\Z:\aaa\1.txt
     return L"\\??\\" + currentPath;
 }
@@ -3360,38 +3347,100 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
     return false;
 }
 
-// [新增] 枚举指定路径的子键到 Map (用于去重)
-void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedRegKey>& map) {
+// ========== [新增] 双指针合并辅助函数 ==========
+// 合并两个已排序的子键 Vector (overrideVec 覆盖 baseVec，并过滤墓碑)
+void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKey>& overrideVec) {
+    std::vector<CachedRegKey> merged;
+    merged.reserve(baseVec.size() + overrideVec.size());
+    auto itBase = baseVec.begin();
+    auto itOver = overrideVec.begin();
+
+    while (itBase != baseVec.end() && itOver != overrideVec.end()) {
+        int cmp = _wcsicmp(itBase->Name.c_str(), itOver->Name.c_str());
+        if (cmp < 0) {
+            merged.push_back(std::move(*itBase));
+            ++itBase;
+        } else if (cmp > 0) {
+            if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+            ++itOver;
+        } else {
+            // 名称相同，overrideVec 覆盖 baseVec
+            if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+            ++itBase;
+            ++itOver;
+        }
+    }
+    while (itBase != baseVec.end()) {
+        merged.push_back(std::move(*itBase));
+        ++itBase;
+    }
+    while (itOver != overrideVec.end()) {
+        if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+        ++itOver;
+    }
+    baseVec = std::move(merged);
+}
+
+// 合并两个已排序的值 Vector (overrideVec 覆盖 baseVec，并过滤墓碑)
+void MergeValueVectors(std::vector<CachedRegValue>& baseVec, std::vector<CachedRegValue>& overrideVec) {
+    std::vector<CachedRegValue> merged;
+    merged.reserve(baseVec.size() + overrideVec.size());
+    auto itBase = baseVec.begin();
+    auto itOver = overrideVec.begin();
+
+    while (itBase != baseVec.end() && itOver != overrideVec.end()) {
+        int cmp = _wcsicmp(itBase->Name.c_str(), itOver->Name.c_str());
+        if (cmp < 0) {
+            merged.push_back(std::move(*itBase));
+            ++itBase;
+        } else if (cmp > 0) {
+            if (itOver->Type != YAPBOX_VALUE_TOMBSTONE_TYPE) merged.push_back(std::move(*itOver));
+            ++itOver;
+        } else {
+            // 名称相同，overrideVec 覆盖 baseVec
+            if (itOver->Type != YAPBOX_VALUE_TOMBSTONE_TYPE) merged.push_back(std::move(*itOver));
+            ++itBase;
+            ++itOver;
+        }
+    }
+    while (itBase != baseVec.end()) {
+        merged.push_back(std::move(*itBase));
+        ++itBase;
+    }
+    while (itOver != overrideVec.end()) {
+        if (itOver->Type != YAPBOX_VALUE_TOMBSTONE_TYPE) merged.push_back(std::move(*itOver));
+        ++itOver;
+    }
+    baseVec = std::move(merged);
+}
+
+//[替换] 枚举指定路径的子键到 Vector (替代原有的 EnumerateKeysToMap)
+void EnumerateKeysToVector(const std::wstring& path, std::vector<CachedRegKey>& vec) {
     HANDLE hKey;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING uStr;
     RtlInitUnicodeString(&uStr, path.c_str());
     InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // 尝试打开键
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
         ULONG len;
-        std::vector<BYTE> buf(4096);
+        std::vector<BYTE> buf(4096); // [优化] 移到循环外，避免重复分配
 
         while (true) {
             NTSTATUS status = fpNtEnumerateKey(hKey, index, KeyNodeInformation, buf.data(), (ULONG)buf.size(), &len);
 
-            // 处理缓冲区不足的情况 (虽然预分配了4k 但仍可能不足)
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
                 if (len > buf.size()) buf.resize(len);
-                continue; // 重试
+                continue;
             }
 
-            if (status == STATUS_NO_MORE_ENTRIES) break;
-            if (!NT_SUCCESS(status)) break;
+            if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
 
             PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf.data();
             std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
 
-            // ========== [新增] 修复 HKCU\Software\Classes 的枚举名称 ==========
-            // 如果当前枚举的父路径是 \REGISTRY\USER\SID\Software
-            // 且子键名称包含 _Classes 强制将其改写为 "Classes"
+            // 修复 HKCU\Software\Classes 的枚举名称
             if (name.length() > 8 && name.compare(name.length() - 8, 8, L"_Classes") == 0) {
                 std::wstring lowerParent = path;
                 std::transform(lowerParent.begin(), lowerParent.end(), lowerParent.begin(), towlower);
@@ -3404,25 +3453,24 @@ void EnumerateKeysToMap(const std::wstring& path, std::map<std::wstring, CachedR
             entry.Name = name;
             entry.LastWriteTime = info->LastWriteTime;
             entry.TitleIndex = info->TitleIndex;
-            if (info->ClassLength > 0 && info->ClassOffset > 0) {
-                // 边界检查
-                if (info->ClassOffset + info->ClassLength <= buf.size()) {
-                    entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
-                }
+            if (info->ClassLength > 0 && info->ClassOffset > 0 && info->ClassOffset + info->ClassLength <= buf.size()) {
+                entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
             }
 
-            std::wstring keyName = name;
-            std::transform(keyName.begin(), keyName.end(), keyName.begin(), towlower);
-            map[keyName] = entry;
-
+            vec.push_back(std::move(entry));
             index++;
         }
         fpNtClose(hKey);
+
+        // 确保按名称排序（不区分大小写），为双指针合并做准备
+        std::sort(vec.begin(), vec.end(),[](const CachedRegKey& a, const CachedRegKey& b) {
+            return _wcsicmp(a.Name.c_str(), b.Name.c_str()) < 0;
+        });
     }
 }
 
-// [新增] 枚举指定路径的值到 Map
-void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, CachedRegValue>& map) {
+// [替换] 枚举指定路径的值到 Vector (替代原有的 EnumerateValuesToMap)
+void EnumerateValuesToVector(const std::wstring& path, std::vector<CachedRegValue>& vec) {
     HANDLE hKey;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING uStr;
@@ -3432,16 +3480,15 @@ void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, Cache
     if (NT_SUCCESS(fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa))) {
         ULONG index = 0;
         ULONG len;
-        std::vector<BYTE> buf(4096);
+        std::vector<BYTE> buf(4096); // [优化] 移到循环外
 
         while (true) {
             NTSTATUS status = fpNtEnumerateValueKey(hKey, index, KeyValueFullInformation, buf.data(), (ULONG)buf.size(), &len);
-            if (status == STATUS_NO_MORE_ENTRIES) break;
             if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
                 buf.resize(len);
                 continue;
             }
-            if (!NT_SUCCESS(status)) break;
+            if (status == STATUS_NO_MORE_ENTRIES || !NT_SUCCESS(status)) break;
 
             PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
             std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
@@ -3455,13 +3502,14 @@ void EnumerateValuesToMap(const std::wstring& path, std::map<std::wstring, Cache
                 entry.Data.assign(pData, pData + info->DataLength);
             }
 
-            std::wstring keyName = name;
-            std::transform(keyName.begin(), keyName.end(), keyName.begin(), towlower);
-            map[keyName] = entry;
-
+            vec.push_back(std::move(entry));
             index++;
         }
         fpNtClose(hKey);
+
+        std::sort(vec.begin(), vec.end(),[](const CachedRegValue& a, const CachedRegValue& b) {
+            return _wcsicmp(a.Name.c_str(), b.Name.c_str()) < 0;
+        });
     }
 }
 
@@ -4686,33 +4734,22 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
     // 4. 构建合并列表 (无锁操作)
     if (needsBuild) {
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-            std::map<std::wstring, CachedRegKey> mergedKeys;
+            // [替换] 使用 Vector 和双指针合并
+            std::vector<CachedRegKey> mergedKeys;
+            EnumerateKeysToVector(realPath, mergedKeys);
 
-            // A. 枚举真实路径
-            EnumerateKeysToMap(realPath, mergedKeys);
+            std::vector<CachedRegKey> sandboxKeys;
+            EnumerateKeysToVector(sandboxPath, sandboxKeys);
 
-            // C. 枚举沙盒路径 (沙盒版本覆盖真实版本)
-            EnumerateKeysToMap(sandboxPath, mergedKeys);
-
-            // [修正] D. 过滤带魔数时间戳的子键
-            // 注意：这里变量名必须是 mergedKeys (Map<wstring, CachedRegKey>)
-            for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
-                // 检查 CachedRegKey 中的 LastWriteTime
-                if (IsDeleteMark(it->second.LastWriteTime)) {
-                    it = mergedKeys.erase(it); // 从列表中移除
-                } else {
-                    ++it;
-                }
-            }
+            // 合并并自动过滤墓碑
+            MergeKeyVectors(mergedKeys, sandboxKeys);
 
             // E. 更新上下文
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->SubKeys.clear();
-                for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
+                ctx->SubKeys = std::move(mergedKeys); // 直接 Move，零拷贝
                 ctx->KeysInitialized = true;
             }
         } else {
@@ -4832,26 +4869,21 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-            std::map<std::wstring, CachedRegValue> mergedValues;
-            EnumerateValuesToMap(realPath, mergedValues);
-            EnumerateValuesToMap(sandboxPath, mergedValues);
+            // [替换] 使用 Vector 和双指针合并
+            std::vector<CachedRegValue> mergedValues;
+            EnumerateValuesToVector(realPath, mergedValues);
 
-            // [新增] 过滤惰性 CoW 的值墓碑
-            for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
-                if (it->second.Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
-                    it = mergedValues.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+            std::vector<CachedRegValue> sandboxValues;
+            EnumerateValuesToVector(sandboxPath, sandboxValues);
+
+            // 合并并自动过滤墓碑
+            MergeValueVectors(mergedValues, sandboxValues);
 
             std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
             auto it = g_RegContextMap.find(KeyHandle);
-            // [修复] 使用 _wcsicmp 忽略大小写比较 防止因大小写不同导致缓存不更新
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->Values.clear();
-                for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
+                ctx->Values = std::move(mergedValues); // 直接 Move，零拷贝
                 ctx->ValuesInitialized = true;
             }
         } else {
@@ -5227,41 +5259,36 @@ NTSTATUS NTAPI Detour_NtQueryKey(
         if (needsBuild) {
             std::wstring realPath, sandboxPath;
             if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-                // 构建 SubKeys
-                std::map<std::wstring, CachedRegKey> mergedKeys;
-                EnumerateKeysToMap(realPath, mergedKeys);
+                // [替换] 构建 SubKeys (支持 HKCR 的三路合并)
+                std::vector<CachedRegKey> mergedKeys;
+                EnumerateKeysToVector(realPath, mergedKeys);
+
                 if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
                     std::wstring subPath = realPath.substr(34);
-                    EnumerateKeysToMap(g_CurrentUserSidPath + L"\\Software\\Classes" + subPath, mergedKeys);
-                }
-                EnumerateKeysToMap(sandboxPath, mergedKeys);
-
-                // 过滤子键墓碑
-                for (auto it = mergedKeys.begin(); it != mergedKeys.end(); ) {
-                    if (IsDeleteMark(it->second.LastWriteTime)) it = mergedKeys.erase(it);
-                    else ++it;
+                    std::vector<CachedRegKey> hkcuClasses;
+                    EnumerateKeysToVector(g_CurrentUserSidPath + L"\\Software\\Classes" + subPath, hkcuClasses);
+                    MergeKeyVectors(mergedKeys, hkcuClasses);
                 }
 
-                // 构建 Values
-                std::map<std::wstring, CachedRegValue> mergedValues;
-                EnumerateValuesToMap(realPath, mergedValues);
-                EnumerateValuesToMap(sandboxPath, mergedValues);
+                std::vector<CachedRegKey> sandboxKeys;
+                EnumerateKeysToVector(sandboxPath, sandboxKeys);
+                MergeKeyVectors(mergedKeys, sandboxKeys);
 
-                // 过滤值墓碑
-                for (auto it = mergedValues.begin(); it != mergedValues.end(); ) {
-                    if (it->second.Type == YAPBOX_VALUE_TOMBSTONE_TYPE) it = mergedValues.erase(it);
-                    else ++it;
-                }
+                // [替换] 构建 Values
+                std::vector<CachedRegValue> mergedValues;
+                EnumerateValuesToVector(realPath, mergedValues);
+
+                std::vector<CachedRegValue> sandboxValues;
+                EnumerateValuesToVector(sandboxPath, sandboxValues);
+                MergeValueVectors(mergedValues, sandboxValues);
 
                 // 更新上下文
                 std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
                 auto it = g_RegContextMap.find(KeyHandle);
                 if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                     ctx = it->second;
-                    ctx->SubKeys.clear();
-                    ctx->Values.clear();
-                    for (auto& pair : mergedKeys) ctx->SubKeys.push_back(pair.second);
-                    for (auto& pair : mergedValues) ctx->Values.push_back(pair.second);
+                    ctx->SubKeys = std::move(mergedKeys);
+                    ctx->Values = std::move(mergedValues);
                     ctx->KeysInitialized = true;
                     ctx->ValuesInitialized = true;
                 }
@@ -6420,7 +6447,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 重定向逻辑
 
     std::wstring targetNtPath;
-    bool isMode3Hidden = false; // [新增] 追踪 Mode 3 隐藏状态 用于 post-call 补偿
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
@@ -6437,7 +6463,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (g_HookMode == 3 && realExists) {
             if (!IsPathVisible(fullNtPath)) {
                 realExists = false;
-				isMode3Hidden = true; // [新增] 记录该文件被策略隐藏（物理存在）
             }
         }
 
@@ -6453,7 +6478,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 shouldRedirect = false;
             } else {
                 // 都不存在 重定向到沙盒以报错
-                shouldRedirect = false;
+                shouldRedirect = true;
             }
         } else if (isWrite) {
             // 写操作
@@ -6488,7 +6513,7 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             } else if (realExists) {
                 shouldRedirect = false;
             } else {
-                shouldRedirect = false;
+                shouldRedirect = true;
             }
         }
 
@@ -6515,14 +6540,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
     // 调用原始函数
     NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
-
-   // [新增] Mode 3 补偿: 文件物理存在但被可见性策略隐藏
-   // 由于不再将"两者都不存在"重定向到沙盒 需要在此拦截原始函数的成功返回
-   if (isMode3Hidden && NT_SUCCESS(status)) {
-       fpNtClose(*FileHandle);
-       *FileHandle = NULL;
-       return STATUS_OBJECT_NAME_NOT_FOUND;
-   }
 
     // 兼容性补丁区域 (Post-Call / Retry)
 
@@ -7080,9 +7097,6 @@ NTSTATUS HandleDirectoryQuery(
         // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
-            ctx->CurrentIndex = 0; // [BUG FIX] 切换 Pattern 时必须重置索引，否则对同一
-                                   // 句柄依次搜索不同扩展名（ping.COM→ping.EXE）时，
-                                   // CurrentIndex 停在上次末尾，新 Pattern 的匹配项被跳过
         }
         // 兜底：如果 Pattern 为空 设为 *
         if (ctx->SearchPattern.empty()) {
