@@ -1091,6 +1091,20 @@ struct RegContext {
     bool ValuesInitialized = false;
 };
 
+// ========== [新增] 真实注册表全局缓存结构 ==========
+struct RealKeyCacheEntry {
+    LARGE_INTEGER LastWriteTime;
+    DWORD LastTickCount; // 用于 30 秒过期淘汰
+    std::vector<CachedRegKey> SubKeys;
+    std::vector<CachedRegValue> Values;
+    bool KeysInitialized;
+    bool ValuesInitialized;
+
+    RealKeyCacheEntry() : LastTickCount(0), KeysInitialized(false), ValuesInitialized(false) {
+        LastWriteTime.QuadPart = 0;
+    }
+};
+
 // --- 全局变量 ---
 wchar_t g_SandboxRoot[MAX_PATH] = { 0 };
 wchar_t g_IpcPipeName[MAX_PATH] = { 0 };
@@ -1159,8 +1173,6 @@ bool g_EnableTimeHook = false;
 // [新增] 防止时间函数递归调用的标志
 thread_local bool g_InTimeHook = false;
 thread_local bool g_IsInHook = false;
-
-
 
 // 辅助类：自动设置和清除标志
 struct TimeRecursionGuard {
@@ -1345,20 +1357,6 @@ void DebugLog(const wchar_t* format, ...) {
     OutputDebugStringW(buffer);
     SetLastError(lastErr);
 }
-
-// ========== [新增] 真实注册表全局缓存结构 ==========
-struct RealKeyCacheEntry {
-    LARGE_INTEGER LastWriteTime;
-    DWORD LastTickCount; // 用于 30 秒过期淘汰
-    std::vector<CachedRegKey> SubKeys;
-    std::vector<CachedRegValue> Values;
-    bool KeysInitialized;
-    bool ValuesInitialized;
-
-    RealKeyCacheEntry() : LastTickCount(0), KeysInitialized(false), ValuesInitialized(false) {
-        LastWriteTime.QuadPart = 0;
-    }
-};
 
 // [新增] 初始化子进程白名单 (在 InitHookThread 中调用)
 void InitChildHookWhitelist() {
