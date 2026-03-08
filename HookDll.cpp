@@ -1120,6 +1120,8 @@ std::wstring g_CurrentUserSidPath; // 例如: \REGISTRY\USER\S-1-5-21-xxxxx
 std::wstring g_RegMountPathNt; // [新增] 注册表挂载点 NT 路径 (例如 \REGISTRY\USER\YapBoxReg_xxx)
 std::map<HANDLE, RegContext*> g_RegContextMap;
 std::shared_mutex g_RegContextMutex;
+std::map<std::wstring, RealKeyCacheEntry> g_RealKeyCache;
+std::shared_mutex g_RealKeyCacheMutex;
 
 // 缓存的 NT 路径
 std::wstring g_LauncherDirNt;
@@ -1157,6 +1159,8 @@ bool g_EnableTimeHook = false;
 // [新增] 防止时间函数递归调用的标志
 thread_local bool g_InTimeHook = false;
 thread_local bool g_IsInHook = false;
+
+
 
 // 辅助类：自动设置和清除标志
 struct TimeRecursionGuard {
@@ -1341,6 +1345,20 @@ void DebugLog(const wchar_t* format, ...) {
     OutputDebugStringW(buffer);
     SetLastError(lastErr);
 }
+
+// ========== [新增] 真实注册表全局缓存结构 ==========
+struct RealKeyCacheEntry {
+    LARGE_INTEGER LastWriteTime;
+    DWORD LastTickCount; // 用于 30 秒过期淘汰
+    std::vector<CachedRegKey> SubKeys;
+    std::vector<CachedRegValue> Values;
+    bool KeysInitialized;
+    bool ValuesInitialized;
+
+    RealKeyCacheEntry() : LastTickCount(0), KeysInitialized(false), ValuesInitialized(false) {
+        LastWriteTime.QuadPart = 0;
+    }
+};
 
 // [新增] 初始化子进程白名单 (在 InitHookThread 中调用)
 void InitChildHookWhitelist() {
@@ -3518,6 +3536,124 @@ void EnumerateValuesToVector(const std::wstring& path, std::vector<CachedRegValu
     }
 }
 
+// ========== [新增] 获取真实键的 LastWriteTime (用于缓存校验) ==========
+bool GetKeyLastWriteTime(const std::wstring& path, LARGE_INTEGER& outTime) {
+    HANDLE hKey;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING uStr;
+    RtlInitUnicodeString(&uStr, path.c_str());
+    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // 仅请求 KEY_QUERY_VALUE 获取基本信息
+    NTSTATUS status = fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa);
+    
+    // WOW64 视图穿透
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+        status = fpNtOpenKey(&hKey, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oa);
+    }
+
+    if (NT_SUCCESS(status)) {
+        KEY_BASIC_INFORMATION kbi;
+        ULONG len;
+        status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
+        fpNtClose(hKey);
+        
+        if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+            outTime = kbi.LastWriteTime;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ========== [新增] 获取真实键的子键 (带全局缓存) ==========
+void GetCachedRealKeys(const std::wstring& path, std::vector<CachedRegKey>& outKeys) {
+    LARGE_INTEGER currentLWT;
+    currentLWT.QuadPart = 0;
+    if (!GetKeyLastWriteTime(path, currentLWT)) {
+        return; // 真实键不存在或无权限，直接返回空
+    }
+
+    // 统一转为小写作为缓存 Key
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    DWORD currentTicks = GetTickCount();
+
+    // 1. 尝试读缓存
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RealKeyCacheMutex);
+        auto it = g_RealKeyCache.find(lowerPath);
+        if (it != g_RealKeyCache.end() && it->second.KeysInitialized) {
+            // 检查是否过期 (30秒 = 30000ms) 且 LastWriteTime 是否一致
+            if ((currentTicks - it->second.LastTickCount <= 30000) &&
+                (it->second.LastWriteTime.QuadPart == currentLWT.QuadPart)) {
+                outKeys = it->second.SubKeys; // 命中缓存，直接拷贝
+                return;
+            }
+        }
+    }
+
+    // 2. 缓存未命中或已失效，执行真实枚举
+    std::vector<CachedRegKey> freshKeys;
+    EnumerateKeysToVector(path, freshKeys);
+
+    // 3. 更新缓存
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RealKeyCacheMutex);
+        auto& entry = g_RealKeyCache[lowerPath];
+        entry.LastWriteTime = currentLWT;
+        entry.LastTickCount = currentTicks;
+        entry.SubKeys = freshKeys; // 拷贝给缓存
+        entry.KeysInitialized = true;
+    }
+
+    outKeys = std::move(freshKeys);
+}
+
+// ==========[新增] 获取真实键的值 (带全局缓存) ==========
+void GetCachedRealValues(const std::wstring& path, std::vector<CachedRegValue>& outValues) {
+    LARGE_INTEGER currentLWT;
+    currentLWT.QuadPart = 0;
+    if (!GetKeyLastWriteTime(path, currentLWT)) {
+        return;
+    }
+
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    DWORD currentTicks = GetTickCount();
+
+    // 1. 尝试读缓存
+    {
+        std::shared_lock<std::shared_mutex> lock(g_RealKeyCacheMutex);
+        auto it = g_RealKeyCache.find(lowerPath);
+        if (it != g_RealKeyCache.end() && it->second.ValuesInitialized) {
+            if ((currentTicks - it->second.LastTickCount <= 30000) &&
+                (it->second.LastWriteTime.QuadPart == currentLWT.QuadPart)) {
+                outValues = it->second.Values;
+                return;
+            }
+        }
+    }
+
+    // 2. 缓存未命中或已失效，执行真实枚举
+    std::vector<CachedRegValue> freshValues;
+    EnumerateValuesToVector(path, freshValues);
+
+    // 3. 更新缓存
+    {
+        std::unique_lock<std::shared_mutex> lock(g_RealKeyCacheMutex);
+        auto& entry = g_RealKeyCache[lowerPath];
+        entry.LastWriteTime = currentLWT;
+        entry.LastTickCount = currentTicks;
+        entry.Values = freshValues;
+        entry.ValuesInitialized = true;
+    }
+
+    outValues = std::move(freshValues);
+}
+
 // [新增] 尝试打开对应的真实键 (用于读取回退)
 HANDLE OpenRealKeyForFallback(const std::wstring& realPath) {
     HANDLE hReal = NULL;
@@ -4734,11 +4870,12 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
     // 4. 构建合并列表 (无锁操作)
     if (needsBuild) {
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-            // [替换] 使用 Vector 和双指针合并
             std::vector<CachedRegKey> mergedKeys;
-            EnumerateKeysToVector(realPath, mergedKeys);
+            //[替换] 使用全局缓存获取真实注册表子键
+            GetCachedRealKeys(realPath, mergedKeys);
 
             std::vector<CachedRegKey> sandboxKeys;
+            // 沙盒键变动频繁，继续使用实时枚举
             EnumerateKeysToVector(sandboxPath, sandboxKeys);
 
             // 合并并自动过滤墓碑
@@ -4749,7 +4886,7 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->SubKeys = std::move(mergedKeys); // 直接 Move，零拷贝
+                ctx->SubKeys = std::move(mergedKeys);
                 ctx->KeysInitialized = true;
             }
         } else {
@@ -4869,11 +5006,12 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
     if (needsBuild) {
         std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
-            // [替换] 使用 Vector 和双指针合并
             std::vector<CachedRegValue> mergedValues;
-            EnumerateValuesToVector(realPath, mergedValues);
+            // [替换] 使用全局缓存获取真实注册表值
+            GetCachedRealValues(realPath, mergedValues);
 
             std::vector<CachedRegValue> sandboxValues;
+            // 沙盒键变动频繁，继续使用实时枚举
             EnumerateValuesToVector(sandboxPath, sandboxValues);
 
             // 合并并自动过滤墓碑
@@ -4883,7 +5021,7 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->Values = std::move(mergedValues); // 直接 Move，零拷贝
+                ctx->Values = std::move(mergedValues);
                 ctx->ValuesInitialized = true;
             }
         } else {
@@ -5261,12 +5399,13 @@ NTSTATUS NTAPI Detour_NtQueryKey(
             if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
                 // [替换] 构建 SubKeys (支持 HKCR 的三路合并)
                 std::vector<CachedRegKey> mergedKeys;
-                EnumerateKeysToVector(realPath, mergedKeys);
+                GetCachedRealKeys(realPath, mergedKeys);
 
                 if (realPath.length() >= 34 && _wcsnicmp(realPath.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes", 34) == 0) {
                     std::wstring subPath = realPath.substr(34);
                     std::vector<CachedRegKey> hkcuClasses;
-                    EnumerateKeysToVector(g_CurrentUserSidPath + L"\\Software\\Classes" + subPath, hkcuClasses);
+                    // HKCU Classes 也是真实注册表，走全局缓存
+                    GetCachedRealKeys(g_CurrentUserSidPath + L"\\Software\\Classes" + subPath, hkcuClasses);
                     MergeKeyVectors(mergedKeys, hkcuClasses);
                 }
 
@@ -5276,7 +5415,7 @@ NTSTATUS NTAPI Detour_NtQueryKey(
 
                 // [替换] 构建 Values
                 std::vector<CachedRegValue> mergedValues;
-                EnumerateValuesToVector(realPath, mergedValues);
+                GetCachedRealValues(realPath, mergedValues);
 
                 std::vector<CachedRegValue> sandboxValues;
                 EnumerateValuesToVector(sandboxPath, sandboxValues);
