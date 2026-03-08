@@ -5054,7 +5054,37 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             return STATUS_ACCESS_DENIED;
         }
 
-        // [核心修复] 无论如何 先获取一个有完全权限的句柄
+        // ========== [恢复] 检查真实注册表中是否存在该键 ==========
+        bool existsInReal = false;
+        if (!realPathForCheck.empty()) {
+            HANDLE hRealCheck = NULL;
+            OBJECT_ATTRIBUTES oaReal;
+            UNICODE_STRING usReal;
+            RtlInitUnicodeString(&usReal, realPathForCheck.c_str());
+            InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            
+            NTSTATUS realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal);
+            if (realSt == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+                realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oaReal);
+            }
+            
+            // 如果返回成功，或者因为权限不足拒绝访问，都认为真实键存在
+            if (NT_SUCCESS(realSt) || realSt == STATUS_ACCESS_DENIED) {
+                existsInReal = true;
+                if (NT_SUCCESS(realSt)) fpNtClose(hRealCheck);
+            }
+        }
+
+        if (!existsInReal) {
+            // 真实注册表中不存在，直接执行物理删除，不留 _YapDel 墓碑垃圾
+            NTSTATUS status = fpNtDeleteKey(KeyHandle);
+            if (NT_SUCCESS(status)) {
+                InvalidateParentRegContext(path);
+            }
+            return status;
+        }
+
+        // 真实注册表中存在，执行逻辑删除 (设置 _YapDel 墓碑)
         HANDLE hWrite = NULL;
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING emptyStr;
@@ -5069,11 +5099,11 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             }
         }
 
-        // [核心修复] 步骤 1: 清理所有非墓碑值和子键
+        // 步骤 1: 清理所有非墓碑值和子键
         CleanNonTombstoneValues(hWrite);
         CleanNonTombstoneValuesRecursive(path); // 确保子键也被清理
 
-        // [核心修复] 步骤 2: 设置键墓碑
+        // 步骤 2: 设置键墓碑 (_YapDel)
         NTSTATUS status = SetKeyTombstone(hWrite, true);
 
         fpNtClose(hWrite); // 关闭我们自己打开的句柄
@@ -5088,7 +5118,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
     // 分支 2: 句柄指向真实键 我们需要在沙盒中创建墓碑
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
-        // [新增] 关键修复：防止对真实 COM 根键进行逻辑删除
+        // 防止对真实 COM 根键进行逻辑删除
         if (IsProtectedCOMKey(path)) {
             return STATUS_ACCESS_DENIED;
         }
@@ -5105,7 +5135,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
             ULONG disposition;
             if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
-                // [核心修复] 同样 先清理 再标记
+                // 同样 先清理 再标记
                 CleanNonTombstoneValues(hSandbox);
 
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
