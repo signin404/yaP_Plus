@@ -3307,6 +3307,20 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     return false;
 }
 
+// ========== [新增] 强制标记键为脏 (Dirty) ==========
+// 解决 NtSetInformationKey 修改时间戳不被系统刷入磁盘的内核机制问题
+void ForceKeyDirty(HANDLE hKey) {
+    if (!fpNtSetValueKey || !fpNtDeleteValueKey) return;
+    
+    UNICODE_STRING dummyName;
+    RtlInitUnicodeString(&dummyName, L"__YapTombstoneDirty__");
+    DWORD dummyData = 1;
+    
+    // 写入并立刻删除，强制触发 Windows 配置管理器的 Dirty 标记
+    fpNtSetValueKey(hKey, &dummyName, 0, REG_DWORD, &dummyData, sizeof(dummyData));
+    fpNtDeleteValueKey(hKey, &dummyName);
+}
+
 // 检查时间戳是否为删除标记
 bool IsDeleteMark(const LARGE_INTEGER& li) {
     return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
@@ -3556,12 +3570,14 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
 
 // 检查键是否被标记为删除
 bool IsKeyMarkedDeleted(HANDLE hKey) {
-    KEY_BASIC_INFORMATION kbi;
-    ULONG len;
-    NTSTATUS status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
-    // [修复] STATUS_BUFFER_OVERFLOW 时固定字段 (LastWriteTime) 已被填充 必须一并检查
+    //[修复] 使用足够大的栈缓冲区，防止 STATUS_BUFFER_TOO_SMALL 导致漏读 LastWriteTime
+    BYTE buf[sizeof(KEY_BASIC_INFORMATION) + 512];
+    ULONG len = 0;
+    NTSTATUS status = fpNtQueryKey(hKey, KeyBasicInformation, buf, sizeof(buf), &len);
+    
     if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-        return IsDeleteMark(kbi.LastWriteTime);
+        PKEY_BASIC_INFORMATION kbi = (PKEY_BASIC_INFORMATION)buf;
+        return IsDeleteMark(kbi->LastWriteTime);
     }
     return false;
 }
@@ -5018,6 +5034,9 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         CleanNonTombstoneValues(hWrite);
         CleanNonTombstoneValuesRecursive(path); // 确保子键也被清理
 
+        // [核心修复] 强制标记键为脏，确保系统将墓碑时间戳刷入磁盘
+        ForceKeyDirty(hWrite);
+
         // [核心修复] 步骤 2: 设置键墓碑
         NTSTATUS status = SetKeyLastWriteTime(hWrite, true);
 
@@ -5055,6 +5074,9 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
                 CleanNonTombstoneValuesRecursive(sandboxPath);
+
+                // [核心修复] 强制标记键为脏，确保系统将墓碑时间戳刷入磁盘
+                ForceKeyDirty(hSandbox);
 
                 SetKeyLastWriteTime(hSandbox, true);
                 fpNtClose(hSandbox);
