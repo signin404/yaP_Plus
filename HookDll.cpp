@@ -3362,17 +3362,22 @@ void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKe
     auto itBase = baseVec.begin();
     auto itOver = overrideVec.begin();
 
+    // 辅助 Lambda：判断是否为墓碑
+    auto isTombstone =[](const CachedRegKey& k) {
+        return IsDeleteMark(k.LastWriteTime) || (k.Class == L"YAPB_DEL");
+    };
+
     while (itBase != baseVec.end() && itOver != overrideVec.end()) {
         int cmp = _wcsicmp(itBase->Name.c_str(), itOver->Name.c_str());
         if (cmp < 0) {
             merged.push_back(std::move(*itBase));
             ++itBase;
         } else if (cmp > 0) {
-            if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+            if (!isTombstone(*itOver)) merged.push_back(std::move(*itOver));
             ++itOver;
         } else {
             // 名称相同，overrideVec 覆盖 baseVec
-            if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+            if (!isTombstone(*itOver)) merged.push_back(std::move(*itOver));
             ++itBase;
             ++itOver;
         }
@@ -3382,7 +3387,7 @@ void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKe
         ++itBase;
     }
     while (itOver != overrideVec.end()) {
-        if (!IsDeleteMark(itOver->LastWriteTime)) merged.push_back(std::move(*itOver));
+        if (!isTombstone(*itOver)) merged.push_back(std::move(*itOver));
         ++itOver;
     }
     baseVec = std::move(merged);
@@ -3558,12 +3563,26 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
 
 // 检查键是否被标记为删除
 bool IsKeyMarkedDeleted(HANDLE hKey) {
-    KEY_BASIC_INFORMATION kbi;
+    BYTE buf[1024];
     ULONG len;
-    NTSTATUS status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
-    // [修复] STATUS_BUFFER_OVERFLOW 时固定字段 (LastWriteTime) 已被填充 必须一并检查
+    // 使用 KeyNodeInformation 可以同时获取时间戳和 Class 字符串
+    NTSTATUS status = fpNtQueryKey(hKey, KeyNodeInformation, buf, sizeof(buf), &len);
     if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-        return IsDeleteMark(kbi.LastWriteTime);
+        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf;
+        
+        // 1. 快速路径：检查时间戳
+        if (IsDeleteMark(info->LastWriteTime)) return true;
+
+        // 2. 持久化路径：检查 Class 字符串 (跨重启防篡改)
+        // L"YAPB_DEL" 长度为 8 个字符，即 16 字节
+        if (info->ClassLength == 16 && info->ClassOffset > 0) {
+            std::wstring cls((WCHAR*)(buf + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
+            if (cls == L"YAPB_DEL") {
+                // 修复被系统篡改的时间戳，优化后续的快速路径检查
+                SetKeyLastWriteTime(hKey, true);
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -4071,22 +4090,30 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 // 检查是否是“已删除”的键 (墓碑)
                 if (IsKeyMarkedDeleted(hMaintenance)) {
                     // === 复活 (Resurrection) ===
-                    // 1. 重置时间戳为当前时间
-                    SetKeyLastWriteTime(hMaintenance, false);
+                    // 重命名并删除墓碑键，以清除 YAPB_DEL Class 标记
+                    wchar_t tempName[128];
+                    swprintf_s(tempName, L"__YBTmpRes%u_%u__", GetTickCount(), GetCurrentThreadId());
+                    UNICODE_STRING usTempName;
+                    RtlInitUnicodeString(&usTempName, tempName);
 
-                    // 2. 清空该键下的所有值
-                    ClearSandboxKeyValues(hMaintenance);
+                    fpNtRenameKey(hMaintenance, &usTempName);
+                    fpNtDeleteKey(hMaintenance);
+                    fpNtClose(hMaintenance);
 
-                    // 3. 标记为“新建”
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                    // 重新创建正常键 (无 Class)
+                    OBJECT_ATTRIBUTES oaNew;
+                    UNICODE_STRING usNew;
+                    RtlInitUnicodeString(&usNew, targetSandboxFull.c_str());
+                    InitializeObjectAttributes(&oaNew, &usNew, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    ULONG disp;
+                    NTSTATUS st = fpNtCreateKey(&hMaintenance, KEY_ALL_ACCESS, &oaNew, 0, NULL, REG_OPTION_NON_VOLATILE, &disp);
 
-                    isResurrected = true;
-                    isNewKey = true;
-                }
-                else {
-                    // 常规新建检查
-                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    if (NT_SUCCESS(st)) {
+                        if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                        isResurrected = true;
                         isNewKey = true;
+                    } else {
+                        hMaintenance = NULL; // 重建失败
                     }
                 }
 
@@ -4197,16 +4224,32 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                  bool needValueTombstones = false;
                  if (IsKeyMarkedDeleted(hMaint)) {
                     // === 复活 (Resurrection) ===
-                    SetKeyLastWriteTime(hMaint, false);
-                    ClearSandboxKeyValues(hMaint);
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                    InvalidateParentRegContext(fullNtPath);
-                    needValueTombstones = true;
-                 }
-                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                    // 首次在沙盒创建、但真实路径已有同名键
-                    needValueTombstones = true;
-                 }
+                    // 重命名并删除墓碑键，以清除 YAPB_DEL Class 标记
+                    wchar_t tempName[128];
+                    swprintf_s(tempName, L"__YBTmpRes%u_%u__", GetTickCount(), GetCurrentThreadId());
+                    UNICODE_STRING usTempName;
+                    RtlInitUnicodeString(&usTempName, tempName);
+
+                    fpNtRenameKey(hMaint, &usTempName);
+                    fpNtDeleteKey(hMaint);
+                    fpNtClose(hMaint);
+
+                    // 重新创建正常键 (无 Class)
+                    OBJECT_ATTRIBUTES oaNew;
+                    UNICODE_STRING usNew;
+                    RtlInitUnicodeString(&usNew, fullNtPath.c_str());
+                    InitializeObjectAttributes(&oaNew, &usNew, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    ULONG disp;
+                    NTSTATUS st = fpNtCreateKey(&hMaint, KEY_ALL_ACCESS, &oaNew, 0, NULL, REG_OPTION_NON_VOLATILE, &disp);
+
+                    if (NT_SUCCESS(st)) {
+                        if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                        isResurrected = true;
+                        isNewKey = true;
+                    } else {
+                        hMaint = NULL; // 重建失败
+                    }
+                }
                  // [核心修复] 惰性 CoW 值墓碑初始化：屏蔽真实路径的值
                  if (needValueTombstones) {
                     std::wstring realPathForTombstone;
@@ -4991,7 +5034,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         // ========== [恢复] COM 根键删除保护 ==========
         std::wstring realPathForCheck;
         if (GetRealFromSandboxPath(path, realPathForCheck) && IsProtectedCOMKey(realPathForCheck)) {
-            // 拒绝删除核心 COM 目录 防止沙盒内系统组件大面积瘫痪
             return STATUS_ACCESS_DENIED;
         }
 
@@ -5009,7 +5051,6 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                 realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oaReal);
             }
             
-            // 如果返回成功，或者因为权限不足拒绝访问，都认为真实键存在
             if (NT_SUCCESS(realSt) || realSt == STATUS_ACCESS_DENIED) {
                 existsInReal = true;
                 if (NT_SUCCESS(realSt)) fpNtClose(hRealCheck);
@@ -5025,42 +5066,61 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             return status;
         }
 
-        // 真实注册表中存在，执行逻辑删除 (设置墓碑)
-        // [核心修复] 无论如何 先获取一个有完全权限的句柄
+        // 真实注册表中存在，执行逻辑删除 (设置持久化墓碑)
         HANDLE hWrite = NULL;
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING emptyStr;
         RtlInitUnicodeString(&emptyStr, L"");
         InitializeObjectAttributes(&oa, &emptyStr, OBJ_CASE_INSENSITIVE, KeyHandle, NULL);
 
-        // 尝试以 ALL_ACCESS 打开 如果失败则降级
         if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_ALL_ACCESS, &oa))) {
             if (!NT_SUCCESS(fpNtOpenKey(&hWrite, KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS, &oa))) {
-                 // 如果连基本权限都无法获取 则放弃逻辑删除 执行物理删除
                  return fpNtDeleteKey(KeyHandle);
             }
         }
 
-        // [核心修复] 步骤 1: 清理所有非墓碑值和子键
         CleanNonTombstoneValues(hWrite);
-        CleanNonTombstoneValuesRecursive(path); // 确保子键也被清理
+        CleanNonTombstoneValuesRecursive(path);
 
-        // [核心修复] 步骤 2: 设置键墓碑
-        NTSTATUS status = SetKeyLastWriteTime(hWrite, true);
+        // [核心修复] 将当前键重命名为临时名称，腾出原名称
+        wchar_t tempName[128];
+        swprintf_s(tempName, L"__YBTmpDel%u_%u__", GetTickCount(), GetCurrentThreadId());
+        UNICODE_STRING usTempName;
+        RtlInitUnicodeString(&usTempName, tempName);
 
-        fpNtClose(hWrite); // 关闭我们自己打开的句柄
+        if (NT_SUCCESS(fpNtRenameKey(hWrite, &usTempName))) {
+            // 原名称已腾出，创建一个带有特殊 Class 的持久化墓碑键
+            HANDLE hTombstone = NULL;
+            OBJECT_ATTRIBUTES oaTomb;
+            UNICODE_STRING usTomb;
+            UNICODE_STRING usClass;
+            RtlInitUnicodeString(&usTomb, path.c_str());
+            RtlInitUnicodeString(&usClass, L"YAPB_DEL");
+            InitializeObjectAttributes(&oaTomb, &usTomb, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        if (NT_SUCCESS(status)) {
+            ULONG disp;
+            if (NT_SUCCESS(fpNtCreateKey(&hTombstone, KEY_ALL_ACCESS, &oaTomb, 0, &usClass, REG_OPTION_NON_VOLATILE, &disp))) {
+                SetKeyLastWriteTime(hTombstone, true);
+                fpNtClose(hTombstone);
+            }
+
+            // 对重命名后的原键执行物理删除
+            fpNtDeleteKey(hWrite);
+            fpNtClose(hWrite);
+
             InvalidateParentRegContext(path);
-            return STATUS_SUCCESS; // 明确返回成功 阻止后续的 fpNtDeleteKey
+            return STATUS_SUCCESS;
+        } else {
+            // 回退：仅设置时间戳
+            SetKeyLastWriteTime(hWrite, true);
+            fpNtClose(hWrite);
+            InvalidateParentRegContext(path);
+            return STATUS_SUCCESS;
         }
-        // 如果设置墓碑失败 则回退到物理删除
-        return fpNtDeleteKey(KeyHandle);
     }
 
     // 分支 2: 句柄指向真实键 我们需要在沙盒中创建墓碑
     if (g_HookReg && g_hAppHive && !isSandboxKey) {
-        // [新增] 关键修复：防止对真实 COM 根键进行逻辑删除
         if (IsProtectedCOMKey(path)) {
             return STATUS_ACCESS_DENIED;
         }
@@ -5071,13 +5131,14 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
 
             HANDLE hSandbox = NULL;
             UNICODE_STRING usRel;
+            UNICODE_STRING usClass;
             OBJECT_ATTRIBUTES oaSandbox;
             RtlInitUnicodeString(&usRel, relPath.c_str());
+            RtlInitUnicodeString(&usClass, L"YAPB_DEL");
             InitializeObjectAttributes(&oaSandbox, &usRel, OBJ_CASE_INSENSITIVE, (HANDLE)g_hAppHive, NULL);
 
             ULONG disposition;
-            if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, NULL, 0, &disposition))) {
-                // [核心修复] 同样 先清理 再标记
+            if (NT_SUCCESS(fpNtCreateKey(&hSandbox, KEY_ALL_ACCESS, &oaSandbox, 0, &usClass, REG_OPTION_NON_VOLATILE, &disposition))) {
                 CleanNonTombstoneValues(hSandbox);
 
                 std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
@@ -5087,12 +5148,11 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                 fpNtClose(hSandbox);
 
                 InvalidateParentRegContext(sandboxPath);
-                return STATUS_SUCCESS; // 明确返回成功
+                return STATUS_SUCCESS;
             }
         }
     }
 
-    // 默认回退到原始函数
     return fpNtDeleteKey(KeyHandle);
 }
 
@@ -5552,14 +5612,30 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
                 if (IsKeyMarkedDeleted(hMaintenance)) {
                     // === 复活 (Resurrection) ===
-                    SetKeyLastWriteTime(hMaintenance, false);
-                    ClearSandboxKeyValues(hMaintenance);
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                    isNewKey = true;
-                }
-                else {
-                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    // 重命名并删除墓碑键，以清除 YAPB_DEL Class 标记
+                    wchar_t tempName[128];
+                    swprintf_s(tempName, L"__YBTmpRes%u_%u__", GetTickCount(), GetCurrentThreadId());
+                    UNICODE_STRING usTempName;
+                    RtlInitUnicodeString(&usTempName, tempName);
+
+                    fpNtRenameKey(hMaintenance, &usTempName);
+                    fpNtDeleteKey(hMaintenance);
+                    fpNtClose(hMaintenance);
+
+                    // 重新创建正常键 (无 Class)
+                    OBJECT_ATTRIBUTES oaNew;
+                    UNICODE_STRING usNew;
+                    RtlInitUnicodeString(&usNew, targetSandboxFull.c_str());
+                    InitializeObjectAttributes(&oaNew, &usNew, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    ULONG disp;
+                    NTSTATUS st = fpNtCreateKey(&hMaintenance, KEY_ALL_ACCESS, &oaNew, 0, NULL, REG_OPTION_NON_VOLATILE, &disp);
+
+                    if (NT_SUCCESS(st)) {
+                        if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                        isResurrected = true;
                         isNewKey = true;
+                    } else {
+                        hMaintenance = NULL; // 重建失败
                     }
                 }
 
@@ -5661,15 +5737,33 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
              if (NT_SUCCESS(fpNtOpenKey(&hMaint, KEY_ALL_ACCESS, &oaM))) {
                  bool needValueTombstones = false;
                  if (IsKeyMarkedDeleted(hMaint)) {
-                    SetKeyLastWriteTime(hMaint, false);
-                    ClearSandboxKeyValues(hMaint);
-                    if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                    InvalidateParentRegContext(fullNtPath);
-                    needValueTombstones = true;
-                 }
-                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
-                    needValueTombstones = true;
-                 }
+                    // === 复活 (Resurrection) ===
+                    // 重命名并删除墓碑键，以清除 YAPB_DEL Class 标记
+                    wchar_t tempName[128];
+                    swprintf_s(tempName, L"__YBTmpRes%u_%u__", GetTickCount(), GetCurrentThreadId());
+                    UNICODE_STRING usTempName;
+                    RtlInitUnicodeString(&usTempName, tempName);
+
+                    fpNtRenameKey(hMaint, &usTempName);
+                    fpNtDeleteKey(hMaint);
+                    fpNtClose(hMaint);
+
+                    // 重新创建正常键 (无 Class)
+                    OBJECT_ATTRIBUTES oaNew;
+                    UNICODE_STRING usNew;
+                    RtlInitUnicodeString(&usNew, fullNtPath.c_str());
+                    InitializeObjectAttributes(&oaNew, &usNew, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                    ULONG disp;
+                    NTSTATUS st = fpNtCreateKey(&hMaint, KEY_ALL_ACCESS, &oaNew, 0, NULL, REG_OPTION_NON_VOLATILE, &disp);
+
+                    if (NT_SUCCESS(st)) {
+                        if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
+                        isResurrected = true;
+                        isNewKey = true;
+                    } else {
+                        hMaint = NULL; // 重建失败
+                    }
+                }
 
                  if (needValueTombstones) {
                     std::wstring realPathForTombstone;
