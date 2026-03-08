@@ -1848,79 +1848,115 @@ std::wstring StripAds(const std::wstring& path) {
 bool IsPipeOrDevice(LPCWSTR path) {
     if (!path) return false;
 
-    // [新增] 自身镜像保护 (防止重定向自身 EXE)
+    size_t len = wcslen(path);
+    if (len == 0 || len >= 1024) return false; // 异常路径直接放行
+
+    // [优化] 使用栈内存进行小写转换 避免多次大小写不同的比较
+    WCHAR szLower[1024];
+    for (size_t i = 0; i < len; ++i) {
+        szLower[i] = towlower(path[i]);
+    }
+    szLower[len] = L'\0';
+
+    // 辅助 lambda：检查是否包含关键词 (在小写路径上进行极速匹配)
+    auto contains = [&](const wchar_t* sub) {
+        return wcsstr(szLower, sub) != nullptr;
+    };
+
+    // --- 0. 基础与自身保护 ---
+    // [原规则] 自身镜像保护 (防止重定向自身 EXE)
     if (!g_CurrentProcessPathNt.empty()) {
         if (_wcsicmp(path, g_CurrentProcessPathNt.c_str()) == 0) return true;
     }
-
-    // [新增] 虚拟别名 SysNative (32位程序访问64位系统目录)
-    if (wcsstr(path, L"SysNative")) return true;
+    // [原规则] 虚拟别名 SysNative (32位程序访问64位系统目录)
+    if (contains(L"sysnative")) return true;
 
     // --- 1. IPC (进程间通信) ---
-    if (wcsstr(path, L"NamedPipe")) return true;
-    if (wcsstr(path, L"Pipe\\")) return true;
-    if (wcsstr(path, L"PIPE\\")) return true;
-    if (wcsstr(path, L"pipe\\")) return true;
-    if (wcsstr(path, L"Mailslot")) return true;
-    if (wcsstr(path, L"RPC Control")) return true;
-    // [新增] Outlook 特殊 IPC
-    if (wcsstr(path, L"OICE_")) return true;
+    if (contains(L"namedpipe")) return true;
+    if (contains(L"pipe\\")) return true;
+    if (contains(L"mailslot")) return true;
+    if (contains(L"rpc control")) return true;
+    // [原规则] Outlook 特殊 IPC
+    if (contains(L"oice_")) return true;
+    // [新增] Windows API 核心通信端口
+    if (contains(L"apiprocess")) return true; // Covers \Windows\ApiPort
+    // [新增] LSA 认证端口
+    if (contains(L"lsaauthenticationport")) return true;
+    // [新增] 核心内核对象
+    if (contains(L"kernelobjects")) return true;
 
     // --- 2. 控制台/终端 ---
-    if (wcsstr(path, L"ConDrv")) return true;
-    if (wcsstr(path, L"CONIN$")) return true;
-    if (wcsstr(path, L"CONOUT$")) return true;
-    if (wcsstr(path, L"\\??\\CON")) return true;
+    if (contains(L"condrv")) return true;
+    if (contains(L"conin$")) return true;
+    if (contains(L"conout$")) return true;
+    if (contains(L"\\??\\con")) return true;
 
     // --- 3. 关键系统驱动 ---
-    if (wcsstr(path, L"Afd")) return true;
-    if (wcsstr(path, L"AFD")) return true;
-    if (wcsstr(path, L"KsecDD")) return true;
-    if (wcsstr(path, L"MountPointManager")) return true;
-    if (wcsstr(path, L"Nsi")) return true;
-    if (wcsstr(path, L"NSI")) return true;
-
-    // [新增] 补充 file.c.txt 中遗漏的系统目录
-    if (wcsstr(path, L"catroot2")) return true;
-    if (wcsstr(path, L"drivers\\etc")) return true;
+    if (contains(L"afd")) return true;
+    if (contains(L"ksecdd")) return true;
+    if (contains(L"mountpointmanager")) return true;
+    if (contains(L"nsi")) return true;
+    // [新增] 加密模块 (Cryptography Next Generation)
+    if (contains(L"\\cng")) return true;
+    // [新增] 网络驱动接口规范
+    if (contains(L"\\ndis")) return true;
+    // [新增] 性能计数器驱动
+    if (contains(L"pcwdrv")) return true;
+    // [新增] 空设备
+    if (contains(L"\\null")) return true;
 
     // --- 4. 网络与共享 (Network & Redirectors) ---
-    if (wcsstr(path, L"Dfs")) return true;
-    if (wcsstr(path, L"\\UNC\\")) return true;
-    if (wcsstr(path, L"\\Mup\\")) return true;
-    // [新增] 关键重定向器
-    if (wcsstr(path, L"LanmanRedirector")) return true; // SMB
-    if (wcsstr(path, L"hgfs")) return true;             // VMware Shared Folders
-    // [新增] 网络重定向器前缀格式 (如 \Device\Mup\;LanmanRedirector)
-    if (wcsstr(path, L";LanmanRedirector")) return true;
+    if (contains(L"dfs")) return true;
+    if (contains(L"\\unc\\")) return true;
+    if (contains(L"\\mup\\")) return true;
+    if (contains(L"lanmanredirector")) return true;
+    if (contains(L"hgfs")) return true; // VMware Shared Folders
+    if (contains(L";lanmanredirector")) return true;
+    // [新增] 核心网络协议栈设备
+    if (contains(L"\\tcp")) return true;
+    if (contains(L"\\ip")) return true;
+    if (contains(L"\\udp")) return true;
+    if (contains(L"\\rawip")) return true;
+    if (contains(L"netbt_tcpip")) return true;
+    if (contains(L"ws2ifsl")) return true; // Winsock Kernel Interface
+    if (contains(L"\\http\\")) return true; // Kernel HTTP Driver
 
     // --- 5. 硬件与磁盘 (Hardware & Raw Disk) ---
-    if (wcsstr(path, L"Volume{")) return true;
-    if (wcsstr(path, L"CdRom")) return true;
-    if (wcsstr(path, L"Harddisk")) return true;
-    // [新增] 物理驱动器
-    if (wcsstr(path, L"PhysicalDrive")) return true;
+    if (contains(L"volume{")) return true;
+    if (contains(L"cdrom")) return true;
+    if (contains(L"harddisk")) return true;
+    if (contains(L"physicaldrive")) return true;
+    // [原规则] PnP 设备标识
+    if (contains(L"hid#")) return true;
+    if (contains(L"usb#")) return true;
+    if (contains(L"pci#")) return true;
+    if (contains(L"acpi#")) return true;
+    if (contains(L"scsi#")) return true;
+    if (contains(L"storage#")) return true;
+    if (contains(L"display#")) return true;
+    if (contains(L"monitor#")) return true;
+    if (contains(L"hdaudio#")) return true;
+    if (contains(L"root#")) return true;
 
-    // PnP 设备标识
-    if (wcsstr(path, L"hid#")) return true;
-    if (wcsstr(path, L"HID#")) return true;
-    if (wcsstr(path, L"usb#")) return true;
-    if (wcsstr(path, L"USB#")) return true;
-    if (wcsstr(path, L"pci#")) return true;
-    if (wcsstr(path, L"PCI#")) return true;
-    if (wcsstr(path, L"acpi#")) return true;
-    if (wcsstr(path, L"scsi#")) return true;
-    if (wcsstr(path, L"storage#")) return true;
-    if (wcsstr(path, L"display#")) return true;
-    if (wcsstr(path, L"monitor#")) return true;
-    if (wcsstr(path, L"hdaudio#")) return true;
-    if (wcsstr(path, L"root#")) return true;
+    // --- 6. 必须直通的系统特殊目录 ---
+    if (contains(L"spool")) return true;        // 打印机
+    if (contains(L"driverstore")) return true;  // 驱动存储
+    if (contains(L"catroot")) return true;      // 签名目录
+    if (contains(L"logfiles")) return true;     // 系统日志
+    // [原规则] 补充 file.c.txt 中遗漏的系统目录
+    if (contains(L"catroot2")) return true;
+    if (contains(L"drivers\\etc")) return true;
 
-    // --- 6. [新增] 必须直通的系统特殊目录 (源自 File_GetName_SkipWow64Link) ---
-    if (wcsstr(path, L"spool")) return true;        // 打印机
-    if (wcsstr(path, L"driverstore")) return true;  // 驱动存储
-    if (wcsstr(path, L"catroot")) return true;      // 签名目录
-    if (wcsstr(path, L"logfiles")) return true;     // 系统日志
+    // --- 7. [新增] UI、本地化与多媒体 ---
+    // [新增] Windows 主题与DWM通信
+    if (contains(L"themeapiprocess")) return true;
+    if (contains(L"uxsmsapiprocess")) return true;
+    // [新增] 已知系统DLL
+    if (contains(L"knowndlls")) return true;
+    // [新增] 国家语言支持 (National Language Support)
+    if (contains(L"\\nls\\")) return true;
+    // [新增] 多媒体类计划服务 (MMCSS)
+    if (contains(L"mmcss")) return true;
 
     return false;
 }
