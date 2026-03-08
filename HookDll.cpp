@@ -3807,15 +3807,54 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
         }
     }
 
-    // [新增] 检查是否是值墓碑 (惰性 CoW 删除标记)
-    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+    // [核心修复] 检查是否是值墓碑 (惰性 CoW 删除标记)
+    // 即使是 STATUS_BUFFER_OVERFLOW (探测长度)，也必须检查是否为墓碑
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
+        bool isTombstone = false;
+        bool typeReadable = false;
         ULONG type = 0;
-        if (KeyValueInformationClass == KeyValueBasicInformation) type = ((PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation)->Type;
-        else if (KeyValueInformationClass == KeyValueFullInformation) type = ((PKEY_VALUE_FULL_INFORMATION)KeyValueInformation)->Type;
-        else if (KeyValueInformationClass == KeyValuePartialInformation) type = ((PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation)->Type;
 
-        if (type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
-            status = STATUS_OBJECT_NAME_NOT_FOUND; // 伪装成不存在
+        // 1. 尝试从用户缓冲区读取 Type
+        if (KeyValueInformation && Length >= sizeof(ULONG)) { // Type 通常在结构体偏移 4 的位置，至少要有 4-8 字节
+            switch (KeyValueInformationClass) {
+                case KeyValueBasicInformation:
+                    if (Length >= FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Type) + sizeof(ULONG)) {
+                        type = ((PKEY_VALUE_BASIC_INFORMATION)KeyValueInformation)->Type;
+                        typeReadable = true;
+                    }
+                    break;
+                case KeyValueFullInformation:
+                    if (Length >= FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Type) + sizeof(ULONG)) {
+                        type = ((PKEY_VALUE_FULL_INFORMATION)KeyValueInformation)->Type;
+                        typeReadable = true;
+                    }
+                    break;
+                case KeyValuePartialInformation:
+                    if (Length >= FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Type) + sizeof(ULONG)) {
+                        type = ((PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation)->Type;
+                        typeReadable = true;
+                    }
+                    break;
+            }
+        }
+
+        // 2. 如果缓冲区太小无法读取 Type (例如 Length=0 的探测调用)，必须手动查询一次
+        if (!typeReadable) {
+            BYTE probeBuf[sizeof(KEY_VALUE_BASIC_INFORMATION) + 64]; // 足够容纳 Basic 信息
+            ULONG probeLen = 0;
+            // 使用 Basic 信息查询开销最小
+            NTSTATUS probeSt = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueBasicInformation, probeBuf, sizeof(probeBuf), &probeLen);
+            if (NT_SUCCESS(probeSt)) {
+                type = ((PKEY_VALUE_BASIC_INFORMATION)probeBuf)->Type;
+                typeReadable = true;
+            }
+        }
+
+        // 3. 判断是否为墓碑
+        if (typeReadable && type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
+            // [关键] 告诉程序：这个值不存在！
+            // 这样程序就会认为名字可用，从而调用 NtSetValueKey 进行覆盖
+            return STATUS_OBJECT_NAME_NOT_FOUND; 
         }
     }
 
