@@ -3982,7 +3982,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         CreateOptions &= ~REG_OPTION_VOLATILE;
     }
 
-    // ========== [新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
+    // ==========[新增] 防御性伪造：拦截特定进程的 UWP/RT 路径 ==========
     if (IsDefensiveSpoofPath(fullNtPath)) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -4058,14 +4058,14 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         }
 
         if (NT_SUCCESS(status)) {
-			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
-			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
-			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
-			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
-				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
-				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
-				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
-			}
+            // [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+            // 无论当前进程是什么权限 都尝试将新键设为 Low IL
+            // 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+            if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+                // 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+                // 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+                SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+            }
 
             // [核心修复] 打开一个拥有完全权限的临时句柄 用于执行维护操作
             // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
@@ -4116,9 +4116,15 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         hMaintenance = NULL; // 重建失败
                     }
                 }
+                else {
+                    // 常规新建检查
+                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                        isNewKey = true;
+                    }
+                }
 
                 // [核心] 惰性 CoW 初始化：屏蔽真实值
-                if (isNewKey) {
+                if (isNewKey && hMaintenance) {
                     HANDLE hRealCheck = NULL;
                     OBJECT_ATTRIBUTES oaRealCheck;
                     UNICODE_STRING usRealCheck;
@@ -4169,7 +4175,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                 }
 
                 // 关闭临时维护句柄
-                fpNtClose(hMaintenance);
+                if (hMaintenance) fpNtClose(hMaintenance);
             }
 
             // 刷新父级缓存
@@ -4244,14 +4250,18 @@ NTSTATUS NTAPI Detour_NtCreateKey(
 
                     if (NT_SUCCESS(st)) {
                         if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                        isResurrected = true;
-                        isNewKey = true;
+                        InvalidateParentRegContext(fullNtPath);
+                        needValueTombstones = true;
                     } else {
                         hMaint = NULL; // 重建失败
                     }
-                }
-                 // [核心修复] 惰性 CoW 值墓碑初始化：屏蔽真实路径的值
-                 if (needValueTombstones) {
+                 }
+                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    // 首次在沙盒创建、但真实路径已有同名键
+                    needValueTombstones = true;
+                 }
+                 //[核心修复] 惰性 CoW 值墓碑初始化：屏蔽真实路径的值
+                 if (needValueTombstones && hMaint) {
                     std::wstring realPathForTombstone;
                     if (GetRealFromSandboxPath(fullNtPath, realPathForTombstone)) {
                         HANDLE hRealCheck = NULL;
@@ -4294,7 +4304,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
                         }
                     }
                  }
-                 fpNtClose(hMaint);
+                 if (hMaint) fpNtClose(hMaint);
              }
         }
 
@@ -5586,14 +5596,14 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
         }
 
         if (NT_SUCCESS(status)) {
-			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
-			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
-			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
-			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
-				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
-				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
-				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
-			}
+            // [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
+            // 无论当前进程是什么权限 都尝试将新键设为 Low IL
+            // 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
+            if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
+                // 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
+                // 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
+                SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
+            }
 
             // [维护操作] 使用非事务句柄进行墓碑复活和初始化
             HANDLE hMaintenance = NULL;
@@ -5632,15 +5642,19 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
                     if (NT_SUCCESS(st)) {
                         if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                        isResurrected = true;
                         isNewKey = true;
                     } else {
                         hMaintenance = NULL; // 重建失败
                     }
                 }
+                else {
+                    if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                        isNewKey = true;
+                    }
+                }
 
                 // 惰性 CoW 初始化：屏蔽真实值
-                if (isNewKey) {
+                if (isNewKey && hMaintenance) {
                     HANDLE hRealCheck = NULL;
                     OBJECT_ATTRIBUTES oaRealCheck;
                     UNICODE_STRING usRealCheck;
@@ -5685,7 +5699,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                         fpNtClose(hRealCheck);
                     }
                 }
-                fpNtClose(hMaintenance);
+                if (hMaintenance) fpNtClose(hMaintenance);
             }
 
             InvalidateParentRegContext(targetSandboxFull);
@@ -5758,14 +5772,17 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
 
                     if (NT_SUCCESS(st)) {
                         if (Disposition) *Disposition = REG_CREATED_NEW_KEY;
-                        isResurrected = true;
-                        isNewKey = true;
+                        InvalidateParentRegContext(fullNtPath);
+                        needValueTombstones = true;
                     } else {
                         hMaint = NULL; // 重建失败
                     }
-                }
+                 }
+                 else if (Disposition && *Disposition == REG_CREATED_NEW_KEY) {
+                    needValueTombstones = true;
+                 }
 
-                 if (needValueTombstones) {
+                 if (needValueTombstones && hMaint) {
                     std::wstring realPathForTombstone;
                     if (GetRealFromSandboxPath(fullNtPath, realPathForTombstone)) {
                         HANDLE hRealCheck = NULL;
@@ -5807,7 +5824,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
                         }
                     }
                  }
-                 fpNtClose(hMaint);
+                 if (hMaint) fpNtClose(hMaint);
              }
         }
 
