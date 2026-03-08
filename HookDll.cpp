@@ -3307,11 +3307,52 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     return false;
 }
 
+// 设置键的时间戳（用于标记删除或复活）
+NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
+    KEY_WRITE_TIME_INFORMATION kwti;
+    if (isDelete) {
+        kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
+        kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
+    } else {
+        // 复活：设置为当前系统时间
+        GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
+    }
+
+    // 需要 KEY_SET_VALUE 权限
+    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
+}
+
 // 检查时间戳是否为删除标记
 bool IsDeleteMark(const LARGE_INTEGER& li) {
     // [修复] 注册表配置单元在卸载和重新加载时，时间戳的低位可能会发生精度丢失
     // 忽略低 8 位 (约 25.6 微秒的精度) 进行匹配，防止重启后墓碑失效
     return (li.HighPart == DELETE_MARK_HIGH && (li.LowPart & 0xFFFFFF00) == (DELETE_MARK_LOW & 0xFFFFFF00));
+}
+
+// 检查键是否被标记为删除
+bool IsKeyMarkedDeleted(HANDLE hKey) {
+    BYTE buf[1024];
+    ULONG len;
+    // 使用 KeyNodeInformation 可以同时获取时间戳和 Class 字符串
+    NTSTATUS status = fpNtQueryKey(hKey, KeyNodeInformation, buf, sizeof(buf), &len);
+    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
+        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf;
+        
+        // 1. 快速路径：检查时间戳
+        if (IsDeleteMark(info->LastWriteTime)) return true;
+
+        // 2. 持久化路径：检查 Class 字符串 (跨重启防篡改)
+        // L"YAPB_DEL" 长度为 8 个字符，即 16 字节
+        if (info->ClassLength == 16 && info->ClassOffset > 0) {
+            std::wstring cls((WCHAR*)(buf + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
+            if (cls == L"YAPB_DEL") {
+                // 修复被系统篡改的时间戳，优化后续的快速路径检查
+                SetKeyLastWriteTime(hKey, true);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // [新增] 获取句柄对应的真实路径和沙盒路径
@@ -3561,32 +3602,6 @@ void EnsureSandboxPathExists(const std::wstring& fullSandboxPath) {
     }
 }
 
-// 检查键是否被标记为删除
-bool IsKeyMarkedDeleted(HANDLE hKey) {
-    BYTE buf[1024];
-    ULONG len;
-    // 使用 KeyNodeInformation 可以同时获取时间戳和 Class 字符串
-    NTSTATUS status = fpNtQueryKey(hKey, KeyNodeInformation, buf, sizeof(buf), &len);
-    if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
-        PKEY_NODE_INFORMATION info = (PKEY_NODE_INFORMATION)buf;
-        
-        // 1. 快速路径：检查时间戳
-        if (IsDeleteMark(info->LastWriteTime)) return true;
-
-        // 2. 持久化路径：检查 Class 字符串 (跨重启防篡改)
-        // L"YAPB_DEL" 长度为 8 个字符，即 16 字节
-        if (info->ClassLength == 16 && info->ClassOffset > 0) {
-            std::wstring cls((WCHAR*)(buf + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
-            if (cls == L"YAPB_DEL") {
-                // 修复被系统篡改的时间戳，优化后续的快速路径检查
-                SetKeyLastWriteTime(hKey, true);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 // --- [新增] 清除键中的所有非墓碑值 (保留 YAPBOX_VALUE_TOMBSTONE_TYPE 值墓碑) ---
 void CleanNonTombstoneValues(HANDLE hKey) {
     if (!fpNtEnumerateValueKey || !fpNtDeleteValueKey) return;
@@ -3706,21 +3721,6 @@ bool IsProtectedCOMKey(const std::wstring& path) {
     }
 
     return false;
-}
-
-// 设置键的时间戳（用于标记删除或复活）
-NTSTATUS SetKeyLastWriteTime(HANDLE hKey, bool isDelete) {
-    KEY_WRITE_TIME_INFORMATION kwti;
-    if (isDelete) {
-        kwti.LastWriteTime.LowPart = DELETE_MARK_LOW;
-        kwti.LastWriteTime.HighPart = DELETE_MARK_HIGH;
-    } else {
-        // 复活：设置为当前系统时间
-        GetSystemTimeAsFileTime((LPFILETIME)&kwti.LastWriteTime);
-    }
-
-    // 需要 KEY_SET_VALUE 权限
-    return fpNtSetInformationKey(hKey, KeyWriteTimeInformation, &kwti, sizeof(kwti));
 }
 
 // --- 注册表 NT API Hook 实现 ---
