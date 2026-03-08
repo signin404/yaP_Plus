@@ -69,10 +69,6 @@
 // [新增] 键墓碑定义 (特殊值名称与类型)
 #define YAPBOX_KEY_TOMBSTONE_NAME L"_YapDel"
 
-// --- Sandboxie 魔数时间戳定义 ---
-#define DELETE_MARK_LOW   0xDEAD44A0
-#define DELETE_MARK_HIGH  0x01B01234
-
 #ifndef _KEY_WRITE_TIME_INFORMATION_DEFINED
 #define _KEY_WRITE_TIME_INFORMATION_DEFINED
 #endif
@@ -3311,14 +3307,14 @@ bool EnsureShadowKeyExists(HANDLE SandboxParent, PUNICODE_STRING ObjectName, HAN
     return false;
 }
 
-// 设置键的时间戳（用于标记删除或复活）
+// [重写] 设置键的墓碑状态
 NTSTATUS SetKeyTombstone(HANDLE hKey, bool isDelete) {
     UNICODE_STRING uName;
     RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
 
     if (isDelete) {
         BYTE dummy = 0;
-        // 类型设为 REG_NONE (0)，数据长度 1 字节 (避免 0 长度可能引发的边界问题)
+        // 类型设为 REG_NONE (0) 数据长度 1 字节 (避免 0 长度可能引发的边界问题)
         return fpNtSetValueKey(hKey, &uName, 0, REG_NONE, &dummy, 1);
     } else {
         // 复活：删除特殊值
@@ -3330,28 +3326,23 @@ NTSTATUS SetKeyTombstone(HANDLE hKey, bool isDelete) {
 bool IsKeyMarkedDeleted(HANDLE hKey) {
     if (!hKey) return false;
 
-    // KeyValueBasicInformation 结构很小，且不包含 Data，只包含 Name
+    // KeyValueBasicInformation 结构很小 且不包含 Data 只包含 Name
     // 64字节足够容纳结构体头 + "_YapDel" 字符串
     BYTE buf[sizeof(KEY_VALUE_BASIC_INFORMATION) + 64];
     UNICODE_STRING uName;
     RtlInitUnicodeString(&uName, YAPBOX_KEY_TOMBSTONE_NAME);
     ULONG len = 0;
 
-    // 使用 Basic 信息查询，开销最小
+    // 使用 Basic 信息查询 开销最小
     NTSTATUS st = fpNtQueryValueKey(hKey, &uName, KeyValueBasicInformation, buf, sizeof(buf), &len);
 
-    // 只要查询成功(STATUS_SUCCESS) 或 缓冲区溢出(STATUS_BUFFER_OVERFLOW，说明名字太长但值存在)
+    // 只要查询成功(STATUS_SUCCESS) 或 缓冲区溢出(STATUS_BUFFER_OVERFLOW 说明名字太长但值存在)
     // 都代表该值存在
     if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW) {
         return true;
     }
 
     return false;
-}
-
-// 检查时间戳是否为删除标记
-bool IsDeleteMark(const LARGE_INTEGER& li) {
-    return (li.LowPart == DELETE_MARK_LOW && li.HighPart == DELETE_MARK_HIGH);
 }
 
 // [新增] 获取句柄对应的真实路径和沙盒路径
@@ -3395,7 +3386,7 @@ bool GetRegPaths(HANDLE hKey, std::wstring& outReal, std::wstring& outSandbox) {
 }
 
 // ========== [新增] 双指针合并辅助函数 ==========
-// 合并两个已排序的子键 Vector (overrideVec 覆盖 baseVec，并过滤墓碑)
+// 合并两个已排序的子键 Vector (overrideVec 覆盖 baseVec 并过滤墓碑)
 void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKey>& overrideVec) {
     std::vector<CachedRegKey> merged;
     merged.reserve(baseVec.size() + overrideVec.size());
@@ -3412,8 +3403,8 @@ void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKe
             if (!itOver->IsTombstone) merged.push_back(std::move(*itOver));
             ++itOver;
         } else {
-            // 名称相同，overrideVec 覆盖 baseVec
-            // [修改] 如果是墓碑，则都不添加（相当于删除了 base）
+            // 名称相同 overrideVec 覆盖 baseVec
+            // [修改] 如果是墓碑 则都不添加（相当于删除了 base）
             if (!itOver->IsTombstone) merged.push_back(std::move(*itOver));
             ++itBase;
             ++itOver;
@@ -3430,7 +3421,7 @@ void MergeKeyVectors(std::vector<CachedRegKey>& baseVec, std::vector<CachedRegKe
     baseVec = std::move(merged);
 }
 
-// 合并两个已排序的值 Vector (overrideVec 覆盖 baseVec，并过滤墓碑)
+// 合并两个已排序的值 Vector (overrideVec 覆盖 baseVec 并过滤墓碑)
 void MergeValueVectors(std::vector<CachedRegValue>& baseVec, std::vector<CachedRegValue>& overrideVec) {
     std::vector<CachedRegValue> merged;
     merged.reserve(baseVec.size() + overrideVec.size());
@@ -3446,7 +3437,7 @@ void MergeValueVectors(std::vector<CachedRegValue>& baseVec, std::vector<CachedR
             if (itOver->Type != YAPBOX_VALUE_TOMBSTONE_TYPE) merged.push_back(std::move(*itOver));
             ++itOver;
         } else {
-            // 名称相同，overrideVec 覆盖 baseVec
+            // 名称相同 overrideVec 覆盖 baseVec
             if (itOver->Type != YAPBOX_VALUE_TOMBSTONE_TYPE) merged.push_back(std::move(*itOver));
             ++itBase;
             ++itOver;
@@ -3476,7 +3467,7 @@ void EnumerateKeysToVector(const std::wstring& path, std::vector<CachedRegKey>& 
         ULONG len;
         std::vector<BYTE> buf(4096);
 
-        // [新增] 检查是否是沙盒路径，只有沙盒路径才需要检查墓碑值
+        // [新增] 检查是否是沙盒路径 只有沙盒路径才需要检查墓碑值
         bool isSandboxPath = (!g_RegMountPathNt.empty() && _wcsnicmp(path.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0);
 
         while (true) {
@@ -3511,7 +3502,7 @@ void EnumerateKeysToVector(const std::wstring& path, std::vector<CachedRegKey>& 
                 entry.Class.assign((WCHAR*)(buf.data() + info->ClassOffset), info->ClassLength / sizeof(WCHAR));
             }
 
-            // [新增] 如果是沙盒路径，必须打开子键检查是否存在 _YapDel 值
+            // [新增] 如果是沙盒路径 必须打开子键检查是否存在 _YapDel 值
             if (isSandboxPath) {
                 HANDLE hSubKey = NULL;
                 UNICODE_STRING uSubName;
@@ -3566,7 +3557,7 @@ void EnumerateValuesToVector(const std::wstring& path, std::vector<CachedRegValu
             PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf.data();
             std::wstring name(info->Name, info->NameLength / sizeof(WCHAR));
 
-            // [新增] 过滤 _YapDel 值，不让它出现在枚举列表中
+            // [新增] 过滤 _YapDel 值 不让它出现在枚举列表中
             if (name == YAPBOX_KEY_TOMBSTONE_NAME) {
                 index++;
                 continue;
@@ -3637,7 +3628,7 @@ void CleanNonTombstoneValues(HANDLE hKey) {
     ULONG index = 0;
 
     while (true) {
-        // 使用 Basic 信息枚举，速度最快
+        // 使用 Basic 信息枚举 速度最快
         NTSTATUS st = fpNtEnumerateValueKey(hKey, index, KeyValueBasicInformation, staticBuf, sizeof(staticBuf), &len);
         if (st == STATUS_NO_MORE_ENTRIES) break;
 
@@ -3653,7 +3644,7 @@ void CleanNonTombstoneValues(HANDLE hKey) {
             break;
         }
 
-        // 1. 保留值墓碑 (惰性 CoW) - 这个类型检查必须保留，因为它是值墓碑
+        // 1. 保留值墓碑 (惰性 CoW) - 这个类型检查必须保留 因为它是值墓碑
         if (info->Type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
             index++;
             continue;
@@ -3765,7 +3756,7 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     ULONG Length,
     PULONG ResultLength
 ) {
-    // [新增] 拦截对 _YapDel 的查询，始终返回找不到
+    // [新增] 拦截对 _YapDel 的查询 始终返回找不到
     if (ValueName && ValueName->Buffer) {
         if (ValueName->Length == 14 && _wcsnicmp(ValueName->Buffer, YAPBOX_KEY_TOMBSTONE_NAME, 7) == 0) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -3808,14 +3799,14 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     }
 
     // [核心修复] 检查是否是值墓碑 (惰性 CoW 删除标记)
-    // 即使是 STATUS_BUFFER_OVERFLOW (探测长度)，也必须检查是否为墓碑
+    // 即使是 STATUS_BUFFER_OVERFLOW (探测长度) 也必须检查是否为墓碑
     if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL) {
         bool isTombstone = false;
         bool typeReadable = false;
         ULONG type = 0;
 
         // 1. 尝试从用户缓冲区读取 Type
-        if (KeyValueInformation && Length >= sizeof(ULONG)) { // Type 通常在结构体偏移 4 的位置，至少要有 4-8 字节
+        if (KeyValueInformation && Length >= sizeof(ULONG)) { // Type 通常在结构体偏移 4 的位置 至少要有 4-8 字节
             switch (KeyValueInformationClass) {
                 case KeyValueBasicInformation:
                     if (Length >= FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Type) + sizeof(ULONG)) {
@@ -3838,7 +3829,7 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
             }
         }
 
-        // 2. 如果缓冲区太小无法读取 Type (例如 Length=0 的探测调用)，必须手动查询一次
+        // 2. 如果缓冲区太小无法读取 Type (例如 Length=0 的探测调用) 必须手动查询一次
         if (!typeReadable) {
             BYTE probeBuf[sizeof(KEY_VALUE_BASIC_INFORMATION) + 64]; // 足够容纳 Basic 信息
             ULONG probeLen = 0;
@@ -3853,8 +3844,8 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
         // 3. 判断是否为墓碑
         if (typeReadable && type == YAPBOX_VALUE_TOMBSTONE_TYPE) {
             // [关键] 告诉程序：这个值不存在！
-            // 这样程序就会认为名字可用，从而调用 NtSetValueKey 进行覆盖
-            return STATUS_OBJECT_NAME_NOT_FOUND; 
+            // 这样程序就会认为名字可用 从而调用 NtSetValueKey 进行覆盖
+            return STATUS_OBJECT_NAME_NOT_FOUND;
         }
     }
 
@@ -4849,7 +4840,7 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->SubKeys = std::move(mergedKeys); // 直接 Move，零拷贝
+                ctx->SubKeys = std::move(mergedKeys); // 直接 Move 零拷贝
                 ctx->KeysInitialized = true;
             }
         } else {
@@ -4983,7 +4974,7 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
             auto it = g_RegContextMap.find(KeyHandle);
             if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
                 ctx = it->second;
-                ctx->Values = std::move(mergedValues); // 直接 Move，零拷贝
+                ctx->Values = std::move(mergedValues); // 直接 Move 零拷贝
                 ctx->ValuesInitialized = true;
             }
         } else {
@@ -5107,7 +5098,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
                 realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oaReal);
             }
 
-            // 如果返回成功，或者因为权限不足拒绝访问，都认为真实键存在
+            // 如果返回成功 或者因为权限不足拒绝访问 都认为真实键存在
             if (NT_SUCCESS(realSt) || realSt == STATUS_ACCESS_DENIED) {
                 existsInReal = true;
                 if (NT_SUCCESS(realSt)) fpNtClose(hRealCheck);
@@ -5115,7 +5106,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
         }
 
         if (!existsInReal) {
-            // 真实注册表中不存在，直接执行物理删除，不留 _YapDel 墓碑垃圾
+            // 真实注册表中不存在 直接执行物理删除 不留 _YapDel 墓碑垃圾
             NTSTATUS status = fpNtDeleteKey(KeyHandle);
             if (NT_SUCCESS(status)) {
                 InvalidateParentRegContext(path);
@@ -5123,7 +5114,7 @@ NTSTATUS NTAPI Detour_NtDeleteKey(HANDLE KeyHandle) {
             return status;
         }
 
-        // 真实注册表中存在，执行逻辑删除 (设置 _YapDel 墓碑)
+        // 真实注册表中存在 执行逻辑删除 (设置 _YapDel 墓碑)
         HANDLE hWrite = NULL;
         OBJECT_ATTRIBUTES oa;
         UNICODE_STRING emptyStr;
@@ -5304,8 +5295,8 @@ NTSTATUS NTAPI Detour_NtQueryKey(
     RecursionGuard guard;
 
     // [修改] 基础信息查询：不再检查时间戳
-    // 因为 Detour_NtOpenKey 已经负责拦截墓碑键的打开。
-    // 如果句柄能成功打开，说明它不是墓碑，或者是在内部维护模式下打开的。
+    // 因为 Detour_NtOpenKey 已经负责拦截墓碑键的打开
+    // 如果句柄能成功打开 说明它不是墓碑 或者是在内部维护模式下打开的
     if (KeyInformationClass == KeyBasicInformation ||
         KeyInformationClass == KeyNodeInformation ||
         KeyInformationClass == KeyFlagsInformation) {
