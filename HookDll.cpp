@@ -20,9 +20,6 @@
 #include <shellapi.h>
 #include <numeric>
 #include <set>
-#include <sddl.h>
-#include <aclapi.h>
-#include <processthreadsapi.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -59,9 +56,6 @@
 // -----------------------------------------------------------
 // 1. 常量和宏补全
 // -----------------------------------------------------------
-
-// [新增] 辅助宏：计算对齐
-#define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 
 // [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
 #define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
@@ -202,6 +196,7 @@
 #define FileAllInformation ((FILE_INFORMATION_CLASS)18)
 #endif
 
+// 1. 补充 NTSTATUS 状态码
 #ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
 #endif
@@ -210,6 +205,8 @@
 #define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
 #endif
 
+// 2. 补充 FILE_INFORMATION_CLASS 枚举值
+// winternl.h 通常只定义了部分值 这里使用宏强制补充
 #ifndef FileDirectoryInformation
 #define FileDirectoryInformation ((FILE_INFORMATION_CLASS)1)
 #endif
@@ -297,6 +294,62 @@
 // -----------------------------------------------------------
 // 2. 补全缺失的 NT 结构体与枚举
 // -----------------------------------------------------------
+
+// --- [新增] 事务注册表相关函数指针 ---
+typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG TitleIndex,
+    PUNICODE_STRING Class,
+    ULONG CreateOptions,
+    HANDLE TransactionHandle,
+    PULONG Disposition
+);
+
+typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(
+    PHANDLE KeyHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE TransactionHandle
+);
+
+typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(
+    HANDLE KeyHandle,
+    PKEY_VALUE_ENTRY ValueEntries,
+    ULONG EntryCount,
+    PVOID ValueBuffer,
+    PULONG BufferLength,
+    PULONG RequiredBufferLength
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(
+    HANDLE KeyHandle,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
+
+typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(
+    HANDLE MasterKeyHandle,
+    ULONG Count,
+    POBJECT_ATTRIBUTES SlaveObjects,
+    HANDLE Event,
+    PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG CompletionFilter,
+    BOOLEAN WatchTree,
+    PVOID Buffer,
+    ULONG BufferSize,
+    BOOLEAN Asynchronous
+);
 
 typedef struct _KEY_WRITE_TIME_INFORMATION {
     LARGE_INTEGER LastWriteTime;
@@ -632,6 +685,7 @@ typedef struct _FILE_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_BOTH_DIR_INFORMATION, *PFILE_BOTH_DIR_INFORMATION;
 
+// FILE_DIRECTORY_INFORMATION 结构体
 typedef struct _FILE_DIRECTORY_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -646,6 +700,7 @@ typedef struct _FILE_DIRECTORY_INFORMATION {
     WCHAR FileName[1];
 } FILE_DIRECTORY_INFORMATION, *PFILE_DIRECTORY_INFORMATION;
 
+// FILE_ID_BOTH_DIR_INFORMATION 结构体
 typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -664,6 +719,7 @@ typedef struct _FILE_ID_BOTH_DIR_INFORMATION {
     WCHAR FileName[1];
 } FILE_ID_BOTH_DIR_INFORMATION, *PFILE_ID_BOTH_DIR_INFORMATION;
 
+// [新增] 补充缺失的目录信息结构体
 typedef struct _FILE_NAMES_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -690,16 +746,6 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // -----------------------------------------------------------
 // 3. 函数指针定义
 // -----------------------------------------------------------
-
-typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags, DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize);
-typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
-
-// --- [新增] 事务注册表相关函数指针 ---
-typedef NTSTATUS (NTAPI *P_NtCreateKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, HANDLE TransactionHandle, PULONG Disposition);
-typedef NTSTATUS (NTAPI *P_NtOpenKeyTransacted)(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, HANDLE TransactionHandle);
-typedef NTSTATUS (NTAPI *P_NtQueryMultipleValueKey)(HANDLE KeyHandle, PKEY_VALUE_ENTRY ValueEntries, ULONG EntryCount, PVOID ValueBuffer, PULONG BufferLength, PULONG RequiredBufferLength);
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeKey)(HANDLE KeyHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
-typedef NTSTATUS (NTAPI *P_NtNotifyChangeMultipleKeys)(HANDLE MasterKeyHandle, ULONG Count, POBJECT_ATTRIBUTES SlaveObjects, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG CompletionFilter, BOOLEAN WatchTree, PVOID Buffer, ULONG BufferSize, BOOLEAN Asynchronous);
 
 typedef NTSTATUS (NTAPI *P_NtQueryKey)(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *P_NtSetInformationKey)(HANDLE, KEY_SET_INFORMATION_CLASS, PVOID, ULONG);
@@ -736,7 +782,6 @@ typedef BOOL (PASCAL *LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOID
 typedef int (WSAAPI* P_WSAIoctl)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 typedef BOOL (WSAAPI* P_WSAConnectByNameW)(SOCKET, LPWSTR, LPWSTR, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, LPDWORD, const struct timeval*, LPWSAOVERLAPPED);
 typedef BOOL (WSAAPI* P_WSAConnectByList)(SOCKET, PSOCKET_ADDRESS_LIST, LPDWORD, LPSOCKADDR, LPDWORD, LPSOCKADDR, const struct timeval*, LPWSAOVERLAPPED);
-
 // ConnectEx 的 GUID
 const GUID g_GuidConnectEx = WSAID_CONNECTEX;
 
@@ -1092,12 +1137,12 @@ bool g_HookChild = true; // [新增] 子进程挂钩开关 默认开启
 std::wstring g_CurrentProcessPathNt; // [新增] 当前进程 NT 路径 用于自身镜像保护
 std::wstring g_SandboxDevicePath;   // 沙盒的完整设备路径 (如 \Device\HarddiskVolume2\Sandbox)
 std::wstring g_SandboxRelativePath; // 沙盒的相对路径 (如 \Sandbox)
+std::wstring g_PipePrefix; // 例如: "YapBox_00000001_"
 DWORD g_FakeVolumeSerial = 0;
 bool g_HookVolumeId = false;
 std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
-std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
 
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
@@ -1141,6 +1186,7 @@ bool g_EnableTimeHook = false;
 
 // [新增] 防止时间函数递归调用的标志
 thread_local bool g_InTimeHook = false;
+
 thread_local bool g_IsInHook = false;
 
 // 辅助类：自动设置和清除标志
@@ -1148,35 +1194,6 @@ struct TimeRecursionGuard {
     TimeRecursionGuard() { g_InTimeHook = true; }
     ~TimeRecursionGuard() { g_InTimeHook = false; }
 };
-
-//[修改] 直接定义并自动初始化全局架构标志
-inline bool InitIsWin64() {
-#ifdef _WIN64
-    return true; // 64位编译环境下 系统必然是64位
-#else
-    BOOL isWow64 = FALSE;
-    // 32位编译环境下 如果当前是Wow64进程 说明系统是64位
-    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
-        return isWow64 != FALSE;
-    }
-    return false;
-#endif
-}
-
-inline bool InitIsWow64Process() {
-#ifdef _WIN64
-    return false; // 64位进程本身不是Wow64进程
-#else
-    BOOL isWow64 = FALSE;
-    if (IsWow64Process(GetCurrentProcess(), &isWow64)) {
-        return isWow64 != FALSE;
-    }
-    return false;
-#endif
-}
-
-bool g_IsWin64 = InitIsWin64();
-bool g_IsWow64Process = InitIsWow64Process();
 
 P_connect fpConnect = NULL;
 P_WSAConnect fpWSAConnect = NULL;
@@ -1278,8 +1295,6 @@ P_NtNotifyChangeKey fpNtNotifyChangeKey = NULL;
 P_NtNotifyChangeMultipleKeys fpNtNotifyChangeMultipleKeys = NULL;
 P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
-P_UpdateProcThreadAttribute fpUpdateProcThreadAttribute = nullptr;
-P_SetProcessMitigationPolicy fpSetProcessMitigationPolicy = nullptr;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -2608,65 +2623,6 @@ struct RecursionGuard {
 };
 
 // --- 注册表重定向辅助函数 ---
-// 获取当前进程名 (小写 懒加载)
-const std::wstring& GetCurrentProcessNameLower() {
-    if (g_CurrentProcessNameLower.empty()) {
-        wchar_t path[MAX_PATH];
-        if (GetModuleFileNameW(NULL, path, MAX_PATH)) {
-            wchar_t* name = wcsrchr(path, L'\\');
-            g_CurrentProcessNameLower = name ? name + 1 : path;
-            std::transform(g_CurrentProcessNameLower.begin(), g_CurrentProcessNameLower.end(), g_CurrentProcessNameLower.begin(), towlower);
-        }
-    }
-    return g_CurrentProcessNameLower;
-}
-
-// 检查是否需要伪造特定的注册表值
-// 返回 true 表示需要伪造 outData 和 outType 将被填充
-bool TryGetAppCompatValue(const std::wstring& valueName, DWORD& outData, ULONG& outType) {
-    const std::wstring& proc = GetCurrentProcessNameLower();
-
-    // 1. Internet Explorer / WebBrowser Control 兼容性
-    // 禁用保护模式 (Protected Mode) 防止 IE 尝试启动 Broker 进程
-    if (proc == L"iexplore.exe" || proc == L"microsoftedgecp.exe" || true) { // "true" 表示对所有进程生效 防止内嵌 WebBrowser 控件崩溃
-        // Zone 设定: 2500 = Protected Mode. 3 = OFF, 0 = ON.
-        if (valueName == L"2500") {
-            outType = REG_DWORD; outData = 3; return true;
-        }
-        // 显式关闭保护模式
-        if (_wcsicmp(valueName.c_str(), L"ProtectedModeOffForAllZones") == 0) {
-            outType = REG_DWORD; outData = 1; return true;
-        }
-        // 隐藏“保护模式已关闭”的警告条
-        if (_wcsicmp(valueName.c_str(), L"NoProtectedModeBanner") == 0) {
-            outType = REG_DWORD; outData = 1; return true;
-        }
-        // 禁用 IE9+ 的 USER32 Detours (Sandboxie 特有 防止冲突)
-        if (_wcsicmp(valueName.c_str(), L"DetourDialogs") == 0) {
-            outType = REG_DWORD; outData = 0; return true;
-        }
-    }
-
-    // 2. Adobe Acrobat / Reader 兼容性
-    // 禁用 Adobe 自带的沙盒 (Protected Mode) 和更新检查
-    if (proc == L"acrord32.exe" || proc == L"acrobat.exe" || proc == L"acrodist.exe") {
-        if (_wcsicmp(valueName.c_str(), L"bProtectedMode") == 0) {
-            outType = REG_DWORD; outData = 0; return true; // 关沙盒
-        }
-        if (_wcsicmp(valueName.c_str(), L"iCheckReader") == 0) {
-            outType = REG_DWORD; outData = 0; return true; // 关更新
-        }
-    }
-
-    // 3. 通用兼容性 (SRP / CreateProcess)
-    // 禁用 Authenticode 检查 防止递归调用 SandboxieCrypto 导致死锁
-    if (_wcsicmp(valueName.c_str(), L"AuthenticodeEnabled") == 0) {
-        outType = REG_DWORD; outData = 0; return true;
-    }
-
-    return false;
-}
-
 // 解析注册表对象属性为完整 NT 路径
 std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
@@ -2720,203 +2676,18 @@ std::wstring ResolveRegPathFromAttr(POBJECT_ATTRIBUTES attr) {
         fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
     }
 
-    // ========== [新增] 路径规范化 (移植自 Sandboxie) ==========
-    if (!fullPath.empty()) {
-        std::wstring lowerPath = fullPath;
-        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-
-        // 1. 统一 ControlSetXXX 为 CurrentControlSet
-        // 匹配 \registry\machine\system\controlset001 等 (前缀长度 35)
-        if (lowerPath.compare(0, 35, L"\\registry\\machine\\system\\controlset") == 0 && lowerPath.length() >= 38) {
-            // 确保后面 3 个字符是数字 (例如 001, 002)
-            if (iswdigit(fullPath[35]) && iswdigit(fullPath[36]) && iswdigit(fullPath[37])) {
-                fullPath = L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet" + fullPath.substr(38);
-                // 更新 lowerPath 以供后续匹配
-                lowerPath = fullPath;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-            }
-        }
-
-        // 2. 统一 \REGISTRY\USER\CURRENT 为 当前用户 SID
-        // 匹配 \registry\user\current (前缀长度 23)
-        if (lowerPath.compare(0, 23, L"\\registry\\user\\current") == 0) {
-            // 确保是完整路径节点 (末尾 或者以 \ 继续)
-            if (lowerPath.length() == 23 || lowerPath[23] == L'\\') {
-                fullPath = g_CurrentUserSidPath + fullPath.substr(23);
-                lowerPath = fullPath;
-                std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-            }
-        }
-
-        // 3. WinSxS (SideBySide) 重定向 (Vista+)
-        // 匹配 \registry\machine\software\microsoft\windows\currentversion\sidebyside (前缀长度 70)
-        if (lowerPath.compare(0, 70, L"\\registry\\machine\\software\\microsoft\\windows\\currentversion\\sidebyside") == 0) {
-            if (lowerPath.length() == 70 || lowerPath[70] == L'\\') {
-                fullPath = L"\\REGISTRY\\MACHINE\\COMPONENTS" + fullPath.substr(70);
-            }
-        }
-    }
-
     return fullPath;
 }
 
-// [新增] 辅助函数：通过句柄获取内核解析后的真实 NT 路径
-std::wstring GetNameFromHandle(HANDLE hKey) {
-    if (!hKey || !fpNtQueryKey) return L"";
-    ULONG len = 0;
-    NTSTATUS st = fpNtQueryKey(hKey, KeyNameInformation, NULL, 0, &len);
-    if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL || len > 0) {
-        std::vector<BYTE> buf(len + 2);
-        if (NT_SUCCESS(fpNtQueryKey(hKey, KeyNameInformation, buf.data(), len, &len))) {
-            PKEY_NAME_INFORMATION info = (PKEY_NAME_INFORMATION)buf.data();
-            return std::wstring(info->Name, info->NameLength / sizeof(WCHAR));
-        }
-    }
-    return L"";
+// 简单的 WOW64 路径修正
+std::wstring FixRegPathWow64(const std::wstring& path) {
+    // 简单判断：如果包含 \Software\ 且不包含 Wow6432Node 且当前是 32 位进程在 64 位系统上
+    // 这里为了简化 暂时不做复杂的 WOW64 模拟 直接返回原路径
+    // 大多数情况下 系统会在 NtCreateKey 之前处理好重定向 或者我们拦截到的已经是重定向后的路径
+    return path;
 }
 
-// [替换] 完善的 WOW64 路径修正 (移植自 Sandboxie Key_FixNameWow64)
-std::wstring FixRegPathWow64(const std::wstring& path, ACCESS_MASK DesiredAccess) {
-    // 如果不是 64 位系统 不需要重定向
-    if (!g_IsWin64) return path;
-
-    // 排除 Office ClickToRun 等特殊路径 (Sandboxie 兼容性逻辑)
-    if (_wcsnicmp(path.c_str(), L"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Office", 43) == 0) {
-        return path;
-    }
-
-    bool wants32 = false;
-    if (DesiredAccess & KEY_WOW64_32KEY) {
-        wants32 = true;
-    } else if (DesiredAccess & KEY_WOW64_64KEY) {
-        wants32 = false;
-    } else {
-        wants32 = g_IsWow64Process;
-    }
-
-    std::wstring lowerPath = path;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
-
-    // 如果明确需要 64 位视图 或者路径中已经包含 wow6432node 则不处理
-    if (!wants32 || lowerPath.find(L"wow6432node") != std::wstring::npos) {
-        return path;
-    }
-
-    // 核心逻辑：利用 Windows 内核的重定向机制
-    std::wstring currentPath = path;
-    std::wstring choppedPath = L"";
-    HANDLE hTemp = NULL;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING us;
-
-    // [修正] 显式指定 WOW64 标志 确保内核使用正确的视图进行路径解析
-    ACCESS_MASK openAccess = KEY_QUERY_VALUE;
-    if (wants32) {
-        openAccess |= KEY_WOW64_32KEY;
-    } else {
-        openAccess |= KEY_WOW64_64KEY;
-    }
-
-    while (!currentPath.empty()) {
-        RtlInitUnicodeString(&us, currentPath.c_str());
-        InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-        NTSTATUS st = fpNtOpenKey(&hTemp, openAccess, &oa);
-        if (NT_SUCCESS(st)) {
-            break; // 成功打开
-        }
-
-        // 如果找不到 砍掉最后一级目录继续往上找 (应对新建键的情况)
-        size_t pos = currentPath.rfind(L'\\');
-        if (pos == std::wstring::npos || pos == 0) {
-            break;
-        }
-
-        std::wstring chopped = currentPath.substr(pos);
-        choppedPath = chopped + choppedPath;
-        currentPath = currentPath.substr(0, pos);
-    }
-
-    if (hTemp) {
-        std::wstring realResolvedPath = GetNameFromHandle(hTemp);
-        fpNtClose(hTemp);
-
-        if (!realResolvedPath.empty()) {
-            std::wstring finalPath = realResolvedPath + choppedPath;
-
-            // 清理可能出现的双重 Wow6432Node
-            std::wstring lowerFinal = finalPath;
-            std::transform(lowerFinal.begin(), lowerFinal.end(), lowerFinal.begin(), towlower);
-            size_t doubleWow = lowerFinal.find(L"\\wow6432node\\wow6432node");
-
-            if (doubleWow != std::wstring::npos) {
-                finalPath.erase(doubleWow, 12); // 删掉一个 \Wow6432Node
-            }
-            return finalPath;
-        }
-    }
-
-    return path; // 回退到原路径
-}
-
-// ========== [新增] 权限与降权 (Low Integrity) 支持 ==========
-// 检查当前进程是否是受限令牌 (Low Integrity / AppContainer)
-bool IsRestrictedToken() {
-    HANDLE hToken;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        DWORD isRestricted = 0;
-        DWORD len = 0;
-        if (GetTokenInformation(hToken, TokenIsRestricted, &isRestricted, sizeof(isRestricted), &len) && isRestricted) {
-            CloseHandle(hToken);
-            return true;
-        }
-
-        PTOKEN_MANDATORY_LABEL pTIL = NULL;
-        GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
-        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-            pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(LPTR, len);
-            if (pTIL && GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, len, &len)) {
-                DWORD dwIntegrityLevel = *GetSidSubAuthority(pTIL->Label.Sid,
-                    (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
-                LocalFree(pTIL);
-                CloseHandle(hToken);
-                return dwIntegrityLevel < SECURITY_MANDATORY_MEDIUM_RID;
-            }
-            if (pTIL) LocalFree(pTIL);
-        }
-        CloseHandle(hToken);
-    }
-    return false;
-}
-
-// 降低指定注册表键的完整性级别 (Mandatory Integrity Control) 为 Low
-bool SetLowLabelKeyByName(const std::wstring& ntPath) {
-    HANDLE hKey = NULL;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING us;
-    RtlInitUnicodeString(&us, ntPath.c_str());
-    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    // 尝试以 WRITE_OWNER | WRITE_DAC 权限打开
-    if (NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY, &oa)) ||
-        NT_SUCCESS(fpNtOpenKey(&hKey, WRITE_DAC, &oa))) {
-
-        PSECURITY_DESCRIPTOR pSD = NULL;
-        // S:(ML;;NW;;;LW) 表示 Low Mandatory Level
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"S:(ML;;NW;;;LW)", SDDL_REVISION_1, &pSD, NULL)) {
-            PACL pSacl = NULL;
-            BOOL saclPresent = FALSE, saclDefaulted = FALSE;
-            GetSecurityDescriptorSacl(pSD, &saclPresent, &pSacl, &saclDefaulted);
-
-            DWORD res = SetSecurityInfo(hKey, SE_REGISTRY_KEY, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, pSacl);
-            LocalFree(pSD);
-            fpNtClose(hKey);
-            return res == ERROR_SUCCESS;
-        }
-        fpNtClose(hKey);
-    }
-    return false;
-}
+// --- [新增] 沙盒墓碑机制 ---
 
 // --- [新增] 清除键的所有值 (用于复活墓碑键时) ---
 void ClearSandboxKeyValues(HANDLE hKey) {
@@ -3103,11 +2874,6 @@ bool IsSystemCriticalRegPath(const std::wstring& path) {
     // 8. IE Zones
     if (contains(L"internet settings\\zones")) return true;
 
-    // ==========[新增] AppHive 直通 (移植自 Sandboxie) ==========
-    // 9. AppHive (UWP/Centennial 私有配置单元)
-    // 路径形如 \REGISTRY\A\... 必须直通 否则现代应用无法运行
-    if (lowerPath.compare(0, 13, L"\\registry\\a\\") == 0) return true;
-
     return false;
 }
 
@@ -3216,19 +2982,6 @@ void EnsureRegPathExistsRelative(const std::wstring& relPath) {
 
         ULONG disposition;
         NTSTATUS status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
-
-        // ========== [新增] 降权处理 (移植自 Sandboxie Key_CreatePath) ==========
-        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
-            // 如果创建失败 说明父键权限过高 降低父键的完整性级别
-            std::wstring parentNtPath = g_RegMountPathNt;
-            if (currentPos > 0) {
-                parentNtPath += L"\\" + relPath.substr(0, currentPos - 1);
-            }
-            SetLowLabelKeyByName(parentNtPath);
-
-            // 重试创建
-            status = fpNtCreateKey(&hKey, KEY_READ | KEY_WRITE, &oa, 0, NULL, 0, &disposition);
-        }
 
         if (NT_SUCCESS(status)) {
             fpNtClose(hKey);
@@ -3564,32 +3317,6 @@ NTSTATUS NTAPI Detour_NtQueryValueKey(
     // 注意：这里不加 RecursionGuard 因为 fpNtQueryValueKey 是原始函数 不会递归
     NTSTATUS status = fpNtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
 
-    // ========== [新增] 特定应用兼容性伪造 (移植自 Sandboxie) ==========
-    // 无论原始调用是否成功 只要程序查询敏感值 我们都强制覆盖为“安全”的值
-    // 仅处理最常用的 KeyValuePartialInformation (RegQueryValueEx 默认使用此类型)
-    if (ValueName && ValueName->Buffer && KeyValueInformationClass == KeyValuePartialInformation) {
-        std::wstring queryName(ValueName->Buffer, ValueName->Length / sizeof(WCHAR));
-        DWORD fakeData = 0;
-        ULONG fakeType = REG_DWORD;
-
-        if (TryGetAppCompatValue(queryName, fakeData, fakeType)) {
-            ULONG requiredSize = FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + sizeof(DWORD);
-
-            if (ResultLength) *ResultLength = requiredSize;
-
-            if (Length >= requiredSize) {
-                PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)KeyValueInformation;
-                info->TitleIndex = 0;
-                info->Type = fakeType;
-                info->DataLength = sizeof(DWORD);
-                memcpy(info->Data, &fakeData, sizeof(DWORD));
-                return STATUS_SUCCESS; // 强制返回成功
-            } else {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-        }
-    }
-
     // [新增] 检查是否是值墓碑 (惰性 CoW 删除标记)
     if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
         ULONG type = 0;
@@ -3809,22 +3536,6 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         realPathCandidate = fullNtPath;
     }
 
-    // ========== [新增] WOW64 路径重定向修正 ==========
-    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
-    if (fixedRealPath != realPathCandidate) {
-        realPathCandidate = fixedRealPath;
-        if (!isSandboxPath) {
-            fullNtPath = fixedRealPath;
-        } else {
-            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
-            // 需要重新计算沙盒路径 fullNtPath
-            std::wstring relPath;
-            if (ShouldRedirectReg(realPathCandidate, relPath)) {
-                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
-            }
-        }
-    }
-
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
@@ -3857,28 +3568,7 @@ NTSTATUS NTAPI Detour_NtCreateKey(
         // 直接尝试创建/打开沙盒键
         NTSTATUS status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
 
-        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
-        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
-            // 降低目标键及其父键的完整性级别
-            SetLowLabelKeyByName(targetSandboxFull);
-            size_t pos = targetSandboxFull.rfind(L'\\');
-            if (pos != std::wstring::npos) {
-                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
-            }
-            // 重试
-            status = fpNtCreateKey(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, Disposition);
-        }
-
         if (NT_SUCCESS(status)) {
-			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
-			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
-			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
-			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
-				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
-				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
-				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
-			}
-
             // [核心修复] 打开一个拥有完全权限的临时句柄 用于执行维护操作
             // 避免因用户申请的 DesiredAccess 权限不足 (如缺少 KEY_QUERY_VALUE) 导致复活/清理失败
             HANDLE hMaintenance = NULL;
@@ -4099,22 +3789,6 @@ NTSTATUS NTAPI Detour_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, PO
         realPathCandidate = fullNtPath;
     }
 
-    // ========== [新增] WOW64 路径重定向修正 ==========
-    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
-    if (fixedRealPath != realPathCandidate) {
-        realPathCandidate = fixedRealPath;
-        if (!isSandboxPath) {
-            fullNtPath = fixedRealPath;
-        } else {
-            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
-            // 需要重新计算沙盒路径 fullNtPath
-            std::wstring relPath;
-            if (ShouldRedirectReg(realPathCandidate, relPath)) {
-                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
-            }
-        }
-    }
-
     // 3. [核心修复] 白名单检查 (DirectSound/Drivers 等)
     // 如果是系统关键路径 强制使用绝对路径打开真实键 丢弃可能指向沙盒的 RootDirectory
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
@@ -4286,22 +3960,6 @@ NTSTATUS NTAPI Detour_NtOpenKeyEx(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, 
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
         realPathCandidate = fullNtPath;
-    }
-
-    // ========== [新增] WOW64 路径重定向修正 ==========
-    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
-    if (fixedRealPath != realPathCandidate) {
-        realPathCandidate = fixedRealPath;
-        if (!isSandboxPath) {
-            fullNtPath = fixedRealPath;
-        } else {
-            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
-            // 需要重新计算沙盒路径 fullNtPath
-            std::wstring relPath;
-            if (ShouldRedirectReg(realPathCandidate, relPath)) {
-                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
-            }
-        }
     }
 
     // 白名单直通
@@ -4969,22 +4627,6 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
         realPathCandidate = fullNtPath;
     }
 
-    // ========== [新增] WOW64 路径重定向修正 ==========
-    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
-    if (fixedRealPath != realPathCandidate) {
-        realPathCandidate = fixedRealPath;
-        if (!isSandboxPath) {
-            fullNtPath = fixedRealPath;
-        } else {
-            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
-            // 需要重新计算沙盒路径 fullNtPath
-            std::wstring relPath;
-            if (ShouldRedirectReg(realPathCandidate, relPath)) {
-                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
-            }
-        }
-    }
-
     if (!realPathCandidate.empty() && IsSystemCriticalRegPath(realPathCandidate)) {
         UNICODE_STRING usReal;
         RtlInitUnicodeString(&usReal, realPathCandidate.c_str());
@@ -5017,28 +4659,7 @@ NTSTATUS NTAPI Detour_NtCreateKeyTransacted(
         // 尝试创建/打开沙盒键 (带事务)
         NTSTATUS status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
 
-        // ========== [新增] 降权处理 (移植自 Sandboxie Key_NtCreateKeyImpl) ==========
-        if (status == STATUS_ACCESS_DENIED && IsRestrictedToken()) {
-            // 降低目标键及其父键的完整性级别
-            SetLowLabelKeyByName(targetSandboxFull);
-            size_t pos = targetSandboxFull.rfind(L'\\');
-            if (pos != std::wstring::npos) {
-                SetLowLabelKeyByName(targetSandboxFull.substr(0, pos));
-            }
-            // 重试 (注意：必须包含 TransactionHandle 参数)
-            status = fpNtCreateKeyTransacted(KeyHandle, DesiredAccess, &oaModified, TitleIndex, Class, CreateOptions, TransactionHandle, Disposition);
-        }
-
         if (NT_SUCCESS(status)) {
-			// [新增] 预防式降权：如果当前是沙盒路径 且是新创建的键
-			// 无论当前进程是什么权限 都尝试将新键设为 Low IL
-			// 这样后续的 Low IL 进程（如 Chrome内核）也能访问它
-			if (isSandboxPath && (Disposition && *Disposition == REG_CREATED_NEW_KEY)) {
-				// 只有当当前进程有权修改 DACL/SACL 时 (Medium/High) 才能成功
-				// 如果当前已经是 Low 它创建出来的本来就是 Low 这里失败也没关系
-				SetLowLabelKeyByName(targetSandboxFull); // 或者使用句柄版本 SetLowLabelKeyByHandle(*KeyHandle)
-			}
-
             // [维护操作] 使用非事务句柄进行墓碑复活和初始化
             HANDLE hMaintenance = NULL;
             OBJECT_ATTRIBUTES oaMaint;
@@ -5228,22 +4849,6 @@ NTSTATUS NTAPI Detour_NtOpenKeyTransacted(PHANDLE KeyHandle, ACCESS_MASK Desired
         GetRealFromSandboxPath(fullNtPath, realPathCandidate);
     } else {
         realPathCandidate = fullNtPath;
-    }
-
-    // ========== [新增] WOW64 路径重定向修正 ==========
-    std::wstring fixedRealPath = FixRegPathWow64(realPathCandidate, DesiredAccess);
-    if (fixedRealPath != realPathCandidate) {
-        realPathCandidate = fixedRealPath;
-        if (!isSandboxPath) {
-            fullNtPath = fixedRealPath;
-        } else {
-            // 如果是沙盒路径 且真实路径因为 WOW64 发生了改变 (例如插入了 Wow6432Node)
-            // 需要重新计算沙盒路径 fullNtPath
-            std::wstring relPath;
-            if (ShouldRedirectReg(realPathCandidate, relPath)) {
-                fullNtPath = g_RegMountPathNt + L"\\" + relPath;
-            }
-        }
     }
 
     // 白名单直通
@@ -5781,6 +5386,40 @@ bool NtPathExists(const std::wstring& ntPath) {
     return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
+// [新增] 初始化管道前缀 (在 InitHookThread 中调用)
+void InitPipeVirtualization() {
+    DWORD sessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+
+    // 生成唯一前缀 格式: YapBox_<SessionId>_
+    // 这样不同 Session 的沙盒不会冲突 且与真实管道区分开
+    wchar_t buf[64];
+    swprintf_s(buf, L"YapBox_%08x_", sessionId);
+    g_PipePrefix = buf;
+}
+
+// [新增] 计算虚拟化管道路径
+// 输入: \Device\NamedPipe\MyPipe
+// 输出: \Device\NamedPipe\YapBox_00000001_MyPipe
+bool GetBoxedPipePath(const std::wstring& fullNtPath, std::wstring& outBoxedPath) {
+    const std::wstring pipeDevice = L"\\Device\\NamedPipe\\";
+
+    // 检查是否为命名管道路径
+    if (fullNtPath.size() > pipeDevice.size() &&
+        _wcsnicmp(fullNtPath.c_str(), pipeDevice.c_str(), pipeDevice.size()) == 0) {
+
+        std::wstring pipeName = fullNtPath.substr(pipeDevice.size());
+
+        // 检查是否已经被虚拟化 (防止重复添加前缀)
+        if (pipeName.find(g_PipePrefix) == 0) return false;
+
+        // 构造虚拟化路径
+        outBoxedPath = pipeDevice + g_PipePrefix + pipeName;
+        return true;
+    }
+    return false;
+}
+
 // [新增] 虚拟光驱路径重定向辅助类 (RAII)
 class VirtualCdRedirector {
 public:
@@ -5885,6 +5524,45 @@ NTSTATUS NTAPI Detour_NtCreateFile(
     // 1. 路径解析与规范化 (后续原有逻辑)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 命名管道客户端虚拟化
+    std::wstring boxedPipePath;
+    if (GetBoxedPipePath(fullNtPath, boxedPipePath)) {
+        // 这是一个管道路径 我们需要决定是连接到沙盒内的虚拟管道 还是直通系统管道
+
+        // 1. 检查沙盒内是否存在该虚拟管道
+        // 使用 NtQueryAttributesFile 探测 避免产生连接副作用
+        OBJECT_ATTRIBUTES oaPipe;
+        UNICODE_STRING usPipe;
+        FILE_BASIC_INFORMATION basicInfo;
+
+        RtlInitUnicodeString(&usPipe, boxedPipePath.c_str());
+        InitializeObjectAttributes(&oaPipe, &usPipe, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        // 注意：对于管道 NtQueryAttributesFile 可能返回 STATUS_SUCCESS 或其他状态
+        // 只要不是 Object Name Not Found 就说明管道存在
+        NTSTATUS probeStatus = fpNtQueryAttributesFile(&oaPipe, &basicInfo);
+
+        if (probeStatus != STATUS_OBJECT_NAME_NOT_FOUND && probeStatus != STATUS_OBJECT_PATH_NOT_FOUND) {
+            // 沙盒内存在同名管道 (由本沙盒内的进程创建) 优先连接它
+            UNICODE_STRING uStr;
+            RtlInitUnicodeString(&uStr, boxedPipePath.c_str());
+
+            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+            HANDLE oldRoot = ObjectAttributes->RootDirectory;
+            ObjectAttributes->ObjectName = &uStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            DebugLog(L"Pipe: Connected to Virtualized Pipe %s", boxedPipePath.c_str());
+            return status;
+        }
+        // 如果沙盒内不存在 则放行 允许连接到真实的系统管道 (如 RPC, SCM 等)
+    }
 
     // 兼容性补丁区域 (Pre-Call)
 
@@ -6849,79 +6527,49 @@ NTSTATUS NTAPI Detour_NtQueryObject(
     ULONG Length,
     PULONG ReturnLength
 ) {
-    // 1. 调用原始函数
+    // 调用原始函数
     NTSTATUS status = fpNtQueryObject(Handle, ObjectInformationClass, ObjectInformation, Length, ReturnLength);
 
-    // 2. 仅处理成功且为 ObjectNameInformation (1) 的情况
-    // 注意：ObjectAllInformation (3) 返回的是全局类型统计 不包含当前对象的路径 因此无需伪装
+    // 仅处理成功且为 ObjectNameInformation 的情况
     if (NT_SUCCESS(status) && ObjectInformationClass == ObjectNameInformation && ObjectInformation) {
 
         POBJECT_NAME_INFORMATION pNameInfo = (POBJECT_NAME_INFORMATION)ObjectInformation;
-
-        // 确保缓冲区包含有效的 Name 结构且 Name 不为空
         if (pNameInfo->Name.Buffer && pNameInfo->Name.Length > 0) {
 
+            // 获取当前返回的路径 (设备路径格式)
+            // 例如: \Device\HarddiskVolume2\Sandbox\C\Windows\System32\notepad.exe
             std::wstring currentPath(pNameInfo->Name.Buffer, pNameInfo->Name.Length / sizeof(wchar_t));
-            std::wstring spoofedPath;
-            bool needSpoof = false;
 
-            // ---------------------------------------------------------
-            // A. 注册表对象伪装 (配合 g_RegMountPathNt)
-            // ---------------------------------------------------------
-            if (!g_RegMountPathNt.empty() &&
-                _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+            // 检查是否以沙盒设备路径开头
+            if (!g_SandboxDevicePath.empty() &&
+                currentPath.size() > g_SandboxDevicePath.size() &&
+                _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
 
-                // 反推真实路径
-                std::wstring realRegPath;
-                if (GetRealFromSandboxPath(currentPath, realRegPath)) {
-                    spoofedPath = realRegPath;
-                    needSpoof = true;
-                }
-            }
-            // ---------------------------------------------------------
-            // B. 文件对象伪装 (配合 g_SandboxDevicePath)
-            // ---------------------------------------------------------
-            else if (!g_SandboxDevicePath.empty() &&
-                     currentPath.size() > g_SandboxDevicePath.size() &&
-                     _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
-
+                // 检查分隔符 确保匹配完整目录
+                // currentPath[devLen] 应该是 '\' 后面跟着盘符 'C' 再后面是 '\'
                 size_t devLen = g_SandboxDevicePath.size();
-                // 检查格式 ...\C\...
-                if (currentPath[devLen] == L'\\' && currentPath.length() > devLen + 2 && currentPath[devLen + 2] == L'\\') {
-                    wchar_t driveLetter = currentPath[devLen + 1];
+                if (currentPath[devLen] == L'\\' && currentPath[devLen + 2] == L'\\') {
+
+                    wchar_t driveLetter = currentPath[devLen + 1]; // 'C'
                     std::wstring realDevicePrefix = GetDevicePathByDrive(driveLetter);
 
                     if (!realDevicePrefix.empty()) {
-                        spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
-                        needSpoof = true;
-                    }
-                }
-            }
+                        // 构造欺骗后的路径
+                        // \Device\HarddiskVolume1 + \Windows\System32\notepad.exe
+                        std::wstring spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
 
-            // ---------------------------------------------------------
-            // C. 执行伪装并修正 ReturnLength
-            // ---------------------------------------------------------
-            if (needSpoof && !spoofedPath.empty()) {
-                USHORT newByteLength = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
+                        // 检查缓冲区是否足够 (通常欺骗后的路径比沙盒路径短 所以是安全的)
+                        if (spoofedPath.length() * sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
 
-                // 检查缓冲区是否足够 (通常伪装后的路径比沙盒路径短 所以是安全的)
-                if (newByteLength <= pNameInfo->Name.MaximumLength) {
+                            // 原地修改缓冲区
+                            memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
+                            pNameInfo->Name.Length = (USHORT)(spoofedPath.length() * sizeof(wchar_t));
 
-                    // 1. 覆盖路径数据
-                    memcpy(pNameInfo->Name.Buffer, spoofedPath.c_str(), newByteLength);
-                    pNameInfo->Name.Length = newByteLength;
-
-                    // 2. 确保 NULL 结尾 (安全防御)
-                    if (newByteLength + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
-                        pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
-                    }
-
-                    // 3. [关键] 修正 ReturnLength
-                    // 很多程序(如.NET)会检查 ReturnLength 是否与实际数据匹配
-                    if (ReturnLength) {
-                        // 计算实际需要的总大小：结构体头 + 字符串长度 + NULL结尾
-                        ULONG actualSize = sizeof(OBJECT_NAME_INFORMATION) + newByteLength + sizeof(wchar_t);
-                        *ReturnLength = actualSize;
+                            // 确保 NULL 结尾 (虽然 UNICODE_STRING 不强制 但为了安全)
+                            if (pNameInfo->Name.Length + sizeof(wchar_t) <= pNameInfo->Name.MaximumLength) {
+                                pNameInfo->Name.Buffer[spoofedPath.length()] = L'\0';
+                            }
+                        }
                     }
                 }
             }
@@ -7056,6 +6704,45 @@ int WINAPI Detour_EnumFontFamiliesW(HDC hdc, LPCWSTR lpszFamily, FONTENUMPROCW l
         return fpEnumFontFamiliesW(hdc, lpszFamily, ProxyEnumFontFamExProc, (LPARAM)&ctx);
     }
     return fpEnumFontFamiliesW(hdc, lpszFamily, lpEnumFontFamProc, lParam);
+}
+
+// [新增] Hook NtCreateNamedPipeFile (用于创建管道服务端)
+NTSTATUS NTAPI Detour_NtCreateNamedPipeFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, ULONG NamedPipeType, ULONG ReadMode,
+    ULONG CompletionMode, ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout)
+{
+    if (g_IsInHook) return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+    RecursionGuard guard;
+
+    std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
+    std::wstring boxedPath;
+
+    // 如果是创建管道 强制重定向到虚拟化名称
+    // 这样沙盒内创建的管道对外部不可见 且不会与系统服务冲突
+    if (GetBoxedPipePath(rawNtPath, boxedPath)) {
+        UNICODE_STRING uStr;
+        RtlInitUnicodeString(&uStr, boxedPath.c_str());
+
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
+        // 替换为绝对路径 忽略 RootDirectory
+        ObjectAttributes->ObjectName = &uStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        NTSTATUS status = fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
+
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+
+        if (NT_SUCCESS(status)) {
+            DebugLog(L"Pipe: Virtualized Server %s -> %s", rawNtPath.c_str(), boxedPath.c_str());
+        }
+        return status;
+    }
+
+    return fpNtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, CreateDisposition, CreateOptions, NamedPipeType, ReadMode, CompletionMode, MaximumInstances, InboundQuota, OutboundQuota, DefaultTimeout);
 }
 
 // [新增] 拦截 GetLogicalDrives (位掩码)
@@ -7202,17 +6889,8 @@ NTSTATUS NTAPI Detour_NtQueryVolumeInformationFile(
 }
 
 NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
-    // 1. 优化 DirContext 清理
-    bool foundDir = false;
+    // 清理 DirContext
     {
-        // 先使用共享锁（读锁） 允许多线程并发查询 极速通过
-        std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
-        if (g_DirContextMap.find(Handle) != g_DirContextMap.end()) {
-            foundDir = true;
-        }
-    }
-    if (foundDir) {
-        // 只有确认存在时 才获取排他锁（写锁）进行删除
         std::unique_lock<std::shared_mutex> lock(g_DirContextMutex);
         auto it = g_DirContextMap.find(Handle);
         if (it != g_DirContextMap.end()) {
@@ -7221,21 +6899,16 @@ NTSTATUS NTAPI Detour_NtClose(HANDLE Handle) {
         }
     }
 
-    // 2. 优化 RegContext 清理
-    bool foundReg = false;
+    // 清理 RegContext
     {
-        std::shared_lock<std::shared_mutex> lock(g_RegContextMutex);
-        if (g_RegContextMap.find(Handle) != g_RegContextMap.end()) {
-            foundReg = true;
-        }
-    }
-    if (foundReg) {
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(Handle);
         if (it != g_RegContextMap.end()) {
+            // [新增] 关闭缓存的真实句柄
             if (it->second->hRealKey) {
                 fpNtClose(it->second->hRealKey);
             }
+            // [新增] 关闭监视句柄
             if (it->second->hMonitorKey) {
                 fpNtClose(it->second->hMonitorKey);
             }
@@ -8623,49 +8296,6 @@ bool InjectCrossArchAndWait(DWORD targetPid, const std::wstring& dllPath, const 
     return success;
 }
 
-// [新增] 检查是否为 Windows 错误报告进程 (崩溃处理)
-bool IsWerFaultProcess(const std::wstring& exePath) {
-    if (exePath.length() >= 12) {
-        std::wstring lowerPath = exePath;
-        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
-        // 匹配 WerFault.exe 或 wermgr.exe
-        if (lowerPath.find(L"werfault.exe") != std::wstring::npos ||
-            lowerPath.find(L"wermgr.exe") != std::wstring::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// [新增] 修复批处理文件的命令行 (批处理处理)
-// 确保重定向后的批处理路径被正确加上双引号 并与原参数拼接
-std::wstring FixBatchCommandLine(const std::wstring& exePath, const std::wstring& originalCmdLine) {
-    std::wstring fixedCmd = L"\"" + exePath + L"\"";
-
-    if (originalCmdLine.empty()) {
-        return fixedCmd;
-    }
-
-    // 寻找原命令行的参数部分 (跳过 argv[0])
-    const wchar_t* ptr = originalCmdLine.c_str();
-    while (*ptr == L' ') ptr++; // 跳过前导空格
-
-    if (*ptr == L'\"') {
-        ptr++;
-        while (*ptr && *ptr != L'\"') ptr++;
-        if (*ptr == L'\"') ptr++;
-    } else {
-        while (*ptr && *ptr != L' ') ptr++;
-    }
-
-    // 追加剩余的参数
-    if (*ptr) {
-        fixedCmd += ptr;
-    }
-
-    return fixedCmd;
-}
-
 // 统一的处理逻辑模板
 template<typename Func, typename CharType>
 BOOL CreateProcessInternal(
@@ -8715,25 +8345,6 @@ BOOL CreateProcessInternal(
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
     }
 
-    //[新增] 批处理文件 (.bat / .cmd) 识别逻辑
-    bool isBatchFile = false;
-    if (targetExe.length() >= 4) {
-        std::wstring ext = targetExe.substr(targetExe.length() - 4);
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-        if (ext == L".bat" || ext == L".cmd") {
-            isBatchFile = true;
-        }
-    }
-
-    if (isBatchFile) {
-        // 确定当前使用的 EXE 路径 (重定向后的或原始的)
-        std::wstring activeExe = redirectedExe.empty() ? targetExe : redirectedExe;
-
-        // 修复命令行：将路径用双引号包裹并拼上参数
-        cmdLineW = FixBatchCommandLine(activeExe, cmdLineW);
-        DebugLog(L"CreateProcess: Fixed batch command line -> %s", cmdLineW.c_str());
-    }
-
     // 4. 准备最终参数
     const void* finalAppName = lpApplicationName;
     const void* finalCurDir = lpCurrentDirectory;
@@ -8747,23 +8358,12 @@ BOOL CreateProcessInternal(
     // 处理 EXE 路径替换
     if (!redirectedExe.empty()) {
         DebugLog(L"CreateProcess Redirect EXE: %s -> %s", targetExe.c_str(), redirectedExe.c_str());
-
-        if (!isBatchFile) {
-            // 普通 EXE 正常替换 lpApplicationName
-            if (isAnsi) {
-                ansiExe = WideToAnsi(redirectedExe.c_str());
-                finalAppName = ansiExe.c_str();
-            } else {
-                finalAppName = redirectedExe.c_str();
-            }
+        if (isAnsi) {
+            ansiExe = WideToAnsi(redirectedExe.c_str());
+            finalAppName = ansiExe.c_str();
         } else {
-            // 关键修复：如果是批处理文件 lpApplicationName 必须强制为 NULL
-            // 否则 CreateProcess 会返回 ERROR_BAD_EXE_FORMAT (193)
-            finalAppName = nullptr;
+            finalAppName = redirectedExe.c_str();
         }
-    } else if (isBatchFile) {
-        // 即使没有重定向 只要是批处理 也强制置空
-        finalAppName = nullptr;
     }
 
     // 处理工作目录替换
@@ -8800,50 +8400,6 @@ BOOL CreateProcessInternal(
     // 强制挂起以便注入
     DWORD newCreationFlags = dwCreationFlags | CREATE_SUSPENDED;
 
-    // [新增] 安全描述符 (Security Descriptor) 修复逻辑
-    void* saveOwnerProcess = nullptr;
-    void* saveOwnerThread = nullptr;
-
-    // 1. 处理进程安全描述符
-    if (lpProcessAttributes && lpProcessAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd) {
-            if (sd->Control & SE_SELF_RELATIVE) {
-                // 自相对描述符 (Owner 是偏移量)
-                SECURITY_DESCRIPTOR_RELATIVE* relSd = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-                if (relSd->Owner != 0) {
-                    saveOwnerProcess = (void*)(ULONG_PTR)relSd->Owner; // 暂存偏移量
-                    relSd->Owner = 0; // 清空
-                }
-            } else {
-                // 绝对描述符 (Owner 是指针)
-                if (sd->Owner != NULL) {
-                    saveOwnerProcess = sd->Owner; // 暂存指针
-                    sd->Owner = NULL; // 清空
-                }
-            }
-        }
-    }
-
-    // 2. 处理线程安全描述符
-    if (lpThreadAttributes && lpThreadAttributes->lpSecurityDescriptor) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd) {
-            if (sd->Control & SE_SELF_RELATIVE) {
-                SECURITY_DESCRIPTOR_RELATIVE* relSd = (SECURITY_DESCRIPTOR_RELATIVE*)sd;
-                if (relSd->Owner != 0) {
-                    saveOwnerThread = (void*)(ULONG_PTR)relSd->Owner;
-                    relSd->Owner = 0;
-                }
-            } else {
-                if (sd->Owner != NULL) {
-                    saveOwnerThread = sd->Owner;
-                    sd->Owner = NULL;
-                }
-            }
-        }
-    }
-
     // 6. 调用原始函数
     BOOL result;
     if (isAnsi) {
@@ -8874,44 +8430,8 @@ BOOL CreateProcessInternal(
         );
     }
 
-    // 恢复进程安全描述符 Owner
-    if (saveOwnerProcess) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpProcessAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)saveOwnerProcess;
-        } else {
-            sd->Owner = saveOwnerProcess;
-        }
-    }
-
-    // 恢复线程安全描述符 Owner
-    if (saveOwnerThread) {
-        SECURITY_DESCRIPTOR* sd = (SECURITY_DESCRIPTOR*)lpThreadAttributes->lpSecurityDescriptor;
-        if (sd->Control & SE_SELF_RELATIVE) {
-            ((SECURITY_DESCRIPTOR_RELATIVE*)sd)->Owner = (DWORD)(ULONG_PTR)saveOwnerThread;
-        } else {
-            sd->Owner = saveOwnerThread;
-        }
-    }
-
     // 7. 注入与恢复
     if (result) {
-
-        // [新增] 崩溃处理：过滤 Windows 错误报告进程
-        if (IsWerFaultProcess(targetExe)) {
-            DebugLog(L"ChildHook: Ignored WerFault.exe to prevent crash loops -> PID %d", pPI->dwProcessId);
-
-            // 绝对不注入 WerFault 直接恢复线程让其正常收集崩溃信息或退出
-            if (!callerWantedSuspended) {
-                ResumeThread(pPI->hThread);
-            }
-            if (!lpProcessInformation) {
-                CloseHandle(localPI.hProcess);
-                CloseHandle(localPI.hThread);
-            }
-            return result;
-        }
-
         // 检查白名单 (hookchildname)
         if (ShouldHookChildProcess(targetExe)) {
 
@@ -8948,35 +8468,41 @@ BOOL CreateProcessInternal(
             // --- 策略 A: 同架构直接注入 (极速) ---
             // 32->32 或 64->64：直接在父进程内存中操作 无需 IPC
             if (currentArch == targetArch && !targetDllPath.empty()) {
+                // 检查文件是否存在 避免无效注入
                 if (GetFileAttributesW(targetDllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-
-                    //[关键修复] 必须在注入前创建 Event 防止子进程跑得太快导致 OpenEvent 失败
-                    std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-                    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-
                     if (InjectDllDirectly(pPI->hProcess, targetDllPath)) {
                         injected = true;
-
+                        // [关键修复] 同架构注入也需要等待就绪事件
+                        std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+                        HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
                         if (hEvent) {
-                            // 等待子进程初始化完成 最多等待 5 秒
-                            WaitForSingleObject(hEvent, 5000);
+							// 等待子进程初始化完成 最多等待 5 秒
+							WaitForSingleObject(hEvent, 5000);
+							CloseHandle(hEvent);
                         }
 
-                        // 顺便注入第三方 DLL (增加架构检查)
+                        // [修改] 顺便注入第三方 DLL (增加架构检查)
                         for (const auto& extraDll : g_ExtraDlls) {
+                            // 1. 检查文件是否存在
                             if (GetFileAttributesW(extraDll.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+
+                            // 2. [新增] 检查 DLL 架构是否与目标进程匹配
                             int dllArch = GetPeArchitecture(extraDll);
-                            if (dllArch != 0 && dllArch != targetArch) continue;
+
+                            // 如果无法读取架构(0)或架构不匹配 则跳过
+                            if (dllArch != 0 && dllArch != targetArch) {
+                                continue;
+                            }
+
+                            // 3. 执行注入
                             if (InjectDllDirectly(pPI->hProcess, extraDll)) {
                                 DebugLog(L"ChildHook: Extra DLL Injected -> %s", extraDll.c_str());
                             }
                         }
+
                     } else {
                         DebugLog(L"ChildHook: Direct Injection Failed -> PID %d", pPI->dwProcessId);
                     }
-
-                    // 无论成功失败 最后关闭句柄
-                    if (hEvent) CloseHandle(hEvent);
                 }
             }
 
@@ -9011,18 +8537,15 @@ BOOL CreateProcessInternal(
             // --- 策略 C: IPC 回退 (仅当上述都失败时) ---
             if (!injected) {
                 DebugLog(L"ChildHook: IPC Injection Request (Fallback) -> PID %d", pPI->dwProcessId);
-
-                //[关键修复] 同样必须在请求前创建 Event
-                std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
-                HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
-
                 RequestInjectionFromLauncher(pPI->dwProcessId);
-
-                if (hEvent) {
-                    WaitForSingleObject(hEvent, 5000);
-                    CloseHandle(hEvent);
-                }
-            }
+				// [建议] 即使是 IPC 请求 也在这里等一下
+				std::wstring eventName = GetReadyEventName(pPI->dwProcessId);
+				HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, eventName.c_str());
+				if (hEvent) {
+					WaitForSingleObject(hEvent, 5000);
+					CloseHandle(hEvent);
+				}
+			}
 
         } else {
             // DebugLog(L"ChildHook: Skipped (Not in whitelist)");
@@ -9043,50 +8566,6 @@ BOOL CreateProcessInternal(
 }
 
 // --- 具体钩子实现 ---
-
-BOOL WINAPI Detour_UpdateProcThreadAttribute(
-    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
-    DWORD dwFlags,
-    DWORD_PTR Attribute,
-    PVOID lpValue,
-    SIZE_T cbSize,
-    PVOID lpPreviousValue,
-    PSIZE_T lpReturnSize)
-{
-    // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值为 0x20007
-    // 这个属性用于设置进程创建时的安全缓解策略
-    if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && cbSize >= sizeof(DWORD64)) {
-
-        DWORD64* policy = (DWORD64*)lpValue;
-
-        // 关键操作: 移除“阻止加载非微软签名的二进制文件”的策略
-        // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (1ui64 << 44)
-        // 我们通过位运算将其对应的标志位清零
-        *policy &= ~(0x00000001ui64 << 44);
-
-        DebugLog(L"MitigationPolicy: Removed BLOCK_NON_MICROSOFT_BINARIES flag.");
-    }
-
-    // 调用原始的 UpdateProcThreadAttribute 函数
-    return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
-}
-
-BOOL WINAPI Detour_SetProcessMitigationPolicy(
-    PROCESS_MITIGATION_POLICY MitigationPolicy,
-    PVOID lpBuffer,
-    SIZE_T dwLength)
-{
-    // ProcessDynamicCodePolicy 的值为 8
-    // 此策略一旦启用 会禁止进程创建动态代码或修改现有可执行代码 这会导致Hook失败
-    if (MitigationPolicy == ProcessDynamicCodePolicy) {
-        DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(ProcessDynamicCodePolicy).");
-        // 直接返回 TRUE 假装成功设置 但不调用原始函数 从而阻止该策略生效
-        return TRUE;
-    }
-
-    // 对于其他策略 正常调用原始函数
-    return fpSetProcessMitigationPolicy(MitigationPolicy, lpBuffer, dwLength);
-}
 
 BOOL WINAPI Detour_CreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
     LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
@@ -9829,6 +9308,8 @@ std::wstring GetNtShortPath(const wchar_t* longPath) {
 }
 
 DWORD WINAPI InitHookThread(LPVOID) {
+    // [新增] 初始化管道前缀
+    InitPipeVirtualization();
     // [新增] 启用特权以支持短文件名设置
     EnableRestorePrivilege();
 
@@ -9840,6 +9321,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
         fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 
         // [修复] 无论何种模式 都初始化 NtClose
+        // 注册表 Hook 中的 EnsureRegPathExistsNT 和 Detour_NtOpenKey 依赖此指针
+        // 如果不在此处初始化 当 YAP_HOOK_FILE=0 时 fpNtClose 为空导致崩溃
         fpNtClose = (P_NtClose)GetProcAddress(hNtdll, "NtClose");
     }
 
@@ -10236,10 +9719,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
     if (g_IpcPipeName[0] == L'\0') {
         if (GetEnvironmentVariableW(L"YAP_IPC_PIPE", buffer, MAX_PATH) > 0) wcscpy_s(g_IpcPipeName, MAX_PATH, buffer);
     }
-    // [新增] 补齐启动器目录的环境变量回退
-    if (g_LauncherDir[0] == L'\0') {
-        if (GetEnvironmentVariableW(L"YAP_LAUNCHER_DIR", buffer, MAX_PATH) > 0) wcscpy_s(g_LauncherDir, MAX_PATH, buffer);
-    }
 
     // 检查根目录是否获取成功
     if (g_SandboxRoot[0] == L'\0') {
@@ -10303,20 +9782,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // 分组挂钩逻辑
     // =======================================================
 
-    // [修改] 公共基础 Hook：NtQueryObject
-    // 只要启用了 文件重定向 OR 虚拟盘符 OR 注册表重定向
-    // 就必须挂钩 NtQueryObject 以进行路径伪装 (防止通过句柄反查到沙盒路径)
-    if (hNtdll && (g_HookMode > 0 || g_VirtualCdDrive != 0 || g_HookReg)) {
-        void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-        if (pNtQueryObject) {
-            // MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址(Trampoline)
-            // 这样 GetPathFromHandle 内部调用 fpNtQueryObject 时依然能正常工作
-            MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
-        }
-    }
-
     // --- 组 A: 文件系统 Hook ---
     if (hNtdll) {
+        // 1. 预先初始化必要的函数指针
+        // Detour_NtQueryVolumeInformationFile 依赖 GetPathFromHandle 而后者依赖 fpNtQueryObject
+        // 如果 g_HookMode=0 我们不会挂钩 NtQueryObject 因此必须手动获取其原始地址
+        // 否则 fpNtQueryObject 为 NULL 会导致崩溃
+        if (fpNtQueryObject == NULL) {
+            fpNtQueryObject = (P_NtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
+        }
+
         // [修改] 启用文件重定向挂钩的条件
         // 1. hookfile > 0 (常规重定向)
         // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
@@ -10331,6 +9806,16 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+
+            // 挂钩 NtQueryObject (用于路径伪装)
+            // 注意：MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+
+            // [新增] 挂钩 NtCreateNamedPipeFile
+            void* pNtCreateNamedPipeFile = (void*)GetProcAddress(hNtdll, "NtCreateNamedPipeFile");
+            if (pNtCreateNamedPipeFile) {
+                MH_CreateHook(pNtCreateNamedPipeFile, &Detour_NtCreateNamedPipeFile, reinterpret_cast<LPVOID*>(&fpNtCreateNamedPipeFile));
+            }
 
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
@@ -10372,39 +9857,41 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // --- 组 B: 进程创建 Hook ---
+    // --- 组 B: 进程创建 Hook (只要启用了任意功能 就需要挂钩以实现子进程注入) ---
     if (g_HookChild) {
-        // 定义一个辅助 Lambda 减少重复的 GetProcAddress 和 MH_CreateHook 逻辑
-        auto HookApi = [](const wchar_t* moduleName, const char* funcName, LPVOID detour, LPVOID* original) {
-            HMODULE hMod = GetModuleHandleW(moduleName);
-            if (!hMod) hMod = LoadLibraryW(moduleName); // 如果没加载则尝试加载
-            if (hMod) {
-                void* pFunc = (void*)GetProcAddress(hMod, funcName);
-                if (pFunc) {
-                    return MH_CreateHook(pFunc, detour, original) == MH_OK;
-                }
-            }
-            return false;
-        };
-
-        // 1. 直接链接的 API (Kernel32)
         MH_CreateHook(&CreateProcessW, &Detour_CreateProcessW, reinterpret_cast<LPVOID*>(&fpCreateProcessW));
         MH_CreateHook(&CreateProcessA, &Detour_CreateProcessA, reinterpret_cast<LPVOID*>(&fpCreateProcessA));
 
-        // 2. KernelBase / Kernel32 组 (缓解策略与 WinExec)
-        const wchar_t* kBase = GetModuleHandleW(L"kernelbase.dll") ? L"kernelbase.dll" : L"kernel32.dll";
-        HookApi(kBase, "UpdateProcThreadAttribute",  &Detour_UpdateProcThreadAttribute,  reinterpret_cast<LPVOID*>(&fpUpdateProcThreadAttribute));
-        HookApi(kBase, "SetProcessMitigationPolicy", &Detour_SetProcessMitigationPolicy, reinterpret_cast<LPVOID*>(&fpSetProcessMitigationPolicy));
-        HookApi(L"kernel32.dll", "WinExec",          &Detour_WinExec,                    reinterpret_cast<LPVOID*>(&fpWinExec));
+        // [新增] 挂钩 WinExec
+        // 很多老程序(VB6/Delphi)使用此 API 启动子进程
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            void* pWinExec = (void*)GetProcAddress(hKernel32, "WinExec");
+            if (pWinExec) {
+                MH_CreateHook(pWinExec, &Detour_WinExec, reinterpret_cast<LPVOID*>(&fpWinExec));
+            }
+        }
 
-        // 3. Shell32 组
-        HookApi(L"shell32.dll", "ShellExecuteExW",   &Detour_ShellExecuteExW,            reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
+        // [新增] 挂钩 ShellExecuteExW
+        HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
+        if (hShell32) {
+            void* pShellExecuteExW = (void*)GetProcAddress(hShell32, "ShellExecuteExW");
+            if (pShellExecuteExW) {
+                MH_CreateHook(pShellExecuteExW, &Detour_ShellExecuteExW, reinterpret_cast<LPVOID*>(&fpShellExecuteExW));
+            }
+        }
 
-        // 4. Advapi32 组
-        HookApi(L"advapi32.dll", "CreateProcessAsUserW",    &Detour_CreateProcessAsUserW,    reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
-        HookApi(L"advapi32.dll", "CreateProcessAsUserA",    &Detour_CreateProcessAsUserA,    reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
-        HookApi(L"advapi32.dll", "CreateProcessWithTokenW", &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
-        HookApi(L"advapi32.dll", "CreateProcessWithLogonW", &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
+        HMODULE hAdvapi32 = LoadLibraryW(L"advapi32.dll");
+        if (hAdvapi32) {
+            void* pCreateProcessAsUserW = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserW");
+            if (pCreateProcessAsUserW) MH_CreateHook(pCreateProcessAsUserW, &Detour_CreateProcessAsUserW, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserW));
+            void* pCreateProcessAsUserA = (void*)GetProcAddress(hAdvapi32, "CreateProcessAsUserA");
+            if (pCreateProcessAsUserA) MH_CreateHook(pCreateProcessAsUserA, &Detour_CreateProcessAsUserA, reinterpret_cast<LPVOID*>(&fpCreateProcessAsUserA));
+            void* pCreateProcessWithTokenW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithTokenW");
+            if (pCreateProcessWithTokenW) MH_CreateHook(pCreateProcessWithTokenW, &Detour_CreateProcessWithTokenW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithTokenW));
+            void* pCreateProcessWithLogonW = (void*)GetProcAddress(hAdvapi32, "CreateProcessWithLogonW");
+            if (pCreateProcessWithLogonW) MH_CreateHook(pCreateProcessWithLogonW, &Detour_CreateProcessWithLogonW, reinterpret_cast<LPVOID*>(&fpCreateProcessWithLogonW));
+        }
     }
 
     // --- 组 C: 网络 Hook (仅当 hooknet=1 时挂钩) ---
