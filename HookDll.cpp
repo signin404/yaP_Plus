@@ -63,11 +63,11 @@
 // [新增] 辅助宏：计算对齐
 #define ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 
-// [新增] 用于惰性 CoW 的值墓碑标记 (Sandboxie 风格)
-#define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
-
-// [新增] 键墓碑定义 (特殊值名称与类型)
+// [新增] 键墓碑定义 (特殊值名称)
 #define YAPBOX_KEY_TOMBSTONE_NAME L"_YapDel"
+
+// [新增] 用于惰性 CoW 的值墓碑标记
+#define YAPBOX_VALUE_TOMBSTONE_TYPE 0x79617062 // 'yapb'
 
 #ifndef _KEY_WRITE_TIME_INFORMATION_DEFINED
 #define _KEY_WRITE_TIME_INFORMATION_DEFINED
@@ -1083,12 +1083,13 @@ struct CachedRegValue {
 
 struct RegContext {
     std::wstring FullPath;
-    HANDLE hRealKey = NULL; // [新增] 缓存对应的真实键句柄
-    HANDLE hMonitorKey = NULL; // [新增] 用于 NtNotifyChangeKey 的沙盒监视句柄
+    HANDLE hRealKey = NULL;
+    HANDLE hMonitorKey = NULL;
     std::vector<CachedRegKey> SubKeys;
     std::vector<CachedRegValue> Values;
     bool KeysInitialized = false;
     bool ValuesInitialized = false;
+    bool IsMergeBypassed = false; // [新增] 用于地狱级键的合并短路
 };
 
 // --- 全局变量 ---
@@ -3173,6 +3174,50 @@ bool IsDefensiveSpoofPath(const std::wstring& fullNtPath) {
     return false;
 }
 
+// ========== [新增] 地狱级键合并短路 Hack ==========
+// 针对 Spybot S&D 等软件在 ZoneMap\Domains 下写入数万个子键导致的合并卡顿
+bool IsHeavyKeyAndEmptyInSandbox(const std::wstring& currentNtPath) {
+    if (currentNtPath.length() < 60) return false;
+
+    // 快速查找特征字符串 (忽略大小写)
+    auto contains_ignore_case =[](const std::wstring& str, const wchar_t* sub) {
+        auto it = std::search(
+            str.begin(), str.end(),
+            sub, sub + wcslen(sub),[](wchar_t ch1, wchar_t ch2) { return towlower(ch1) == towlower(ch2); }
+        );
+        return it != str.end();
+    };
+
+    // 检查是否是 ZoneMap\Domains 键或其子键
+    if (contains_ignore_case(currentNtPath, L"\\Internet Settings\\ZoneMap\\Domains")) {
+
+        // 如果当前路径已经是沙盒路径 说明沙盒里有这个键 必须走合并
+        if (!g_RegMountPathNt.empty() &&
+            _wcsnicmp(currentNtPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) == 0) {
+            return false;
+        }
+
+        // 当前是真实路径 检查沙盒中是否建立了对应的影子键
+        std::wstring relPath;
+        if (ShouldRedirectReg(currentNtPath, relPath)) {
+            std::wstring sandboxPath = g_RegMountPathNt + L"\\" + relPath;
+            HANDLE hTest = NULL;
+            OBJECT_ATTRIBUTES oa;
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, sandboxPath.c_str());
+            InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            // 尝试打开沙盒键 (仅查询权限 极快)
+            if (NT_SUCCESS(fpNtOpenKey(&hTest, KEY_QUERY_VALUE, &oa))) {
+                fpNtClose(hTest);
+                return false; // 沙盒中存在 不能短路
+            }
+            return true; // 沙盒中不存在 可以安全短路！
+        }
+    }
+    return false;
+}
+
 // 判断注册表路径是否需要重定向 并输出相对于 AppHive 的相对路径
 bool ShouldRedirectReg(const std::wstring& fullNtPath, std::wstring& relPathOut) {
     if (!g_HookReg || !g_hAppHive || g_CurrentUserSidPath.empty()) return false;
@@ -4808,6 +4853,10 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
                 needsBuild = true;
             } else {
                 ctx = it->second;
+                // ========== [新增] 短路放行 ==========
+                if (ctx->IsMergeBypassed) {
+                    return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+                }
                 if (!ctx->KeysInitialized) needsBuild = true;
             }
         } else {
@@ -4824,6 +4873,16 @@ NTSTATUS NTAPI Detour_NtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMAT
 
     // 4. 构建合并列表 (无锁操作)
     if (needsBuild) {
+        // ========== [新增] 地狱级键合并短路 Hack ==========
+        if (IsHeavyKeyAndEmptyInSandbox(currentNtPath)) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
+                it->second->IsMergeBypassed = true;
+            }
+            return fpNtEnumerateKey(KeyHandle, Index, KeyInformationClass, KeyInformation, Length, ResultLength);
+        }
+
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             // [替换] 使用 Vector 和双指针合并
             std::vector<CachedRegKey> mergedKeys;
@@ -4937,13 +4996,16 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
         std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
         auto it = g_RegContextMap.find(KeyHandle);
         if (it != g_RegContextMap.end()) {
-            // [关键修复] 忽略大小写比较
             if (_wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
                 delete it->second;
                 g_RegContextMap.erase(it);
                 needsBuild = true;
             } else {
                 ctx = it->second;
+                // ========== [新增] 短路放行 ==========
+                if (ctx->IsMergeBypassed) {
+                    return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+                }
                 if (!ctx->ValuesInitialized) needsBuild = true;
             }
         } else {
@@ -4958,6 +5020,16 @@ NTSTATUS NTAPI Detour_NtEnumerateValueKey(HANDLE KeyHandle, ULONG Index, KEY_VAL
     }
 
     if (needsBuild) {
+        // ========== [新增] 地狱级键合并短路 Hack ==========
+        if (IsHeavyKeyAndEmptyInSandbox(currentNtPath)) {
+            std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+            auto it = g_RegContextMap.find(KeyHandle);
+            if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
+                it->second->IsMergeBypassed = true;
+            }
+            return fpNtEnumerateValueKey(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation, Length, ResultLength);
+        }
+
         std::wstring realPath, sandboxPath;
         if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
             // [替换] 使用 Vector 和双指针合并
@@ -5349,14 +5421,16 @@ NTSTATUS NTAPI Detour_NtQueryKey(
             auto it = g_RegContextMap.find(KeyHandle);
 
             if (it != g_RegContextMap.end()) {
-                // 校验路径一致性
                 if (_wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) != 0) {
                     delete it->second;
                     g_RegContextMap.erase(it);
                     needsBuild = true;
                 } else {
                     ctx = it->second;
-                    // 确保 SubKeys 和 Values 都已初始化
+                    // ==========[新增] 短路放行 ==========
+                    if (ctx->IsMergeBypassed) {
+                        return fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+                    }
                     if (!ctx->KeysInitialized || !ctx->ValuesInitialized) needsBuild = true;
                 }
             } else {
@@ -5371,6 +5445,16 @@ NTSTATUS NTAPI Detour_NtQueryKey(
         }
 
         if (needsBuild) {
+            // ========== [新增] 地狱级键合并短路 Hack ==========
+            if (IsHeavyKeyAndEmptyInSandbox(currentNtPath)) {
+                std::unique_lock<std::shared_mutex> lock(g_RegContextMutex);
+                auto it = g_RegContextMap.find(KeyHandle);
+                if (it != g_RegContextMap.end() && _wcsicmp(it->second->FullPath.c_str(), currentNtPath.c_str()) == 0) {
+                    it->second->IsMergeBypassed = true;
+                }
+                return fpNtQueryKey(KeyHandle, KeyInformationClass, KeyInformation, Length, ResultLength);
+            }
+
             std::wstring realPath, sandboxPath;
             if (GetRegPaths(KeyHandle, realPath, sandboxPath)) {
                 // [替换] 构建 SubKeys (支持 HKCR 的三路合并)
