@@ -3544,7 +3544,7 @@ bool GetKeyLastWriteTime(const std::wstring& path, LARGE_INTEGER& outTime) {
 
     // 仅请求 KEY_QUERY_VALUE 获取基本信息
     NTSTATUS status = fpNtOpenKey(&hKey, KEY_QUERY_VALUE, &oa);
-    
+
     // WOW64 视图穿透
     if (status == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
         status = fpNtOpenKey(&hKey, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oa);
@@ -3555,7 +3555,7 @@ bool GetKeyLastWriteTime(const std::wstring& path, LARGE_INTEGER& outTime) {
         ULONG len;
         status = fpNtQueryKey(hKey, KeyBasicInformation, &kbi, sizeof(kbi), &len);
         fpNtClose(hKey);
-        
+
         if (NT_SUCCESS(status) || status == STATUS_BUFFER_OVERFLOW) {
             outTime = kbi.LastWriteTime;
             return true;
@@ -4004,7 +4004,7 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
         return fpNtRenameKey(KeyHandle, NewName);
     RecursionGuard guard;
 
-    // 只处理沙盒内的句柄 [修复] 使用 _wcsnicmp
+    // 只处理沙盒内的句柄
     std::wstring currentPath = GetPathFromHandle(KeyHandle);
     if (currentPath.empty() || _wcsnicmp(currentPath.c_str(), g_RegMountPathNt.c_str(), g_RegMountPathNt.length()) != 0)
         return fpNtRenameKey(KeyHandle, NewName);
@@ -4017,17 +4017,17 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
     std::wstring newName(NewName->Buffer, NewName->Length / sizeof(WCHAR));
     std::wstring targetSandboxPath = parentSandboxPath + L"\\" + newName;
 
-    // 检查目标路径是否有墓碑键 有则物理删除以让路
+    // 1. 检查目标路径是否有墓碑键 有则物理删除或移走以让路
     HANDLE hTarget = NULL;
     OBJECT_ATTRIBUTES oaTarget;
     UNICODE_STRING usTarget;
     RtlInitUnicodeString(&usTarget, targetSandboxPath.c_str());
     InitializeObjectAttributes(&oaTarget, &usTarget, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // [修复] 使用 MAXIMUM_ALLOWED 打开 确保拥有 Rename 所需的权限 并修复 Use-After-Close 漏洞
+    std::wstring tempPathToClean; // 用于记录需要延后清理的临时键
+
     if (NT_SUCCESS(fpNtOpenKey(&hTarget, MAXIMUM_ALLOWED, &oaTarget))) {
         bool hasTomb = IsKeyMarkedDeleted(hTarget);
-
         if (hasTomb) {
             wchar_t tempName[64];
             swprintf_s(tempName, L"__YBTmp%u_%u__", GetTickCount(), GetCurrentThreadId());
@@ -4036,24 +4036,16 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
 
             // 把墓碑键 rename 到临时名（目标名现在空出来了）
             NTSTATUS mvSt = fpNtRenameKey(hTarget, &usTempName);
-            fpNtClose(hTarget); // [修复] 必须在 Rename 之后 Close
+            fpNtClose(hTarget);
 
-            if (!NT_SUCCESS(mvSt)) {
-                DeleteSandboxKeyRecursive(targetSandboxPath);
-                return fpNtRenameKey(KeyHandle, NewName); // 回退
+            if (NT_SUCCESS(mvSt)) {
+                tempPathToClean = parentSandboxPath + L"\\" + tempName;
+            } else {
+                DeleteSandboxKeyRecursive(targetSandboxPath); // 降级回退：直接物理删除
             }
-
-            // 正式 rename 源键到目标名
-            NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
-
-            // 清理临时键（递归删除）
-            std::wstring tempPath = parentSandboxPath + L"\\" + tempName;
-            DeleteSandboxKeyRecursive(tempPath);
-
-            if (NT_SUCCESS(status)) InvalidateParentRegContext(currentPath);
-            return status;
+        } else {
+            fpNtClose(hTarget);
         }
-        fpNtClose(hTarget);
     } else if (NT_SUCCESS(fpNtOpenKey(&hTarget, KEY_QUERY_VALUE, &oaTarget))) {
         // 降级回退：如果无法以高权限打开 则尝试直接物理删除
         bool hasTomb = IsKeyMarkedDeleted(hTarget);
@@ -4063,11 +4055,56 @@ NTSTATUS NTAPI Detour_NtRenameKey(HANDLE KeyHandle, PUNICODE_STRING NewName) {
         }
     }
 
+    // ========== [新增] 2. 检查源路径对应的真实键是否存在 ==========
+    std::wstring realSourcePath;
+    bool realSourceExists = false;
+    if (GetRealFromSandboxPath(currentPath, realSourcePath)) {
+        HANDLE hRealCheck = NULL;
+        OBJECT_ATTRIBUTES oaReal;
+        UNICODE_STRING usReal;
+        RtlInitUnicodeString(&usReal, realSourcePath.c_str());
+        InitializeObjectAttributes(&oaReal, &usReal, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        // 尝试打开真实键
+        NTSTATUS realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE, &oaReal);
+        if (realSt == STATUS_OBJECT_NAME_NOT_FOUND && g_IsWow64Process) {
+            realSt = fpNtOpenKey(&hRealCheck, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &oaReal);
+        }
+        if (NT_SUCCESS(realSt)) {
+            realSourceExists = true;
+            fpNtClose(hRealCheck);
+        }
+    }
+
+    // 3. 正式执行重命名
     NTSTATUS status = fpNtRenameKey(KeyHandle, NewName);
 
+    // 4. 清理让路时产生的临时键
+    if (!tempPathToClean.empty()) {
+        DeleteSandboxKeyRecursive(tempPathToClean);
+    }
+
     if (NT_SUCCESS(status)) {
-        // 使父键枚举缓存失效
+        // ========== [新增] 5. 修复真实键“死而复生”漏洞 ==========
+        // 如果真实源键存在，重命名（移走）后必须在原位置留下一个墓碑，继续遮蔽真实注册表
+        if (realSourceExists) {
+            HANDLE hTombstone = NULL;
+            OBJECT_ATTRIBUTES oaTomb;
+            UNICODE_STRING usTomb;
+            RtlInitUnicodeString(&usTomb, currentPath.c_str());
+            InitializeObjectAttributes(&oaTomb, &usTomb, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+            ULONG disp;
+            // 创建墓碑键 (需要 KEY_ALL_ACCESS 以便写入时间戳)
+            if (NT_SUCCESS(fpNtCreateKey(&hTombstone, KEY_ALL_ACCESS, &oaTomb, 0, NULL, 0, &disp))) {
+                SetKeyLastWriteTime(hTombstone, true);
+                fpNtClose(hTombstone);
+            }
+        }
+
+        // 使源路径和目标路径的父键枚举缓存失效
         InvalidateParentRegContext(currentPath);
+        InvalidateParentRegContext(targetSandboxPath);
     }
 
     return status;
