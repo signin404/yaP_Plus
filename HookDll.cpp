@@ -23,6 +23,9 @@
 #include <sddl.h>
 #include <aclapi.h>
 #include <processthreadsapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <objbase.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -34,6 +37,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma pack(push, 1)
 #pragma pack(pop)
 
@@ -705,6 +709,9 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+typedef HRESULT(WINAPI* P_SHGetKnownFolderPath)(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR*);
+typedef HRESULT(WINAPI* P_SHGetFolderPathW)(HWND, int, HANDLE, DWORD, LPWSTR);
+
 typedef BOOL (WINAPI *P_UpdateProcThreadAttribute)(LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList, DWORD dwFlags, DWORD_PTR Attribute, PVOID lpValue, SIZE_T cbSize, PVOID lpPreviousValue, PSIZE_T lpReturnSize);
 typedef BOOL (WINAPI *P_SetProcessMitigationPolicy)(PROCESS_MITIGATION_POLICY MitigationPolicy, PVOID lpBuffer, SIZE_T dwLength);
 
@@ -1114,6 +1121,7 @@ std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
+int g_HookShell = 0; // 是否启用 Shell 目录重定向
 
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
@@ -1296,6 +1304,8 @@ P_NtCreateKeyTransacted fpNtCreateKeyTransacted = NULL;
 P_NtOpenKeyTransacted fpNtOpenKeyTransacted = NULL;
 P_UpdateProcThreadAttribute fpUpdateProcThreadAttribute = nullptr;
 P_SetProcessMitigationPolicy fpSetProcessMitigationPolicy = nullptr;
+P_SHGetKnownFolderPath fpSHGetKnownFolderPath = nullptr;
+P_SHGetFolderPathW fpSHGetFolderPathW = nullptr;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -7736,6 +7746,83 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     return status;
 }
 
+// --- Shell Hook ---
+
+// 辅助函数：将 KNOWNFOLDERID 映射到沙盒的相对子目录
+bool GetSandboxSubPathForKnownFolder(REFKNOWNFOLDERID rfid, std::wstring& subPath) {
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L"\\AppData\\Local"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L"\\AppData\\Roaming"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L"\\ProgramData"; return true; } // 涵盖 %AllUsersProfile%
+    if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L"\\Public"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\UserProfile"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L"\\Public\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L"\\UserProfile\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L"\\UserProfile\\Saved Games"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L"\\AppData\\LocalLow"; return true; }
+    return false;
+}
+
+// 辅助函数：将 CSIDL 映射到沙盒的相对子目录
+bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
+    // 屏蔽掉 CSIDL_FLAG_CREATE 等标志位，只取真实的 ID
+    int realCsidl = csidl & 0xFF; 
+    
+    switch (realCsidl) {
+        case CSIDL_LOCAL_APPDATA:    subPath = L"\\AppData\\Local"; return true;
+        case CSIDL_APPDATA:          subPath = L"\\AppData\\Roaming"; return true;
+        case CSIDL_COMMON_APPDATA:   subPath = L"\\ProgramData"; return true;
+        case CSIDL_PROFILE:          subPath = L"\\UserProfile"; return true;
+        case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Public\\Documents"; return true;
+        case CSIDL_PERSONAL:         subPath = L"\\UserProfile\\Documents"; return true;
+    }
+    return false;
+}
+
+// 拦截 SHGetKnownFolderPath (Vista 及以上现代 API)
+HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken, PWSTR *ppszPath) {
+    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+        std::wstring subPath;
+        if (GetSandboxSubPathForKnownFolder(rfid, subPath)) {
+            // 拼接完整的沙盒路径
+            std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
+            
+            // 确保沙盒中的目标目录存在 (防止程序因找不到目录而崩溃)
+            SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
+
+            // 必须使用 CoTaskMemAlloc 分配内存，因为调用者会用 CoTaskMemFree 释放
+            size_t allocSize = (fullPath.length() + 1) * sizeof(WCHAR);
+            *ppszPath = (PWSTR)CoTaskMemAlloc(allocSize);
+            if (*ppszPath) {
+                wcscpy_s(*ppszPath, fullPath.length() + 1, fullPath.c_str());
+                return S_OK;
+            }
+            return E_OUTOFMEMORY;
+        }
+    }
+    // 如果不是我们要拦截的目录，或者未启用 Hook，则调用原函数
+    return fpSHGetKnownFolderPath(rfid, dwFlags, hToken, ppszPath);
+}
+
+// 拦截 SHGetFolderPathW (老旧程序常用的 API)
+HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath) {
+    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+        std::wstring subPath;
+        if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
+            // 拼接完整的沙盒路径
+            std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
+            
+            // 确保沙盒中的目标目录存在
+            SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
+
+            // SHGetFolderPathW 要求 pszPath 是一个预分配的 MAX_PATH 长度的缓冲区
+            wcscpy_s(pszPath, MAX_PATH, fullPath.c_str());
+            return S_OK;
+        }
+    }
+    // 如果不是我们要拦截的目录，调用原函数
+    return fpSHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath);
+}
+
 // --- [新增] UI 语言 Hook ---
 LANGID WINAPI Detour_GetUserDefaultUILanguage(void) {
     return g_FakeLangID ? g_FakeLangID : fpGetUserDefaultUILanguage();
@@ -10954,6 +11041,11 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
+    // 读取 YAP_HOOK_SHELL 环境变量
+    if (GetEnvironmentVariableW(L"YAP_HOOK_SHELL", buffer, MAX_PATH) > 0) {
+        g_HookShell = _wtoi(buffer);
+    }
+
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -11524,6 +11616,23 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pNtQueryValueKey = (void*)GetProcAddress(hNtdll, "NtQueryValueKey");
             if (pNtQueryValueKey) {
                 MH_CreateHook(pNtQueryValueKey, &Detour_NtQueryValueKey, reinterpret_cast<LPVOID*>(&fpNtQueryValueKey));
+            }
+        }
+    }
+
+    // --- [新增] 组 S: Shell 目录重定向 Hook ---
+    if (g_HookShell != 0) {
+        // Shell32.dll 通常已经被加载，但为了安全起见我们显式获取句柄
+        HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
+        if (hShell32) {
+            void* pSHGetKnownFolderPath = (void*)GetProcAddress(hShell32, "SHGetKnownFolderPath");
+            if (pSHGetKnownFolderPath && fpSHGetKnownFolderPath == NULL) {
+                MH_CreateHook(pSHGetKnownFolderPath, &Detour_SHGetKnownFolderPath, reinterpret_cast<LPVOID*>(&fpSHGetKnownFolderPath));
+            }
+
+            void* pSHGetFolderPathW = (void*)GetProcAddress(hShell32, "SHGetFolderPathW");
+            if (pSHGetFolderPathW && fpSHGetFolderPathW == NULL) {
+                MH_CreateHook(pSHGetFolderPathW, &Detour_SHGetFolderPathW, reinterpret_cast<LPVOID*>(&fpSHGetFolderPathW));
             }
         }
     }
