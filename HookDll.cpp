@@ -709,6 +709,10 @@ typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 // 3. 函数指针定义
 // -----------------------------------------------------------
 
+// --- [新增] 补充的 Shell Hook 函数指针 ---
+typedef HRESULT(WINAPI* P_SHGetFolderPathA)(HWND, int, HANDLE, DWORD, LPSTR);
+typedef BOOL(WINAPI* P_SHGetSpecialFolderPathW)(HWND, LPWSTR, int, BOOL);
+typedef BOOL(WINAPI* P_SHGetSpecialFolderPathA)(HWND, LPSTR, int, BOOL);
 typedef HRESULT(WINAPI* P_SHGetKnownFolderPath)(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR*);
 typedef HRESULT(WINAPI* P_SHGetFolderPathW)(HWND, int, HANDLE, DWORD, LPWSTR);
 
@@ -1306,6 +1310,9 @@ P_UpdateProcThreadAttribute fpUpdateProcThreadAttribute = nullptr;
 P_SetProcessMitigationPolicy fpSetProcessMitigationPolicy = nullptr;
 P_SHGetKnownFolderPath fpSHGetKnownFolderPath = nullptr;
 P_SHGetFolderPathW fpSHGetFolderPathW = nullptr;
+P_SHGetFolderPathA fpSHGetFolderPathA = nullptr;
+P_SHGetSpecialFolderPathW fpSHGetSpecialFolderPathW = nullptr;
+P_SHGetSpecialFolderPathA fpSHGetSpecialFolderPathA = nullptr;
 
 // 原始函数指针
 P_NtCreateFile fpNtCreateFile = NULL;
@@ -7823,6 +7830,55 @@ HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWOR
     return fpSHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath);
 }
 
+// 拦截 SHGetFolderPathA (ANSI 版本)
+HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath) {
+    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+        std::wstring subPath;
+        if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
+            std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
+            SHCreateDirectoryExW(NULL, fullPathW.c_str(), NULL);
+
+            // 将宽字符 (UTF-16) 转换为多字节字符 (ANSI)
+            WideCharToMultiByte(CP_ACP, 0, fullPathW.c_str(), -1, pszPath, MAX_PATH, NULL, NULL);
+            return S_OK;
+        }
+    }
+    return fpSHGetFolderPathA(hwnd, csidl, hToken, dwFlags, pszPath);
+}
+
+// 拦截 SHGetSpecialFolderPathW (更老的遗留 API，返回 BOOL)
+BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl, BOOL fCreate) {
+    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+        std::wstring subPath;
+        if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
+            std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
+            
+            // 无论原程序的 fCreate 是什么，为了沙盒稳定性，我们都确保目录存在
+            SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
+
+            wcscpy_s(pszPath, MAX_PATH, fullPath.c_str());
+            return TRUE; // 注意这里返回 TRUE 而不是 S_OK
+        }
+    }
+    return fpSHGetSpecialFolderPathW(hwnd, pszPath, csidl, fCreate);
+}
+
+// 拦截 SHGetSpecialFolderPathA (更老的遗留 API 的 ANSI 版本)
+BOOL WINAPI Detour_SHGetSpecialFolderPathA(HWND hwnd, LPSTR pszPath, int csidl, BOOL fCreate) {
+    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+        std::wstring subPath;
+        if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
+            std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
+            SHCreateDirectoryExW(NULL, fullPathW.c_str(), NULL);
+
+            // 将宽字符转换为 ANSI
+            WideCharToMultiByte(CP_ACP, 0, fullPathW.c_str(), -1, pszPath, MAX_PATH, NULL, NULL);
+            return TRUE;
+        }
+    }
+    return fpSHGetSpecialFolderPathA(hwnd, pszPath, csidl, fCreate);
+}
+
 // --- [新增] UI 语言 Hook ---
 LANGID WINAPI Detour_GetUserDefaultUILanguage(void) {
     return g_FakeLangID ? g_FakeLangID : fpGetUserDefaultUILanguage();
@@ -11633,6 +11689,21 @@ DWORD WINAPI InitHookThread(LPVOID) {
             void* pSHGetFolderPathW = (void*)GetProcAddress(hShell32, "SHGetFolderPathW");
             if (pSHGetFolderPathW && fpSHGetFolderPathW == NULL) {
                 MH_CreateHook(pSHGetFolderPathW, &Detour_SHGetFolderPathW, reinterpret_cast<LPVOID*>(&fpSHGetFolderPathW));
+            }
+			
+            void* pSHGetFolderPathA = (void*)GetProcAddress(hShell32, "SHGetFolderPathA");
+            if (pSHGetFolderPathA && fpSHGetFolderPathA == NULL) {
+                MH_CreateHook(pSHGetFolderPathA, &Detour_SHGetFolderPathA, reinterpret_cast<LPVOID*>(&fpSHGetFolderPathA));
+            }
+
+            void* pSHGetSpecialFolderPathW = (void*)GetProcAddress(hShell32, "SHGetSpecialFolderPathW");
+            if (pSHGetSpecialFolderPathW && fpSHGetSpecialFolderPathW == NULL) {
+                MH_CreateHook(pSHGetSpecialFolderPathW, &Detour_SHGetSpecialFolderPathW, reinterpret_cast<LPVOID*>(&fpSHGetSpecialFolderPathW));
+            }
+
+            void* pSHGetSpecialFolderPathA = (void*)GetProcAddress(hShell32, "SHGetSpecialFolderPathA");
+            if (pSHGetSpecialFolderPathA && fpSHGetSpecialFolderPathA == NULL) {
+                MH_CreateHook(pSHGetSpecialFolderPathA, &Detour_SHGetSpecialFolderPathA, reinterpret_cast<LPVOID*>(&fpSHGetSpecialFolderPathA));
             }
         }
     }
