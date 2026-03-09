@@ -7756,15 +7756,40 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
 // 辅助函数：将 KNOWNFOLDERID 映射到沙盒的相对子目录
 bool GetSandboxSubPathForKnownFolder(REFKNOWNFOLDERID rfid, std::wstring& subPath) {
+    if (IsEqualGUID(rfid, FOLDERID_UserProfiles))        { subPath = L"\\Users"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\Users\\Current"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L"\\Users\\Current\\AppData\\Local"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L"\\Users\\Current\\AppData\\LocalLow"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L"\\Users\\Current\\AppData\\Roaming"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Desktop))        { subPath = L"\\Users\\Current\\Desktop"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L"\\Users\\Current\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Downloads))        { subPath = L"\\Users\\Current\\Downloads"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Music))        { subPath = L"\\Users\\Current\\Music"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Pictures))        { subPath = L"\\Users\\Current\\Pictures"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L"\\Users\\Current\\Saved Games"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\Users\\Current"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Videos))        { subPath = L"\\Users\\Current\\Videos"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserProgramFiles))        { subPath = L"\\Users\\Current\\AppData\\Local\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserProgramFilesCommon))        { subPath = L"\\Users\\Current\\AppData\\Local\\Programs\\Common"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_StartMenu))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Programs))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Startup))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_SendTo))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\SendTo"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_QuickLaunch))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserPinned))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_ImplicitAppShortcuts))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\ImplicitAppShortcuts"; return true; }
+    // All
     if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L"\\Users\\All"; return true; } // 涵盖 %AllUsersProfile%
+    if (IsEqualGUID(rfid, FOLDERID_CommonStartMenu))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_CommonPrograms))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_CommonStartup))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true; }
+    // Public
     if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L"\\Users\\Public"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDesktop))        { subPath = L"\\Users\\Public\\Desktop"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L"\\Users\\Public\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDownloads))        { subPath = L"\\Users\\Public\\Downloads"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicMusic))        { subPath = L"\\Users\\Public\\Music"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicPictures))        { subPath = L"\\Users\\Public\\Pictures"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicVideos))        { subPath = L"\\Users\\Public\\Videos"; return true; }
     return false;
 }
 
@@ -7774,12 +7799,33 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
     int realCsidl = csidl & 0xFF;
 
     switch (realCsidl) {
+        case CSIDL_PROFILE:          subPath = L"\\Users\\Current"; return true;
         case CSIDL_LOCAL_APPDATA:    subPath = L"\\Users\\Current\\AppData\\Local"; return true;
         case CSIDL_APPDATA:          subPath = L"\\Users\\Current\\AppData\\Roaming"; return true;
+        case CSIDL_DESKTOP:         subPath = L"\\Users\\Current\\Desktop"; return true;
+        case CSIDL_DESKTOPDIRECTORY:         subPath = L"\\Users\\Current\\Desktop"; return true;
         case CSIDL_PERSONAL:         subPath = L"\\Users\\Current\\Documents"; return true;
-        case CSIDL_PROFILE:          subPath = L"\\Users\\Current"; return true;
-        case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
+        case CSIDL_MYDOCUMENTS:         subPath = L"\\Users\\Current\\Documents"; return true;
+        case CSIDL_MYMUSIC:         subPath = L"\\Users\\Current\\Music"; return true;
+        case CSIDL_MYPICTURES:         subPath = L"\\Users\\Current\\Pictures"; return true;
+        case CSIDL_MYVIDEO:         subPath = L"\\Users\\Current\\Videos"; return true;
+        case CSIDL_STARTMENU:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true;
+        case CSIDL_PROGRAMS:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true;
+        case CSIDL_STARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_ALTSTARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_SENDTO:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\SendTo"; return true;
+        // Public
+        case CSIDL_COMMON_DESKTOPDIRECTORY:   subPath = L"\\Users\\Public\\Desktop"; return true;
         case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Users\\Public\\Documents"; return true;
+        case CSIDL_COMMON_MUSIC:   subPath = L"\\Users\\Public\\Music"; return true;
+        case CSIDL_COMMON_PICTURES:   subPath = L"\\Users\\Public\\Pictures"; return true;
+        case CSIDL_COMMON_VIDEO:   subPath = L"\\Users\\Public\\Videos"; return true;
+        // All
+        case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
+        case CSIDL_COMMON_STARTMENU:   subPath = L"\\Users\\All\\Start Menu"; return true;
+        case CSIDL_COMMON_PROGRAMS:   subPath = L"\\Users\\All\\Start Menu\\Programs"; return true;
+        case CSIDL_COMMON_STARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
+        case CSIDL_COMMON_ALTSTARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
     }
     return false;
 }
