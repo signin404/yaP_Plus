@@ -11236,12 +11236,14 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // [修改] 公共基础 Hook：NtQueryObject
     // 只要启用了 文件重定向 OR 虚拟盘符 OR 注册表重定向
     // 就必须挂钩 NtQueryObject 以进行路径伪装 (防止通过句柄反查到沙盒路径)
-    if (hNtdll && (g_HookMode > 0 || g_VirtualCdDrive != 0 || g_HookReg)) {
-        void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
-        if (pNtQueryObject) {
-            // MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址(Trampoline)
-            // 这样 GetPathFromHandle 内部调用 fpNtQueryObject 时依然能正常工作
-            MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+    if (hNtdll) {
+        bool bNeedNtQueryObject = ((g_HookMode >= 1 && g_HookMode <= 3) || g_VirtualCdDrive != 0 || g_HookReg != 0);
+        if (bNeedNtQueryObject) {
+            void* pNtQueryObject = (void*)GetProcAddress(hNtdll, "NtQueryObject");
+            if (pNtQueryObject) {
+                // MH_CreateHook 会自动更新 fpNtQueryObject 为跳板地址(Trampoline)
+                MH_CreateHook(pNtQueryObject, &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
+            }
         }
     }
 
