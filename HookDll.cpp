@@ -1125,7 +1125,6 @@ std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
-int g_HookShell = 0; // 是否启用 Shell 目录重定向
 
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
@@ -7757,15 +7756,40 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
 // 辅助函数：将 KNOWNFOLDERID 映射到沙盒的相对子目录
 bool GetSandboxSubPathForKnownFolder(REFKNOWNFOLDERID rfid, std::wstring& subPath) {
+    if (IsEqualGUID(rfid, FOLDERID_UserProfiles))        { subPath = L"\\Users"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\Users\\Current"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L"\\Users\\Current\\AppData\\Local"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L"\\Users\\Current\\AppData\\LocalLow"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L"\\Users\\Current\\AppData\\Roaming"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Desktop))        { subPath = L"\\Users\\Current\\Desktop"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L"\\Users\\Current\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Downloads))        { subPath = L"\\Users\\Current\\Downloads"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Music))        { subPath = L"\\Users\\Current\\Music"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Pictures))        { subPath = L"\\Users\\Current\\Pictures"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L"\\Users\\Current\\Saved Games"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\Users\\Current"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Videos))        { subPath = L"\\Users\\Current\\Videos"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserProgramFiles))        { subPath = L"\\Users\\Current\\AppData\\Local\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserProgramFilesCommon))        { subPath = L"\\Users\\Current\\AppData\\Local\\Programs\\Common"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_StartMenu))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Programs))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Startup))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_SendTo))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\SendTo"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_QuickLaunch))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_UserPinned))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_ImplicitAppShortcuts))        { subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\ImplicitAppShortcuts"; return true; }
+    // All
     if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L"\\Users\\All"; return true; } // 涵盖 %AllUsersProfile%
+    if (IsEqualGUID(rfid, FOLDERID_CommonStartMenu))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_CommonPrograms))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu\\Programs"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_CommonStartup))        { subPath = L"\\Users\\All\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true; }
+    // Public
     if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L"\\Users\\Public"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDesktop))        { subPath = L"\\Users\\Public\\Desktop"; return true; }
     if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L"\\Users\\Public\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDownloads))        { subPath = L"\\Users\\Public\\Downloads"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicMusic))        { subPath = L"\\Users\\Public\\Music"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicPictures))        { subPath = L"\\Users\\Public\\Pictures"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicVideos))        { subPath = L"\\Users\\Public\\Videos"; return true; }
     return false;
 }
 
@@ -7775,19 +7799,39 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
     int realCsidl = csidl & 0xFF;
 
     switch (realCsidl) {
+        case CSIDL_PROFILE:          subPath = L"\\Users\\Current"; return true;
         case CSIDL_LOCAL_APPDATA:    subPath = L"\\Users\\Current\\AppData\\Local"; return true;
         case CSIDL_APPDATA:          subPath = L"\\Users\\Current\\AppData\\Roaming"; return true;
+        case CSIDL_DESKTOP:         subPath = L"\\Users\\Current\\Desktop"; return true;
+        case CSIDL_DESKTOPDIRECTORY:         subPath = L"\\Users\\Current\\Desktop"; return true;
         case CSIDL_PERSONAL:         subPath = L"\\Users\\Current\\Documents"; return true;
-        case CSIDL_PROFILE:          subPath = L"\\Users\\Current"; return true;
-        case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
+        case CSIDL_MYMUSIC:         subPath = L"\\Users\\Current\\Music"; return true;
+        case CSIDL_MYPICTURES:         subPath = L"\\Users\\Current\\Pictures"; return true;
+        case CSIDL_MYVIDEO:         subPath = L"\\Users\\Current\\Videos"; return true;
+        case CSIDL_STARTMENU:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true;
+        case CSIDL_PROGRAMS:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true;
+        case CSIDL_STARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_ALTSTARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_SENDTO:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\SendTo"; return true;
+        // Public
+        case CSIDL_COMMON_DESKTOPDIRECTORY:   subPath = L"\\Users\\Public\\Desktop"; return true;
         case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Users\\Public\\Documents"; return true;
+        case CSIDL_COMMON_MUSIC:   subPath = L"\\Users\\Public\\Music"; return true;
+        case CSIDL_COMMON_PICTURES:   subPath = L"\\Users\\Public\\Pictures"; return true;
+        case CSIDL_COMMON_VIDEO:   subPath = L"\\Users\\Public\\Videos"; return true;
+        // All
+        case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
+        case CSIDL_COMMON_STARTMENU:   subPath = L"\\Users\\All\\Start Menu"; return true;
+        case CSIDL_COMMON_PROGRAMS:   subPath = L"\\Users\\All\\Start Menu\\Programs"; return true;
+        case CSIDL_COMMON_STARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
+        case CSIDL_COMMON_ALTSTARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
     }
     return false;
 }
 
 // 拦截 SHGetKnownFolderPath (Vista 及以上现代 API)
 HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken, PWSTR *ppszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForKnownFolder(rfid, subPath)) {
             // 拼接完整的沙盒路径
@@ -7812,7 +7856,7 @@ HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
 
 // 拦截 SHGetFolderPathW (老旧程序常用的 API)
 HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             // 拼接完整的沙盒路径
@@ -7832,7 +7876,7 @@ HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWOR
 
 // 拦截 SHGetFolderPathA (ANSI 版本)
 HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
@@ -7848,7 +7892,7 @@ HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWOR
 
 // 拦截 SHGetSpecialFolderPathW (更老的遗留 API 返回 BOOL)
 BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl, BOOL fCreate) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
@@ -7865,7 +7909,7 @@ BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl,
 
 // 拦截 SHGetSpecialFolderPathA (更老的遗留 API 的 ANSI 版本)
 BOOL WINAPI Detour_SHGetSpecialFolderPathA(HWND hwnd, LPSTR pszPath, int csidl, BOOL fCreate) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
@@ -11097,11 +11141,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // 读取 YAP_HOOK_SHELL 环境变量
-    if (GetEnvironmentVariableW(L"YAP_HOOK_SHELL", buffer, MAX_PATH) > 0) {
-        g_HookShell = _wtoi(buffer);
-    }
-
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -11211,7 +11250,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // [修改] 启用文件重定向挂钩的条件
         // 1. hookfile > 0 (常规重定向)
         // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
-        if (g_HookMode > 0 || g_VirtualCdDrive != 0) {
+        if ((g_HookMode >= 1 && g_HookMode <= 3) || g_VirtualCdDrive != 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
@@ -11677,7 +11716,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // --- [新增] 组 S: Shell 目录重定向 Hook ---
-    if (g_HookShell != 0) {
+    if (g_HookMode == 4) {
         // Shell32.dll 通常已经被加载 但为了安全起见我们显式获取句柄
         HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
         if (hShell32) {
