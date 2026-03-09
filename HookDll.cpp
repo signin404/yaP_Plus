@@ -7757,15 +7757,15 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
 // 辅助函数：将 KNOWNFOLDERID 映射到沙盒的相对子目录
 bool GetSandboxSubPathForKnownFolder(REFKNOWNFOLDERID rfid, std::wstring& subPath) {
-    if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L""; return true; } // 涵盖 %AllUsersProfile%
-    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L""; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L"\\Users\\Current\\AppData\\Local"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L"\\Users\\Current\\AppData\\LocalLow"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L"\\Users\\Current\\AppData\\Roaming"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L"\\Users\\Current\\Documents"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L"\\Users\\Current\\Saved Games"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\Users\\Current"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L"\\Users\\All"; return true; } // 涵盖 %AllUsersProfile%
+    if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L"\\Users\\Public"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L"\\Users\\Public\\Documents"; return true; }
     return false;
 }
 
@@ -7775,12 +7775,12 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
     int realCsidl = csidl & 0xFF;
 
     switch (realCsidl) {
-        case CSIDL_LOCAL_APPDATA:    subPath = L""; return true;
-        case CSIDL_APPDATA:          subPath = L""; return true;
-        case CSIDL_COMMON_APPDATA:   subPath = L""; return true;
-        case CSIDL_PROFILE:          subPath = L""; return true;
-        case CSIDL_PERSONAL:         subPath = L""; return true;
-        case CSIDL_COMMON_DOCUMENTS: subPath = L""; return true;
+        case CSIDL_LOCAL_APPDATA:    subPath = L"\\Users\\Current\\AppData\\Local"; return true;
+        case CSIDL_APPDATA:          subPath = L"\\Users\\Current\\AppData\\Roaming"; return true;
+        case CSIDL_PERSONAL:         subPath = L"\\Users\\Current\\Documents"; return true;
+        case CSIDL_PROFILE:          subPath = L"\\Users\\Current"; return true;
+        case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
+        case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Users\\Public\\Documents"; return true;
     }
     return false;
 }
