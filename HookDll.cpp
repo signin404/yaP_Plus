@@ -7757,30 +7757,30 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
 
 // 辅助函数：将 KNOWNFOLDERID 映射到沙盒的相对子目录
 bool GetSandboxSubPathForKnownFolder(REFKNOWNFOLDERID rfid, std::wstring& subPath) {
-    if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L"\\AppData\\Local"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L"\\AppData\\Roaming"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L"\\ProgramData"; return true; } // 涵盖 %AllUsersProfile%
-    if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L"\\Public"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L"\\UserProfile"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L"\\Public\\Documents"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L"\\UserProfile\\Documents"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L"\\UserProfile\\Saved Games"; return true; }
-    if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L"\\AppData\\LocalLow"; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppData))      { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_LocalAppDataLow))   { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_RoamingAppData))    { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_ProgramData))       { subPath = L""; return true; } // 涵盖 %AllUsersProfile%
+    if (IsEqualGUID(rfid, FOLDERID_Profile))           { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Documents))         { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_SavedGames))        { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_Public))            { subPath = L""; return true; }
+    if (IsEqualGUID(rfid, FOLDERID_PublicDocuments))   { subPath = L""; return true; }
     return false;
 }
 
 // 辅助函数：将 CSIDL 映射到沙盒的相对子目录
 bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
-    // 屏蔽掉 CSIDL_FLAG_CREATE 等标志位，只取真实的 ID
-    int realCsidl = csidl & 0xFF; 
-    
+    // 屏蔽掉 CSIDL_FLAG_CREATE 等标志位 只取真实的 ID
+    int realCsidl = csidl & 0xFF;
+
     switch (realCsidl) {
-        case CSIDL_LOCAL_APPDATA:    subPath = L"\\AppData\\Local"; return true;
-        case CSIDL_APPDATA:          subPath = L"\\AppData\\Roaming"; return true;
-        case CSIDL_COMMON_APPDATA:   subPath = L"\\ProgramData"; return true;
-        case CSIDL_PROFILE:          subPath = L"\\UserProfile"; return true;
-        case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Public\\Documents"; return true;
-        case CSIDL_PERSONAL:         subPath = L"\\UserProfile\\Documents"; return true;
+        case CSIDL_LOCAL_APPDATA:    subPath = L""; return true;
+        case CSIDL_APPDATA:          subPath = L""; return true;
+        case CSIDL_COMMON_APPDATA:   subPath = L""; return true;
+        case CSIDL_PROFILE:          subPath = L""; return true;
+        case CSIDL_PERSONAL:         subPath = L""; return true;
+        case CSIDL_COMMON_DOCUMENTS: subPath = L""; return true;
     }
     return false;
 }
@@ -7792,11 +7792,11 @@ HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
         if (GetSandboxSubPathForKnownFolder(rfid, subPath)) {
             // 拼接完整的沙盒路径
             std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
-            
+
             // 确保沙盒中的目标目录存在 (防止程序因找不到目录而崩溃)
             SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
 
-            // 必须使用 CoTaskMemAlloc 分配内存，因为调用者会用 CoTaskMemFree 释放
+            // 必须使用 CoTaskMemAlloc 分配内存 因为调用者会用 CoTaskMemFree 释放
             size_t allocSize = (fullPath.length() + 1) * sizeof(WCHAR);
             *ppszPath = (PWSTR)CoTaskMemAlloc(allocSize);
             if (*ppszPath) {
@@ -7806,7 +7806,7 @@ HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
             return E_OUTOFMEMORY;
         }
     }
-    // 如果不是我们要拦截的目录，或者未启用 Hook，则调用原函数
+    // 如果不是我们要拦截的目录 或者未启用 Hook 则调用原函数
     return fpSHGetKnownFolderPath(rfid, dwFlags, hToken, ppszPath);
 }
 
@@ -7817,7 +7817,7 @@ HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWOR
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             // 拼接完整的沙盒路径
             std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
-            
+
             // 确保沙盒中的目标目录存在
             SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
 
@@ -7826,7 +7826,7 @@ HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWOR
             return S_OK;
         }
     }
-    // 如果不是我们要拦截的目录，调用原函数
+    // 如果不是我们要拦截的目录 调用原函数
     return fpSHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath);
 }
 
@@ -7846,14 +7846,14 @@ HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWOR
     return fpSHGetFolderPathA(hwnd, csidl, hToken, dwFlags, pszPath);
 }
 
-// 拦截 SHGetSpecialFolderPathW (更老的遗留 API，返回 BOOL)
+// 拦截 SHGetSpecialFolderPathW (更老的遗留 API 返回 BOOL)
 BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl, BOOL fCreate) {
     if (g_HookShell && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
-            
-            // 无论原程序的 fCreate 是什么，为了沙盒稳定性，我们都确保目录存在
+
+            // 无论原程序的 fCreate 是什么 为了沙盒稳定性 我们都确保目录存在
             SHCreateDirectoryExW(NULL, fullPath.c_str(), NULL);
 
             wcscpy_s(pszPath, MAX_PATH, fullPath.c_str());
@@ -11678,7 +11678,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     // --- [新增] 组 S: Shell 目录重定向 Hook ---
     if (g_HookShell != 0) {
-        // Shell32.dll 通常已经被加载，但为了安全起见我们显式获取句柄
+        // Shell32.dll 通常已经被加载 但为了安全起见我们显式获取句柄
         HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
         if (hShell32) {
             void* pSHGetKnownFolderPath = (void*)GetProcAddress(hShell32, "SHGetKnownFolderPath");
@@ -11690,7 +11690,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             if (pSHGetFolderPathW && fpSHGetFolderPathW == NULL) {
                 MH_CreateHook(pSHGetFolderPathW, &Detour_SHGetFolderPathW, reinterpret_cast<LPVOID*>(&fpSHGetFolderPathW));
             }
-			
+
             void* pSHGetFolderPathA = (void*)GetProcAddress(hShell32, "SHGetFolderPathA");
             if (pSHGetFolderPathA && fpSHGetFolderPathA == NULL) {
                 MH_CreateHook(pSHGetFolderPathA, &Detour_SHGetFolderPathA, reinterpret_cast<LPVOID*>(&fpSHGetFolderPathA));
