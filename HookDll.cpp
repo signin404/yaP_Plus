@@ -7805,7 +7805,6 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
         case CSIDL_DESKTOP:         subPath = L"\\Users\\Current\\Desktop"; return true;
         case CSIDL_DESKTOPDIRECTORY:         subPath = L"\\Users\\Current\\Desktop"; return true;
         case CSIDL_PERSONAL:         subPath = L"\\Users\\Current\\Documents"; return true;
-        case CSIDL_MYDOCUMENTS:         subPath = L"\\Users\\Current\\Documents"; return true;
         case CSIDL_MYMUSIC:         subPath = L"\\Users\\Current\\Music"; return true;
         case CSIDL_MYPICTURES:         subPath = L"\\Users\\Current\\Pictures"; return true;
         case CSIDL_MYVIDEO:         subPath = L"\\Users\\Current\\Videos"; return true;
