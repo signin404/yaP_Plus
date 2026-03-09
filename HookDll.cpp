@@ -1125,7 +1125,6 @@ std::wstring g_OverrideFontName; // 存储 hookfont 指定的字体名称
 HFONT g_hNewGSOFont = NULL;      // [新增] 用于替换 GetStockObject 的字体句柄
 std::vector<std::wstring> g_ExtraDlls; // [新增] 第三方 DLL 列表
 std::wstring g_CurrentProcessNameLower; // 缓存当前进程名
-int g_HookShell = 0; // 是否启用 Shell 目录重定向
 
 bool g_HookReg = false;
 HKEY g_hAppHive = NULL; // 私有配置单元 (AppKey) 的句柄
@@ -11097,11 +11096,6 @@ DWORD WINAPI InitHookThread(LPVOID) {
         }
     }
 
-    // 读取 YAP_HOOK_SHELL 环境变量
-    if (GetEnvironmentVariableW(L"YAP_HOOK_SHELL", buffer, MAX_PATH) > 0) {
-        g_HookShell = _wtoi(buffer);
-    }
-
     // 4. [新增] 获取系统盘符并初始化白名单
     if (GetSystemDirectoryW(buffer, MAX_PATH) > 0) {
         buffer[2] = L'\0'; // 截断为 "C:"
@@ -11211,7 +11205,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
         // [修改] 启用文件重定向挂钩的条件
         // 1. hookfile > 0 (常规重定向)
         // 2. hookcd 启用了虚拟盘符 (需要重定向 M: -> Z:)
-        if (g_HookMode > 0 || g_VirtualCdDrive != 0) {
+        if ((g_HookMode >= 1 && g_HookMode <= 3) || g_VirtualCdDrive != 0) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtCreateFile"), &Detour_NtCreateFile, reinterpret_cast<LPVOID*>(&fpNtCreateFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtOpenFile"), &Detour_NtOpenFile, reinterpret_cast<LPVOID*>(&fpNtOpenFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
@@ -11677,7 +11671,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     // --- [新增] 组 S: Shell 目录重定向 Hook ---
-    if (g_HookShell != 0) {
+    if (g_HookMode == 4) {
         // Shell32.dll 通常已经被加载 但为了安全起见我们显式获取句柄
         HMODULE hShell32 = LoadLibraryW(L"shell32.dll");
         if (hShell32) {
