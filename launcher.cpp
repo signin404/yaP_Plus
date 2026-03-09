@@ -5144,6 +5144,14 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // --- [新增] 解析 hookreg 配置 (注册表重定向) ---
     std::wstring hookRegVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookreg");
 
+    // --- [新增] 解析 hookshell 配置 (Shell 目录重定向) ---
+    std::wstring hookShellVal = GetValueFromIniContent(data->iniContent, L"Hook", L"hookshell");
+    if (!hookShellVal.empty()) {
+        SetEnvironmentVariableW(L"YAP_HOOK_SHELL", hookShellVal.c_str());
+    } else {
+        SetEnvironmentVariableW(L"YAP_HOOK_SHELL", NULL);
+    }
+
     // [新增] 将第三方 DLL 列表拼接并设置环境变量 (供 HookDll 直接注入使用)
     std::wstring extraDllsEnv;
     for (const auto& dll : thirdPartyDlls) {
@@ -5158,7 +5166,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
 
     // [修改] 启用 Hook 的条件 (针对当前进程)
     // 只有当需要文件重定向、网络拦截、伪装等核心功能时 才认为当前进程需要 "Hook"
-    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || !hookRegVal.empty() || (hookChild && !thirdPartyDlls.empty()));
+    bool enableHook = (hookMode > 0 || blockNetwork || !hookVolumeIdVal.empty() || !hookCdVal.empty() || !hookFontVal.empty() || !hookLocaleVal.empty() || !hookTimeVal.empty() || !hookRegVal.empty() || !hookShellVal.empty() || (hookChild && !thirdPartyDlls.empty()));
 
     // [新增] 解析 multiple 配置
     std::wstring multipleVal = GetValueFromIniContent(data->iniContent, L"General", L"multiple");
@@ -5985,6 +5993,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookTimeVal = GetValueFromIniContent(iniContent, L"Hook", L"hooktime");
             std::wstring hookChildVal = GetValueFromIniContent(iniContent, L"Hook", L"hookchild");
             std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
+            std::wstring hookShellVal = GetValueFromIniContent(iniContent, L"Hook", L"hookshell");
 
             if (hookChildVal.empty()) hookChildVal = L"1";
 
@@ -6107,6 +6116,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 SetEnvironmentVariableW(L"YAP_HOOK_REGPATH", NULL);
             }
 
+            // --- [新增] 条件设置：hookshell ---
+            if (!hookShellVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_SHELL", hookShellVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_SHELL", NULL);
+            }
+
             // 处理字体路径 (必须像第一实例那样解析成绝对路径)
             if (!hookFontVal.empty()) {
                 std::wstring resolvedFontPath = ResolveToAbsolutePath(ExpandVariables(hookFontVal, variables), variables);
@@ -6127,7 +6143,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             bool needHook = (_wtoi(hookFileVal.c_str()) > 0 || _wtoi(netBlockVal.c_str()) > 0 ||
                              !hookVolumeIdVal.empty() || !hookCdVal.empty() ||
                              !hookLocaleVal.empty() || !hookFontVal.empty() ||
-                             !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);
+                             !hookTimeVal.empty() || !hookRegVal.empty() || !hookShellVal.empty() || hasThirdPartyDlls);
 
             if (!needHook) {
                 LaunchApplication(iniContent, variables);
