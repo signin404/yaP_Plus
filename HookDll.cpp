@@ -7786,7 +7786,7 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
 
 // 拦截 SHGetKnownFolderPath (Vista 及以上现代 API)
 HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags, HANDLE hToken, PWSTR *ppszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForKnownFolder(rfid, subPath)) {
             // 拼接完整的沙盒路径
@@ -7811,7 +7811,7 @@ HRESULT WINAPI Detour_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD dwFlags,
 
 // 拦截 SHGetFolderPathW (老旧程序常用的 API)
 HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             // 拼接完整的沙盒路径
@@ -7831,7 +7831,7 @@ HRESULT WINAPI Detour_SHGetFolderPathW(HWND hwnd, int csidl, HANDLE hToken, DWOR
 
 // 拦截 SHGetFolderPathA (ANSI 版本)
 HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPSTR pszPath) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
@@ -7847,7 +7847,7 @@ HRESULT WINAPI Detour_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE hToken, DWOR
 
 // 拦截 SHGetSpecialFolderPathW (更老的遗留 API 返回 BOOL)
 BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl, BOOL fCreate) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPath = std::wstring(g_SandboxRoot) + subPath;
@@ -7864,7 +7864,7 @@ BOOL WINAPI Detour_SHGetSpecialFolderPathW(HWND hwnd, LPWSTR pszPath, int csidl,
 
 // 拦截 SHGetSpecialFolderPathA (更老的遗留 API 的 ANSI 版本)
 BOOL WINAPI Detour_SHGetSpecialFolderPathA(HWND hwnd, LPSTR pszPath, int csidl, BOOL fCreate) {
-    if (g_HookShell && g_SandboxRoot[0] != L'\0') {
+    if (g_HookMode == 4 && g_SandboxRoot[0] != L'\0') {
         std::wstring subPath;
         if (GetSandboxSubPathForCSIDL(csidl, subPath)) {
             std::wstring fullPathW = std::wstring(g_SandboxRoot) + subPath;
