@@ -634,6 +634,7 @@ bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
 // Forward declaration for recursive delete
 namespace ActionHelpers {
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
+    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view = 0);
 }
 
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
@@ -722,10 +723,32 @@ LSTATUS RecursiveRegCopyKey(HKEY hSrcKey, HKEY hDestKey) {
 // <-- [修改] 使用API重写RenameRegistryKey
 bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wstring& newSubKey) {
     HKEY hSrcKey, hDestKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey) != ERROR_SUCCESS) {
+    LSTATUS res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey);
+
+    // [新增] 如果源键拒绝访问 尝试提权后重试
+    if (res == ERROR_ACCESS_DENIED) {
+        ActionHelpers::GrantRegistryKeyPermission(hRootKey, subKey, 0);
+        res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hSrcKey);
+    }
+    if (res != ERROR_SUCCESS) {
         return false;
     }
+
     LSTATUS createStatus = RegCreateKeyExW(hRootKey, newSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestKey, NULL);
+
+    // [新增] 如果创建备份键拒绝访问（通常是因为父键如 Enum\Root 没有写入权限） 对父键提权
+    if (createStatus == ERROR_ACCESS_DENIED) {
+        std::wstring parentKey;
+        size_t lastSlash = newSubKey.find_last_of(L'\\');
+        if (lastSlash != std::wstring::npos) {
+            parentKey = newSubKey.substr(0, lastSlash);
+            ActionHelpers::GrantRegistryKeyPermission(hRootKey, parentKey, 0);
+        } else {
+            ActionHelpers::GrantRegistryKeyPermission(hRootKey, L"", 0);
+        }
+        createStatus = RegCreateKeyExW(hRootKey, newSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hDestKey, NULL);
+    }
+
     if (createStatus != ERROR_SUCCESS) {
         RegCloseKey(hSrcKey);
         return false;
@@ -742,7 +765,14 @@ bool RenameRegistryKey(HKEY hRootKey, const std::wstring& subKey, const std::wst
 
 bool RenameRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& newValueName) {
     HKEY hKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) return false;
+    LSTATUS res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ | KEY_WRITE, &hKey);
+
+    // [新增] 如果拒绝访问 尝试提权后重试
+    if (res == ERROR_ACCESS_DENIED) {
+        ActionHelpers::GrantRegistryKeyPermission(hRootKey, subKey, 0);
+        res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ | KEY_WRITE, &hKey);
+    }
+    if (res != ERROR_SUCCESS) return false;
 
     DWORD type, size = 0;
     if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
@@ -885,7 +915,14 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
     else return false;
 
     HKEY hKeyToExport;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKeyToExport) != ERROR_SUCCESS) {
+    LSTATUS res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKeyToExport);
+
+    // [新增] 如果导出时拒绝访问 尝试提权后重试
+    if (res == ERROR_ACCESS_DENIED) {
+        ActionHelpers::GrantRegistryKeyPermission(hRootKey, subKey, 0);
+        res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKeyToExport);
+    }
+    if (res != ERROR_SUCCESS) {
         return false;
     }
 
@@ -920,7 +957,14 @@ bool ExportRegistryKey(const std::wstring& rootKeyStr, const std::wstring& subKe
 // <-- [修改] 修正了 hex 值的导出换行逻辑 以精确匹配 reg.exe 的行为
 bool ExportRegistryValue(HKEY hRootKey, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& rootKeyStr, const std::wstring& filePath) {
     HKEY hKey;
-    if (RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return false;
+    LSTATUS res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey);
+
+    // [新增] 如果导出时拒绝访问 尝试提权后重试
+    if (res == ERROR_ACCESS_DENIED) {
+        ActionHelpers::GrantRegistryKeyPermission(hRootKey, subKey, 0);
+        res = RegOpenKeyExW(hRootKey, subKey.c_str(), 0, KEY_READ, &hKey);
+    }
+    if (res != ERROR_SUCCESS) return false;
 
     DWORD type, size = 0;
     if (RegQueryValueExW(hKey, valueName.c_str(), NULL, &type, NULL, &size) != ERROR_SUCCESS) {
@@ -1122,6 +1166,37 @@ std::wstring GetProcessFullPathByPid(DWORD pid) {
 
 // Deletion and Action Helpers
 namespace ActionHelpers {
+
+    // [新增] 辅助函数：获取注册表项权限 (提权)
+    // 相当于 NSIS 中的 AccessControl::GrantOnRegKey ... "(BU)" "FullAccess"
+    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view) {
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        // O:BA (Owner: Built-in Admins) G:BA (Group: Built-in Admins) D:(A;OICI;KA;;;BU) (DACL: Allow Full Access to Built-in Users)
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:(A;OICI;KA;;;BU)", SDDL_REVISION_1, &pSD, nullptr)) {
+            PACL pDacl = nullptr;
+            PSID pOwner = nullptr;
+            BOOL bDaclPresent = FALSE, bDaclDefaulted = FALSE;
+            BOOL bOwnerDefaulted = FALSE;
+
+            GetSecurityDescriptorDacl(pSD, &bDaclPresent, &pDacl, &bDaclDefaulted);
+            GetSecurityDescriptorOwner(pSD, &pOwner, &bOwnerDefaulted);
+
+            HKEY hTemp;
+            // 1. 尝试获取所有权 (需要 SeTakeOwnershipPrivilege)
+            if (RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, WRITE_OWNER | view, &hTemp) == ERROR_SUCCESS) {
+                SetSecurityInfo(hTemp, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION, pOwner, nullptr, nullptr, nullptr);
+                RegCloseKey(hTemp);
+            }
+
+            // 2. 尝试修改 DACL 赋予完全控制权限 (获取所有权后通常拥有 WRITE_DAC 权限)
+            if (RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, WRITE_DAC | view, &hTemp) == ERROR_SUCCESS) {
+                SetSecurityInfo(hTemp, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, nullptr, nullptr, pDacl, nullptr);
+                RegCloseKey(hTemp);
+            }
+
+            LocalFree(pSD);
+        }
+    }
 
     // [新增] 辅助函数：判断字符串是否以指定后缀结尾
     bool EndsWith(const std::wstring& str, const std::wstring& suffix) {
@@ -2071,8 +2146,21 @@ namespace ActionHelpers {
     LSTATUS RecursiveRegDeleteKey_Internal(HKEY hKeyParent, const std::wstring& subKey, REGSAM samAccess) {
         HKEY hKey;
         LSTATUS res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
+
+        // [新增] 如果拒绝访问 尝试提权后重试
+        if (res == ERROR_ACCESS_DENIED) {
+            GrantRegistryKeyPermission(hKeyParent, subKey, samAccess);
+            res = RegOpenKeyExW(hKeyParent, subKey.c_str(), 0, KEY_ENUMERATE_SUB_KEYS | samAccess, &hKey);
+        }
+
         if (res != ERROR_SUCCESS) {
-            return res;
+            // [新增] 如果仍然打不开（可能没有子项但有权限问题） 尝试直接提权并删除
+            LSTATUS delRes = RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+            if (delRes == ERROR_ACCESS_DENIED) {
+                GrantRegistryKeyPermission(hKeyParent, subKey, samAccess);
+                delRes = RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+            }
+            return delRes == ERROR_SUCCESS ? ERROR_SUCCESS : res;
         }
 
         wchar_t subKeyName[MAX_PATH];
@@ -2087,7 +2175,14 @@ namespace ActionHelpers {
         }
 
         RegCloseKey(hKey);
-        return RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+
+        res = RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+        // [新增] 删除时如果拒绝访问 尝试提权后重试
+        if (res == ERROR_ACCESS_DENIED) {
+            GrantRegistryKeyPermission(hKeyParent, subKey, samAccess);
+            res = RegDeleteKeyExW(hKeyParent, subKey.c_str(), samAccess, 0);
+        }
+        return res;
     }
 
     void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey) {
@@ -2182,14 +2277,26 @@ namespace ActionHelpers {
             if (ifEmpty) {
                 if (hRootKey == HKEY_LOCAL_MACHINE) {
                     if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_64KEY)) {
-                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
+                        // [修改] 增加提权重试
+                        if (RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0) == ERROR_ACCESS_DENIED) {
+                            GrantRegistryKeyPermission(hRootKey, key, KEY_WOW64_64KEY);
+                            RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_64KEY, 0);
+                        }
                     }
                     if (IsKeyEmptyInView(hRootKey, key, KEY_WOW64_32KEY)) {
-                        RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                        // [修改] 增加提权重试
+                        if (RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0) == ERROR_ACCESS_DENIED) {
+                            GrantRegistryKeyPermission(hRootKey, key, KEY_WOW64_32KEY);
+                            RegDeleteKeyExW(hRootKey, key.c_str(), KEY_WOW64_32KEY, 0);
+                        }
                     }
                 } else {
                     if (IsKeyEmptyInView(hRootKey, key, 0)) {
-                        RegDeleteKeyW(hRootKey, key.c_str());
+                        // [修改] 增加提权重试
+                        if (RegDeleteKeyW(hRootKey, key.c_str()) == ERROR_ACCESS_DENIED) {
+                            GrantRegistryKeyPermission(hRootKey, key, 0);
+                            RegDeleteKeyW(hRootKey, key.c_str());
+                        }
                     }
                 }
             } else {
@@ -2218,7 +2325,15 @@ namespace ActionHelpers {
 
             for (REGSAM view : viewsToSearch) {
                 HKEY hKey;
-                if (RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey) == ERROR_SUCCESS) {
+                LSTATUS res = RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey);
+
+                // [新增] 如果拒绝访问 尝试提权后重试
+                if (res == ERROR_ACCESS_DENIED) {
+                    GrantRegistryKeyPermission(hRootKey, keyPath, view);
+                    res = RegOpenKeyExW(hRootKey, keyPath.c_str(), 0, KEY_READ | KEY_SET_VALUE | view, &hKey);
+                }
+
+                if (res == ERROR_SUCCESS) {
                     DWORD dwValues, maxValueNameLen;
                     if (RegQueryInfoKeyW(hKey, NULL, NULL, NULL, NULL, NULL, NULL, &dwValues, &maxValueNameLen, NULL, NULL, NULL) == ERROR_SUCCESS) {
                         std::vector<wchar_t> valNameBuffer(maxValueNameLen + 1);
@@ -3938,7 +4053,15 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
             if (arg.isKey) ActionHelpers::DeleteRegistryKeyTree(arg.hRootKey, arg.subKey.c_str());
             else {
                 HKEY hKey;
-                if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+                LSTATUS res = RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey);
+
+                //[新增] 如果删除值时拒绝访问 尝试提权后重试
+                if (res == ERROR_ACCESS_DENIED) {
+                    ActionHelpers::GrantRegistryKeyPermission(arg.hRootKey, arg.subKey, 0);
+                    res = RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_WRITE, &hKey);
+                }
+
+                if (res == ERROR_SUCCESS) {
                     RegDeleteValueW(hKey, arg.valueName.c_str());
                     RegCloseKey(hKey);
                 }
