@@ -1169,7 +1169,7 @@ namespace ActionHelpers {
 
     // [新增] 辅助函数：获取注册表项权限 (提权)
     // 相当于 NSIS 中的 AccessControl::GrantOnRegKey ... "(BU)" "FullAccess"
-    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view = 0) {
+    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view) {
         PSECURITY_DESCRIPTOR pSD = nullptr;
         // O:BA (Owner: Built-in Admins) G:BA (Group: Built-in Admins) D:(A;OICI;KA;;;BU) (DACL: Allow Full Access to Built-in Users)
         if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:(A;OICI;KA;;;BU)", SDDL_REVISION_1, &pSD, nullptr)) {
