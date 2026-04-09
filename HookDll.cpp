@@ -7808,23 +7808,23 @@ bool GetSandboxSubPathForCSIDL(int csidl, std::wstring& subPath) {
         case CSIDL_MYMUSIC:         subPath = L"\\Users\\Current\\Music"; return true;
         case CSIDL_MYPICTURES:         subPath = L"\\Users\\Current\\Pictures"; return true;
         case CSIDL_MYVIDEO:         subPath = L"\\Users\\Current\\Videos"; return true;
-        case CSIDL_STARTMENU:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true;
-        case CSIDL_PROGRAMS:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true;
-        case CSIDL_STARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
-        case CSIDL_ALTSTARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_STARTMENU:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; return true;
+        case CSIDL_PROGRAMS:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; return true;
+        case CSIDL_STARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
+        case CSIDL_ALTSTARTUP:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp"; return true;
         case CSIDL_SENDTO:         subPath = L"\\Users\\Current\\AppData\\Roaming\\Microsoft\\SendTo"; return true;
-        // Public
-        case CSIDL_COMMON_DESKTOPDIRECTORY:   subPath = L"\\Users\\Public\\Desktop"; return true;
-        case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Users\\Public\\Documents"; return true;
-        case CSIDL_COMMON_MUSIC:   subPath = L"\\Users\\Public\\Music"; return true;
-        case CSIDL_COMMON_PICTURES:   subPath = L"\\Users\\Public\\Pictures"; return true;
-        case CSIDL_COMMON_VIDEO:   subPath = L"\\Users\\Public\\Videos"; return true;
         // All
         case CSIDL_COMMON_APPDATA:   subPath = L"\\Users\\All"; return true;
         case CSIDL_COMMON_STARTMENU:   subPath = L"\\Users\\All\\Start Menu"; return true;
         case CSIDL_COMMON_PROGRAMS:   subPath = L"\\Users\\All\\Start Menu\\Programs"; return true;
         case CSIDL_COMMON_STARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
         case CSIDL_COMMON_ALTSTARTUP:   subPath = L"\\Users\\All\\Start Menu\\Programs\\Startup"; return true;
+        // Public
+        case CSIDL_COMMON_DESKTOPDIRECTORY:   subPath = L"\\Users\\Public\\Desktop"; return true;
+        case CSIDL_COMMON_DOCUMENTS: subPath = L"\\Users\\Public\\Documents"; return true;
+        case CSIDL_COMMON_MUSIC:   subPath = L"\\Users\\Public\\Music"; return true;
+        case CSIDL_COMMON_PICTURES:   subPath = L"\\Users\\Public\\Pictures"; return true;
+        case CSIDL_COMMON_VIDEO:   subPath = L"\\Users\\Public\\Videos"; return true;
     }
     return false;
 }
