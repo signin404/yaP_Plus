@@ -94,6 +94,9 @@
     *   软件越复杂或挂钩越多 冲突概率呈指数级增高
     *   对于不兼容的软件或插件 需要进行针对性的修复
     *   持续维护的工作量巨大
+*   **使用此方案的软件:**
+    *   [WinPathShim](https://github.com/dam-cav/win-path-shim)
+    *   [fakereg](https://github.com/luojunyuan/fakereg)
 
 ### 启动器
 
@@ -113,6 +116,7 @@
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
+    *   [Mini-Launcher](https://github.com/xan105/Mini-Launcher)
 
 ### 虚拟化
 
@@ -129,8 +133,9 @@
     *   **性能瓶颈:** 虚拟化转译带来的性能损耗不可忽视 因此**不适合游戏或对性能要求高的软件**
 *   **使用此方案的软件:**
     *   [Turbo Studio](https://turbo.net/studio)
-    *   VMware ThinApp
+    *   [Omnissa ThinApp](https://www.omnissa.com/products/thin-app)
     *   [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
+    *   [Seanox Virtual Environment](https://github.com/seanox/virtual-environment)
 
 ### 自解压文件
 

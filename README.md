@@ -94,6 +94,9 @@ Just copy and paste to create portable software.
     *   The more complex the software or the more hooks are used, the higher the probability of conflicts.
     *   Incompatible software or plugins require targeted fixes.
     *   The ongoing maintenance workload is high.
+*   **Software using this solution:**
+    *   [WinPathShim](https://github.com/dam-cav/win-path-shim)
+    *   [fakereg](https://github.com/luojunyuan/fakereg)
 
 ### Launcher
 
@@ -113,6 +116,7 @@ Just copy and paste to create portable software.
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
+    *   [Mini-Launcher](https://github.com/xan105/Mini-Launcher)
 
 ### Virtualization
 
@@ -129,8 +133,9 @@ Just copy and paste to create portable software.
     *   **Performance Bottleneck:** The performance overhead from the translation/virtualization layer is significant, making it unsuitable for gaming or other high-performance software.
 *   **Software using this solution:**
     *   [Turbo Studio](https://turbo.net/studio)
-    *   VMware ThinApp
+    *   [Omnissa ThinApp](https://www.omnissa.com/products/thin-app)
     *   [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
+    *   [Seanox Virtual Environment](https://github.com/seanox/virtual-environment)
 
 ### Self-extracting file
 
