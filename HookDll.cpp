@@ -6725,9 +6725,11 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         }
     }
 
-    // 重定向逻辑
-
+    // 重定向与真实路径回退逻辑
     std::wstring targetNtPath;
+    NTSTATUS status = STATUS_SUCCESS;
+    bool handled = false;
+    std::wstring* lastUsedPath = nullptr; // 记录最终发送给底层 API 的实际解析路径，确保自动降级重试时不会再次陷入死锁
 
     if (ShouldRedirect(fullNtPath, targetNtPath)) {
         bool isDirectory = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
@@ -6798,11 +6800,13 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             }
         }
 
+        PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+        HANDLE oldRoot = ObjectAttributes->RootDirectory;
+
         if (shouldRedirect) {
+            // A. 需要重定向至沙盒路径 (必须清空 RootDirectory 并替换为绝对路径)
             UNICODE_STRING uStr;
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
-            PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
-            HANDLE oldRoot = ObjectAttributes->RootDirectory;
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
@@ -6811,16 +6815,36 @@ NTSTATUS NTAPI Detour_NtCreateFile(
                 EnsureDirectoryExistsNT(targetNtPath.c_str());
             }
 
-            NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
-            return status;
+
+            lastUsedPath = &targetNtPath;
+            handled = true;
+        } else {
+            // [核心修复] B. 不需要重定向，需要访问真实文件
+            // 此时必须使用解析出的绝对真实路径 (fullNtPath) 并将 RootDirectory 设为 NULL。
+            // 否则，底层在沙盒目录下强行寻找只存在于真实路径中的文件，会返回未找到错误。
+            UNICODE_STRING uRealStr;
+            RtlInitUnicodeString(&uRealStr, fullNtPath.c_str());
+            ObjectAttributes->ObjectName = &uRealStr;
+            ObjectAttributes->RootDirectory = NULL;
+
+            status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+            ObjectAttributes->ObjectName = oldName;
+            ObjectAttributes->RootDirectory = oldRoot;
+
+            lastUsedPath = &fullNtPath;
+            handled = true;
         }
     }
 
-    // 调用原始函数
-    NTSTATUS status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    // 如果未进入重定向过滤逻辑（即外部安全路径），直接透传
+    if (!handled) {
+        status = fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
 
     // 兼容性补丁区域 (Post-Call / Retry)
 
@@ -6830,7 +6854,25 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         if (CreateDisposition == FILE_OPEN || CreateDisposition == FILE_OPEN_IF) {
             ACCESS_MASK downgradedAccess = DesiredAccess & ~FILE_WRITE_ATTRIBUTES;
             if (downgradedAccess != 0) {
+                PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
+                HANDLE oldRoot = ObjectAttributes->RootDirectory;
+                UNICODE_STRING uRetryStr;
+
+                // [核心修复] 如果先前是由 redirect/fallback 托管处理过的句柄 relative 打开，
+                // 降级权限重试时，依然需要使用之前拼装好的绝对路径进行重试，否则在此处会重新产生句柄语法死锁。
+                if (handled && lastUsedPath) {
+                    RtlInitUnicodeString(&uRetryStr, lastUsedPath->c_str());
+                    ObjectAttributes->ObjectName = &uRetryStr;
+                    ObjectAttributes->RootDirectory = NULL;
+                }
+
                 status = fpNtCreateFile(FileHandle, downgradedAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+                if (handled && lastUsedPath) {
+                    ObjectAttributes->ObjectName = oldName;
+                    ObjectAttributes->RootDirectory = oldRoot;
+                }
+
                 if (NT_SUCCESS(status)) {
                     DebugLog(L"Compat: Auto-downgraded access (removed FILE_WRITE_ATTRIBUTES) for %s", fullNtPath.c_str());
                 }
@@ -6854,6 +6896,7 @@ NTSTATUS NTAPI Detour_NtOpenFile(
     ULONG ShareAccess,
     ULONG OpenOptions
 ) {
+    // 直接复用修复后的 Detour_NtCreateFile，所有重定向与回退逻辑已统一合并
     return Detour_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, NULL, 0, ShareAccess, FILE_OPEN, OpenOptions, NULL, 0);
 }
 
@@ -7222,6 +7265,18 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
+
+        // [核心修复] 使用绝对真实路径回退查询
+        UNICODE_STRING uRealStr;
+        RtlInitUnicodeString(&uRealStr, fullNtPath.c_str());
+        ObjectAttributes->ObjectName = &uRealStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
+
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+        return status;
     }
     return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
 }
@@ -7262,6 +7317,18 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
+
+        // [核心修复] 使用绝对真实路径回退查询
+        UNICODE_STRING uRealStr;
+        RtlInitUnicodeString(&uRealStr, fullNtPath.c_str());
+        ObjectAttributes->ObjectName = &uRealStr;
+        ObjectAttributes->RootDirectory = NULL;
+
+        status = fpNtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+
+        ObjectAttributes->ObjectName = oldName;
+        ObjectAttributes->RootDirectory = oldRoot;
+        return status;
     }
 
     // 3. 调用原始函数查询真实路径
