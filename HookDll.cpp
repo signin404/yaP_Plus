@@ -1541,17 +1541,22 @@ void RefreshDeviceMap() {
     }
 }
 
-// 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path
+// [修改] 将 \Device\HarddiskVolumeX\Path 转换为 \??\C:\Path (不区分大小写，自愈)
 std::wstring DevicePathToNtPath(const std::wstring& devicePath) {
-    // 注意：不再这里调用 RefreshDeviceMap() 依赖 InitHookThread 初始化
-    // 如果 g_DeviceMap 为空 说明初始化未完成或失败 直接返回原路径
+    // 自动恢复/自愈机制：如果映射表为空，尝试在运行时重新刷新，防止初始化时序竞争
+    if (g_DeviceMap.empty()) {
+        RefreshDeviceMap();
+    }
     if (g_DeviceMap.empty()) return devicePath;
 
     for (const auto& pair : g_DeviceMap) {
         const std::wstring& devPrefix = pair.first;
         const std::wstring& driveLetter = pair.second;
 
-        if (devicePath.find(devPrefix) == 0) {
+        // 核心修复：改用不区分大小写的 _wcsnicmp 匹配设备前缀
+        if (devicePath.length() >= devPrefix.length() &&
+            _wcsnicmp(devicePath.c_str(), devPrefix.c_str(), devPrefix.length()) == 0) {
+
             if (devicePath.length() == devPrefix.length() || devicePath[devPrefix.length()] == L'\\') {
                 std::wstring suffix = devicePath.substr(devPrefix.length());
                 return L"\\??\\" + driveLetter + suffix;
@@ -1977,13 +1982,13 @@ bool IsPipeOrDevice(LPCWSTR path) {
     return false;
 }
 
+// [修改] 转为 DOS 路径 (不区分大小写)
 std::wstring NtPathToDosPath(const std::wstring& ntPath) {
-    if (ntPath.rfind(L"\\??\\", 0) == 0) {
+    if (_wcsnicmp(ntPath.c_str(), L"\\??\\", 4) == 0) {
         return ntPath.substr(4);
     }
-    // [新增] 处理 \Device\HarddiskVolumeX 格式遗漏的情况
-    // 如果无法转换为 DOS 路径 返回空字符串 避免 FindFirstFile 访问错误的路径
-    if (ntPath.find(L"\\Device\\") == 0) {
+    // 核心修复：改用不区分大小写的匹配，防止因 \device\ 导致拦截失效
+    if (_wcsnicmp(ntPath.c_str(), L"\\Device\\", 8) == 0) {
         return L"";
     }
     return ntPath;
@@ -2400,6 +2405,8 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
 
 // [重写] 辅助：从 ObjectAttributes 解析出完整的规范化 NT 路径
 std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
+    if (!attr) return L""; // 安全防御，防止空指针崩溃
+
     std::wstring fullPath;
 
     // 1. 如果存在根目录句柄，先查询根目录的完整设备路径
@@ -2427,7 +2434,7 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
 
     // 3. [核心修复] 统一将 \Device\HarddiskVolumeX 路径转换为 \??\Drive 格式
     // 确保后续 NormalizeNtPath 和 ShouldRedirect 能够正确识别并触发 Fallback 回退读取逻辑
-    if (fullPath.find(L"\\Device\\") == 0) {
+    if (_wcsnicmp(fullPath.c_str(), L"\\Device\\", 8) == 0) {
         fullPath = DevicePathToNtPath(fullPath);
     }
 
@@ -2493,9 +2500,10 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
     std::wstring sandboxPrefix = L"\\??\\" + std::wstring(g_SandboxRoot);
     if (ContainsCaseInsensitive(fullNtPath, sandboxPrefix)) return true;
 
-    // 2. 检查是否为系统盘
-    if (!g_SystemDriveNt.empty() && fullNtPath.find(g_SystemDriveNt) == 0) {
-        // 根目录可见 (\??\C: 或 \??\C:\)
+    // 2. 检查是否为系统盘 (核心修复：改用 _wcsnicmp 以兼容小写盘符如 \??\c:\ )
+    if (!g_SystemDriveNt.empty() &&
+        _wcsnicmp(fullNtPath.c_str(), g_SystemDriveNt.c_str(), g_SystemDriveNt.length()) == 0) {
+
         if (fullNtPath.length() == g_SystemDriveNt.length() ||
            (fullNtPath.length() == g_SystemDriveNt.length() + 1 && fullNtPath.back() == L'\\')) {
             return true;
@@ -2516,9 +2524,10 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
         return false; // 系统盘其他路径隐藏
     }
 
-    // 3. 检查是否为启动器所在盘
-    if (!g_LauncherDriveNt.empty() && fullNtPath.find(g_LauncherDriveNt) == 0) {
-        // 根目录可见
+    // 3. 检查是否为启动器所在盘 (核心修复：大小写无关)
+    if (!g_LauncherDriveNt.empty() &&
+        _wcsnicmp(fullNtPath.c_str(), g_LauncherDriveNt.c_str(), g_LauncherDriveNt.length()) == 0) {
+
         if (fullNtPath.length() == g_LauncherDriveNt.length() ||
            (fullNtPath.length() == g_LauncherDriveNt.length() + 1 && fullNtPath.back() == L'\\')) {
             return true;
