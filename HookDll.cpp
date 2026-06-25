@@ -2137,8 +2137,16 @@ bool GetRealAndSandboxPaths(HANDLE hFile, std::wstring& outRealDos, std::wstring
              realNtPath = L"\\??\\";
              realNtPath += driveLetter;
              realNtPath += L":";
-             // 注意：这里不需要补斜杠 NtPathToDosPath 会处理为 C:
-             // BuildMergedDirectoryList 拼接 pattern 时会补斜杠变成 C:\*
+        }
+        // 反向映射：非盘符层级且非 Users 目录，归属于启动器目录下的相对路径
+        else if (!g_LauncherDirNt.empty() && g_LauncherDirNt.length() >= 6 && g_LauncherDirNt[5] == L':' &&
+                 _wcsnicmp(relPath.c_str(), L"\\Users", 6) != 0) {
+
+            std::wstring normLauncherDir = g_LauncherDirNt;
+            if (normLauncherDir.length() > 1 && normLauncherDir.back() == L'\\') {
+                normLauncherDir.pop_back();
+            }
+            realNtPath = normLauncherDir + relPath;
         }
         else {
             // 对于 Users 等特殊目录 如果需要支持反向合并 需要在这里添加逻辑
@@ -2432,10 +2440,17 @@ bool ContainsCaseInsensitive(const std::wstring& str, const std::wstring& sub) {
 // [修改] 检查路径是否匹配前缀 并进行映射
 bool CheckAndMap(const std::wstring& fullPath, const std::wstring& prefix, const std::wstring& replacement, std::wstring& outTarget) {
     if (prefix.empty()) return false;
-    size_t pLen = prefix.length();
+
+    // 规范化 prefix，移除末尾斜杠以确保匹配一致性
+    std::wstring normPrefix = prefix;
+    if (normPrefix.length() > 1 && normPrefix.back() == L'\\') {
+        normPrefix.pop_back();
+    }
+
+    size_t pLen = normPrefix.length();
 
     // 检查前缀匹配 (不区分大小写)
-    if (fullPath.length() >= pLen && _wcsnicmp(fullPath.c_str(), prefix.c_str(), pLen) == 0) {
+    if (fullPath.length() >= pLen && _wcsnicmp(fullPath.c_str(), normPrefix.c_str(), pLen) == 0) {
         // 确保匹配的是完整目录名 (例如匹配 C:\User 而不是 C:\UsersOld)
         // 或者是完全相等
         if (fullPath.length() == pLen || fullPath[pLen] == L'\\') {
@@ -2501,19 +2516,26 @@ bool IsPathVisible(const std::wstring& fullNtPath) {
         }
 
         // 逻辑：启动器目录及其子目录可见 + 到根目录的路径可见
+
+        // 规范化启动器目录路径 (移除末尾斜杠)
+        std::wstring normLauncherDir = g_LauncherDirNt;
+        if (normLauncherDir.length() > 1 && normLauncherDir.back() == L'\\') {
+            normLauncherDir.pop_back();
+        }
+
         // 情况 A: 访问的是启动器目录或其子目录
-        if (fullNtPath.size() >= g_LauncherDirNt.size()) {
-            if (_wcsnicmp(fullNtPath.c_str(), g_LauncherDirNt.c_str(), g_LauncherDirNt.size()) == 0) {
-                if (fullNtPath.size() == g_LauncherDirNt.size() || fullNtPath[g_LauncherDirNt.size()] == L'\\') {
+        if (fullNtPath.size() >= normLauncherDir.size()) {
+            if (_wcsnicmp(fullNtPath.c_str(), normLauncherDir.c_str(), normLauncherDir.size()) == 0) {
+                if (fullNtPath.size() == normLauncherDir.size() || fullNtPath[normLauncherDir.size()] == L'\\') {
                     return true;
                 }
             }
         }
 
         // 情况 B: 访问的是启动器目录的父级路径
-        if (g_LauncherDirNt.size() > fullNtPath.size()) {
-            if (_wcsnicmp(g_LauncherDirNt.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
-                if (g_LauncherDirNt[fullNtPath.size()] == L'\\') {
+        if (normLauncherDir.size() > fullNtPath.size()) {
+            if (_wcsnicmp(normLauncherDir.c_str(), fullNtPath.c_str(), fullNtPath.size()) == 0) {
+                if (normLauncherDir[fullNtPath.size()] == L'\\') {
                     return true;
                 }
             }
@@ -7645,13 +7667,29 @@ NTSTATUS NTAPI Detour_NtQueryObject(
                      _wcsnicmp(currentPath.c_str(), g_SandboxDevicePath.c_str(), g_SandboxDevicePath.size()) == 0) {
 
                 size_t devLen = g_SandboxDevicePath.size();
-                // 检查格式 ...\C\...
+                // A. 含有盘符结构的沙盒路径还原 (...\C\...)
                 if (currentPath[devLen] == L'\\' && currentPath.length() > devLen + 2 && currentPath[devLen + 2] == L'\\') {
                     wchar_t driveLetter = currentPath[devLen + 1];
                     std::wstring realDevicePrefix = GetDevicePathByDrive(driveLetter);
 
                     if (!realDevicePrefix.empty()) {
                         spoofedPath = realDevicePrefix + currentPath.substr(devLen + 3);
+                        needSpoof = true;
+                    }
+                }
+                // B. 启动器子目录的沙盒路径伪装还原 (无中间盘符层)
+                else if (!g_LauncherDirNt.empty() && g_LauncherDirNt.length() >= 6 && g_LauncherDirNt[5] == L':' &&
+                         _wcsnicmp(currentPath.c_str() + devLen, L"\\Users", 6) != 0) {
+
+                    wchar_t launcherDrive = g_LauncherDirNt[4];
+                    std::wstring launcherDevicePrefix = GetDevicePathByDrive(launcherDrive);
+
+                    if (!launcherDevicePrefix.empty()) {
+                        std::wstring launcherRel = g_LauncherDirNt.substr(6);
+                        if (!launcherRel.empty() && launcherRel.back() == L'\\') {
+                            launcherRel.pop_back();
+                        }
+                        spoofedPath = launcherDevicePrefix + launcherRel + currentPath.substr(devLen);
                         needSpoof = true;
                     }
                 }
@@ -7740,10 +7778,26 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
                 _wcsnicmp(currentPath.c_str(), g_SandboxRelativePath.c_str(), g_SandboxRelativePath.size()) == 0) {
 
                 size_t relLen = g_SandboxRelativePath.size();
+                // A. 包含盘符结构的命名伪装还原
                 if (currentPath[relLen] == L'\\' && currentPath[relLen + 2] == L'\\') {
                     std::wstring spoofedPath = currentPath.substr(relLen + 2);
                     memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
                     pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
+                }
+                // B. 启动器子目录的命名伪装还原
+                else if (!g_LauncherDirNt.empty() && g_LauncherDirNt.length() >= 6 && g_LauncherDirNt[5] == L':' &&
+                         _wcsnicmp(currentPath.c_str() + relLen, L"\\Users", 6) != 0) {
+
+                    std::wstring launcherRel = g_LauncherDirNt.substr(6);
+                    if (!launcherRel.empty() && launcherRel.back() == L'\\') {
+                        launcherRel.pop_back();
+                    }
+                    std::wstring spoofedPath = launcherRel + currentPath.substr(relLen);
+
+                    if (spoofedPath.length() * sizeof(wchar_t) <= Length - sizeof(FILE_NAME_INFORMATION)) {
+                        memcpy(pNameInfo->FileName, spoofedPath.c_str(), spoofedPath.length() * sizeof(wchar_t));
+                        pNameInfo->FileNameLength = (ULONG)(spoofedPath.length() * sizeof(wchar_t));
+                    }
                 }
             }
         }
