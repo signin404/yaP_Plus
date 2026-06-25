@@ -6627,6 +6627,70 @@ private:
     bool m_redirected = false;
 };
 
+// [新增] 将沙盒 NT 路径反向还原为真实的 NT 路径
+std::wstring SandboxPathToRealPath(const std::wstring& sandboxNtPath) {
+    if (g_SandboxRoot[0] == L'\0') return L"";
+
+    std::wstring sandboxRootNt = L"\\??\\";
+    sandboxRootNt += g_SandboxRoot;
+    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
+
+    if (sandboxNtPath.size() >= sandboxRootNt.size() &&
+        _wcsnicmp(sandboxNtPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0) {
+
+        std::wstring relPath = sandboxNtPath.substr(sandboxRootNt.size());
+
+        // A. 特殊目录的反向映射
+        auto reverseMap = [&](const std::wstring& subRel, const std::wstring& targetPrefix) -> std::wstring {
+            if (targetPrefix.empty()) return L"";
+            if (_wcsnicmp(relPath.c_str(), subRel.c_str(), subRel.length()) == 0) {
+                if (relPath.length() == subRel.length() || relPath[subRel.length()] == L'\\') {
+                    std::wstring real = targetPrefix;
+                    if (real.back() == L'\\') real.pop_back();
+                    real += relPath.substr(subRel.length());
+                    return real;
+                }
+            }
+            return L"";
+        };
+
+        std::wstring mapped;
+        if (!(mapped = reverseMap(L"\\Users\\Current", g_UserProfileNt)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users\\Current", g_UserProfileNtShort)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users\\All", g_ProgramDataNt)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users\\All", g_ProgramDataNtShort)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users\\Public", g_PublicNt)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users", g_UsersDirNt)).empty()) return mapped;
+        if (!(mapped = reverseMap(L"\\Users", g_UsersDirNtShort)).empty()) return mapped;
+
+        // B. 盘符结构的反向映射 (如 \C\ 或 \D\)
+        bool isDriveLetter = false;
+        if (relPath.length() >= 3 && relPath[0] == L'\\' && relPath[2] == L'\\') {
+            isDriveLetter = true;
+        } else if (relPath.length() == 2 && relPath[0] == L'\\') {
+            isDriveLetter = true;
+        }
+
+        if (isDriveLetter) {
+            wchar_t driveLetter = relPath[1];
+            std::wstring realNt = L"\\??\\";
+            realNt += driveLetter;
+            realNt += L":";
+            realNt += relPath.substr(2);
+            return realNt;
+        }
+
+        // C. 启动器目录相对路径的反向映射
+        if (!g_LauncherDirNt.empty()) {
+            std::wstring realNt = g_LauncherDirNt;
+            if (realNt.back() == L'\\') realNt.pop_back();
+            realNt += relPath;
+            return realNt;
+        }
+    }
+    return L"";
+}
+
 NTSTATUS NTAPI Detour_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -6681,9 +6745,17 @@ NTSTATUS NTAPI Detour_NtCreateFile(
         return fpNtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes, ShareAccess, CreateDisposition, CreateOptions, EaBuffer, EaLength);
     }
 
-    // 1. 路径解析与规范化 (后续原有逻辑)
+    // 1. 路径解析与规范化
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 沙盒至真实路径回退机制 (解决因父目录重定向至沙盒导致子文件读取失败的问题)
+    if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot) && !NtPathExists(fullNtPath)) {
+        std::wstring realNtPath = SandboxPathToRealPath(fullNtPath);
+        if (!realNtPath.empty() && NtPathExists(realNtPath)) {
+            fullNtPath = realNtPath;
+        }
+    }
 
     // 兼容性补丁区域 (Pre-Call)
 
@@ -6933,6 +7005,14 @@ NTSTATUS NTAPI Detour_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
 
     // [修改] 增加路径规范化 确保删除操作也能正确识别短文件名和链接
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 沙盒至真实路径回退机制 (处理相对路径删除)
+    if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot) && !NtPathExists(fullNtPath)) {
+        std::wstring realNtPath = SandboxPathToRealPath(fullNtPath);
+        if (!realNtPath.empty() && NtPathExists(realNtPath)) {
+            fullNtPath = realNtPath;
+        }
+    }
 
     std::wstring targetNtPath;
 
@@ -7244,8 +7324,14 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
 
-    // [新增] Explorer Autorun.inf 优化
-    // file.c: File_NtQueryFullAttributesFileImpl 中的优化
+    // [新增] 沙盒至真实路径回退机制 (处理相对路径查询)
+    if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot) && !NtPathExists(fullNtPath)) {
+        std::wstring realNtPath = SandboxPathToRealPath(fullNtPath);
+        if (!realNtPath.empty() && NtPathExists(realNtPath)) {
+            fullNtPath = realNtPath;
+        }
+    }
+
     if (g_CurrentProcessType == ProcType_Explorer) {
         if (fullNtPath.length() >= 12 &&
             _wcsicmp(fullNtPath.c_str() + fullNtPath.length() - 12, L"\\autorun.inf") == 0) {
@@ -7300,6 +7386,15 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
     // 1. 路径解析与规范化 (处理短文件名、Symlink)
     std::wstring rawNtPath = ResolvePathFromAttr(ObjectAttributes);
     std::wstring fullNtPath = NormalizeNtPath(rawNtPath);
+
+    // [新增] 沙盒至真实路径回退机制 (处理相对路径查询)
+    if (ContainsCaseInsensitive(fullNtPath, g_SandboxRoot) && !NtPathExists(fullNtPath)) {
+        std::wstring realNtPath = SandboxPathToRealPath(fullNtPath);
+        if (!realNtPath.empty() && NtPathExists(realNtPath)) {
+            fullNtPath = realNtPath;
+        }
+    }
+
     std::wstring targetNtPath;
 
     // 2. 重定向逻辑
