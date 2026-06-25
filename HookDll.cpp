@@ -2398,9 +2398,11 @@ void EnsureDirectoryExistsNT(LPCWSTR ntPath) {
     }
 }
 
+// [重写] 辅助：从 ObjectAttributes 解析出完整的规范化 NT 路径
 std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
     std::wstring fullPath;
 
+    // 1. 如果存在根目录句柄，先查询根目录的完整设备路径
     if (attr->RootDirectory) {
         ULONG len = 0;
         fpNtQueryObject(attr->RootDirectory, ObjectNameInformation, NULL, 0, &len);
@@ -2418,8 +2420,15 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
         }
     }
 
+    // 2. 拼接相对目标文件名
     if (attr->ObjectName && attr->ObjectName->Buffer) {
         fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
+    }
+
+    // 3. [核心修复] 统一将 \Device\HarddiskVolumeX 路径转换为 \??\Drive 格式
+    // 确保后续 NormalizeNtPath 和 ShouldRedirect 能够正确识别并触发 Fallback 回退读取逻辑
+    if (fullPath.find(L"\\Device\\") == 0) {
+        fullPath = DevicePathToNtPath(fullPath);
     }
 
     return fullPath;
