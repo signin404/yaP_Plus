@@ -2414,6 +2414,12 @@ std::wstring ResolvePathFromAttr(POBJECT_ATTRIBUTES attr) {
         fullPath.append(attr->ObjectName->Buffer, attr->ObjectName->Length / sizeof(WCHAR));
     }
 
+    // [修复] 如果解析出的路径以 \Device\ 开头（常见于通过 RootDirectory 句柄打开相对路径的情况）
+    // 将其转换为标准的 \??\ 格式，以便后续的 NormalizeNtPath 和 ShouldRedirect 能够正确识别并处理
+    if (fullPath.find(L"\\Device\\") == 0) {
+        fullPath = DevicePathToNtPath(fullPath);
+    }
+
     return fullPath;
 }
 
