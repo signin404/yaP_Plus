@@ -1896,7 +1896,11 @@ bool IsMyDefragProcess() {
     if (isMyDefrag == -1) {
         isMyDefrag = 0;
         if (!g_CurrentProcessPathNt.empty()) {
-            if (ContainsCaseInsensitive(g_CurrentProcessPathNt, L"MyDefrag")) {
+            std::wstring lowerPath = g_CurrentProcessPathNt;
+            for (auto& c : lowerPath) {
+                c = towlower(c);
+            }
+            if (lowerPath.find(L"mydefrag") != std::wstring::npos) {
                 isMyDefrag = 1;
             }
         }
@@ -1904,18 +1908,10 @@ bool IsMyDefragProcess() {
     return isMyDefrag == 1;
 }
 
-// [修改] File ID 混淆/还原算法 (对于 MyDefrag 进程跳过混淆，保护 MFT 物理记录索引)
-void ToggleFileIdScramble(PLARGE_INTEGER pId) {
-    if (IsMyDefragProcess()) return; 
-    if (pId) {
-        pId->LowPart ^= 0xFFFFFFFF;
-        pId->HighPart ^= 0xFFFFFFFF;
-    }
-}
-
 // [新增] File ID 混淆/还原算法 (XOR 翻转)
 // 移植自 file.c: IS_DELETE_MARK 附近的逻辑
 void ToggleFileIdScramble(PLARGE_INTEGER pId) {
+    if (IsMyDefragProcess()) return; 
     if (pId) {
         pId->LowPart ^= 0xFFFFFFFF;
         pId->HighPart ^= 0xFFFFFFFF;
