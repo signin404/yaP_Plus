@@ -11466,6 +11466,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtDeleteFile"), &Detour_NtDeleteFile, reinterpret_cast<LPVOID*>(&fpNtDeleteFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtClose"), &Detour_NtClose, reinterpret_cast<LPVOID*>(&fpNtClose));
+            // [新增补全] 注册 NtQueryObject 挂钩，确保句柄路径伪装生效
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
 
             void* pNtQueryDirectoryFileEx = (void*)GetProcAddress(hNtdll, "NtQueryDirectoryFileEx");
             if (pNtQueryDirectoryFileEx) {
