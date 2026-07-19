@@ -621,6 +621,45 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // --- Registry Helpers ---
 
+bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
+    if (fullPath.empty()) return false;
+    size_t firstSlash = fullPath.find(L'\\');
+    if (firstSlash == std::wstring::npos) return false;
+
+    std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
+    std::wstring restOfPath = fullPath.substr(firstSlash + 1);
+
+    if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
+    else if (_wcsicmp(rootStrRaw.c_str(), L"HKU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_USERS") == 0) { hRootKey = HKEY_USERS; rootKeyStr = L"HKEY_USERS"; }
+    else return false;
+
+    if (isKey) {
+        subKey = restOfPath;
+        valueName = L"";
+    } else {
+        std::wstring currentPath = restOfPath;
+        size_t lastSlashPos = currentPath.find_last_of(L'\\');
+
+        while (lastSlashPos != std::wstring::npos) {
+            std::wstring potentialSubKey = currentPath.substr(0, lastSlashPos);
+            HKEY hTempKey;
+            if (RegOpenKeyExW(hRootKey, potentialSubKey.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
+                RegCloseKey(hTempKey);
+                subKey = potentialSubKey;
+                valueName = currentPath.substr(lastSlashPos + 1);
+                return true;
+            }
+            lastSlashPos = currentPath.find_last_of(L'\\', lastSlashPos - 1);
+        }
+
+        subKey = L"";
+        valueName = restOfPath;
+    }
+    return true;
+}
+
 // <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
 bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
     const wchar_t* star_text = nullptr;
@@ -748,45 +787,6 @@ bool DeleteRegistrySymbolicLink(HKEY hRootKey, const std::wstring& subKey) {
         return (ntStatus == 0);
     }
     return false;
-}
-
-bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
-    if (fullPath.empty()) return false;
-    size_t firstSlash = fullPath.find(L'\\');
-    if (firstSlash == std::wstring::npos) return false;
-
-    std::wstring rootStrRaw = fullPath.substr(0, firstSlash);
-    std::wstring restOfPath = fullPath.substr(firstSlash + 1);
-
-    if (_wcsicmp(rootStrRaw.c_str(), L"HKCU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CURRENT_USER") == 0) { hRootKey = HKEY_CURRENT_USER; rootKeyStr = L"HKEY_CURRENT_USER"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKLM") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_LOCAL_MACHINE") == 0) { hRootKey = HKEY_LOCAL_MACHINE; rootKeyStr = L"HKEY_LOCAL_MACHINE"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKCR") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_CLASSES_ROOT") == 0) { hRootKey = HKEY_CLASSES_ROOT; rootKeyStr = L"HKEY_CLASSES_ROOT"; }
-    else if (_wcsicmp(rootStrRaw.c_str(), L"HKU") == 0 || _wcsicmp(rootStrRaw.c_str(), L"HKEY_USERS") == 0) { hRootKey = HKEY_USERS; rootKeyStr = L"HKEY_USERS"; }
-    else return false;
-
-    if (isKey) {
-        subKey = restOfPath;
-        valueName = L"";
-    } else {
-        std::wstring currentPath = restOfPath;
-        size_t lastSlashPos = currentPath.find_last_of(L'\\');
-
-        while (lastSlashPos != std::wstring::npos) {
-            std::wstring potentialSubKey = currentPath.substr(0, lastSlashPos);
-            HKEY hTempKey;
-            if (RegOpenKeyExW(hRootKey, potentialSubKey.c_str(), 0, KEY_READ, &hTempKey) == ERROR_SUCCESS) {
-                RegCloseKey(hTempKey);
-                subKey = potentialSubKey;
-                valueName = currentPath.substr(lastSlashPos + 1);
-                return true;
-            }
-            lastSlashPos = currentPath.find_last_of(L'\\', lastSlashPos - 1);
-        }
-
-        subKey = L"";
-        valueName = restOfPath;
-    }
-    return true;
 }
 
 // <-- [修改] 为子键名称枚举也使用动态缓冲区
