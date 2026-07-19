@@ -7399,7 +7399,7 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
     return status;
 }
 
-// [新增] 内部公共查询逻辑
+// [重写] 内部公共查询逻辑 (完美兼容真实路径与沙盒路径的双向目录合并)
 NTSTATUS HandleDirectoryQuery(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoStatusBlock,
@@ -7414,10 +7414,32 @@ NTSTATUS HandleDirectoryQuery(
     if (rawPath.empty()) return STATUS_INVALID_HANDLE;
 
     std::wstring ntDirPath = DevicePathToNtPath(rawPath);
-    std::wstring targetPath;
 
-    if (!ShouldRedirect(ntDirPath, targetPath)) {
-        return STATUS_NOT_SUPPORTED;
+    std::wstring sandboxRootNt = L"\\??\\";
+    sandboxRootNt += g_SandboxRoot;
+    if (sandboxRootNt.back() == L'\\') sandboxRootNt.pop_back();
+
+    // 检查目录句柄是否已经指向沙盒
+    bool isAlreadyInSandbox = (ntDirPath.size() >= sandboxRootNt.size() &&
+                               _wcsnicmp(ntDirPath.c_str(), sandboxRootNt.c_str(), sandboxRootNt.size()) == 0);
+
+    std::wstring realNtDirPath;
+    std::wstring sandboxNtDirPath;
+
+    if (isAlreadyInSandbox) {
+        // 句柄在沙盒内：沙盒目录为当前目录，真实目录通过反向映射获取 [1, 2]
+        sandboxNtDirPath = ntDirPath;
+        realNtDirPath = SandboxNtPathToRealNtPath(ntDirPath);
+    } else {
+        // 句柄在真实路径下：通过正向重定向获取沙盒目录 [1, 2]
+        realNtDirPath = ntDirPath;
+        std::wstring targetPath;
+        if (ShouldRedirect(ntDirPath, targetPath)) {
+            sandboxNtDirPath = targetPath;
+        } else {
+            // 不需要重定向的目录，直接放行
+            return STATUS_NOT_SUPPORTED;
+        }
     }
 
     std::vector<CachedDirEntry> localEntries;
@@ -7434,9 +7456,6 @@ NTSTATUS HandleDirectoryQuery(
     {
         std::shared_lock<std::shared_mutex> lock(g_DirContextMutex);
 
-        // 逻辑变更：只要 Context 存在且已初始化 就不需要重新构建 (除非 RestartScan)
-        // 我们总是构建完整的列表 (*) 所以不需要根据 FileName 重新构建
-
         if (RestartScan) {
             needsBuild = true;
         } else {
@@ -7450,11 +7469,9 @@ NTSTATUS HandleDirectoryQuery(
         }
     }
 
-    // --- 阶段 2: 执行 I/O (无锁) ---
+    // --- 阶段 2: 执行 I/O (双向合并扫描) ---
     if (needsBuild) {
-        // [修改] 直接传递 NT 路径 不再转换为 DOS 路径
-        // BuildMergedDirectoryList 内部已改为使用 NT API
-        BuildMergedDirectoryList(ntDirPath, targetPath, localEntries);
+        BuildMergedDirectoryList(realNtDirPath, sandboxNtDirPath, localEntries);
     }
 
     // --- 阶段 3: 更新上下文 ---
@@ -7484,9 +7501,7 @@ NTSTATUS HandleDirectoryQuery(
             ctx->IsInitialized = true;
         }
 
-        // [关键修复] 更新搜索模式
-        // 如果是 RestartScan 或者 第一次调用 (FileName != NULL) 更新 Pattern
-        // 如果 FileName == NULL 保持之前的 Pattern (继续之前的搜索)
+        // 更新搜索模式
         if (RestartScan || (FileName && FileName->Length > 0)) {
             ctx->SearchPattern = currentPattern;
         }
@@ -7513,8 +7528,7 @@ NTSTATUS HandleDirectoryQuery(
     while (ctx->CurrentIndex < ctx->Entries.size()) {
         const CachedDirEntry& entry = ctx->Entries[ctx->CurrentIndex];
 
-        // [关键修复] 过滤逻辑：使用 PathMatchSpecW 进行通配符匹配
-        // 如果不匹配 跳过此条目 继续下一个
+        // 过滤逻辑：使用 PathMatchSpecW 进行通配符匹配
         if (!PathMatchSpecW(entry.FileName.c_str(), ctx->SearchPattern.c_str())) {
             ctx->CurrentIndex++;
             continue;
@@ -7555,10 +7569,7 @@ NTSTATUS HandleDirectoryQuery(
         void* entryPtr = buffer + offset;
         memset(entryPtr, 0, entrySize);
 
-        // [修改] 使用 entry 中存储的真实/混淆后的 FileId
         LARGE_INTEGER fileId = entry.FileId;
-
-        // 兜底：如果 ID 为 0 (异常情况) 回退到哈希生成
         if (fileId.QuadPart == 0) {
              fileId = GenerateFileId(entry.FileName);
         }
@@ -7672,7 +7683,6 @@ NTSTATUS HandleDirectoryQuery(
         *(ULONG*)prevEntryPtr = 0;
     }
 
-    // 如果没有写入任何字节 说明没有更多文件了 (或者过滤后没有匹配项)
     if (bytesWritten == 0) {
         IoStatusBlock->Status = STATUS_NO_MORE_FILES;
         IoStatusBlock->Information = 0;
