@@ -1874,6 +1874,12 @@ bool IsPipeOrDevice(LPCWSTR path) {
     }
     szLower[len] = L'\0';
 
+    // [核心修复] 过滤 \??\X: 格式的原始卷句柄（如 \\.\C: 或 \\.\Z:）
+    // 碎片整理或磁盘工具必须获取真实的原始卷句柄才能正常工作，绝不能被重定向到沙盒 [2, 3]
+    if (len == 6 && szLower[0] == L'\\' && szLower[1] == L'?' && szLower[2] == L'?' && szLower[3] == L'\\' && szLower[5] == L':') {
+        return true;
+    }
+
     // 辅助 lambda：检查是否包含关键词 (在小写路径上进行极速匹配)
     auto contains = [&](const wchar_t* sub) {
         return wcsstr(szLower, sub) != nullptr;
