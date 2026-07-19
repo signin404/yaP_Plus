@@ -6460,161 +6460,64 @@ bool MatchPattern(const std::wstring& fileName, const std::wstring& pattern) {
 
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
-    HANDLE hDir = INVALID_HANDLE_VALUE;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING uStr;
-    IO_STATUS_BLOCK iosb;
+    // 转换为标准 DOS 路径以供 FindFirstFileW 使用
+    std::wstring dosPath = NtPathToDosPath(ntPath);
+    if (dosPath.empty()) return;
 
-    RtlInitUnicodeString(&uStr, ntPath.c_str());
-    InitializeObjectAttributes(&oa, &uStr, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    // 确保路径以 \* 结尾
+    if (dosPath.back() != L'\\') dosPath += L"\\";
+    std::wstring searchPattern = dosPath + L"*";
 
-    NTSTATUS status = fpNtOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                   FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
 
-    if (!NT_SUCCESS(status)) return;
+    do {
+        std::wstring fileName = fd.cFileName;
+        if (fileName != L"." && fileName != L"..") {
+            bool isVisible = true;
+            if (g_HookMode == 3 && !isSandbox) {
+                std::wstring fullChildPath = ntPath;
+                if (fullChildPath.back() != L'\\') fullChildPath += L'\\';
+                fullChildPath += fileName;
+                if (!IsPathVisible(fullChildPath)) {
+                    isVisible = false;
+                }
+            }
 
-    const size_t bufSize = 16384; // 增加缓冲区至 16KB，提升读取性能
-    std::vector<BYTE> buffer(bufSize);
-    std::wstring pathPrefix = ntPath;
-    if (pathPrefix.back() != L'\\') pathPrefix += L"\\";
+            if (isVisible) {
+                CachedDirEntry entry;
+                entry.FileName = fileName;
+                entry.ShortName = fd.cAlternateFileName;
+                entry.FileAttributes = fd.dwFileAttributes;
+                
+                entry.CreationTime.LowPart = fd.ftCreationTime.dwLowDateTime;
+                entry.CreationTime.HighPart = fd.ftCreationTime.dwHighDateTime;
+                entry.LastAccessTime.LowPart = fd.ftLastAccessTime.dwLowDateTime;
+                entry.LastAccessTime.HighPart = fd.ftLastAccessTime.dwHighDateTime;
+                entry.LastWriteTime.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+                entry.LastWriteTime.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+                entry.ChangeTime = entry.LastWriteTime; // 针对非标准属性的安全回落 [2]
+                
+                entry.EndOfFile.LowPart = fd.nFileSizeLow;
+                entry.EndOfFile.HighPart = fd.nFileSizeHigh;
+                entry.AllocationSize = entry.EndOfFile; // 安全回落
+                
+                // 动态生成 FileId
+                entry.FileId = GenerateFileId(fileName);
 
-    // 1. 首选尝试高级 FileIdBothDirectoryInformation 级别
-    FILE_INFORMATION_CLASS queryClass = FileIdBothDirectoryInformation;
-    bool firstQuery = true;
-    status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                    queryClass, FALSE, NULL, firstQuery);
+                if (isSandbox) {
+                    ToggleFileIdScramble(&entry.FileId);
+                }
 
-    // 2. 如果不支持，则自动向下回落至通用 FileBothDirectoryInformation 级别
-    if (status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_PARAMETER) {
-        queryClass = FileBothDirectoryInformation;
-        firstQuery = true;
-        status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                        queryClass, FALSE, NULL, firstQuery);
-    }
-    // 3. 如果依然不支持（某些极其特殊的网络/虚拟文件系统），回落至最基础的 FileDirectoryInformation 级别
-    if (status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_SUPPORTED || status == STATUS_INVALID_PARAMETER) {
-        queryClass = FileDirectoryInformation;
-        firstQuery = true;
-        status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                        queryClass, FALSE, NULL, firstQuery);
-    }
-
-    if (!NT_SUCCESS(status)) {
-        fpNtClose(hDir);
-        return;
-    }
-
-    while (true) {
-        if (!firstQuery) {
-            status = fpNtQueryDirectoryFile(hDir, NULL, NULL, NULL, &iosb, buffer.data(), (ULONG)bufSize,
-                                            queryClass, FALSE, NULL, FALSE);
-            if (status == STATUS_NO_MORE_FILES) break;
-            if (!NT_SUCCESS(status)) break;
+                std::wstring key = fileName;
+                std::transform(key.begin(), key.end(), key.begin(), towlower);
+                outMap[key] = entry;
+            }
         }
-        firstQuery = false;
+    } while (FindNextFileW(hFind, &fd));
 
-        BYTE* pData = buffer.data();
-        while (true) {
-            std::wstring fileName;
-            std::wstring shortName;
-            ULONG fileAttributes = 0;
-            LARGE_INTEGER creationTime = {0};
-            LARGE_INTEGER lastAccessTime = {0};
-            LARGE_INTEGER lastWriteTime = {0};
-            LARGE_INTEGER changeTime = {0};
-            LARGE_INTEGER endOfFile = {0};
-            LARGE_INTEGER allocationSize = {0};
-            LARGE_INTEGER fileId = {0};
-            ULONG nextEntryOffset = 0;
-
-            if (queryClass == FileIdBothDirectoryInformation) {
-                PFILE_ID_BOTH_DIR_INFORMATION info = (PFILE_ID_BOTH_DIR_INFORMATION)pData;
-                if (info->FileNameLength > 0) {
-                    fileName.assign(info->FileName, info->FileNameLength / sizeof(wchar_t));
-                    if (info->ShortNameLength > 0) {
-                        shortName.assign(info->ShortName, info->ShortNameLength / sizeof(wchar_t));
-                    }
-                }
-                fileAttributes = info->FileAttributes;
-                creationTime = info->CreationTime;
-                lastAccessTime = info->LastAccessTime;
-                lastWriteTime = info->LastWriteTime;
-                changeTime = info->ChangeTime;
-                endOfFile = info->EndOfFile;
-                allocationSize = info->AllocationSize;
-                fileId = info->FileId;
-                nextEntryOffset = info->NextEntryOffset;
-            }
-            else if (queryClass == FileBothDirectoryInformation) {
-                PFILE_BOTH_DIR_INFORMATION info = (PFILE_BOTH_DIR_INFORMATION)pData;
-                if (info->FileNameLength > 0) {
-                    fileName.assign(info->FileName, info->FileNameLength / sizeof(wchar_t));
-                    if (info->ShortNameLength > 0) {
-                        shortName.assign(info->ShortName, info->ShortNameLength / sizeof(wchar_t));
-                    }
-                }
-                fileAttributes = info->FileAttributes;
-                creationTime = info->CreationTime;
-                lastAccessTime = info->LastAccessTime;
-                lastWriteTime = info->LastWriteTime;
-                changeTime = info->ChangeTime;
-                endOfFile = info->EndOfFile;
-                allocationSize = info->AllocationSize;
-                nextEntryOffset = info->NextEntryOffset;
-            }
-            else if (queryClass == FileDirectoryInformation) {
-                PFILE_DIRECTORY_INFORMATION info = (PFILE_DIRECTORY_INFORMATION)pData;
-                if (info->FileNameLength > 0) {
-                    fileName.assign(info->FileName, info->FileNameLength / sizeof(wchar_t));
-                }
-                fileAttributes = info->FileAttributes;
-                creationTime = info->CreationTime;
-                lastAccessTime = info->LastAccessTime;
-                lastWriteTime = info->LastWriteTime;
-                changeTime = info->ChangeTime;
-                endOfFile = info->EndOfFile;
-                allocationSize = info->AllocationSize;
-                nextEntryOffset = info->NextEntryOffset;
-            }
-
-            if (!fileName.empty() && fileName != L"." && fileName != L"..") {
-                bool isVisible = true;
-                if (g_HookMode == 3 && !isSandbox) {
-                    std::wstring fullChildPath = pathPrefix + fileName;
-                    if (!IsPathVisible(fullChildPath)) {
-                        isVisible = false;
-                    }
-                }
-
-                if (isVisible) {
-                    CachedDirEntry entry;
-                    entry.FileName = fileName;
-                    entry.ShortName = shortName;
-                    entry.FileAttributes = fileAttributes;
-                    entry.CreationTime = creationTime;
-                    entry.LastAccessTime = lastAccessTime;
-                    entry.LastWriteTime = lastWriteTime;
-                    entry.ChangeTime = changeTime;
-                    entry.EndOfFile = endOfFile;
-                    entry.AllocationSize = allocationSize;
-                    entry.FileId = fileId;
-
-                    if (isSandbox) {
-                        ToggleFileIdScramble(&entry.FileId);
-                    }
-
-                    std::wstring key = fileName;
-                    std::transform(key.begin(), key.end(), key.begin(), towlower);
-                    outMap[key] = entry;
-                }
-            }
-
-            if (nextEntryOffset == 0) break;
-            pData += nextEntryOffset;
-        }
-    }
-    fpNtClose(hDir);
+    FindClose(hFind);
 }
 
 // [修复] 辅助：判断是否为驱动器根目录 (如 C: 或 C:\)
