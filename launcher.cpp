@@ -131,6 +131,7 @@ struct RegLinkOp {
     HKEY hRootKey;
     std::wstring rootKeyStr;
     std::wstring subKey;
+    std::wstring targetWin32Path;
     std::wstring targetNtPath;
     std::wstring backupSubKey;
     bool backupCreated = false;
@@ -4069,8 +4070,18 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
         } else if constexpr (std::is_same_v<T, RegLinkOp>) {
-            // 运行前:
-            // 1. 将已存在的注册表项重命名为 _Backup
+            // 1. 自动创建链接的目标键 (如果不存在)
+            HKEY hTargetRoot;
+            std::wstring targetRootStr, targetSubKey, targetValName;
+            if (ParseRegistryPath(arg.targetWin32Path, true, hTargetRoot, targetRootStr, targetSubKey, targetValName)) {
+                HKEY hTargetKey;
+                // RegCreateKeyExW 会自动递归创建所有不存在的父级键
+                if (RegCreateKeyExW(hTargetRoot, targetSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hTargetKey, NULL) == ERROR_SUCCESS) {
+                    RegCloseKey(hTargetKey);
+                }
+            }
+
+            // 2. 将已存在的注册表项重命名为 _Backup
             HKEY hTemp;
             if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_READ, &hTemp) == ERROR_SUCCESS) {
                 RegCloseKey(hTemp);
@@ -4078,7 +4089,8 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                     arg.backupCreated = true;
                 }
             }
-            // 2. 创建注册表符号链接指向目标
+
+            // 3. 创建注册表符号链接指向目标
             if (CreateRegistrySymbolicLink(arg.hRootKey, arg.subKey, arg.targetNtPath)) {
                 arg.isCreated = true;
             }
@@ -4759,6 +4771,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     std::wstring dummyValName;
 
                     if (ParseRegistryPath(srcPath, true, rl_op.hRootKey, rl_op.rootKeyStr, rl_op.subKey, dummyValName)) {
+                        rl_op.targetWin32Path = destPath;
                         rl_op.targetNtPath = ConvertToNtRegistryPath(destPath);
                         rl_op.backupSubKey = rl_op.subKey + L"_Backup";
                         beforeOp.data = rl_op;
@@ -5797,6 +5810,31 @@ std::wstring GetDeterministicPipeName(const std::wstring& launcherName) {
     return L"\\\\.\\pipe\\YapLauncherPipe_" + launcherName;
 }
 
+// [新增] 用于检测 INI 文件的 [Before] 区域是否配置了注册表符号链接
+bool HasRegLinkInBefore(const std::wstring& iniContent) {
+    std::wstringstream stream(iniContent);
+    std::wstring line;
+    bool inBefore = false;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[' && line.back() == L']') {
+            inBefore = (_wcsicmp(line.c_str(), L"[Before]") == 0);
+            continue;
+        }
+        if (inBefore) {
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(line.substr(0, delimiterPos));
+                if (_wcsicmp(key.c_str(), L"reglink") == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
 	DWORD launcherPid = GetCurrentProcessId();
@@ -6070,11 +6108,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         // --- [新增] 提前解析并挂载注册表配置单元 (支持 [Before] 写入) ---
         std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
+        bool hasRegLink = HasRegLinkInBefore(iniContent);
         std::wstring regMountName;
         std::wstring hivePath;
 
-        if (!hookRegVal.empty()) {
-            SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+        if (!hookRegVal.empty() || hasRegLink) {
+            // 仅当设置了注册表挂钩重定向时才注入 YAP_HOOK_REG 变量
+            if (!hookRegVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+            }
 
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
