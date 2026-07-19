@@ -6458,6 +6458,16 @@ bool MatchPattern(const std::wstring& fileName, const std::wstring& pattern) {
     return match(match, pattern.c_str(), fileName.c_str());
 }
 
+// [新增] 生成简单的 FileId (基于文件名哈希)
+LARGE_INTEGER GenerateFileId(const std::wstring& name) {
+    LARGE_INTEGER id;
+    std::hash<std::wstring> hasher;
+    // 简单的哈希 确保非零
+    size_t h = hasher(name);
+    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
+    return id;
+}
+
 // [新增] 使用 NT API 枚举目录以获取真实 FileId
 void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::wstring, CachedDirEntry>& outMap) {
     // 转换为标准 DOS 路径以供 FindFirstFileW 使用
@@ -6528,16 +6538,6 @@ bool IsDriveRoot(const std::wstring& path) {
     // 匹配 C:\ (注意：不匹配 C:\Windows)
     if (path.length() == 3 && path[1] == L':' && path[2] == L'\\') return true;
     return false;
-}
-
-// [新增] 生成简单的 FileId (基于文件名哈希)
-LARGE_INTEGER GenerateFileId(const std::wstring& name) {
-    LARGE_INTEGER id;
-    std::hash<std::wstring> hasher;
-    // 简单的哈希 确保非零
-    size_t h = hasher(name);
-    id.QuadPart = (LONGLONG)(h == 0 ? 1 : h);
-    return id;
 }
 
 // 核心：构建合并后的文件列表
