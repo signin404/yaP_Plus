@@ -42,6 +42,7 @@ Just copy and paste to create portable software.
 - [x] Wait for process
 - [x] Scheduled backup
 - [x] Create hard links
+- [x] Create registry symbolic link
 - [x] Create firewall rules
 - [x] Load temporary fonts
 - [x] Hide console program window
@@ -96,7 +97,12 @@ Just copy and paste to create portable software.
     *   The ongoing maintenance workload is high.
 *   **Software using this solution:**
     *   [WinPathShim](https://github.com/dam-cav/win-path-shim)
+    *   [Pathwinder](https://github.com/samuelgr/Pathwinder)
+    *   [VirtLauncher](https://github.com/badrelmers/VirtLauncher)
+    *   [Reg-To-File-Tune](https://github.com/ike9000e/Reg-To-File-Tune)
     *   [fakereg](https://github.com/luojunyuan/fakereg)
+    *   [WFRR](https://github.com/peitaosu/WFRR)
+    *   [pdx](https://github.com/batteryshark/pdx)
 
 ### Launcher
 

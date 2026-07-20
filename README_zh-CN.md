@@ -42,6 +42,7 @@
 - [x] 等待进程
 - [x] 定时备份
 - [x] 创建硬链接
+- [x] 创建注册表符号链接
 - [x] 创建防火墙规则
 - [x] 加载临时字体
 - [x] 隐藏控制台程序窗口
@@ -96,7 +97,12 @@
     *   持续维护的工作量巨大
 *   **使用此方案的软件:**
     *   [WinPathShim](https://github.com/dam-cav/win-path-shim)
+    *   [Pathwinder](https://github.com/samuelgr/Pathwinder)
+    *   [VirtLauncher](https://github.com/badrelmers/VirtLauncher)
+    *   [Reg-To-File-Tune](https://github.com/ike9000e/Reg-To-File-Tune)
     *   [fakereg](https://github.com/luojunyuan/fakereg)
+    *   [WFRR](https://github.com/peitaosu/WFRR)
+    *   [pdx](https://github.com/batteryshark/pdx)
 
 ### 启动器
 
