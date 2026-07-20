@@ -45,13 +45,19 @@
 #define IDR_HOOK_DLL_64 103
 #define IDR_INJECTOR32 104
 
+#ifndef REG_OPTION_OPEN_LINK
+#define REG_OPTION_OPEN_LINK (0x00000008L)
+#endif
+
 // --- Function pointer types for NTDLL functions ---
+typedef LONG (NTAPI *pfnNtDeleteKey)(IN HANDLE KeyHandle);
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *pfnRtlCreateUserThread)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
 
 // [修改] 确保全局变量已声明
+pfnNtDeleteKey g_NtDeleteKey = nullptr;
 pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 pfnNtQueryInformationProcess g_NtQueryInformationProcess = nullptr;
@@ -120,8 +126,20 @@ struct RegDllOp {
     std::wstring dllPath;
 };
 
+// [新增] 注册表符号链接操作结构体
+struct RegLinkOp {
+    HKEY hRootKey;
+    std::wstring rootKeyStr;
+    std::wstring subKey;
+    std::wstring targetWin32Path;
+    std::wstring targetNtPath;
+    std::wstring backupSubKey;
+    bool backupCreated = false;
+    bool isCreated = false;
+};
+
 // This variant is now only used for the shutdown stack
-using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp>;
+using StartupShutdownOperationData = std::variant<FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp, RegLinkOp>;
 struct StartupShutdownOperation {
     StartupShutdownOperationData data;
 };
@@ -279,7 +297,7 @@ struct AfterOperation {
 
 // A new unified variant for all possible operations in the [Before] section
 using BeforeOperationData = std::variant<
-    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp, // Startup/Shutdown types
+    FileOp, RestoreOnlyFileOp, RegistryOp, LinkOp, FirewallOp, RegDllOp, RegLinkOp, // Startup/Shutdown types
     ActionOpData // One-shot types (using the variant directly)
 >;
 struct BeforeOperation {
@@ -604,39 +622,6 @@ void PerformFileSystemOperation(int func, const std::wstring& from, const std::w
 
 // --- Registry Helpers ---
 
-// <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
-bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
-    const wchar_t* star_text = nullptr;
-    const wchar_t* star_pattern = nullptr;
-
-    while (*text) {
-        if (*pattern == L'*') {
-            star_pattern = pattern++;
-            star_text = text;
-        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
-            pattern++;
-            text++;
-        } else if (star_pattern) {
-            pattern = star_pattern + 1;
-            text = ++star_text;
-        } else {
-            return false;
-        }
-    }
-
-    while (*pattern == L'*') {
-        pattern++;
-    }
-
-    return !*pattern;
-}
-
-// Forward declaration for recursive delete
-namespace ActionHelpers {
-    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
-    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view = 0);
-}
-
 bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey, std::wstring& rootKeyStr, std::wstring& subKey, std::wstring& valueName) {
     if (fullPath.empty()) return false;
     size_t firstSlash = fullPath.find(L'\\');
@@ -674,6 +659,135 @@ bool ParseRegistryPath(const std::wstring& fullPath, bool isKey, HKEY& hRootKey,
         valueName = restOfPath;
     }
     return true;
+}
+
+// <-- [新增] 替换 PathMatchSpecW 的、可靠的通配符匹配函数
+bool WildcardMatch(const wchar_t* text, const wchar_t* pattern) {
+    const wchar_t* star_text = nullptr;
+    const wchar_t* star_pattern = nullptr;
+
+    while (*text) {
+        if (*pattern == L'*') {
+            star_pattern = pattern++;
+            star_text = text;
+        } else if (*pattern == L'?' || towlower(*pattern) == towlower(*text)) {
+            pattern++;
+            text++;
+        } else if (star_pattern) {
+            pattern = star_pattern + 1;
+            text = ++star_text;
+        } else {
+            return false;
+        }
+    }
+
+    while (*pattern == L'*') {
+        pattern++;
+    }
+
+    return !*pattern;
+}
+
+// Forward declaration for recursive delete
+namespace ActionHelpers {
+    void DeleteRegistryKeyTree(HKEY hRootKey, const std::wstring& subKey);
+    void GrantRegistryKeyPermission(HKEY hKeyParent, const std::wstring& subKey, REGSAM view = 0);
+}
+
+// [新增] 获取当前用户 SID 字符串的辅助函数
+std::wstring GetCurrentUserSidString() {
+    std::wstring sidStr;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD dwSize = 0;
+        GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+        if (dwSize > 0) {
+            std::vector<BYTE> buffer(dwSize);
+            if (GetTokenInformation(hToken, TokenUser, buffer.data(), dwSize, &dwSize)) {
+                PTOKEN_USER pTokenUser = reinterpret_cast<PTOKEN_USER>(buffer.data());
+                wchar_t* szSid = NULL;
+                if (ConvertSidToStringSidW(pTokenUser->User.Sid, &szSid)) {
+                    sidStr = szSid;
+                    LocalFree(szSid);
+                }
+            }
+        }
+        CloseHandle(hToken);
+    }
+    return sidStr;
+}
+
+// [新增] 将 Win32 注册表路径转换为 NT 内核绝对注册表路径 (注册表符号链接必须使用 NT 绝对路径)
+std::wstring ConvertToNtRegistryPath(const std::wstring& win32RegPath) {
+    HKEY hRootKey;
+    std::wstring rootKeyStr, subKey, valueName;
+    if (!ParseRegistryPath(win32RegPath, true, hRootKey, rootKeyStr, subKey, valueName)) {
+        return L"";
+    }
+
+    std::wstring ntPath;
+    if (hRootKey == HKEY_LOCAL_MACHINE) {
+        ntPath = L"\\Registry\\Machine\\" + subKey;
+    } else if (hRootKey == HKEY_CURRENT_USER) {
+        std::wstring sid = GetCurrentUserSidString();
+        if (!sid.empty()) {
+            ntPath = L"\\Registry\\User\\" + sid + L"\\" + subKey;
+        } else {
+            ntPath = L"\\Registry\\User\\CurrentUser\\" + subKey;
+        }
+    } else if (hRootKey == HKEY_USERS) {
+        ntPath = L"\\Registry\\User\\" + subKey;
+    } else if (hRootKey == HKEY_CLASSES_ROOT) {
+        ntPath = L"\\Registry\\Machine\\Software\\Classes\\" + subKey;
+    }
+
+    return ntPath;
+}
+
+// [新增] 创建注册表符号链接
+bool CreateRegistrySymbolicLink(HKEY hRootKey, const std::wstring& subKey, const std::wstring& targetNtPath) {
+    HKEY hKey = NULL;
+    DWORD disposition = 0;
+    LSTATUS status = RegCreateKeyExW(
+        hRootKey,
+        subKey.c_str(),
+        0,
+        NULL,
+        REG_OPTION_CREATE_LINK,
+        KEY_WRITE | KEY_CREATE_LINK,
+        NULL,
+        &hKey,
+        &disposition
+    );
+    if (status != ERROR_SUCCESS) {
+        return false;
+    }
+
+    // 写入 SymbolicLinkValue 目标值 (必须是 REG_LINK 类型且不包含空终止符)
+    status = RegSetValueExW(
+        hKey,
+        L"SymbolicLinkValue",
+        0,
+        REG_LINK,
+        reinterpret_cast<const BYTE*>(targetNtPath.c_str()),
+        static_cast<DWORD>(targetNtPath.length() * sizeof(wchar_t))
+    );
+
+    RegCloseKey(hKey);
+    return (status == ERROR_SUCCESS);
+}
+
+// [新增] 删除注册表符号链接 (必须指定 REG_OPTION_OPEN_LINK 并使用 NtDeleteKey)
+bool DeleteRegistrySymbolicLink(HKEY hRootKey, const std::wstring& subKey) {
+    if (!g_NtDeleteKey) return false;
+    HKEY hKey = NULL;
+    LSTATUS status = RegOpenKeyExW(hRootKey, subKey.c_str(), REG_OPTION_OPEN_LINK, KEY_WRITE | DELETE, &hKey);
+    if (status == ERROR_SUCCESS) {
+        LONG ntStatus = g_NtDeleteKey(hKey);
+        RegCloseKey(hKey);
+        return (ntStatus == 0);
+    }
+    return false;
 }
 
 // <-- [修改] 为子键名称枚举也使用动态缓冲区
@@ -3955,6 +4069,31 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
             }
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             CreateFirewallRule(arg);
+        } else if constexpr (std::is_same_v<T, RegLinkOp>) {
+            // 1. 自动创建链接的目标键 (如果不存在)
+            HKEY hTargetRoot;
+            std::wstring targetRootStr, targetSubKey, targetValName;
+            if (ParseRegistryPath(arg.targetWin32Path, true, hTargetRoot, targetRootStr, targetSubKey, targetValName)) {
+                HKEY hTargetKey;
+                // RegCreateKeyExW 会自动递归创建所有不存在的父级键
+                if (RegCreateKeyExW(hTargetRoot, targetSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hTargetKey, NULL) == ERROR_SUCCESS) {
+                    RegCloseKey(hTargetKey);
+                }
+            }
+
+            // 2. 将已存在的注册表项重命名为 _Backup
+            HKEY hTemp;
+            if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_READ, &hTemp) == ERROR_SUCCESS) {
+                RegCloseKey(hTemp);
+                if (RenameRegistryKey(arg.hRootKey, arg.subKey, arg.backupSubKey)) {
+                    arg.backupCreated = true;
+                }
+            }
+
+            // 3. 创建注册表符号链接指向目标
+            if (CreateRegistrySymbolicLink(arg.hRootKey, arg.subKey, arg.targetNtPath)) {
+                arg.isCreated = true;
+            }
         }
         // [新增] 处理 DLL 注册
         else if constexpr (std::is_same_v<T, RegDllOp>) {
@@ -4119,6 +4258,16 @@ void PerformShutdownOperation(StartupShutdownOperationData& opData) {
         } else if constexpr (std::is_same_v<T, FirewallOp>) {
             if (arg.ruleCreated) {
                 DeleteFirewallRule(arg.ruleName);
+            }
+        } else if constexpr (std::is_same_v<T, RegLinkOp>) {
+            // 退出后:
+            // 1. 删除注册表符号链接键本身
+            if (arg.isCreated) {
+                DeleteRegistrySymbolicLink(arg.hRootKey, arg.subKey);
+            }
+            // 2. 将备份重命名恢复
+            if (arg.backupCreated) {
+                RenameRegistryKey(arg.hRootKey, arg.backupSubKey, arg.subKey);
             }
         }
         // [新增] 处理 DLL 反注册 (自动清理)
@@ -4611,6 +4760,23 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
 
                     beforeOp.data = f_op;
                     op_created = true;
+                }
+            }
+            else if (_wcsicmp(key.c_str(), L"reglink") == 0) {
+                auto parts = split_string(value, delimiter);
+                if (parts.size() == 2) {
+                    RegLinkOp rl_op;
+                    std::wstring srcPath = ExpandVariables(parts[0], variables);
+                    std::wstring destPath = ExpandVariables(parts[1], variables);
+                    std::wstring dummyValName;
+
+                    if (ParseRegistryPath(srcPath, true, rl_op.hRootKey, rl_op.rootKeyStr, rl_op.subKey, dummyValName)) {
+                        rl_op.targetWin32Path = destPath;
+                        rl_op.targetNtPath = ConvertToNtRegistryPath(destPath);
+                        rl_op.backupSubKey = rl_op.subKey + L"_Backup";
+                        beforeOp.data = rl_op;
+                        op_created = true;
+                    }
                 }
             }
             else {
@@ -5644,6 +5810,31 @@ std::wstring GetDeterministicPipeName(const std::wstring& launcherName) {
     return L"\\\\.\\pipe\\YapLauncherPipe_" + launcherName;
 }
 
+// [新增] 用于检测 INI 文件的 [Before] 区域是否配置了注册表符号链接
+bool HasRegLinkInBefore(const std::wstring& iniContent) {
+    std::wstringstream stream(iniContent);
+    std::wstring line;
+    bool inBefore = false;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        if (line[0] == L'[' && line.back() == L']') {
+            inBefore = (_wcsicmp(line.c_str(), L"[Before]") == 0);
+            continue;
+        }
+        if (inBefore) {
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = trim(line.substr(0, delimiterPos));
+                if (_wcsicmp(key.c_str(), L"reglink") == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     EnableAllPrivileges();
 	DWORD launcherPid = GetCurrentProcessId();
@@ -5656,6 +5847,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (hNtdll) {
+        g_NtDeleteKey = (pfnNtDeleteKey)GetProcAddress(hNtdll, "NtDeleteKey");
         g_NtSuspendProcess = (pfnNtSuspendProcess)GetProcAddress(hNtdll, "NtSuspendProcess");
         g_NtResumeProcess = (pfnNtResumeProcess)GetProcAddress(hNtdll, "NtResumeProcess");
         // [新增] 初始化这两个关键函数
@@ -5869,6 +6061,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                                         op_data.backedUpPaths.push_back({op_data.backupPath, op_data.linkPath});
                                      }
                                 }
+                            } else if constexpr (std::is_same_v<OpType, RegLinkOp>) {
+                                op_data.backupCreated = true;
+                                op_data.isCreated = true;
                             }
                         }, ssOp.data);
                         shutdownOpsForCrash.push_back(ssOp);
@@ -5913,11 +6108,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         // --- [新增] 提前解析并挂载注册表配置单元 (支持 [Before] 写入) ---
         std::wstring hookRegVal = GetValueFromIniContent(iniContent, L"Hook", L"hookreg");
+        bool hasRegLink = HasRegLinkInBefore(iniContent);
         std::wstring regMountName;
         std::wstring hivePath;
 
-        if (!hookRegVal.empty()) {
-            SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+        if (!hookRegVal.empty() || hasRegLink) {
+            // 仅当设置了注册表挂钩重定向时才注入 YAP_HOOK_REG 变量
+            if (!hookRegVal.empty()) {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", hookRegVal.c_str());
+            } else {
+                SetEnvironmentVariableW(L"YAP_HOOK_REG", NULL);
+            }
 
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
