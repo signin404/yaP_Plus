@@ -102,7 +102,6 @@
     *   [Reg-To-File-Tune](https://github.com/ike9000e/Reg-To-File-Tune)
     *   [fakereg](https://github.com/luojunyuan/fakereg)
     *   [WFRR](https://github.com/peitaosu/WFRR)
-    *   [pdx](https://github.com/batteryshark/pdx)
 
 ### 启动器
 
