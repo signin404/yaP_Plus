@@ -140,7 +140,7 @@ Just copy and paste to create portable software.
     *   [Turbo Studio](https://turbo.net/studio)
     *   [Omnissa ThinApp](https://www.omnissa.com/products/thin-app)
     *   [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
-    *   [Seanox Virtual Environment](https://github.com/seanox/virtual-environment)
+    *   [workspace](https://github.com/seanox/workspace)
 
 ### Self-extracting file
 
