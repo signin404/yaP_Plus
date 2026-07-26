@@ -470,12 +470,13 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 拼装 FILE:/// URI 并全部大写（模拟 .NET URLString::NormalizeUrl()）
+    // 1. 构造 URI: "file:///" + 原始路径(保留反斜杠) → 全部大写
     std::wstring uri = L"file:///" + absoluteAppPath;
     for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';
+        // 注意: 不转换反斜杠为正斜杠!
         if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
     }
+    // 结果: "FILE:///Z:\ONTOPREPLICA\APP\ONTOPREPLICA.EXE"
 
     // 2. 转换为 UTF-8
     std::string utf8Uri;
@@ -483,11 +484,10 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. 模拟 .NET BinaryFormatter.Serialize(ms, (string)oNormalized)
-    //    格式：MS-NRBF SerializationHeaderRecord + BinaryObjectString + MessageEnd
+    // 3. BinaryFormatter 序列化格式 (MS-NRBF)
     std::vector<uint8_t> serializedData;
 
-    // 3a. SerializationHeaderRecord（17 字节）
+    // 3a. SerializationHeaderRecord (17 字节)
     const uint8_t bfHeader[] = {
         0x00, 0x01, 0x00, 0x00, 0x00,
         0xFF, 0xFF, 0xFF, 0xFF,
@@ -496,16 +496,16 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     };
     serializedData.insert(serializedData.end(), bfHeader, bfHeader + 17);
 
-    // 3b. BinaryObjectString record type
+    // 3b. BinaryObjectString record type (0x06)
     serializedData.push_back(0x06);
 
-    // 3c. ObjectId = 1（4 字节）
+    // 3c. ObjectId = 1
     serializedData.push_back(0x01);
     serializedData.push_back(0x00);
     serializedData.push_back(0x00);
     serializedData.push_back(0x00);
 
-    // 3d. LengthPrefixedString（7-bit 变长长度 + UTF-8 字节）
+    // 3d. LengthPrefixedString: 7-bit 变长长度 + UTF-8 数据
     size_t val = utf8Uri.length();
     while (val >= 0x80) {
         serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
@@ -514,10 +514,10 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
 
-    // 3e. MessageEnd
+    // 3e. MessageEnd (0x0B)
     serializedData.push_back(0x0B);
 
-    // 4. SHA1 & Base32（此部分无需修改，两版代码实现正确）
+    // 4. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
