@@ -504,18 +504,16 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
         std::wstring rawUnc = resolvedPath.substr(2);
         for (auto& ch : rawUnc) {
             if (ch == L'\\') ch = L'/';
-            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
         }
-        uri = L"FILE://" + rawUnc;
+        uri = L"file://" + rawUnc;
     } else {
         // 本地盘符路径格式: C:\path
         // 拼装并规范化为 file:///C:/path
         std::wstring rawLocal = resolvedPath;
         for (auto& ch : rawLocal) {
             if (ch == L'\\') ch = L'/';
-            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
         }
-        uri = L"FILE:///" + rawLocal;
+        uri = L"file:///" + rawLocal;
     }
 
     // 3. 转换为 UTF-8
