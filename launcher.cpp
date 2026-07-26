@@ -6121,6 +6121,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
+        variables[L"NETPATH2"] = CalculateNetPath(launcherFullPath);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
@@ -6444,6 +6445,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
             variables[L"APPEXE"] = absoluteAppPath;
             variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
+            variables[L"NETPATH2"] = CalculateNetPath(launcherFullPath);
 
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
