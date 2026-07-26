@@ -40,6 +40,7 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Mpr.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
