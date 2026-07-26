@@ -28,7 +28,6 @@
 #include <regex>
 #include <functional>
 #include <wincrypt.h>
-#include <winnetwk.h>
 #include "IpcCommon.h"
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -41,7 +40,6 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Gdi32.lib")
-#pragma comment(lib, "Mpr.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
@@ -407,27 +405,6 @@ void EnableAllPrivileges() {
 
 // --- Path and INI Parsing Utilities ---
 
-// [新增] 将网络映射盘符转换为真实 UNC 路径 (例如 Z:\... 转换为 \\server\share\...)
-std::wstring GetUncPathIfNetworkDrive(const std::wstring& path) {
-    if (path.length() < 2 || path[1] != L':') {
-        return path;
-    }
-
-    std::wstring drive = path.substr(0, 2); // "Z:"
-    std::wstring driveRoot = drive + L"\\";
-
-    // 检查是否为远程网络映射盘
-    if (GetDriveTypeW(driveRoot.c_str()) == DRIVE_REMOTE) {
-        wchar_t uncBuffer[MAX_PATH];
-        DWORD size = MAX_PATH;
-        if (WNetGetConnectionW(drive.c_str(), uncBuffer, &size) == NO_ERROR) {
-            std::wstring remotePath = uncBuffer;
-            return remotePath + path.substr(2);
-        }
-    }
-    return path;
-}
-
 // [新增] 计算二进制数据的 SHA1 值
 std::vector<uint8_t> CalculateSHA1(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> hash(20, 0);
@@ -493,40 +470,36 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 尝试解析可能存在的网络映射盘符
-    std::wstring resolvedPath = GetUncPathIfNetworkDrive(absoluteAppPath);
-
-    std::wstring uri;
-    // 2. 根据路径类型格式化为 file:// (2个斜杠) 或 file:/// (3个斜杠)
-    if (resolvedPath.length() >= 2 && resolvedPath[0] == L'\\' && resolvedPath[1] == L'\\') {
-        // UNC 路径格式: \\server\share\path
-        std::wstring rawUnc = resolvedPath.substr(2);
-        for (auto& ch : rawUnc) {
-            if (ch == L'\\') ch = L'/';
-            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 必须转大写！
-        }
-        uri = L"FILE://" + rawUnc;
-    } else {
-        // 本地盘符路径格式: C:\path
-        std::wstring rawLocal = resolvedPath;
-        for (auto& ch : rawLocal) {
-            if (ch == L'\\') ch = L'/';
-            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 必须转大写！
-        }
-        uri = L"FILE:///" + rawLocal;
+    // 1. 拼装 file:/// 协议 替换路径符号并进行大写规范化处理
+    std::wstring uri = L"file:///" + absoluteAppPath;
+    for (auto& ch : uri) {
+        if (ch == L'\\') ch = L'/';
+        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
     }
 
-    // 3. 转换为 UTF-8
+    // 2. 转换为 UTF-8
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 4. 直接对字符串的 UTF-8 字节计算 SHA1 (不需要 BinaryFormatter 序列化头!)
-    std::vector<uint8_t> utf8Bytes(utf8Uri.begin(), utf8Uri.end());
-    std::vector<uint8_t> sha1Hash = CalculateSHA1(utf8Bytes);
+    // 3. 模拟 .NET BinaryWriter.Write(string)：仅写入 7-bit 变长长度  UTF-8 字节
+    // （.NET 检测到 Url.Normalize() 返回 System.String 后，使用 BinaryWriter，不是 BinaryFormatter）
+    std::vector<uint8_t> serializedData;
     
-    // 5. 转为 Base32 目录名
+    // 写入 7-bit 变长编码的字符串长度（与原代码相同）
+    size_t val = utf8Uri.length();
+    while (val >= 0x80) {
+    serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
+    val >>= 7;
+    }
+    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
+    
+    // 写入实际 UTF-8 字符串数据（无 BinaryFormatter 头，无 MessageEnd 0x0B）
+    serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
+
+    // 4. SHA1 & Base32
+    std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
     return std::wstring(appFilename) + L"_Url_" + base32Hash;
@@ -6102,7 +6075,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
-        variables[L"NETPATH2"] = CalculateNetPath(launcherFullPath);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
@@ -6426,7 +6398,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
             variables[L"APPEXE"] = absoluteAppPath;
             variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
-            variables[L"NETPATH2"] = CalculateNetPath(launcherFullPath);
 
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
