@@ -405,6 +405,27 @@ void EnableAllPrivileges() {
 
 // --- Path and INI Parsing Utilities ---
 
+// [新增] 将网络映射盘符转换为真实 UNC 路径 (例如 Z:\... 转换为 \\server\share\...)
+std::wstring GetUncPathIfNetworkDrive(const std::wstring& path) {
+    if (path.length() < 2 || path[1] != L':') {
+        return path;
+    }
+
+    std::wstring drive = path.substr(0, 2); // "Z:"
+    std::wstring driveRoot = drive + L"\\";
+
+    // 检查是否为远程网络映射盘
+    if (GetDriveTypeW(driveRoot.c_str()) == DRIVE_REMOTE) {
+        wchar_t uncBuffer[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (WNetGetConnectionW(drive.c_str(), uncBuffer, &size) == NO_ERROR) {
+            std::wstring remotePath = uncBuffer;
+            return remotePath + path.substr(2);
+        }
+    }
+    return path;
+}
+
 // [新增] 计算二进制数据的 SHA1 值
 std::vector<uint8_t> CalculateSHA1(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> hash(20, 0);
@@ -470,20 +491,38 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 拼装 file:/// 协议 替换路径符号并进行大写规范化处理
-    std::wstring uri = L"file:///" + absoluteAppPath;
-    for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';
-        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+    // 1. 尝试解析可能存在的网络映射盘符
+    std::wstring resolvedPath = GetUncPathIfNetworkDrive(absoluteAppPath);
+
+    std::wstring uri;
+    // 2. 根据路径类型格式化为 file:// (2个斜杠) 或 file:/// (3个斜杠)
+    if (resolvedPath.length() >= 2 && resolvedPath[0] == L'\\' && resolvedPath[1] == L'\\') {
+        // UNC 路径格式: \\server\share\path
+        // 去掉前面的双反斜杠, 拼装并规范化为 file://server/share/path
+        std::wstring rawUnc = resolvedPath.substr(2);
+        for (auto& ch : rawUnc) {
+            if (ch == L'\\') ch = L'/';
+            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+        }
+        uri = L"file://" + rawUnc;
+    } else {
+        // 本地盘符路径格式: C:\path
+        // 拼装并规范化为 file:///C:/path
+        std::wstring rawLocal = resolvedPath;
+        for (auto& ch : rawLocal) {
+            if (ch == L'\\') ch = L'/';
+            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+        }
+        uri = L"file:///" + rawLocal;
     }
 
-    // 2. 转换为 UTF-8
+    // 3. 转换为 UTF-8
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. 构建 BinaryFormatter 序列化头和数据帧
+    // 4. 构建 BinaryFormatter 序列化头和数据帧
     std::vector<uint8_t> serializedData;
     uint8_t header[] = {0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     serializedData.insert(serializedData.end(), header, header + 17);
@@ -503,7 +542,7 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
     serializedData.push_back(0x0B);
 
-    // 4. SHA1 & Base32
+    // 5. 计算 SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
