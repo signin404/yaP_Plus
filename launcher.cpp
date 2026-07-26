@@ -500,20 +500,20 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     // 2. 根据路径类型格式化为 file:// (2个斜杠) 或 file:/// (3个斜杠)
     if (resolvedPath.length() >= 2 && resolvedPath[0] == L'\\' && resolvedPath[1] == L'\\') {
         // UNC 路径格式: \\server\share\path
-        // 去掉前面的双反斜杠, 拼装并规范化为 file://server/share/path
         std::wstring rawUnc = resolvedPath.substr(2);
         for (auto& ch : rawUnc) {
             if (ch == L'\\') ch = L'/';
+            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 必须转大写！
         }
-        uri = L"file://" + rawUnc;
+        uri = L"FILE://" + rawUnc;
     } else {
         // 本地盘符路径格式: C:\path
-        // 拼装并规范化为 file:///C:/path
         std::wstring rawLocal = resolvedPath;
         for (auto& ch : rawLocal) {
             if (ch == L'\\') ch = L'/';
+            if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 必须转大写！
         }
-        uri = L"file:///" + rawLocal;
+        uri = L"FILE:///" + rawLocal;
     }
 
     // 3. 转换为 UTF-8
