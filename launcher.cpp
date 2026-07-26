@@ -28,6 +28,7 @@
 #include <regex>
 #include <functional>
 #include <wincrypt.h>
+#include <winnetwk.h>
 #include "IpcCommon.h"
 
 #pragma comment(lib, "Shlwapi.lib")
