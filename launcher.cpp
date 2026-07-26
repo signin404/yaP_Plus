@@ -522,28 +522,11 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 4. 构建 BinaryFormatter 序列化头和数据帧
-    std::vector<uint8_t> serializedData;
-    uint8_t header[] = {0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    serializedData.insert(serializedData.end(), header, header + 17);
-    serializedData.push_back(0x06); // RecordType: BinaryObjectString
-    uint8_t objectId[] = {0x01, 0x00, 0x00, 0x00};
-    serializedData.insert(serializedData.end(), objectId, objectId + 4);
-
-    // 写入 7-bit 变长编码的字符串长度
-    size_t val = utf8Uri.length();
-    while (val >= 0x80) {
-        serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
-        val >>= 7;
-    }
-    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
-
-    // 写入实际字符串数据并追加 MessageEnd
-    serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
-    serializedData.push_back(0x0B);
-
-    // 5. 计算 SHA1 & Base32
-    std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
+    // 4. 直接对字符串的 UTF-8 字节计算 SHA1 (不需要 BinaryFormatter 序列化头!)
+    std::vector<uint8_t> utf8Bytes(utf8Uri.begin(), utf8Uri.end());
+    std::vector<uint8_t> sha1Hash = CalculateSHA1(utf8Bytes);
+    
+    // 5. 转为 Base32 目录名
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
     return std::wstring(appFilename) + L"_Url_" + base32Hash;
