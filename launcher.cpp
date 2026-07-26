@@ -27,6 +27,7 @@
 #include <codecvt>
 #include <regex>
 #include <functional>
+#include <wincrypt.h>
 #include "IpcCommon.h"
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -403,6 +404,112 @@ void EnableAllPrivileges() {
 
 
 // --- Path and INI Parsing Utilities ---
+
+// [新增] 计算二进制数据的 SHA1 值
+std::vector<uint8_t> CalculateSHA1(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> hash(20, 0);
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        if (CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
+            if (CryptHashData(hHash, data.data(), static_cast<DWORD>(data.size()), 0)) {
+                DWORD hashLen = 20;
+                CryptGetHashParam(hHash, HP_HASHVAL, hash.data(), &hashLen, 0);
+            }
+            CryptDestroyHash(hHash);
+        }
+        CryptReleaseContext(hProv, 0);
+    }
+    return hash;
+}
+
+// [新增] 模拟 .NET 独有的 ToBase32StringSuitableForDirName 编码算法
+std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) {
+    static const wchar_t s_Base32Char[] = {
+        L'a', L'b', L'c', L'd', L'e', L'f', L'g', L'h',
+        L'i', L'j', L'k', L'l', L'm', L'n', L'o', L'p',
+        L'q', L'r', L's', L't', L'u', L'v', L'w', L'x',
+        L'y', L'z', L'0', L'1', L'2', L'3', L'4', L'5'
+    };
+
+    std::wstring result;
+    size_t l = buff.size();
+    size_t i = 0;
+    uint8_t b0, b1, b2, b3, b4;
+
+    do {
+        b0 = (i < l) ? buff[i++] : 0;
+        b1 = (i < l) ? buff[i++] : 0;
+        b2 = (i < l) ? buff[i++] : 0;
+        b3 = (i < l) ? buff[i++] : 0;
+        b4 = (i < l) ? buff[i++] : 0;
+
+        // 获取每个字节的后 5 位进行 Base32 映射
+        result += s_Base32Char[b0 & 0x1F];
+        result += s_Base32Char[b1 & 0x1F];
+        result += s_Base32Char[b2 & 0x1F];
+        result += s_Base32Char[b3 & 0x1F];
+        result += s_Base32Char[b4 & 0x1F];
+
+        // 处理高位数据合并与移位
+        result += s_Base32Char[((b0 & 0xE0) >> 5) | ((b3 & 0x60) >> 2)];
+        result += s_Base32Char[((b1 & 0xE0) >> 5) | ((b4 & 0x60) >> 2)];
+
+        b2 >>= 5;
+        if ((b3 & 0x80) != 0) b2 |= 0x08;
+        if ((b4 & 0x80) != 0) b2 |= 0x10;
+        result += s_Base32Char[b2];
+    } while (i < l);
+
+    return result;
+}
+
+// [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
+std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
+    const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
+    if (!appFilename || wcslen(appFilename) == 0) return L"";
+
+    // 1. 拼装 file:/// 协议 替换路径符号并进行大写规范化处理
+    std::wstring uri = L"file:///" + absoluteAppPath;
+    for (auto& ch : uri) {
+        if (ch == L'\\') ch = L'/';
+        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+    }
+
+    // 2. 转换为 UTF-8
+    std::string utf8Uri;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+    utf8Uri.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
+
+    // 3. 构建 BinaryFormatter 序列化头和数据帧
+    std::vector<uint8_t> serializedData;
+    uint8_t header[] = {0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    serializedData.insert(serializedData.end(), header, header + 17);
+    serializedData.push_back(0x06); // RecordType: BinaryObjectString
+    uint8_t objectId[] = {0x01, 0x00, 0x00, 0x00};
+    serializedData.insert(serializedData.end(), objectId, objectId + 4);
+
+    // 写入 7-bit 变长编码的字符串长度
+    size_t val = utf8Uri.length();
+    while (val >= 0x80) {
+        serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
+        val >>= 7;
+    }
+    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
+
+    // 写入实际字符串数据并追加 MessageEnd
+    serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
+    serializedData.push_back(0x0B);
+
+    // 4. SHA1 & Base32
+    std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
+    std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
+
+    return std::wstring(appFilename) + L"_Url_" + base32Hash;
+}
+
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -5972,6 +6079,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
+        variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
@@ -6290,6 +6398,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(hMutex);
 
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
+
+            // [新增] 在多实例进程环境中提前解析和注入 NETPATH 支持 uservar 和 envvar 的继承展开
+            std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
+            variables[L"APPEXE"] = absoluteAppPath;
+            variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
 
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
