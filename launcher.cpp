@@ -470,7 +470,7 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 拼装 file:/// 协议 替换路径符号并进行大写规范化处理
+    // 1. 拼装 FILE:/// URI 并全部大写（模拟 .NET URLString::NormalizeUrl()）
     std::wstring uri = L"file:///" + absoluteAppPath;
     for (auto& ch : uri) {
         if (ch == L'\\') ch = L'/';
@@ -483,31 +483,41 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    std::vector serializedData;
+    // 3. 模拟 .NET BinaryFormatter.Serialize(ms, (string)oNormalized)
+    //    格式：MS-NRBF SerializationHeaderRecord + BinaryObjectString + MessageEnd
+    std::vector<uint8_t> serializedData;
 
-    // 添加 BinaryFormatter 序列化头
-    static const uint8_t bfHeader[] = {
-        0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
-        0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x06, 0x01, 0x00, 0x00, 0x00
+    // 3a. SerializationHeaderRecord（17 字节）
+    const uint8_t bfHeader[] = {
+        0x00, 0x01, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
     };
-    serializedData.insert(serializedData.end(), bfHeader, bfHeader + sizeof(bfHeader));
-    
-    // 写入 7-bit 变长编码的字符串长度
+    serializedData.insert(serializedData.end(), bfHeader, bfHeader + 17);
+
+    // 3b. BinaryObjectString record type
+    serializedData.push_back(0x06);
+
+    // 3c. ObjectId = 1（4 字节）
+    serializedData.push_back(0x01);
+    serializedData.push_back(0x00);
+    serializedData.push_back(0x00);
+    serializedData.push_back(0x00);
+
+    // 3d. LengthPrefixedString（7-bit 变长长度 + UTF-8 字节）
     size_t val = utf8Uri.length();
     while (val >= 0x80) {
-        serializedData.push_back(static_cast((val & 0x7F) | 0x80));
+        serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
         val >>= 7;
     }
-    serializedData.push_back(static_cast(val & 0x7F));
-    
-    // 写入实际 UTF-8 字符串数据
+    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
 
-    // 添加 MessageEnd 标记
+    // 3e. MessageEnd
     serializedData.push_back(0x0B);
 
-    // 4. SHA1 & Base32
+    // 4. SHA1 & Base32（此部分无需修改，两版代码实现正确）
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
