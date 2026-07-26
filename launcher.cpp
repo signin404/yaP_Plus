@@ -483,20 +483,29 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. 模拟 .NET BinaryWriter.Write(string)：仅写入 7-bit 变长长度  UTF-8 字节
-    // （.NET 检测到 Url.Normalize() 返回 System.String 后，使用 BinaryWriter，不是 BinaryFormatter）
-    std::vector<uint8_t> serializedData;
+    std::vector serializedData;
+
+    // 添加 BinaryFormatter 序列化头
+    static const uint8_t bfHeader[] = {
+        0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x06, 0x01, 0x00, 0x00, 0x00
+    };
+    serializedData.insert(serializedData.end(), bfHeader, bfHeader + sizeof(bfHeader));
     
-    // 写入 7-bit 变长编码的字符串长度（与原代码相同）
+    // 写入 7-bit 变长编码的字符串长度
     size_t val = utf8Uri.length();
     while (val >= 0x80) {
-    serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
-    val >>= 7;
+        serializedData.push_back(static_cast((val & 0x7F) | 0x80));
+        val >>= 7;
     }
-    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
+    serializedData.push_back(static_cast(val & 0x7F));
     
-    // 写入实际 UTF-8 字符串数据（无 BinaryFormatter 头，无 MessageEnd 0x0B）
+    // 写入实际 UTF-8 字符串数据
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
+
+    // 添加 MessageEnd 标记
+    serializedData.push_back(0x0B);
 
     // 4. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
