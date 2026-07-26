@@ -40,6 +40,7 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Version.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
@@ -6106,6 +6107,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 			wcscpy_s(appNameBuffer, MAX_PATH, appFilename);
 			PathRemoveExtensionW(appNameBuffer);
 			variables[L"APPNAME"] = appNameBuffer;
+        }
+
+        // [新增] 获取文件版本和产品版本
+        variables[L"EXEVER"] = L"";
+        variables[L"APPVER"] = L"";
+        DWORD verHandle = 0;
+        DWORD verSize = GetFileVersionInfoSizeW(absoluteAppPath.c_str(), &verHandle);
+        if (verSize > 0) {
+            std::vector<BYTE> verData(verSize);
+            if (GetFileVersionInfoW(absoluteAppPath.c_str(), verHandle, verSize, verData.data())) {
+                VS_FIXEDFILEINFO* verInfo = NULL;
+                UINT size = 0;
+                if (VerQueryValueW(verData.data(), L"\\", (LPVOID*)&verInfo, &size) && size >= sizeof(VS_FIXEDFILEINFO) && verInfo != NULL) {
+                    // 解析文件版本 (File Version)
+                    std::wstringstream fs;
+                    fs << HIWORD(verInfo->dwFileVersionMS) << L"."
+                       << LOWORD(verInfo->dwFileVersionMS) << L"."
+                       << HIWORD(verInfo->dwFileVersionLS) << L"."
+                       << LOWORD(verInfo->dwFileVersionLS);
+                    variables[L"EXEVER"] = fs.str();
+
+                    // 解析产品版本 (Product Version)
+                    std::wstringstream ps;
+                    ps << HIWORD(verInfo->dwProductVersionMS) << L"."
+                       << LOWORD(verInfo->dwProductVersionMS) << L"."
+                       << HIWORD(verInfo->dwProductVersionLS) << L"."
+                       << LOWORD(verInfo->dwProductVersionLS);
+                    variables[L"APPVER"] = ps.str();
+                }
+            }
         }
 
         std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
