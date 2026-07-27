@@ -40,6 +40,7 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Userenv.lib")
 #pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Version.lib")
 
 #define IDR_INI_FILE 101
 #define IDR_HOOK_DLL_32 102
@@ -6108,6 +6109,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 			variables[L"APPNAME"] = appNameBuffer;
         }
 
+        // [新增] 获取文件版本和产品版本 (文件版本仅读取二进制 产品版本优先字符串)
+        variables[L"EXEVER"] = L"";
+        variables[L"APPVER"] = L"";
+        DWORD verHandle = 0;
+        DWORD verSize = GetFileVersionInfoSizeW(absoluteAppPath.c_str(), &verHandle);
+        if (verSize > 0) {
+            std::vector<BYTE> verData(verSize);
+            if (GetFileVersionInfoW(absoluteAppPath.c_str(), verHandle, verSize, verData.data())) {
+
+                // 1. 读取 VS_FIXEDFILEINFO 二进制版本号
+                VS_FIXEDFILEINFO* verInfo = NULL;
+                UINT size = 0;
+                if (VerQueryValueW(verData.data(), L"\\", (LPVOID*)&verInfo, &size) && size >= sizeof(VS_FIXEDFILEINFO) && verInfo != NULL) {
+                    // 文件版本 (EXEVER) 仅使用二进制版本
+                    std::wstringstream fs;
+                    fs << HIWORD(verInfo->dwFileVersionMS) << L"."
+                       << LOWORD(verInfo->dwFileVersionMS) << L"."
+                       << HIWORD(verInfo->dwFileVersionLS) << L"."
+                       << LOWORD(verInfo->dwFileVersionLS);
+                    variables[L"EXEVER"] = fs.str();
+
+                    // 产品版本 (APPVER) 默认使用二进制版本作为回退
+                    std::wstringstream ps;
+                    ps << HIWORD(verInfo->dwProductVersionMS) << L"."
+                       << LOWORD(verInfo->dwProductVersionMS) << L"."
+                       << HIWORD(verInfo->dwProductVersionLS) << L"."
+                       << LOWORD(verInfo->dwProductVersionLS);
+                    variables[L"APPVER"] = ps.str();
+                }
+
+                // 2. 尝试从 StringFileInfo 获取产品版本的字符串版本 (覆盖二进制版本)
+                struct LANGANDCODEPAGE {
+                    WORD wLanguage;
+                    WORD wCodePage;
+                } *lpTranslate;
+                UINT cbTranslate = 0;
+
+                if (VerQueryValueW(verData.data(), L"\\VarFileInfo\\Translation", (LPVOID*)&lpTranslate, &cbTranslate) && (cbTranslate >= sizeof(LANGANDCODEPAGE))) {
+                    wchar_t subBlock[256];
+                    wchar_t* lpBuffer = NULL;
+                    UINT dwBytes = 0;
+
+                    // 仅获取 ProductVersion (产品版本)
+                    swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\ProductVersion", lpTranslate[0].wLanguage, lpTranslate[0].wCodePage);
+                    if (VerQueryValueW(verData.data(), subBlock, (LPVOID*)&lpBuffer, &dwBytes) && dwBytes > 0 && lpBuffer != NULL) {
+                        std::wstring strVer = lpBuffer;
+                        if (!strVer.empty()) {
+                            variables[L"APPVER"] = strVer;
+                        }
+                    }
+                }
+            }
+        }
+
         std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
         std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
         if (finalWorkDir.empty() || !PathIsDirectoryW(finalWorkDir.c_str())) {
@@ -6412,11 +6467,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CloseHandle(hMutex);
 
         if (GetValueFromIniContent(iniContent, L"General", L"multiple") == L"1") {
-
-            // [新增] 在多实例进程环境中提前解析和注入 NETPATH 支持 uservar 和 envvar 的继承展开
-            std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
-            variables[L"APPEXE"] = absoluteAppPath;
-            variables[L"NETPATH"] = CalculateNetPath(absoluteAppPath);
 
             // 1. 解析所有 Hook 配置
             std::wstring hookFileVal = GetValueFromIniContent(iniContent, L"Hook", L"hookfile");
