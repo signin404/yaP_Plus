@@ -467,148 +467,70 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath, int mode = 0) {
-    // 第一步：提取用于【拼接前缀】的文件名（永远去掉扩展名）
+std::wstring CalculateNetPathEx(std::wstring absoluteAppPath, int mode) {
+    // 1. 提取前缀（永远是去掉了扩展名的文件名，因为正确结果是 AssetStudio.GUI_Url_...）
     std::wstring appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (appFilename.empty()) return L"";
-    
     std::wstring prefixName = appFilename;
     size_t dotPos = prefixName.find_last_of(L".");
-    if (dotPos != std::wstring::npos) {
-        prefixName = prefixName.substr(0, dotPos);
+    if (dotPos != std::wstring::npos) prefixName = prefixName.substr(0, dotPos);
+
+    // 2. 通过 mode (0-47) 还原 5 个维度的配置
+    int m = mode;
+    int enc_idx = m % 3; m /= 3;     // 0:纯UTF8, 1:7-bit+UTF8, 2:纯UTF16LE
+    int ext_idx = m % 2; m /= 2;     // 0:无扩展名, 1:带扩展名
+    int case_idx = m % 2; m /= 2;    // 0:原样, 1:转大写
+    int slash_idx = m % 2; m /= 2;   // 0:反斜杠, 1:正斜杠
+    int prefix_idx = m % 2;          // 0:无前缀, 1:file:///
+
+    // 3. 构造路径部分
+    std::wstring basePath = absoluteAppPath;
+    dotPos = basePath.find_last_of(L".");
+    size_t slashPos = basePath.find_last_of(L"\\/");
+    if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
+        basePath = basePath.substr(0, dotPos);
+    }
+    std::wstring pathStr = basePath + (ext_idx ? L".exe" : L"");
+
+    // 4. 加上协议前缀
+    std::wstring uri = (prefix_idx ? L"file:///" : L"") + pathStr;
+
+    // 5. 处理斜杠和大小写
+    wchar_t targetSlash = (slash_idx == 1) ? L'/' : L'\\';
+    for (auto& ch : uri) {
+        if (ch == L'\\' || ch == L'/') ch = targetSlash;
+        if (case_idx == 1 && ch >= L'a' && ch <= L'z') ch -= 32;
     }
 
-    std::wstring pathStr;
+    // 6. 按照编码方式组装待哈希的原始字节
+    std::vector<uint8_t> rawData;
+    if (enc_idx == 2) {
+        // 纯 UTF-16LE 字节
+        rawData.resize(uri.length() * 2);
+        memcpy(rawData.data(), uri.c_str(), uri.length() * 2);
+    } else {
+        // 转换为 UTF-8
+        std::string utf8Uri;
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+        utf8Uri.resize(size_needed);
+        WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    if (mode == 0) {
-        // ==========================================
-        // 盲区 A：无前缀 + 无扩展名 + 保留原样大小写 + 正斜杠
-        // ==========================================
-        pathStr = absoluteAppPath;
-        dotPos = pathStr.find_last_of(L".");
-        size_t slashPos = pathStr.find_last_of(L"\\/");
-        if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
-            pathStr = pathStr.substr(0, dotPos); // 去掉扩展名
+        if (enc_idx == 1) { // 7-bit 长度前缀
+            size_t val = utf8Uri.length();
+            while (val >= 0x80) {
+                rawData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
+                val >>= 7;
+            }
+            rawData.push_back(static_cast<uint8_t>(val & 0x7F));
         }
-        for (auto& ch : pathStr) {
-            if (ch == L'\\') ch = L'/';
-            // 不转大写
-        }
-        // 结果: "D:/Locale/Other/AssetStudio/App/AssetStudio.GUI"
-    } 
-    else if (mode == 1) {
-        // ==========================================
-        // 盲区 B：有 file:/// 前缀 + 有扩展名 + 全大写 + 正斜杠
-        // ==========================================
-        pathStr = L"file:///" + absoluteAppPath;
-        for (auto& ch : pathStr) {
-            if (ch == L'\\') ch = L'/';
-            else if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 转大写
-        }
-        // 结果: "FILE:///D:/LOCALE/OTHER/ASSETSTUDIO/APP/ASSETSTUDIO.GUI.EXE"
+        rawData.insert(rawData.end(), utf8Uri.begin(), utf8Uri.end());
     }
 
-    // 第二步：转换为 UTF-8
-    std::string utf8Path;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), NULL, 0, NULL, NULL);
-    utf8Path.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), &utf8Path[0], size_needed, NULL, NULL);
-
-    // 第三步：纯 UTF-8 字节计算 SHA1 (没有任何前缀，没有 7-bit，没有 BF 头)
-    std::vector<uint8_t> rawData(utf8Path.begin(), utf8Path.end());
+    // 7. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    // 第四步：拼接
     return prefixName + L"_Url_" + base32Hash;
-}
-
-// 在你的代码中找个位置放上这个测试函数
-void FindCorrectNet10Hash(std::wstring absoluteAppPath) {
-    std::wstring ext = L".exe";
-    std::wstring basePath = absoluteAppPath;
-    // 去掉扩展名作为基础路径备用
-    if (basePath.length() > ext.length() && basePath.substr(basePath.length() - ext.length()) == ext) {
-        basePath = basePath.substr(0, basePath.length() - ext.length());
-    }
-
-    std::wstring target = L"3pyyjnhnxc14my5zfym5w3cfjwkrkgkf";
-    
-    // 定义所有可能的变量维度
-    std::vector<std::wstring> prefixes = { L"", L"file:///" };
-    std::vector<wchar_t> slashes = { L'\\', L'/' };
-    std::vector<int> cases = { 0, 1 }; // 0=原样, 1=转大写
-    std::vector<int> exts = { 0, 1 };  // 0=无扩展名, 1=带扩展名
-    std::vector<int> encs = { 0, 1, 2 }; // 0=纯UTF8, 1=7-bit UTF8, 2=纯UTF16LE
-
-    int count = 0;
-    for (const auto& prefix : prefixes) {
-        for (wchar_t slash : slashes) {
-            for (int c : cases) {
-                for (int e : exts) {
-                    for (int enc : encs) {
-                        count++;
-                        std::wstring pathStr = basePath + (e ? ext : L"");
-                        std::wstring uri = prefix + pathStr;
-                        
-                        // 处理斜杠和大小写
-                        for (auto& ch : uri) {
-                            if (ch == L'\\' || ch == L'/') ch = slash;
-                            if (c == 1 && ch >= L'a' && ch <= L'z') ch -= 32;
-                        }
-
-                        std::vector<uint8_t> rawData;
-                        
-                        if (enc == 2) {
-                            // 编码方式: 纯 UTF-16LE
-                            std::string utf8Uri;
-                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-                            utf8Uri.resize(size_needed);
-                            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
-                            
-                            int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Uri.c_str(), utf8Uri.length(), NULL, 0);
-                            rawData.resize(wideLen * 2);
-                            MultiByteToWideChar(CP_UTF8, 0, utf8Uri.c_str(), utf8Uri.length(), (LPWSTR)rawData.data(), wideLen);
-                        } else {
-                            // 编码方式: UTF-8
-                            std::string utf8Uri;
-                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-                            utf8Uri.resize(size_needed);
-                            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
-
-                            if (enc == 1) { // 7-bit 长度前缀
-                                size_t val = utf8Uri.length();
-                                while (val >= 0x80) {
-                                    rawData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
-                                    val >>= 7;
-                                }
-                                rawData.push_back(static_cast<uint8_t>(val & 0x7F));
-                            }
-                            rawData.insert(rawData.end(), utf8Uri.begin(), utf8Uri.end());
-                        }
-
-                        std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
-                        std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
-
-                        if (base32Hash == target) {
-                            printf("\n==================================================\n");
-                            printf(">>> 找到完美匹配！正确的组合规则如下：<<<\n");
-                            printf("==================================================\n");
-                            printf("前缀:     %ls\n", prefix.c_str());
-                            printf("斜杠:     %lc\n", slash);
-                            printf("转大写:   %s\n", c ? "是" : "否");
-                            printf("扩展名:   %s\n", e ? "带 .exe" : "不带 .exe");
-                            printf("编码方式: %s\n", enc == 0 ? "纯 UTF-8 字节" : (enc == 1 ? "7-bit前缀 + UTF-8" : "纯 UTF-16LE 字节"));
-                            wprintf(L"完整原串: %s\n", uri.c_str());
-                            printf("==================================================\n");
-                            return; // 找到了直接退出
-                        }
-                    }
-                }
-            }
-        }
-    }
-    printf("已穷举测试 %d 种组合，未找到匹配项（可能存在其他未知变异）。\n", count);
 }
 
 std::wstring trim(const std::wstring& s) {
@@ -6180,8 +6102,54 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
-        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath);
-		FindCorrectNet10Hash(absoluteAppPath); // 运行一次看输出结果
+        variables[L"NETHASH0"] = CalculateNetPathEx(absoluteAppPath, 0);
+        variables[L"NETHASH1"] = CalculateNetPathEx(absoluteAppPath, 1);
+        variables[L"NETHASH2"] = CalculateNetPathEx(absoluteAppPath, 2);
+        variables[L"NETHASH3"] = CalculateNetPathEx(absoluteAppPath, 3);
+        variables[L"NETHASH4"] = CalculateNetPathEx(absoluteAppPath, 4);
+        variables[L"NETHASH5"] = CalculateNetPathEx(absoluteAppPath, 5);
+        variables[L"NETHASH6"] = CalculateNetPathEx(absoluteAppPath, 6);
+        variables[L"NETHASH7"] = CalculateNetPathEx(absoluteAppPath, 7);
+        variables[L"NETHASH8"] = CalculateNetPathEx(absoluteAppPath, 8);
+        variables[L"NETHASH9"] = CalculateNetPathEx(absoluteAppPath, 9);
+        variables[L"NETHASH10"] = CalculateNetPathEx(absoluteAppPath, 10);
+        variables[L"NETHASH11"] = CalculateNetPathEx(absoluteAppPath, 11);
+        variables[L"NETHASH12"] = CalculateNetPathEx(absoluteAppPath, 12);
+        variables[L"NETHASH13"] = CalculateNetPathEx(absoluteAppPath, 13);
+        variables[L"NETHASH14"] = CalculateNetPathEx(absoluteAppPath, 14);
+        variables[L"NETHASH15"] = CalculateNetPathEx(absoluteAppPath, 15);
+        variables[L"NETHASH16"] = CalculateNetPathEx(absoluteAppPath, 16);
+        variables[L"NETHASH17"] = CalculateNetPathEx(absoluteAppPath, 17);
+        variables[L"NETHASH18"] = CalculateNetPathEx(absoluteAppPath, 18);
+        variables[L"NETHASH19"] = CalculateNetPathEx(absoluteAppPath, 19);
+        variables[L"NETHASH20"] = CalculateNetPathEx(absoluteAppPath, 20);
+        variables[L"NETHASH21"] = CalculateNetPathEx(absoluteAppPath, 21);
+        variables[L"NETHASH22"] = CalculateNetPathEx(absoluteAppPath, 22);
+        variables[L"NETHASH23"] = CalculateNetPathEx(absoluteAppPath, 23);
+        variables[L"NETHASH24"] = CalculateNetPathEx(absoluteAppPath, 24);
+        variables[L"NETHASH25"] = CalculateNetPathEx(absoluteAppPath, 25);
+        variables[L"NETHASH26"] = CalculateNetPathEx(absoluteAppPath, 26);
+        variables[L"NETHASH27"] = CalculateNetPathEx(absoluteAppPath, 27);
+        variables[L"NETHASH28"] = CalculateNetPathEx(absoluteAppPath, 28);
+        variables[L"NETHASH29"] = CalculateNetPathEx(absoluteAppPath, 29);
+        variables[L"NETHASH30"] = CalculateNetPathEx(absoluteAppPath, 30);
+        variables[L"NETHASH31"] = CalculateNetPathEx(absoluteAppPath, 31);
+        variables[L"NETHASH32"] = CalculateNetPathEx(absoluteAppPath, 32);
+        variables[L"NETHASH33"] = CalculateNetPathEx(absoluteAppPath, 33);
+        variables[L"NETHASH34"] = CalculateNetPathEx(absoluteAppPath, 34);
+        variables[L"NETHASH35"] = CalculateNetPathEx(absoluteAppPath, 35);
+        variables[L"NETHASH36"] = CalculateNetPathEx(absoluteAppPath, 36);
+        variables[L"NETHASH37"] = CalculateNetPathEx(absoluteAppPath, 37);
+        variables[L"NETHASH38"] = CalculateNetPathEx(absoluteAppPath, 38);
+        variables[L"NETHASH39"] = CalculateNetPathEx(absoluteAppPath, 39);
+        variables[L"NETHASH40"] = CalculateNetPathEx(absoluteAppPath, 40);
+        variables[L"NETHASH41"] = CalculateNetPathEx(absoluteAppPath, 41);
+        variables[L"NETHASH42"] = CalculateNetPathEx(absoluteAppPath, 42);
+        variables[L"NETHASH43"] = CalculateNetPathEx(absoluteAppPath, 43);
+        variables[L"NETHASH44"] = CalculateNetPathEx(absoluteAppPath, 44);
+        variables[L"NETHASH45"] = CalculateNetPathEx(absoluteAppPath, 45);
+        variables[L"NETHASH46"] = CalculateNetPathEx(absoluteAppPath, 46);
+        variables[L"NETHASH47"] = CalculateNetPathEx(absoluteAppPath, 47);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
