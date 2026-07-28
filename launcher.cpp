@@ -468,7 +468,7 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
 std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension = false) {
-    // 1. 处理扩展名：.NET 10 会剥离 .exe / .dll 扩展名
+    // 1. 处理扩展名（.NET 10 在此场景下去除了扩展名，可能是为了统一 exe 和 dll 的缓存路径）
     if (removeExtension) {
         size_t dotPos = absoluteAppPath.find_last_of(L".");
         size_t slashPos = absoluteAppPath.find_last_of(L"\\/");
@@ -483,12 +483,9 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension
     // 2. 构造 URI: "file:///" + 路径
     std::wstring uri = L"file:///" + absoluteAppPath;
     for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';  // 反斜杠转正斜杠 (Uri.AbsoluteUri 的标准行为)
-        
-        // [极其关键的修改] 删除了 ToUpperInvariant() 的逻辑！
-        // .NET 10 保留了原始大小写，以兼容 Linux/macOS 的大小写敏感特性
+        if (ch == L'\\') ch = L'/';  // 反斜杠转正斜杠
+        // 注意：不转大写，保留原始大小写
     }
-    // 结果示例: "file:///D:/Locale/Other/AssetStudio/App/AssetStudio.GUI" (注意 file 是小写，路径保留原样)
 
     // 3. 转换为 UTF-8
     std::string utf8Uri;
@@ -496,22 +493,12 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 4. BinaryWriter.Write(string) 格式（无 BinaryFormatter 头部！）
-    std::vector<uint8_t> serializedData;
-
-    // 4a. 7-bit 变长长度前缀（LEB128 编码）
-    size_t val = utf8Uri.length();
-    while (val >= 0x80) {
-        serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
-        val >>= 7;
-    }
-    serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
-
-    // 4b. UTF-8 字节数据（直接跟在长度后面，无 NRBF 头，无 MessageEnd）
-    serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
+    // 4. [极其关键的修改] .NET 10 彻底抛弃了长度前缀！
+    //    直接将 UTF-8 字节数据作为待哈希的原始数据，不要加任何前缀！
+    std::vector<uint8_t> rawData(utf8Uri.begin(), utf8Uri.end());
 
     // 5. SHA1 & Base32
-    std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
+    std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
     return std::wstring(appFilename) + L"_Url_" + base32Hash;
