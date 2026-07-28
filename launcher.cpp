@@ -523,6 +523,94 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath, int mode = 0) {
     return prefixName + L"_Url_" + base32Hash;
 }
 
+// 在你的代码中找个位置放上这个测试函数
+void FindCorrectNet10Hash(std::wstring absoluteAppPath) {
+    std::wstring ext = L".exe";
+    std::wstring basePath = absoluteAppPath;
+    // 去掉扩展名作为基础路径备用
+    if (basePath.length() > ext.length() && basePath.substr(basePath.length() - ext.length()) == ext) {
+        basePath = basePath.substr(0, basePath.length() - ext.length());
+    }
+
+    std::wstring target = L"3pyyjnhnxc14my5zfym5w3cfjwkrkgkf";
+    
+    // 定义所有可能的变量维度
+    std::vector<std::wstring> prefixes = { L"", L"file:///" };
+    std::vector<wchar_t> slashes = { L'\\', L'/' };
+    std::vector<int> cases = { 0, 1 }; // 0=原样, 1=转大写
+    std::vector<int> exts = { 0, 1 };  // 0=无扩展名, 1=带扩展名
+    std::vector<int> encs = { 0, 1, 2 }; // 0=纯UTF8, 1=7-bit UTF8, 2=纯UTF16LE
+
+    int count = 0;
+    for (const auto& prefix : prefixes) {
+        for (wchar_t slash : slashes) {
+            for (int c : cases) {
+                for (int e : exts) {
+                    for (int enc : encs) {
+                        count++;
+                        std::wstring pathStr = basePath + (e ? ext : L"");
+                        std::wstring uri = prefix + pathStr;
+                        
+                        // 处理斜杠和大小写
+                        for (auto& ch : uri) {
+                            if (ch == L'\\' || ch == L'/') ch = slash;
+                            if (c == 1 && ch >= L'a' && ch <= L'z') ch -= 32;
+                        }
+
+                        std::vector<uint8_t> rawData;
+                        
+                        if (enc == 2) {
+                            // 编码方式: 纯 UTF-16LE
+                            std::string utf8Uri;
+                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+                            utf8Uri.resize(size_needed);
+                            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
+                            
+                            int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Uri.c_str(), utf8Uri.length(), NULL, 0);
+                            rawData.resize(wideLen * 2);
+                            MultiByteToWideChar(CP_UTF8, 0, utf8Uri.c_str(), utf8Uri.length(), (LPWSTR)rawData.data(), wideLen);
+                        } else {
+                            // 编码方式: UTF-8
+                            std::string utf8Uri;
+                            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+                            utf8Uri.resize(size_needed);
+                            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
+
+                            if (enc == 1) { // 7-bit 长度前缀
+                                size_t val = utf8Uri.length();
+                                while (val >= 0x80) {
+                                    rawData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
+                                    val >>= 7;
+                                }
+                                rawData.push_back(static_cast<uint8_t>(val & 0x7F));
+                            }
+                            rawData.insert(rawData.end(), utf8Uri.begin(), utf8Uri.end());
+                        }
+
+                        std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
+                        std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
+
+                        if (base32Hash == target) {
+                            printf("\n==================================================\n");
+                            printf(">>> 找到完美匹配！正确的组合规则如下：<<<\n");
+                            printf("==================================================\n");
+                            printf("前缀:     %ls\n", prefix.c_str());
+                            printf("斜杠:     %lc\n", slash);
+                            printf("转大写:   %s\n", c ? "是" : "否");
+                            printf("扩展名:   %s\n", e ? "带 .exe" : "不带 .exe");
+                            printf("编码方式: %s\n", enc == 0 ? "纯 UTF-8 字节" : (enc == 1 ? "7-bit前缀 + UTF-8" : "纯 UTF-16LE 字节"));
+                            wprintf(L"完整原串: %s\n", uri.c_str());
+                            printf("==================================================\n");
+                            return; // 找到了直接退出
+                        }
+                    }
+                }
+            }
+        }
+    }
+    printf("已穷举测试 %d 种组合，未找到匹配项（可能存在其他未知变异）。\n", count);
+}
+
 std::wstring trim(const std::wstring& s) {
     const std::wstring WHITESPACE = L" \t\n\r\f\v";
     size_t first = s.find_first_not_of(WHITESPACE);
@@ -6092,8 +6180,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
-        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath, 0);
-        variables[L"NETHASH2"] = CalculateNetPath(absoluteAppPath, 1);
+        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath);
+		FindCorrectNet10Hash(absoluteAppPath); // 运行一次看输出结果
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
