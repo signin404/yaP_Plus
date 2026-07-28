@@ -469,7 +469,7 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
 std::wstring CalculateNetPath(std::wstring absoluteAppPath) {
     // ----------------------------------------------------
-    // 第一步：提取用于【拼接前缀】的文件名（去掉扩展名，模拟 Assembly.GetName().Name）
+    // 第一步：提取用于【拼接前缀】的文件名（去掉扩展名）
     // ----------------------------------------------------
     std::wstring appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (appFilename.empty()) return L"";
@@ -481,32 +481,34 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath) {
     }
 
     // ----------------------------------------------------
-    // 第二步：构造用于【计算哈希】的 URI（必须保留完整的原始路径，包含 .exe！）
+    // 第二步：构造用于【计算哈希】的字符串
+    // 【极其关键的修改】：绝对不要加 "file:///" 前缀！！！
+    // 直接使用原始路径，仅做斜杠替换。
     // ----------------------------------------------------
-    std::wstring uri = L"file:///" + absoluteAppPath;
-    for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';  // 反斜杠转正斜杠 (Uri.AbsoluteUri 的标准行为)
-        // 绝对不要转大写！.NET 10 保留原始大小写以兼容 Linux
+    std::wstring pathStr = absoluteAppPath;
+    for (auto& ch : pathStr) {
+        if (ch == L'\\') ch = L'/';  
+        // 不转大写，保留原始大小写
     }
-    // 结果示例: "file:///D:/Locale/Other/AssetStudio/App/AssetStudio.GUI.exe"
+    // 结果示例: "D:/Locale/Other/AssetStudio/App/AssetStudio.GUI.exe"
 
     // ----------------------------------------------------
     // 第三步：转换为 UTF-8
     // ----------------------------------------------------
-    std::string utf8Uri;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-    utf8Uri.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
+    std::string utf8Path;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), NULL, 0, NULL, NULL);
+    utf8Path.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), &utf8Path[0], size_needed, NULL, NULL);
 
     // ----------------------------------------------------
-    // 第四步：直接对纯 UTF-8 字节计算 SHA1（无任何前缀，无长度编码）
+    // 第四步：直接对纯 UTF-8 字节计算 SHA1（无前缀，无长度编码）
     // ----------------------------------------------------
-    std::vector<uint8_t> rawData(utf8Uri.begin(), utf8Uri.end());
+    std::vector<uint8_t> rawData(utf8Path.begin(), utf8Path.end());
     std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
     // ----------------------------------------------------
-    // 第五步：拼接（前缀无扩展名，哈希由带扩展名的路径算出）
+    // 第五步：拼接
     // ----------------------------------------------------
     return prefixName + L"_Url_" + base32Hash;
 }
