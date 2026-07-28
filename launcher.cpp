@@ -467,52 +467,77 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension = false) {
-    if (removeExtension) {
-        size_t dotPos = absoluteAppPath.find_last_of(L".");
-        size_t slashPos = absoluteAppPath.find_last_of(L"\\/");
-        if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
-            absoluteAppPath = absoluteAppPath.substr(0, dotPos);
+// [修改] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
+std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool isNetCoreOrLater = true) {
+    const wchar_t* appFilenameWithExt = PathFindFileNameW(absoluteAppPath.c_str());
+    if (!appFilenameWithExt || wcslen(appFilenameWithExt) == 0) return L"";
+
+    // 1. 前缀处理：.NET Core / .NET 10 前缀名默认不带 .exe，而 .NET Framework 4.7 带 .exe
+    std::wstring appFilename = appFilenameWithExt;
+    if (isNetCoreOrLater) {
+        size_t dotPos = appFilename.find_last_of(L".");
+        if (dotPos != std::wstring::npos) {
+            appFilename = appFilename.substr(0, dotPos);
         }
     }
 
-    const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
-    if (!appFilename || wcslen(appFilename) == 0) return L"";
-
-    // 1. 构造 URI: "file:///" + 路径（反斜杠转正斜杠）→ 全部大写
+    // 2. 构造 URI：URI 路径中需保留完整 .exe 扩展名，且 '\' 需转为 '/'
     std::wstring uri = L"file:///" + absoluteAppPath;
     for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';           // [修改] 反斜杠 → 正斜杠
-        else if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+        if (ch == L'\\') {
+            ch = L'/'; // 标准 URI 要求转为正斜杠
+        }
+        if (isNetCoreOrLater) {
+            ch = static_cast<wchar_t>(towlower(ch)); // .NET 10 使用小写 (ToLowerInvariant)
+        } else {
+            ch = static_cast<wchar_t>(towupper(ch)); // .NET 4.7 使用大写 (ToUpperInvariant)
+        }
     }
-    // 结果示例: "FILE:///Z:/PATH/ASSETSTUDIO.GUI.EXE"
 
-    // 2. 转换为 UTF-8
+    // 3. 转换为 UTF-8
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. [修改] BinaryWriter.Write(string) 格式（无 BinaryFormatter 头部！）
-    //    对应 .NET 源码: BinaryWriter b; b.Write(name.ToUpperInvariant());
+    // 4. BinaryFormatter 序列化格式 (MS-NRBF)
     std::vector<uint8_t> serializedData;
 
-    // 3a. 7-bit 变长长度前缀（LEB128 编码）
+    // 4a. SerializationHeaderRecord (17 字节)
+    const uint8_t bfHeader[] = {
+        0x00, 0x01, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    serializedData.insert(serializedData.end(), bfHeader, bfHeader + 17);
+
+    // 4b. BinaryObjectString record type (0x06)
+    serializedData.push_back(0x06);
+
+    // 4c. ObjectId = 1
+    serializedData.push_back(0x01);
+    serializedData.push_back(0x00);
+    serializedData.push_back(0x00);
+    serializedData.push_back(0x00);
+
+    // 4d. LengthPrefixedString: 7-bit 变长长度 + UTF-8 数据
     size_t val = utf8Uri.length();
     while (val >= 0x80) {
         serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
         val >>= 7;
     }
     serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
-
-    // 3b. UTF-8 字节数据（直接跟在长度后面，无 NRBF 头，无 MessageEnd）
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
 
-    // 4. SHA1 & Base32（不变）
+    // 4e. MessageEnd (0x0B)
+    serializedData.push_back(0x0B);
+
+    // 5. SHA1 & Base32 编码
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    return std::wstring(appFilename) + L"_Url_" + base32Hash;
+    return appFilename + L"_Url_" + base32Hash;
 }
 
 std::wstring trim(const std::wstring& s) {
