@@ -467,10 +467,8 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath) {
-    // ----------------------------------------------------
-    // 第一步：提取用于【拼接前缀】的文件名（去掉扩展名）
-    // ----------------------------------------------------
+std::wstring CalculateNetPath(std::wstring absoluteAppPath, int mode = 0) {
+    // 第一步：提取用于【拼接前缀】的文件名（永远去掉扩展名）
     std::wstring appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (appFilename.empty()) return L"";
     
@@ -480,36 +478,48 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath) {
         prefixName = prefixName.substr(0, dotPos);
     }
 
-    // ----------------------------------------------------
-    // 第二步：构造用于【计算哈希】的字符串
-    // 【极其关键的修改】：绝对不要加 "file:///" 前缀！！！
-    // 直接使用原始路径，仅做斜杠替换。
-    // ----------------------------------------------------
-    std::wstring pathStr = absoluteAppPath;
-    for (auto& ch : pathStr) {
-        if (ch == L'\\') ch = L'/';  
-        // 不转大写，保留原始大小写
-    }
-    // 结果示例: "D:/Locale/Other/AssetStudio/App/AssetStudio.GUI.exe"
+    std::wstring pathStr;
 
-    // ----------------------------------------------------
-    // 第三步：转换为 UTF-8
-    // ----------------------------------------------------
+    if (mode == 0) {
+        // ==========================================
+        // 盲区 A：无前缀 + 无扩展名 + 保留原样大小写 + 正斜杠
+        // ==========================================
+        pathStr = absoluteAppPath;
+        dotPos = pathStr.find_last_of(L".");
+        size_t slashPos = pathStr.find_last_of(L"\\/");
+        if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
+            pathStr = pathStr.substr(0, dotPos); // 去掉扩展名
+        }
+        for (auto& ch : pathStr) {
+            if (ch == L'\\') ch = L'/';
+            // 不转大写
+        }
+        // 结果: "D:/Locale/Other/AssetStudio/App/AssetStudio.GUI"
+    } 
+    else if (mode == 1) {
+        // ==========================================
+        // 盲区 B：有 file:/// 前缀 + 有扩展名 + 全大写 + 正斜杠
+        // ==========================================
+        pathStr = L"file:///" + absoluteAppPath;
+        for (auto& ch : pathStr) {
+            if (ch == L'\\') ch = L'/';
+            else if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A'; // 转大写
+        }
+        // 结果: "FILE:///D:/LOCALE/OTHER/ASSETSTUDIO/APP/ASSETSTUDIO.GUI.EXE"
+    }
+
+    // 第二步：转换为 UTF-8
     std::string utf8Path;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), NULL, 0, NULL, NULL);
     utf8Path.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, pathStr.c_str(), (int)pathStr.length(), &utf8Path[0], size_needed, NULL, NULL);
 
-    // ----------------------------------------------------
-    // 第四步：直接对纯 UTF-8 字节计算 SHA1（无前缀，无长度编码）
-    // ----------------------------------------------------
+    // 第三步：纯 UTF-8 字节计算 SHA1 (没有任何前缀，没有 7-bit，没有 BF 头)
     std::vector<uint8_t> rawData(utf8Path.begin(), utf8Path.end());
     std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    // ----------------------------------------------------
-    // 第五步：拼接
-    // ----------------------------------------------------
+    // 第四步：拼接
     return prefixName + L"_Url_" + base32Hash;
 }
 
@@ -6082,7 +6092,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
-        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath);
+        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath, 0);
+        variables[L"NETHASH2"] = CalculateNetPath(absoluteAppPath, 1);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
