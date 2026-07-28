@@ -439,120 +439,101 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
     size_t i = 0;
     uint8_t b0, b1, b2, b3, b4;
 
-    do {
+    while (i < l) {
         b0 = (i < l) ? buff[i++] : 0;
         b1 = (i < l) ? buff[i++] : 0;
         b2 = (i < l) ? buff[i++] : 0;
         b3 = (i < l) ? buff[i++] : 0;
         b4 = (i < l) ? buff[i++] : 0;
 
-        // 获取每个字节的后 5 位进行 Base32 映射
         result += s_Base32Char[b0 & 0x1F];
-        result += s_Base32Char[b1 & 0x1F];
-        result += s_Base32Char[b2 & 0x1F];
-        result += s_Base32Char[b3 & 0x1F];
-        result += s_Base32Char[b4 & 0x1F];
-
-        // 处理高位数据合并与移位
-        result += s_Base32Char[((b0 & 0xE0) >> 5) | ((b3 & 0x60) >> 2)];
-        result += s_Base32Char[((b1 & 0xE0) >> 5) | ((b4 & 0x60) >> 2)];
-
-        b2 >>= 5;
-        if ((b3 & 0x80) != 0) b2 |= 0x08;
-        if ((b4 & 0x80) != 0) b2 |= 0x10;
-        result += s_Base32Char[b2];
-    } while (i < l);
-
+        result += s_Base32Char[((b0 & 0xE0) >> 5) | ((b1 & 0x03) << 3)];
+        result += s_Base32Char[(b1 >> 2) & 0x1F];
+        result += s_Base32Char[((b1 & 0xC0) >> 6) | ((b2 & 0x0F) << 2)];
+        result += s_Base32Char[(b2 >> 4) & 0x1F];
+        result += s_Base32Char[((b2 & 0xF0) >> 4) | ((b3 & 0x01) << 4)];
+        result += s_Base32Char[(b3 >> 1) & 0x1F];
+        result += s_Base32Char[((b3 & 0xFE) >> 1) | ((b4 & 0x07) << 4)];
+        result += s_Base32Char[(b4 >> 3) & 0x1F];
+    }
     return result;
 }
 
-// [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath, int mode) {
-    if (mode < 0 || mode >= 256) return L"";
+// 穷举函数 (0 ~ 127)
+std::wstring CalculateNetPathEx(std::wstring absoluteAppPath, int mode) {
+    if (mode < 0 || mode >= 128) return L"";
 
     int m = mode;
-    int proto_mode  = m % 4; m /= 4;  // 0:无, 1:file:///, 2:file://, 3:file:
-    int drive_mode  = m % 4; m /= 4;  // 0:原样, 1:小写, 2:去盘符, 3:盘符为主机去冒号
-    int slash_mode  = m % 2; m /= 2;  // 0:反斜杠, 1:正斜杠
-    int case_mode   = m % 2; m /= 2;  // 0:原样, 1:全大写
-    int salt_mode   = m % 2; m /= 2;  // 0:无, 1:后置 File:
-    int enc_mode    = m % 2;          // 0:纯UTF8, 1:7bit+UTF8
+    int prefix_ext_mode = m % 2; m /= 2;  // 0:无扩展名, 1:带扩展名
+    int path_ext_mode   = m % 2; m /= 2;  // 0:带扩展名, 1:无扩展名
+    int proto_mode      = m % 4; m /= 4;  // 0:file://, 1:file:///, 2:file:, 3:无
+    int drive_mode      = m % 2; m /= 2;  // 0:原样, 1:小写
+    int case_mode       = m % 2; m /= 2;  // 0:原样, 1:全大写
+    int enc_mode        = m % 2;          // 0:UTF8, 1:UTF16LE
 
-    // 1. 文件名前缀（永远不带扩展名，对应 .NET 10 行为）
+    // 1. 提取前缀文件名
     const wchar_t* appFilenameWithExt = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilenameWithExt || wcslen(appFilenameWithExt) == 0) return L"";
 
-    std::wstring prefixName = appFilenameWithExt;
-    size_t dotPos = prefixName.find_last_of(L".");
-    if (dotPos != std::wstring::npos) prefixName = prefixName.substr(0, dotPos);
+    std::wstring prefixWithExt = appFilenameWithExt;
+    std::wstring prefixNoExt = prefixWithExt;
+    size_t dotPos = prefixNoExt.find_last_of(L".");
+    if (dotPos != std::wstring::npos) prefixNoExt = prefixNoExt.substr(0, dotPos);
 
-    // 2. 构造路径主体（强制带 .exe 扩展名）
-    std::wstring pathStr = absoluteAppPath;
-    dotPos = pathStr.find_last_of(L".");
-    size_t slashPos = pathStr.find_last_of(L"\\/");
+    std::wstring prefixName = (prefix_ext_mode == 0) ? prefixNoExt : prefixWithExt;
+
+    // 2. 路径主体
+    std::wstring basePath = absoluteAppPath;
+    dotPos = basePath.find_last_of(L".");
+    size_t slashPos = basePath.find_last_of(L"\\/");
     if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
-        pathStr = pathStr.substr(0, dotPos) + L".exe";
+        basePath = basePath.substr(0, dotPos);
     }
+    std::wstring pathStr = (path_ext_mode == 0) ? absoluteAppPath : basePath;
 
-    // 3. 处理盘符（覆盖 Uri 类强制转换主机名大小写等行为）
-    std::wstring modifiedPath = pathStr;
-    if (modifiedPath.length() >= 2 && modifiedPath[1] == L':') {
-        wchar_t driveLetter = modifiedPath[0];
-        if (drive_mode == 0) { 
-            // 原样保留
-        } else if (drive_mode == 1) { 
-            modifiedPath[0] = towlower(driveLetter); // 盘符转小写
-        } else if (drive_mode == 2) { 
-            modifiedPath = modifiedPath.substr(2); // 去掉盘符和冒号
-        } else if (drive_mode == 3) { 
-            modifiedPath = std::wstring(1, driveLetter) + modifiedPath.substr(2); // 去掉冒号保留盘符
+    // 3. 协议前缀
+    std::wstring uri;
+    if (proto_mode == 0) uri = L"file://" + pathStr;
+    else if (proto_mode == 1) uri = L"file:///" + pathStr;
+    else if (proto_mode == 2) uri = L"file:" + pathStr;
+    else uri = pathStr;
+
+    // 4. 盘符小写处理 (模拟 Uri 类对 host 的处理)
+    if (drive_mode == 1) {
+        size_t start = std::wstring::npos;
+        if (uri.rfind(L"file://", 0) == 0) start = 7;
+        else if (uri.rfind(L"file:///", 0) == 0) start = 8;
+        else if (uri.rfind(L"file:", 0) == 0) start = 5;
+        
+        if (start != std::wstring::npos && start + 1 < uri.length() && uri[start + 1] == L':') {
+            uri[start] = towlower(uri[start]);
         }
     }
 
-    // 4. 处理斜杠方向
-    wchar_t targetSlash = (slash_mode == 0) ? L'\\' : L'/';
-    for (auto& ch : modifiedPath) {
-        if (ch == L'\\' || ch == L'/') ch = targetSlash;
+    // 5. 反斜杠转为正斜杠
+    for (auto& ch : uri) {
+        if (ch == L'\\') ch = L'/';
     }
 
-    // 5. 处理协议前缀
-    std::wstring uri;
-    if (proto_mode == 0) uri = modifiedPath;
-    else if (proto_mode == 1) uri = L"file:///" + modifiedPath;
-    else if (proto_mode == 2) uri = L"file://" + modifiedPath;
-    else uri = L"file:" + modifiedPath;
-
-    // 6. 处理全局大小写
+    // 6. 全局大写 (.NET 默认行为)
     if (case_mode == 1) {
         for (auto& ch : uri) {
             if (ch >= L'a' && ch <= L'z') ch -= 32;
         }
     }
 
-    // 7. 转换为 UTF-8
-    std::string utf8Uri;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-    utf8Uri.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
-
-    // 8. 拼接待哈希的数据
+    // 7. 编码字节流
     std::vector<uint8_t> rawData;
-    if (enc_mode == 1) { // 7bit 长度前缀
-        size_t val = utf8Uri.length();
-        while (val >= 0x80) {
-            rawData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
-            val >>= 7;
-        }
-        rawData.push_back(static_cast<uint8_t>(val & 0x7F));
-    }
-    rawData.insert(rawData.end(), utf8Uri.begin(), utf8Uri.end());
-
-    if (salt_mode == 1) { // 后置 Salt
-        std::string salt = "File:";
-        rawData.insert(rawData.end(), salt.begin(), salt.end());
+    if (enc_mode == 0) { // UTF8
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+        rawData.resize(size_needed);
+        WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), (char*)rawData.data(), size_needed, NULL, NULL);
+    } else { // UTF16LE
+        rawData.resize(uri.length() * 2);
+        memcpy(rawData.data(), uri.c_str(), uri.length() * 2);
     }
 
-    // 9. SHA1 & Base32
+    // 8. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(rawData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
@@ -6128,262 +6109,134 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
-        variables[L"NETHASH0"] = CalculateNetPath(absoluteAppPath, 0);
-        variables[L"NETHASH1"] = CalculateNetPath(absoluteAppPath, 1);
-        variables[L"NETHASH2"] = CalculateNetPath(absoluteAppPath, 2);
-        variables[L"NETHASH3"] = CalculateNetPath(absoluteAppPath, 3);
-        variables[L"NETHASH4"] = CalculateNetPath(absoluteAppPath, 4);
-        variables[L"NETHASH5"] = CalculateNetPath(absoluteAppPath, 5);
-        variables[L"NETHASH6"] = CalculateNetPath(absoluteAppPath, 6);
-        variables[L"NETHASH7"] = CalculateNetPath(absoluteAppPath, 7);
-        variables[L"NETHASH8"] = CalculateNetPath(absoluteAppPath, 8);
-        variables[L"NETHASH9"] = CalculateNetPath(absoluteAppPath, 9);
-        variables[L"NETHASH10"] = CalculateNetPath(absoluteAppPath, 10);
-        variables[L"NETHASH11"] = CalculateNetPath(absoluteAppPath, 11);
-        variables[L"NETHASH12"] = CalculateNetPath(absoluteAppPath, 12);
-        variables[L"NETHASH13"] = CalculateNetPath(absoluteAppPath, 13);
-        variables[L"NETHASH14"] = CalculateNetPath(absoluteAppPath, 14);
-        variables[L"NETHASH15"] = CalculateNetPath(absoluteAppPath, 15);
-        variables[L"NETHASH16"] = CalculateNetPath(absoluteAppPath, 16);
-        variables[L"NETHASH17"] = CalculateNetPath(absoluteAppPath, 17);
-        variables[L"NETHASH18"] = CalculateNetPath(absoluteAppPath, 18);
-        variables[L"NETHASH19"] = CalculateNetPath(absoluteAppPath, 19);
-        variables[L"NETHASH20"] = CalculateNetPath(absoluteAppPath, 20);
-        variables[L"NETHASH21"] = CalculateNetPath(absoluteAppPath, 21);
-        variables[L"NETHASH22"] = CalculateNetPath(absoluteAppPath, 22);
-        variables[L"NETHASH23"] = CalculateNetPath(absoluteAppPath, 23);
-        variables[L"NETHASH24"] = CalculateNetPath(absoluteAppPath, 24);
-        variables[L"NETHASH25"] = CalculateNetPath(absoluteAppPath, 25);
-        variables[L"NETHASH26"] = CalculateNetPath(absoluteAppPath, 26);
-        variables[L"NETHASH27"] = CalculateNetPath(absoluteAppPath, 27);
-        variables[L"NETHASH28"] = CalculateNetPath(absoluteAppPath, 28);
-        variables[L"NETHASH29"] = CalculateNetPath(absoluteAppPath, 29);
-        variables[L"NETHASH30"] = CalculateNetPath(absoluteAppPath, 30);
-        variables[L"NETHASH31"] = CalculateNetPath(absoluteAppPath, 31);
-        variables[L"NETHASH32"] = CalculateNetPath(absoluteAppPath, 32);
-        variables[L"NETHASH33"] = CalculateNetPath(absoluteAppPath, 33);
-        variables[L"NETHASH34"] = CalculateNetPath(absoluteAppPath, 34);
-        variables[L"NETHASH35"] = CalculateNetPath(absoluteAppPath, 35);
-        variables[L"NETHASH36"] = CalculateNetPath(absoluteAppPath, 36);
-        variables[L"NETHASH37"] = CalculateNetPath(absoluteAppPath, 37);
-        variables[L"NETHASH38"] = CalculateNetPath(absoluteAppPath, 38);
-        variables[L"NETHASH39"] = CalculateNetPath(absoluteAppPath, 39);
-        variables[L"NETHASH40"] = CalculateNetPath(absoluteAppPath, 40);
-        variables[L"NETHASH41"] = CalculateNetPath(absoluteAppPath, 41);
-        variables[L"NETHASH42"] = CalculateNetPath(absoluteAppPath, 42);
-        variables[L"NETHASH43"] = CalculateNetPath(absoluteAppPath, 43);
-        variables[L"NETHASH44"] = CalculateNetPath(absoluteAppPath, 44);
-        variables[L"NETHASH45"] = CalculateNetPath(absoluteAppPath, 45);
-        variables[L"NETHASH46"] = CalculateNetPath(absoluteAppPath, 46);
-        variables[L"NETHASH47"] = CalculateNetPath(absoluteAppPath, 47);
-        variables[L"NETHASH48"] = CalculateNetPath(absoluteAppPath, 48);
-        variables[L"NETHASH49"] = CalculateNetPath(absoluteAppPath, 49);
-        variables[L"NETHASH50"] = CalculateNetPath(absoluteAppPath, 50);
-        variables[L"NETHASH51"] = CalculateNetPath(absoluteAppPath, 51);
-        variables[L"NETHASH52"] = CalculateNetPath(absoluteAppPath, 52);
-        variables[L"NETHASH53"] = CalculateNetPath(absoluteAppPath, 53);
-        variables[L"NETHASH54"] = CalculateNetPath(absoluteAppPath, 54);
-        variables[L"NETHASH55"] = CalculateNetPath(absoluteAppPath, 55);
-        variables[L"NETHASH56"] = CalculateNetPath(absoluteAppPath, 56);
-        variables[L"NETHASH57"] = CalculateNetPath(absoluteAppPath, 57);
-        variables[L"NETHASH58"] = CalculateNetPath(absoluteAppPath, 58);
-        variables[L"NETHASH59"] = CalculateNetPath(absoluteAppPath, 59);
-        variables[L"NETHASH60"] = CalculateNetPath(absoluteAppPath, 60);
-        variables[L"NETHASH61"] = CalculateNetPath(absoluteAppPath, 61);
-        variables[L"NETHASH62"] = CalculateNetPath(absoluteAppPath, 62);
-        variables[L"NETHASH63"] = CalculateNetPath(absoluteAppPath, 63);
-        variables[L"NETHASH64"] = CalculateNetPath(absoluteAppPath, 64);
-        variables[L"NETHASH65"] = CalculateNetPath(absoluteAppPath, 65);
-        variables[L"NETHASH66"] = CalculateNetPath(absoluteAppPath, 66);
-        variables[L"NETHASH67"] = CalculateNetPath(absoluteAppPath, 67);
-        variables[L"NETHASH68"] = CalculateNetPath(absoluteAppPath, 68);
-        variables[L"NETHASH69"] = CalculateNetPath(absoluteAppPath, 69);
-        variables[L"NETHASH70"] = CalculateNetPath(absoluteAppPath, 70);
-        variables[L"NETHASH71"] = CalculateNetPath(absoluteAppPath, 71);
-        variables[L"NETHASH72"] = CalculateNetPath(absoluteAppPath, 72);
-        variables[L"NETHASH73"] = CalculateNetPath(absoluteAppPath, 73);
-        variables[L"NETHASH74"] = CalculateNetPath(absoluteAppPath, 74);
-        variables[L"NETHASH75"] = CalculateNetPath(absoluteAppPath, 75);
-        variables[L"NETHASH76"] = CalculateNetPath(absoluteAppPath, 76);
-        variables[L"NETHASH77"] = CalculateNetPath(absoluteAppPath, 77);
-        variables[L"NETHASH78"] = CalculateNetPath(absoluteAppPath, 78);
-        variables[L"NETHASH79"] = CalculateNetPath(absoluteAppPath, 79);
-        variables[L"NETHASH80"] = CalculateNetPath(absoluteAppPath, 80);
-        variables[L"NETHASH81"] = CalculateNetPath(absoluteAppPath, 81);
-        variables[L"NETHASH82"] = CalculateNetPath(absoluteAppPath, 82);
-        variables[L"NETHASH83"] = CalculateNetPath(absoluteAppPath, 83);
-        variables[L"NETHASH84"] = CalculateNetPath(absoluteAppPath, 84);
-        variables[L"NETHASH85"] = CalculateNetPath(absoluteAppPath, 85);
-        variables[L"NETHASH86"] = CalculateNetPath(absoluteAppPath, 86);
-        variables[L"NETHASH87"] = CalculateNetPath(absoluteAppPath, 87);
-        variables[L"NETHASH88"] = CalculateNetPath(absoluteAppPath, 88);
-        variables[L"NETHASH89"] = CalculateNetPath(absoluteAppPath, 89);
-        variables[L"NETHASH90"] = CalculateNetPath(absoluteAppPath, 90);
-        variables[L"NETHASH91"] = CalculateNetPath(absoluteAppPath, 91);
-        variables[L"NETHASH92"] = CalculateNetPath(absoluteAppPath, 92);
-        variables[L"NETHASH93"] = CalculateNetPath(absoluteAppPath, 93);
-        variables[L"NETHASH94"] = CalculateNetPath(absoluteAppPath, 94);
-        variables[L"NETHASH95"] = CalculateNetPath(absoluteAppPath, 95);
-        variables[L"NETHASH96"] = CalculateNetPath(absoluteAppPath, 96);
-        variables[L"NETHASH97"] = CalculateNetPath(absoluteAppPath, 97);
-        variables[L"NETHASH98"] = CalculateNetPath(absoluteAppPath, 98);
-        variables[L"NETHASH99"] = CalculateNetPath(absoluteAppPath, 99);
-        variables[L"NETHASH100"] = CalculateNetPath(absoluteAppPath, 100);
-        variables[L"NETHASH101"] = CalculateNetPath(absoluteAppPath, 101);
-        variables[L"NETHASH102"] = CalculateNetPath(absoluteAppPath, 102);
-        variables[L"NETHASH103"] = CalculateNetPath(absoluteAppPath, 103);
-        variables[L"NETHASH104"] = CalculateNetPath(absoluteAppPath, 104);
-        variables[L"NETHASH105"] = CalculateNetPath(absoluteAppPath, 105);
-        variables[L"NETHASH106"] = CalculateNetPath(absoluteAppPath, 106);
-        variables[L"NETHASH107"] = CalculateNetPath(absoluteAppPath, 107);
-        variables[L"NETHASH108"] = CalculateNetPath(absoluteAppPath, 108);
-        variables[L"NETHASH109"] = CalculateNetPath(absoluteAppPath, 109);
-        variables[L"NETHASH110"] = CalculateNetPath(absoluteAppPath, 110);
-        variables[L"NETHASH111"] = CalculateNetPath(absoluteAppPath, 111);
-        variables[L"NETHASH112"] = CalculateNetPath(absoluteAppPath, 112);
-        variables[L"NETHASH113"] = CalculateNetPath(absoluteAppPath, 113);
-        variables[L"NETHASH114"] = CalculateNetPath(absoluteAppPath, 114);
-        variables[L"NETHASH115"] = CalculateNetPath(absoluteAppPath, 115);
-        variables[L"NETHASH116"] = CalculateNetPath(absoluteAppPath, 116);
-        variables[L"NETHASH117"] = CalculateNetPath(absoluteAppPath, 117);
-        variables[L"NETHASH118"] = CalculateNetPath(absoluteAppPath, 118);
-        variables[L"NETHASH119"] = CalculateNetPath(absoluteAppPath, 119);
-        variables[L"NETHASH120"] = CalculateNetPath(absoluteAppPath, 120);
-        variables[L"NETHASH121"] = CalculateNetPath(absoluteAppPath, 121);
-        variables[L"NETHASH122"] = CalculateNetPath(absoluteAppPath, 122);
-        variables[L"NETHASH123"] = CalculateNetPath(absoluteAppPath, 123);
-        variables[L"NETHASH124"] = CalculateNetPath(absoluteAppPath, 124);
-        variables[L"NETHASH125"] = CalculateNetPath(absoluteAppPath, 125);
-        variables[L"NETHASH126"] = CalculateNetPath(absoluteAppPath, 126);
-        variables[L"NETHASH127"] = CalculateNetPath(absoluteAppPath, 127);
-        variables[L"NETHASH128"] = CalculateNetPath(absoluteAppPath, 128);
-        variables[L"NETHASH129"] = CalculateNetPath(absoluteAppPath, 129);
-        variables[L"NETHASH130"] = CalculateNetPath(absoluteAppPath, 130);
-        variables[L"NETHASH131"] = CalculateNetPath(absoluteAppPath, 131);
-        variables[L"NETHASH132"] = CalculateNetPath(absoluteAppPath, 132);
-        variables[L"NETHASH133"] = CalculateNetPath(absoluteAppPath, 133);
-        variables[L"NETHASH134"] = CalculateNetPath(absoluteAppPath, 134);
-        variables[L"NETHASH135"] = CalculateNetPath(absoluteAppPath, 135);
-        variables[L"NETHASH136"] = CalculateNetPath(absoluteAppPath, 136);
-        variables[L"NETHASH137"] = CalculateNetPath(absoluteAppPath, 137);
-        variables[L"NETHASH138"] = CalculateNetPath(absoluteAppPath, 138);
-        variables[L"NETHASH139"] = CalculateNetPath(absoluteAppPath, 139);
-        variables[L"NETHASH140"] = CalculateNetPath(absoluteAppPath, 140);
-        variables[L"NETHASH141"] = CalculateNetPath(absoluteAppPath, 141);
-        variables[L"NETHASH142"] = CalculateNetPath(absoluteAppPath, 142);
-        variables[L"NETHASH143"] = CalculateNetPath(absoluteAppPath, 143);
-        variables[L"NETHASH144"] = CalculateNetPath(absoluteAppPath, 144);
-        variables[L"NETHASH145"] = CalculateNetPath(absoluteAppPath, 145);
-        variables[L"NETHASH146"] = CalculateNetPath(absoluteAppPath, 146);
-        variables[L"NETHASH147"] = CalculateNetPath(absoluteAppPath, 147);
-        variables[L"NETHASH148"] = CalculateNetPath(absoluteAppPath, 148);
-        variables[L"NETHASH149"] = CalculateNetPath(absoluteAppPath, 149);
-        variables[L"NETHASH150"] = CalculateNetPath(absoluteAppPath, 150);
-        variables[L"NETHASH151"] = CalculateNetPath(absoluteAppPath, 151);
-        variables[L"NETHASH152"] = CalculateNetPath(absoluteAppPath, 152);
-        variables[L"NETHASH153"] = CalculateNetPath(absoluteAppPath, 153);
-        variables[L"NETHASH154"] = CalculateNetPath(absoluteAppPath, 154);
-        variables[L"NETHASH155"] = CalculateNetPath(absoluteAppPath, 155);
-        variables[L"NETHASH156"] = CalculateNetPath(absoluteAppPath, 156);
-        variables[L"NETHASH157"] = CalculateNetPath(absoluteAppPath, 157);
-        variables[L"NETHASH158"] = CalculateNetPath(absoluteAppPath, 158);
-        variables[L"NETHASH159"] = CalculateNetPath(absoluteAppPath, 159);
-        variables[L"NETHASH160"] = CalculateNetPath(absoluteAppPath, 160);
-        variables[L"NETHASH161"] = CalculateNetPath(absoluteAppPath, 161);
-        variables[L"NETHASH162"] = CalculateNetPath(absoluteAppPath, 162);
-        variables[L"NETHASH163"] = CalculateNetPath(absoluteAppPath, 163);
-        variables[L"NETHASH164"] = CalculateNetPath(absoluteAppPath, 164);
-        variables[L"NETHASH165"] = CalculateNetPath(absoluteAppPath, 165);
-        variables[L"NETHASH166"] = CalculateNetPath(absoluteAppPath, 166);
-        variables[L"NETHASH167"] = CalculateNetPath(absoluteAppPath, 167);
-        variables[L"NETHASH168"] = CalculateNetPath(absoluteAppPath, 168);
-        variables[L"NETHASH169"] = CalculateNetPath(absoluteAppPath, 169);
-        variables[L"NETHASH170"] = CalculateNetPath(absoluteAppPath, 170);
-        variables[L"NETHASH171"] = CalculateNetPath(absoluteAppPath, 171);
-        variables[L"NETHASH172"] = CalculateNetPath(absoluteAppPath, 172);
-        variables[L"NETHASH173"] = CalculateNetPath(absoluteAppPath, 173);
-        variables[L"NETHASH174"] = CalculateNetPath(absoluteAppPath, 174);
-        variables[L"NETHASH175"] = CalculateNetPath(absoluteAppPath, 175);
-        variables[L"NETHASH176"] = CalculateNetPath(absoluteAppPath, 176);
-        variables[L"NETHASH177"] = CalculateNetPath(absoluteAppPath, 177);
-        variables[L"NETHASH178"] = CalculateNetPath(absoluteAppPath, 178);
-        variables[L"NETHASH179"] = CalculateNetPath(absoluteAppPath, 179);
-        variables[L"NETHASH180"] = CalculateNetPath(absoluteAppPath, 180);
-        variables[L"NETHASH181"] = CalculateNetPath(absoluteAppPath, 181);
-        variables[L"NETHASH182"] = CalculateNetPath(absoluteAppPath, 182);
-        variables[L"NETHASH183"] = CalculateNetPath(absoluteAppPath, 183);
-        variables[L"NETHASH184"] = CalculateNetPath(absoluteAppPath, 184);
-        variables[L"NETHASH185"] = CalculateNetPath(absoluteAppPath, 185);
-        variables[L"NETHASH186"] = CalculateNetPath(absoluteAppPath, 186);
-        variables[L"NETHASH187"] = CalculateNetPath(absoluteAppPath, 187);
-        variables[L"NETHASH188"] = CalculateNetPath(absoluteAppPath, 188);
-        variables[L"NETHASH189"] = CalculateNetPath(absoluteAppPath, 189);
-        variables[L"NETHASH190"] = CalculateNetPath(absoluteAppPath, 190);
-        variables[L"NETHASH191"] = CalculateNetPath(absoluteAppPath, 191);
-        variables[L"NETHASH192"] = CalculateNetPath(absoluteAppPath, 192);
-        variables[L"NETHASH193"] = CalculateNetPath(absoluteAppPath, 193);
-        variables[L"NETHASH194"] = CalculateNetPath(absoluteAppPath, 194);
-        variables[L"NETHASH195"] = CalculateNetPath(absoluteAppPath, 195);
-        variables[L"NETHASH196"] = CalculateNetPath(absoluteAppPath, 196);
-        variables[L"NETHASH197"] = CalculateNetPath(absoluteAppPath, 197);
-        variables[L"NETHASH198"] = CalculateNetPath(absoluteAppPath, 198);
-        variables[L"NETHASH199"] = CalculateNetPath(absoluteAppPath, 199);
-        variables[L"NETHASH200"] = CalculateNetPath(absoluteAppPath, 200);
-        variables[L"NETHASH201"] = CalculateNetPath(absoluteAppPath, 201);
-        variables[L"NETHASH202"] = CalculateNetPath(absoluteAppPath, 202);
-        variables[L"NETHASH203"] = CalculateNetPath(absoluteAppPath, 203);
-        variables[L"NETHASH204"] = CalculateNetPath(absoluteAppPath, 204);
-        variables[L"NETHASH205"] = CalculateNetPath(absoluteAppPath, 205);
-        variables[L"NETHASH206"] = CalculateNetPath(absoluteAppPath, 206);
-        variables[L"NETHASH207"] = CalculateNetPath(absoluteAppPath, 207);
-        variables[L"NETHASH208"] = CalculateNetPath(absoluteAppPath, 208);
-        variables[L"NETHASH209"] = CalculateNetPath(absoluteAppPath, 209);
-        variables[L"NETHASH210"] = CalculateNetPath(absoluteAppPath, 210);
-        variables[L"NETHASH211"] = CalculateNetPath(absoluteAppPath, 211);
-        variables[L"NETHASH212"] = CalculateNetPath(absoluteAppPath, 212);
-        variables[L"NETHASH213"] = CalculateNetPath(absoluteAppPath, 213);
-        variables[L"NETHASH214"] = CalculateNetPath(absoluteAppPath, 214);
-        variables[L"NETHASH215"] = CalculateNetPath(absoluteAppPath, 215);
-        variables[L"NETHASH216"] = CalculateNetPath(absoluteAppPath, 216);
-        variables[L"NETHASH217"] = CalculateNetPath(absoluteAppPath, 217);
-        variables[L"NETHASH218"] = CalculateNetPath(absoluteAppPath, 218);
-        variables[L"NETHASH219"] = CalculateNetPath(absoluteAppPath, 219);
-        variables[L"NETHASH220"] = CalculateNetPath(absoluteAppPath, 220);
-        variables[L"NETHASH221"] = CalculateNetPath(absoluteAppPath, 221);
-        variables[L"NETHASH222"] = CalculateNetPath(absoluteAppPath, 222);
-        variables[L"NETHASH223"] = CalculateNetPath(absoluteAppPath, 223);
-        variables[L"NETHASH224"] = CalculateNetPath(absoluteAppPath, 224);
-        variables[L"NETHASH225"] = CalculateNetPath(absoluteAppPath, 225);
-        variables[L"NETHASH226"] = CalculateNetPath(absoluteAppPath, 226);
-        variables[L"NETHASH227"] = CalculateNetPath(absoluteAppPath, 227);
-        variables[L"NETHASH228"] = CalculateNetPath(absoluteAppPath, 228);
-        variables[L"NETHASH229"] = CalculateNetPath(absoluteAppPath, 229);
-        variables[L"NETHASH230"] = CalculateNetPath(absoluteAppPath, 230);
-        variables[L"NETHASH231"] = CalculateNetPath(absoluteAppPath, 231);
-        variables[L"NETHASH232"] = CalculateNetPath(absoluteAppPath, 232);
-        variables[L"NETHASH233"] = CalculateNetPath(absoluteAppPath, 233);
-        variables[L"NETHASH234"] = CalculateNetPath(absoluteAppPath, 234);
-        variables[L"NETHASH235"] = CalculateNetPath(absoluteAppPath, 235);
-        variables[L"NETHASH236"] = CalculateNetPath(absoluteAppPath, 236);
-        variables[L"NETHASH237"] = CalculateNetPath(absoluteAppPath, 237);
-        variables[L"NETHASH238"] = CalculateNetPath(absoluteAppPath, 238);
-        variables[L"NETHASH239"] = CalculateNetPath(absoluteAppPath, 239);
-        variables[L"NETHASH240"] = CalculateNetPath(absoluteAppPath, 240);
-        variables[L"NETHASH241"] = CalculateNetPath(absoluteAppPath, 241);
-        variables[L"NETHASH242"] = CalculateNetPath(absoluteAppPath, 242);
-        variables[L"NETHASH243"] = CalculateNetPath(absoluteAppPath, 243);
-        variables[L"NETHASH244"] = CalculateNetPath(absoluteAppPath, 244);
-        variables[L"NETHASH245"] = CalculateNetPath(absoluteAppPath, 245);
-        variables[L"NETHASH246"] = CalculateNetPath(absoluteAppPath, 246);
-        variables[L"NETHASH247"] = CalculateNetPath(absoluteAppPath, 247);
-        variables[L"NETHASH248"] = CalculateNetPath(absoluteAppPath, 248);
-        variables[L"NETHASH249"] = CalculateNetPath(absoluteAppPath, 249);
-        variables[L"NETHASH250"] = CalculateNetPath(absoluteAppPath, 250);
-        variables[L"NETHASH251"] = CalculateNetPath(absoluteAppPath, 251);
-        variables[L"NETHASH252"] = CalculateNetPath(absoluteAppPath, 252);
-        variables[L"NETHASH253"] = CalculateNetPath(absoluteAppPath, 253);
-        variables[L"NETHASH254"] = CalculateNetPath(absoluteAppPath, 254);
-        variables[L"NETHASH255"] = CalculateNetPath(absoluteAppPath, 255);
+        variables[L"NETHASH0"] = CalculateNetPathEX(absoluteAppPath, 0);
+        variables[L"NETHASH1"] = CalculateNetPathEX(absoluteAppPath, 1);
+        variables[L"NETHASH2"] = CalculateNetPathEX(absoluteAppPath, 2);
+        variables[L"NETHASH3"] = CalculateNetPathEX(absoluteAppPath, 3);
+        variables[L"NETHASH4"] = CalculateNetPathEX(absoluteAppPath, 4);
+        variables[L"NETHASH5"] = CalculateNetPathEX(absoluteAppPath, 5);
+        variables[L"NETHASH6"] = CalculateNetPathEX(absoluteAppPath, 6);
+        variables[L"NETHASH7"] = CalculateNetPathEX(absoluteAppPath, 7);
+        variables[L"NETHASH8"] = CalculateNetPathEX(absoluteAppPath, 8);
+        variables[L"NETHASH9"] = CalculateNetPathEX(absoluteAppPath, 9);
+        variables[L"NETHASH10"] = CalculateNetPathEX(absoluteAppPath, 10);
+        variables[L"NETHASH11"] = CalculateNetPathEX(absoluteAppPath, 11);
+        variables[L"NETHASH12"] = CalculateNetPathEX(absoluteAppPath, 12);
+        variables[L"NETHASH13"] = CalculateNetPathEX(absoluteAppPath, 13);
+        variables[L"NETHASH14"] = CalculateNetPathEX(absoluteAppPath, 14);
+        variables[L"NETHASH15"] = CalculateNetPathEX(absoluteAppPath, 15);
+        variables[L"NETHASH16"] = CalculateNetPathEX(absoluteAppPath, 16);
+        variables[L"NETHASH17"] = CalculateNetPathEX(absoluteAppPath, 17);
+        variables[L"NETHASH18"] = CalculateNetPathEX(absoluteAppPath, 18);
+        variables[L"NETHASH19"] = CalculateNetPathEX(absoluteAppPath, 19);
+        variables[L"NETHASH20"] = CalculateNetPathEX(absoluteAppPath, 20);
+        variables[L"NETHASH21"] = CalculateNetPathEX(absoluteAppPath, 21);
+        variables[L"NETHASH22"] = CalculateNetPathEX(absoluteAppPath, 22);
+        variables[L"NETHASH23"] = CalculateNetPathEX(absoluteAppPath, 23);
+        variables[L"NETHASH24"] = CalculateNetPathEX(absoluteAppPath, 24);
+        variables[L"NETHASH25"] = CalculateNetPathEX(absoluteAppPath, 25);
+        variables[L"NETHASH26"] = CalculateNetPathEX(absoluteAppPath, 26);
+        variables[L"NETHASH27"] = CalculateNetPathEX(absoluteAppPath, 27);
+        variables[L"NETHASH28"] = CalculateNetPathEX(absoluteAppPath, 28);
+        variables[L"NETHASH29"] = CalculateNetPathEX(absoluteAppPath, 29);
+        variables[L"NETHASH30"] = CalculateNetPathEX(absoluteAppPath, 30);
+        variables[L"NETHASH31"] = CalculateNetPathEX(absoluteAppPath, 31);
+        variables[L"NETHASH32"] = CalculateNetPathEX(absoluteAppPath, 32);
+        variables[L"NETHASH33"] = CalculateNetPathEX(absoluteAppPath, 33);
+        variables[L"NETHASH34"] = CalculateNetPathEX(absoluteAppPath, 34);
+        variables[L"NETHASH35"] = CalculateNetPathEX(absoluteAppPath, 35);
+        variables[L"NETHASH36"] = CalculateNetPathEX(absoluteAppPath, 36);
+        variables[L"NETHASH37"] = CalculateNetPathEX(absoluteAppPath, 37);
+        variables[L"NETHASH38"] = CalculateNetPathEX(absoluteAppPath, 38);
+        variables[L"NETHASH39"] = CalculateNetPathEX(absoluteAppPath, 39);
+        variables[L"NETHASH40"] = CalculateNetPathEX(absoluteAppPath, 40);
+        variables[L"NETHASH41"] = CalculateNetPathEX(absoluteAppPath, 41);
+        variables[L"NETHASH42"] = CalculateNetPathEX(absoluteAppPath, 42);
+        variables[L"NETHASH43"] = CalculateNetPathEX(absoluteAppPath, 43);
+        variables[L"NETHASH44"] = CalculateNetPathEX(absoluteAppPath, 44);
+        variables[L"NETHASH45"] = CalculateNetPathEX(absoluteAppPath, 45);
+        variables[L"NETHASH46"] = CalculateNetPathEX(absoluteAppPath, 46);
+        variables[L"NETHASH47"] = CalculateNetPathEX(absoluteAppPath, 47);
+        variables[L"NETHASH48"] = CalculateNetPathEX(absoluteAppPath, 48);
+        variables[L"NETHASH49"] = CalculateNetPathEX(absoluteAppPath, 49);
+        variables[L"NETHASH50"] = CalculateNetPathEX(absoluteAppPath, 50);
+        variables[L"NETHASH51"] = CalculateNetPathEX(absoluteAppPath, 51);
+        variables[L"NETHASH52"] = CalculateNetPathEX(absoluteAppPath, 52);
+        variables[L"NETHASH53"] = CalculateNetPathEX(absoluteAppPath, 53);
+        variables[L"NETHASH54"] = CalculateNetPathEX(absoluteAppPath, 54);
+        variables[L"NETHASH55"] = CalculateNetPathEX(absoluteAppPath, 55);
+        variables[L"NETHASH56"] = CalculateNetPathEX(absoluteAppPath, 56);
+        variables[L"NETHASH57"] = CalculateNetPathEX(absoluteAppPath, 57);
+        variables[L"NETHASH58"] = CalculateNetPathEX(absoluteAppPath, 58);
+        variables[L"NETHASH59"] = CalculateNetPathEX(absoluteAppPath, 59);
+        variables[L"NETHASH60"] = CalculateNetPathEX(absoluteAppPath, 60);
+        variables[L"NETHASH61"] = CalculateNetPathEX(absoluteAppPath, 61);
+        variables[L"NETHASH62"] = CalculateNetPathEX(absoluteAppPath, 62);
+        variables[L"NETHASH63"] = CalculateNetPathEX(absoluteAppPath, 63);
+        variables[L"NETHASH64"] = CalculateNetPathEX(absoluteAppPath, 64);
+        variables[L"NETHASH65"] = CalculateNetPathEX(absoluteAppPath, 65);
+        variables[L"NETHASH66"] = CalculateNetPathEX(absoluteAppPath, 66);
+        variables[L"NETHASH67"] = CalculateNetPathEX(absoluteAppPath, 67);
+        variables[L"NETHASH68"] = CalculateNetPathEX(absoluteAppPath, 68);
+        variables[L"NETHASH69"] = CalculateNetPathEX(absoluteAppPath, 69);
+        variables[L"NETHASH70"] = CalculateNetPathEX(absoluteAppPath, 70);
+        variables[L"NETHASH71"] = CalculateNetPathEX(absoluteAppPath, 71);
+        variables[L"NETHASH72"] = CalculateNetPathEX(absoluteAppPath, 72);
+        variables[L"NETHASH73"] = CalculateNetPathEX(absoluteAppPath, 73);
+        variables[L"NETHASH74"] = CalculateNetPathEX(absoluteAppPath, 74);
+        variables[L"NETHASH75"] = CalculateNetPathEX(absoluteAppPath, 75);
+        variables[L"NETHASH76"] = CalculateNetPathEX(absoluteAppPath, 76);
+        variables[L"NETHASH77"] = CalculateNetPathEX(absoluteAppPath, 77);
+        variables[L"NETHASH78"] = CalculateNetPathEX(absoluteAppPath, 78);
+        variables[L"NETHASH79"] = CalculateNetPathEX(absoluteAppPath, 79);
+        variables[L"NETHASH80"] = CalculateNetPathEX(absoluteAppPath, 80);
+        variables[L"NETHASH81"] = CalculateNetPathEX(absoluteAppPath, 81);
+        variables[L"NETHASH82"] = CalculateNetPathEX(absoluteAppPath, 82);
+        variables[L"NETHASH83"] = CalculateNetPathEX(absoluteAppPath, 83);
+        variables[L"NETHASH84"] = CalculateNetPathEX(absoluteAppPath, 84);
+        variables[L"NETHASH85"] = CalculateNetPathEX(absoluteAppPath, 85);
+        variables[L"NETHASH86"] = CalculateNetPathEX(absoluteAppPath, 86);
+        variables[L"NETHASH87"] = CalculateNetPathEX(absoluteAppPath, 87);
+        variables[L"NETHASH88"] = CalculateNetPathEX(absoluteAppPath, 88);
+        variables[L"NETHASH89"] = CalculateNetPathEX(absoluteAppPath, 89);
+        variables[L"NETHASH90"] = CalculateNetPathEX(absoluteAppPath, 90);
+        variables[L"NETHASH91"] = CalculateNetPathEX(absoluteAppPath, 91);
+        variables[L"NETHASH92"] = CalculateNetPathEX(absoluteAppPath, 92);
+        variables[L"NETHASH93"] = CalculateNetPathEX(absoluteAppPath, 93);
+        variables[L"NETHASH94"] = CalculateNetPathEX(absoluteAppPath, 94);
+        variables[L"NETHASH95"] = CalculateNetPathEX(absoluteAppPath, 95);
+        variables[L"NETHASH96"] = CalculateNetPathEX(absoluteAppPath, 96);
+        variables[L"NETHASH97"] = CalculateNetPathEX(absoluteAppPath, 97);
+        variables[L"NETHASH98"] = CalculateNetPathEX(absoluteAppPath, 98);
+        variables[L"NETHASH99"] = CalculateNetPathEX(absoluteAppPath, 99);
+        variables[L"NETHASH100"] = CalculateNetPathEX(absoluteAppPath, 100);
+        variables[L"NETHASH101"] = CalculateNetPathEX(absoluteAppPath, 101);
+        variables[L"NETHASH102"] = CalculateNetPathEX(absoluteAppPath, 102);
+        variables[L"NETHASH103"] = CalculateNetPathEX(absoluteAppPath, 103);
+        variables[L"NETHASH104"] = CalculateNetPathEX(absoluteAppPath, 104);
+        variables[L"NETHASH105"] = CalculateNetPathEX(absoluteAppPath, 105);
+        variables[L"NETHASH106"] = CalculateNetPathEX(absoluteAppPath, 106);
+        variables[L"NETHASH107"] = CalculateNetPathEX(absoluteAppPath, 107);
+        variables[L"NETHASH108"] = CalculateNetPathEX(absoluteAppPath, 108);
+        variables[L"NETHASH109"] = CalculateNetPathEX(absoluteAppPath, 109);
+        variables[L"NETHASH110"] = CalculateNetPathEX(absoluteAppPath, 110);
+        variables[L"NETHASH111"] = CalculateNetPathEX(absoluteAppPath, 111);
+        variables[L"NETHASH112"] = CalculateNetPathEX(absoluteAppPath, 112);
+        variables[L"NETHASH113"] = CalculateNetPathEX(absoluteAppPath, 113);
+        variables[L"NETHASH114"] = CalculateNetPathEX(absoluteAppPath, 114);
+        variables[L"NETHASH115"] = CalculateNetPathEX(absoluteAppPath, 115);
+        variables[L"NETHASH116"] = CalculateNetPathEX(absoluteAppPath, 116);
+        variables[L"NETHASH117"] = CalculateNetPathEX(absoluteAppPath, 117);
+        variables[L"NETHASH118"] = CalculateNetPathEX(absoluteAppPath, 118);
+        variables[L"NETHASH119"] = CalculateNetPathEX(absoluteAppPath, 119);
+        variables[L"NETHASH120"] = CalculateNetPathEX(absoluteAppPath, 120);
+        variables[L"NETHASH121"] = CalculateNetPathEX(absoluteAppPath, 121);
+        variables[L"NETHASH122"] = CalculateNetPathEX(absoluteAppPath, 122);
+        variables[L"NETHASH123"] = CalculateNetPathEX(absoluteAppPath, 123);
+        variables[L"NETHASH124"] = CalculateNetPathEX(absoluteAppPath, 124);
+        variables[L"NETHASH125"] = CalculateNetPathEX(absoluteAppPath, 125);
+        variables[L"NETHASH126"] = CalculateNetPathEX(absoluteAppPath, 126);
+        variables[L"NETHASH127"] = CalculateNetPathEX(absoluteAppPath, 127);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
