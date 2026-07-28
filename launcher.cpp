@@ -478,25 +478,23 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension
         appFilenameStr = appFilenameStr.substr(0, dotPos);
     }
 
-    // 1. 构造 URI: "file:///" + 原始路径(保留 .exe 扩展名)
-    //    反斜杠转正斜杠(.NET Uri 规范化),并全部大写化
-    std::wstring uri = L"file:///" + absoluteAppPath;
-    for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';
-        else if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+    // 1. 构造哈希输入：.NET 10 保留了反斜杠和 file:/// 前缀
+    //    不再使用 BinaryFormatter(NRBF) 序列化，直接哈希字符串本身
+    std::wstring hashInput = L"file:///" + absoluteAppPath;
+    for (auto& ch : hashInput) {
+        // 注意: 不转换反斜杠为正斜杠!
+        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
     }
-    // 结果: "FILE:///D:/LOCALE/OTHER/ASSETSTUDIO/APP/ASSETSTUDIO.GUI.EXE"
+    // 结果: "FILE:///D:\LOCALE\OTHER\ASSETSTUDIO\APP\ASSETSTUDIO.GUI.EXE"
 
     // 2. 转换为 UTF-8
-    std::string utf8Uri;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-    utf8Uri.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
+    std::string utf8Input;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, hashInput.c_str(), (int)hashInput.length(), NULL, 0, NULL, NULL);
+    utf8Input.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, hashInput.c_str(), (int)hashInput.length(), &utf8Input[0], size_needed, NULL, NULL);
 
-    // 3. [修改] .NET 10+ 直接对 UTF-8 字节做 SHA1
-    //    不再使用 BinaryFormatter(NRBF) 序列化,也不使用 BinaryWriter 的 7-bit 长度前缀
-    //    (BinaryFormatter 在 .NET 9+ 已废弃, .NET 10+ 已移除, ClickOnce 改为直接哈希字符串)
-    std::vector<uint8_t> serializedData(utf8Uri.begin(), utf8Uri.end());
+    // 3. 直接对 UTF-8 字节做 SHA1 (无 NRBF 头，无 7-bit 长度前缀)
+    std::vector<uint8_t> serializedData(utf8Input.begin(), utf8Input.end());
 
     // 4. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
