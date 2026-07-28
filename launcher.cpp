@@ -467,7 +467,15 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
+std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension = false) {
+    if (removeExtension) {
+        size_t dotPos = absoluteAppPath.find_last_of(L".");
+        size_t slashPos = absoluteAppPath.find_last_of(L"\\/");
+        if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
+            absoluteAppPath = absoluteAppPath.substr(0, dotPos);
+        }
+    }
+
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
@@ -6095,6 +6103,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
         variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath);
+        variables[L"NETHASH2"] = CalculateNetPath(absoluteAppPath, true);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
