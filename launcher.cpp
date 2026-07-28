@@ -468,48 +468,38 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
 std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension = false) {
-    // [替换] 开头这段：不要在这里改 absoluteAppPath（会导致哈希输入错误）
-    std::wstring fullPath = absoluteAppPath;
-
-    // 可选但建议：先标准化成绝对路径（与 .NET Path.GetFullPath 对齐）
-    wchar_t normalizedPath[MAX_PATH];
-    DWORD n = GetFullPathNameW(fullPath.c_str(), MAX_PATH, normalizedPath, nullptr);
-    if (n > 0 && n < MAX_PATH) {
-        fullPath.assign(normalizedPath);
-    }
-
-    const wchar_t* appFilenameWithExt = PathFindFileNameW(fullPath.c_str());
-    if (!appFilenameWithExt || wcslen(appFilenameWithExt) == 0) return L"";
-
-    // removeExtension 只作用于输出名，不作用于 fullPath（哈希输入）
-    std::wstring appName = appFilenameWithExt;
+    // 1. 处理扩展名：.NET 10 会剥离 .exe / .dll 扩展名
     if (removeExtension) {
-        size_t dotPos = appName.find_last_of(L'.');
-        if (dotPos != std::wstring::npos) {
-            appName = appName.substr(0, dotPos);
+        size_t dotPos = absoluteAppPath.find_last_of(L".");
+        size_t slashPos = absoluteAppPath.find_last_of(L"\\/");
+        if (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos)) {
+            absoluteAppPath = absoluteAppPath.substr(0, dotPos);
         }
     }
 
-    // 1. 构造 URI: "file:///" + 路径（反斜杠转正斜杠）→ 全部大写
-    // [替换] URI 构造时使用 fullPath（始终带扩展名）
-    std::wstring uri = L"file:///" + fullPath;
-    for (auto& ch : uri) {
-        if (ch == L'\\') ch = L'/';           // [修改] 反斜杠 → 正斜杠
-        else if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
-    }
-    // 结果示例: "FILE:///Z:/PATH/ASSETSTUDIO.GUI.EXE"
+    const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
+    if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 2. 转换为 UTF-8
+    // 2. 构造 URI: "file:///" + 路径
+    std::wstring uri = L"file:///" + absoluteAppPath;
+    for (auto& ch : uri) {
+        if (ch == L'\\') ch = L'/';  // 反斜杠转正斜杠 (Uri.AbsoluteUri 的标准行为)
+        
+        // [极其关键的修改] 删除了 ToUpperInvariant() 的逻辑！
+        // .NET 10 保留了原始大小写，以兼容 Linux/macOS 的大小写敏感特性
+    }
+    // 结果示例: "file:///D:/Locale/Other/AssetStudio/App/AssetStudio.GUI" (注意 file 是小写，路径保留原样)
+
+    // 3. 转换为 UTF-8
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. [修改] BinaryWriter.Write(string) 格式（无 BinaryFormatter 头部！）
-    //    对应 .NET 源码: BinaryWriter b; b.Write(name.ToUpperInvariant());
+    // 4. BinaryWriter.Write(string) 格式（无 BinaryFormatter 头部！）
     std::vector<uint8_t> serializedData;
 
-    // 3a. 7-bit 变长长度前缀（LEB128 编码）
+    // 4a. 7-bit 变长长度前缀（LEB128 编码）
     size_t val = utf8Uri.length();
     while (val >= 0x80) {
         serializedData.push_back(static_cast<uint8_t>((val & 0x7F) | 0x80));
@@ -517,15 +507,14 @@ std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension
     }
     serializedData.push_back(static_cast<uint8_t>(val & 0x7F));
 
-    // 3b. UTF-8 字节数据（直接跟在长度后面，无 NRBF 头，无 MessageEnd）
+    // 4b. UTF-8 字节数据（直接跟在长度后面，无 NRBF 头，无 MessageEnd）
     serializedData.insert(serializedData.end(), utf8Uri.begin(), utf8Uri.end());
 
-    // 4. SHA1 & Base32（不变）
+    // 5. SHA1 & Base32
     std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    // [替换] 返回值前缀改为 appName
-    return appName + L"_Url_" + base32Hash;
+    return std::wstring(appFilename) + L"_Url_" + base32Hash;
 }
 
 std::wstring trim(const std::wstring& s) {
