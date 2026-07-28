@@ -467,7 +467,7 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath, int mode) {
+std::wstring CalculateNetPathEx(std::wstring absoluteAppPath, int mode) {
     if (mode < 0 || mode >= 1728) return L"";
 
     // 通过 mode 还原 8 个维度的配置 (0 ~ 1727)
