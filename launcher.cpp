@@ -490,7 +490,7 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath, int type = 1)
 
     std::vector<uint8_t> inputBytes;
 
-    // 2. 根据 type 准备对应的字节数据（完全整合代码2的各种猜测）
+    // 2. 根据 type 准备对应的字节数据
     switch (type) {
         case 1: {
             // === 猜测 1: UTF-16LE + 大写 + 反斜杠 ===
@@ -533,7 +533,7 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath, int type = 1)
             break;
         }
         case 5: {
-            // === 猜测 3 变体 (代码2追加项)：UTF-16LE + 纯路径原样(正斜杠) ===
+            // === 猜测 3 变体：UTF-16LE + 纯路径原样(正斜杠) ===
             std::wstring purePath = absoluteAppPath;
             for (auto& ch : purePath) {
                 if (ch == L'\\') ch = L'/';
@@ -542,14 +542,14 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath, int type = 1)
             break;
         }
         case 6: {
-            // === 对照组 变体 (代码2追加项)：UTF-8 + 大写 + 反斜杠 ===
+            // === 对照组 变体：UTF-8 + 大写 + 反斜杠 ===
             std::wstring uri = L"file:///" + absoluteAppPath;
             for (auto& ch : uri) {
                 if (ch >= L'a' && ch <= L'z') ch -= 32;
             }
             int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
             std::string utf8Uri(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)utf8Uri[0], size_needed, NULL, NULL);
+            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
             inputBytes = std::vector<uint8_t>(utf8Uri.begin(), utf8Uri.end());
             break;
         }
