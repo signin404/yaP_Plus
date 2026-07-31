@@ -471,34 +471,46 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 构造 URI: "file:///" + 原始路径
-    std::wstring uri = L"file:///" + absoluteAppPath;
+    // 1. 处理前缀：.NET 10 使用 Assembly Name，即自动去掉 .exe 后缀
+    std::wstring prefix = appFilename;
+    if (prefix.length() > 4 && _wcsicmp(prefix.c_str() + prefix.length() - 4, L".exe") == 0) {
+        prefix.resize(prefix.length() - 4);
+    }
+
+    // 2. 提取目录路径 (模拟 AppDomain.CurrentDomain.BaseDirectory)
+    std::wstring dir = absoluteAppPath;
+    if (wcslen(appFilename) > 0) {
+        dir = absoluteAppPath.substr(0, absoluteAppPath.length() - wcslen(appFilename));
+    }
     
-    // 2. .NET 10 变更点：
-    //    a. 将反斜杠替换为正斜杠
-    //    b. 将所有字母转为小写
+    // .NET 的 BaseDirectory 必须以斜杠结尾
+    if (dir.empty() || (dir.back() != L'\\' && dir.back() != L'/')) {
+        dir += L'\\';
+    }
+
+    // 3. 构造 URI: "file:///" + 目录路径
+    std::wstring uri = L"file:///" + dir;
+    
+    // 4. 替换反斜杠为正斜杠，且【保留原始大小写】(Uri.AbsoluteUri 的默认行为)
     for (auto& ch : uri) {
         if (ch == L'\\') {
             ch = L'/';
-        } else if (ch >= L'A' && ch <= L'Z') {
-            ch = ch - L'A' + L'a';
         }
     }
+    // 结果示例: "file:///Z:/AssetStudio/App/"
 
-    // 3. 转换为纯 UTF-8 字节 (注意：.NET 10 不再需要 BinaryFormatter 包装！)
+    // 5. 转换为纯 UTF-8 字节 (无 BinaryFormatter 包装)
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 4. 直接对 UTF-8 字符串计算 SHA1
+    // 6. 计算 SHA1 & Base32
     std::vector<uint8_t> inputBytes(utf8Uri.begin(), utf8Uri.end());
     std::vector<uint8_t> sha1Hash = CalculateSHA1(inputBytes);
-    
-    // 5. Base32 编码
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    return std::wstring(appFilename) + L"_Url_" + base32Hash;
+    return prefix + L"_Url_" + base32Hash;
 }
 
 std::wstring trim(const std::wstring& s) {
