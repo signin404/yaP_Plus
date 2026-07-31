@@ -21,6 +21,7 @@
 #include <netfw.h>
 #include <winreg.h>
 #include <iomanip>
+#include <iostream>
 #include <atlbase.h>
 #include <psapi.h>
 #include <locale>
