@@ -484,13 +484,6 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
             ch = ch - L'A' + L'a';
         }
     }
-    // 结果: "FILE:///Z:\ONTOPREPLICA\APP\ONTOPREPLICA.EXE"
-
-    // 2. 转换为 UTF-8
-    std::string utf8Uri;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-    utf8Uri.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
     // 3. 转换为纯 UTF-8 字节 (注意：.NET 10 不再需要 BinaryFormatter 包装！)
     std::string utf8Uri;
