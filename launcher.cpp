@@ -486,6 +486,7 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     std::wstring uri = L"file:///" + absoluteAppPath;
     for (auto& ch : uri) {
         if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+		if (ch == L'\\') ch = L'/';
     }
     // 结果: "FILE:///Z:\ASSETSTUDIO\APP\ASSETSTUDIO.GUI.EXE"
 
