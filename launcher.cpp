@@ -467,40 +467,45 @@ std::wstring ToBase32StringSuitableForDirName(const std::vector<uint8_t>& buff) 
 }
 
 // [新增] 模拟 .NET 逻辑计算含有 Url 及 SHA1 校验码的文件名段
-std::wstring CalculateNetPath(std::wstring absoluteAppPath, bool removeExtension = false) {
-    // .NET 10+: 目录名前缀恒定去扩展名(忽略 removeExtension 参数)
+std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    std::wstring appFilenameStr(appFilename);
-    size_t dotPos = appFilenameStr.find_last_of(L".");
-    if (dotPos != std::wstring::npos) {
-        appFilenameStr = appFilenameStr.substr(0, dotPos);
+    // 1. 构造 URI: "file:///" + 原始路径
+    std::wstring uri = L"file:///" + absoluteAppPath;
+    
+    // 2. .NET 10 变更点：
+    //    a. 将反斜杠替换为正斜杠
+    //    b. 将所有字母转为小写
+    for (auto& ch : uri) {
+        if (ch == L'\\') {
+            ch = L'/';
+        } else if (ch >= L'A' && ch <= L'Z') {
+            ch = ch - L'A' + L'a';
+        }
     }
-
-    // 1. 构造哈希输入：.NET 10 保留了反斜杠和 file:/// 前缀
-    //    不再使用 BinaryFormatter(NRBF) 序列化，直接哈希字符串本身
-    std::wstring hashInput = L"file:///" + absoluteAppPath;
-    for (auto& ch : hashInput) {
-        // 注意: 不转换反斜杠为正斜杠!
-        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
-    }
-    // 结果: "FILE:///D:\LOCALE\OTHER\ASSETSTUDIO\APP\ASSETSTUDIO.GUI.EXE"
+    // 结果: "FILE:///Z:\ONTOPREPLICA\APP\ONTOPREPLICA.EXE"
 
     // 2. 转换为 UTF-8
-    std::string utf8Input;
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, hashInput.c_str(), (int)hashInput.length(), NULL, 0, NULL, NULL);
-    utf8Input.resize(size_needed);
-    WideCharToMultiByte(CP_UTF8, 0, hashInput.c_str(), (int)hashInput.length(), &utf8Input[0], size_needed, NULL, NULL);
+    std::string utf8Uri;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+    utf8Uri.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 3. 直接对 UTF-8 字节做 SHA1 (无 NRBF 头，无 7-bit 长度前缀)
-    std::vector<uint8_t> serializedData(utf8Input.begin(), utf8Input.end());
+    // 3. 转换为纯 UTF-8 字节 (注意：.NET 10 不再需要 BinaryFormatter 包装！)
+    std::string utf8Uri;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
+    utf8Uri.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 4. SHA1 & Base32
-    std::vector<uint8_t> sha1Hash = CalculateSHA1(serializedData);
+    // 4. 直接对 UTF-8 字符串计算 SHA1
+    std::vector<uint8_t> inputBytes(utf8Uri.begin(), utf8Uri.end());
+    std::vector<uint8_t> sha1Hash = CalculateSHA1(inputBytes);
+    
+    // 5. Base32 编码
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
 
-    return appFilenameStr + L"_Url_" + base32Hash;
+    return std::wstring(appFilename) + L"_Url_" + base32Hash;
 }
 
 std::wstring trim(const std::wstring& s) {
