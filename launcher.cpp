@@ -478,90 +478,31 @@ std::vector<uint8_t> GetBytes_UTF16LE(const std::wstring& str) {
 }
 
 // [合并] 遵循代码 1 结构，通过 type 切换不同算法，不产生任何 I/O 打印
-std::wstring CalculateNetPath(const std::wstring& absoluteAppPath, int type = 1) {
+std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 处理前缀：安全去掉 .exe
+    // 1. 处理前缀：.NET 10 使用 Assembly.GetName().Name，天然不带 .exe 后缀
     std::wstring prefix = appFilename;
     if (prefix.length() > 4 && _wcsicmp(prefix.c_str() + prefix.length() - 4, L".exe") == 0) {
         prefix.resize(prefix.length() - 4);
     }
 
-    std::vector<uint8_t> inputBytes;
+    // 2. 哈希输入：.NET 10 直接使用原始路径字符串！
+    // 不拼接 file:///、不转大写、不替换反斜杠、不用 UTF-16LE
+    // 直接就是: "Z:\AssetStudio\App\AssetStudio.GUI.exe"
 
-    // 2. 根据 type 准备对应的字节数据
-    switch (type) {
-        case 1: {
-            // === 猜测 1: UTF-16LE + 大写 + 反斜杠 ===
-            std::wstring uri = L"file:///" + absoluteAppPath;
-            for (auto& ch : uri) {
-                if (ch >= L'a' && ch <= L'z') ch -= 32;
-            }
-            inputBytes = GetBytes_UTF16LE(uri);
-            break;
-        }
-        case 2: {
-            // === 猜测 2: UTF-16LE + 小写 + 正斜杠 ===
-            std::wstring uri = L"file:///" + absoluteAppPath;
-            for (auto& ch : uri) {
-                if (ch == L'\\') ch = L'/';
-            }
-            inputBytes = GetBytes_UTF16LE(uri);
-            break;
-        }
-        case 3: {
-            // === 猜测 3: UTF-16LE + 纯路径大写 ===
-            std::wstring purePath = absoluteAppPath;
-            for (auto& ch : purePath) {
-                if (ch >= L'a' && ch <= L'z') ch -= 32;
-            }
-            inputBytes = GetBytes_UTF16LE(purePath);
-            break;
-        }
-        case 4: {
-            // === 对照组 (代码1原始逻辑)：UTF-8 + 大写 + 正斜杠 ===
-            std::wstring uri = L"file:///" + absoluteAppPath;
-            for (auto& ch : uri) {
-                if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
-                if (ch == L'\\') ch = L'/';
-            }
-            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-            std::string utf8Uri(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
-            inputBytes = std::vector<uint8_t>(utf8Uri.begin(), utf8Uri.end());
-            break;
-        }
-        case 5: {
-            // === 猜测 3 变体：UTF-16LE + 纯路径原样(正斜杠) ===
-            std::wstring purePath = absoluteAppPath;
-            for (auto& ch : purePath) {
-                if (ch == L'\\') ch = L'/';
-            }
-            inputBytes = GetBytes_UTF16LE(purePath);
-            break;
-        }
-        case 6: {
-            // === 对照组 变体：UTF-8 + 大写 + 反斜杠 ===
-            std::wstring uri = L"file:///" + absoluteAppPath;
-            for (auto& ch : uri) {
-                if (ch >= L'a' && ch <= L'z') ch -= 32;
-            }
-            int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
-            std::string utf8Uri(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
-            inputBytes = std::vector<uint8_t>(utf8Uri.begin(), utf8Uri.end());
-            break;
-        }
-        default:
-            return L"";
-    }
+    // 3. 转换为纯 UTF-8 字节
+    std::string utf8Path;
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, absoluteAppPath.c_str(), (int)absoluteAppPath.length(), NULL, 0, NULL, NULL);
+    utf8Path.resize(size_needed);
+    WideCharToMultiByte(CP_UTF8, 0, absoluteAppPath.c_str(), (int)absoluteAppPath.length(), &utf8Path[0], size_needed, NULL, NULL);
 
-    // 3. 计算二进制数据的 SHA1 值
+    // 4. 计算 SHA1 & Base32
+    std::vector<uint8_t> inputBytes(utf8Path.begin(), utf8Path.end());
     std::vector<uint8_t> sha1Hash = CalculateSHA1(inputBytes);
-
-    // 4. 进行 Base32 编码并返回结果
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
+
     return prefix + L"_Url_" + base32Hash;
 }
 
@@ -6134,12 +6075,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
         variables[L"APPEXE"] = absoluteAppPath;
-        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath, 1);
-		variables[L"NETHASH2"] = CalculateNetPath(absoluteAppPath, 2);
-		variables[L"NETHASH3"] = CalculateNetPath(absoluteAppPath, 3);
-		variables[L"NETHASH4"] = CalculateNetPath(absoluteAppPath, 4);
-		variables[L"NETHASH5"] = CalculateNetPath(absoluteAppPath, 5);
-		variables[L"NETHASH6"] = CalculateNetPath(absoluteAppPath, 6);
+        variables[L"NETHASH"] = CalculateNetPath(absoluteAppPath);
         wchar_t appDir[MAX_PATH];
         wcscpy_s(appDir, absoluteAppPath.c_str());
         PathRemoveFileSpecW(appDir);
