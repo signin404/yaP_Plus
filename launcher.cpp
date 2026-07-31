@@ -471,41 +471,31 @@ std::wstring CalculateNetPath(const std::wstring& absoluteAppPath) {
     const wchar_t* appFilename = PathFindFileNameW(absoluteAppPath.c_str());
     if (!appFilename || wcslen(appFilename) == 0) return L"";
 
-    // 1. 处理前缀：.NET 10 使用 Assembly Name，即自动去掉 .exe 后缀
+    // 1. 处理前缀：.NET 10 使用 Assembly.GetName().Name，天然不带 .exe 后缀
     std::wstring prefix = appFilename;
-    if (prefix.length() > 4 && _wcsicmp(prefix.c_str() + prefix.length() - 4, L".exe") == 0) {
-        prefix.resize(prefix.length() - 4);
-    }
-
-    // 2. 提取目录路径 (模拟 AppDomain.CurrentDomain.BaseDirectory)
-    std::wstring dir = absoluteAppPath;
-    if (wcslen(appFilename) > 0) {
-        dir = absoluteAppPath.substr(0, absoluteAppPath.length() - wcslen(appFilename));
-    }
-    
-    // .NET 的 BaseDirectory 必须以斜杠结尾
-    if (dir.empty() || (dir.back() != L'\\' && dir.back() != L'/')) {
-        dir += L'\\';
-    }
-
-    // 3. 构造 URI: "file:///" + 目录路径
-    std::wstring uri = L"file:///" + dir;
-    
-    // 4. 替换反斜杠为正斜杠，且【保留原始大小写】(Uri.AbsoluteUri 的默认行为)
-    for (auto& ch : uri) {
-        if (ch == L'\\') {
-            ch = L'/';
+    if (prefix.length() > 4) {
+        if (prefix[prefix.length()-4] == L'.' &&
+           (prefix[prefix.length()-3] == L'e' || prefix[prefix.length()-3] == L'E') &&
+           (prefix[prefix.length()-2] == L'x' || prefix[prefix.length()-2] == L'X') &&
+           (prefix[prefix.length()-1] == L'e' || prefix[prefix.length()-1] == L'E')) {
+            prefix.resize(prefix.length() - 4);
         }
     }
-    // 结果示例: "file:///Z:/AssetStudio/App/"
 
-    // 5. 转换为纯 UTF-8 字节 (无 BinaryFormatter 包装)
+    // 2. 构造 URI: "file:///" + 原始路径 → 全部大写 (与 .NET 4.7 的输入完全一致！)
+    std::wstring uri = L"file:///" + absoluteAppPath;
+    for (auto& ch : uri) {
+        if (ch >= L'a' && ch <= L'z') ch = ch - L'a' + L'A';
+    }
+    // 结果: "FILE:///Z:\ASSETSTUDIO\APP\ASSETSTUDIO.GUI.EXE"
+
+    // 3. 转换为纯 UTF-8 字节
     std::string utf8Uri;
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), NULL, 0, NULL, NULL);
     utf8Uri.resize(size_needed);
     WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), (int)uri.length(), &utf8Uri[0], size_needed, NULL, NULL);
 
-    // 6. 计算 SHA1 & Base32
+    // 4. 直接对纯文本计算 SHA1 (去掉了所有 BinaryFormatter 序列化的垃圾数据)
     std::vector<uint8_t> inputBytes(utf8Uri.begin(), utf8Uri.end());
     std::vector<uint8_t> sha1Hash = CalculateSHA1(inputBytes);
     std::wstring base32Hash = ToBase32StringSuitableForDirName(sha1Hash);
