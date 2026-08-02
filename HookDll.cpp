@@ -6475,11 +6475,7 @@ void EnumerateFilesNt(const std::wstring& ntPath, bool isSandbox, std::map<std::
                         if (info->ShortNameLength > 0) {
                             entry.ShortName = std::wstring(info->ShortName, info->ShortNameLength / sizeof(wchar_t));
                         }
-
-                        // [修改] 剥离只读属性 防止游戏遍历目录时发现只读文件报错
-                        entry.FileAttributes = info->FileAttributes & ~FILE_ATTRIBUTE_READONLY;
-                        if (entry.FileAttributes == 0) entry.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-
+                        entry.FileAttributes = info->FileAttributes;
                         entry.CreationTime = info->CreationTime;
                         entry.LastAccessTime = info->LastAccessTime;
                         entry.LastWriteTime = info->LastWriteTime;
@@ -6849,11 +6845,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
             RtlInitUnicodeString(&uStr, targetNtPath.c_str());
             PUNICODE_STRING oldName = ObjectAttributes->ObjectName;
             HANDLE oldRoot = ObjectAttributes->RootDirectory;
-
-            // [新增] 保存并移除原始安全描述符 强制继承沙盒的默认用户读写权限
-            PVOID oldSd = ObjectAttributes->SecurityDescriptor;
-            ObjectAttributes->SecurityDescriptor = NULL;
-
             ObjectAttributes->ObjectName = &uStr;
             ObjectAttributes->RootDirectory = NULL;
 
@@ -6866,9 +6857,6 @@ NTSTATUS NTAPI Detour_NtCreateFile(
 
             ObjectAttributes->ObjectName = oldName;
             ObjectAttributes->RootDirectory = oldRoot;
-
-            // [新增] 恢复原始安全描述符
-            ObjectAttributes->SecurityDescriptor = oldSd;
             return status;
         }
     }
@@ -7268,28 +7256,14 @@ NTSTATUS NTAPI Detour_NtQueryAttributesFile(POBJECT_ATTRIBUTES ObjectAttributes,
         NTSTATUS status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
         ObjectAttributes->ObjectName = oldName;
         ObjectAttributes->RootDirectory = oldRoot;
+        if (status == STATUS_SUCCESS) return status;
 
-        if (status == STATUS_SUCCESS) {
-            // [新增] 欺骗程序：沙盒内的文件始终可写
-            FileInformation->FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-            if (FileInformation->FileAttributes == 0) FileInformation->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-            return status;
-        }
-
-        // 2. 如果沙盒没有 检查真实路径是否被隐藏
+        // 2. [新增] 如果沙盒没有 检查真实路径是否被隐藏
         if (g_HookMode == 3) {
             if (!IsPathVisible(fullNtPath)) {
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
-
-        // 3. [新增] 查询真实路径并剥离只读属性
-        status = fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
-        if (NT_SUCCESS(status)) {
-            FileInformation->FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-            if (FileInformation->FileAttributes == 0) FileInformation->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-        }
-        return status;
     }
     return fpNtQueryAttributesFile(ObjectAttributes, FileInformation);
 }
@@ -7322,12 +7296,7 @@ NTSTATUS NTAPI Detour_NtQueryFullAttributesFile(POBJECT_ATTRIBUTES ObjectAttribu
         ObjectAttributes->RootDirectory = oldRoot;
 
         // 如果沙盒中存在 直接返回
-        if (status == STATUS_SUCCESS) {
-            // [新增] 欺骗程序：沙盒内的文件始终可写
-            FileInformation->FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-            if (FileInformation->FileAttributes == 0) FileInformation->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-            return status;
-        }
+        if (status == STATUS_SUCCESS) return status;
 
         // [Mode 3] 隐藏检查：如果沙盒没有 且真实路径被策略隐藏 则返回未找到
         if (g_HookMode == 3) {
@@ -7808,26 +7777,6 @@ NTSTATUS NTAPI Detour_NtQueryInformationFile(
     NTSTATUS status = fpNtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (NT_SUCCESS(status)) {
-
-        // [新增] 剥离只读属性 (如果文件在重定向范围内)
-        if (FileInformationClass == FileBasicInformation || FileInformationClass == FileAllInformation) {
-            std::wstring rawPath = GetPathFromHandle(FileHandle);
-            std::wstring ntPath = DevicePathToNtPath(rawPath);
-            std::wstring targetPath;
-
-            if (ShouldRedirect(ntPath, targetPath)) {
-                if (FileInformationClass == FileBasicInformation && Length >= sizeof(FILE_BASIC_INFORMATION)) {
-                    PFILE_BASIC_INFORMATION pBasic = (PFILE_BASIC_INFORMATION)FileInformation;
-                    pBasic->FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-                    if (pBasic->FileAttributes == 0) pBasic->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-                }
-                else if (FileInformationClass == FileAllInformation && Length >= sizeof(FILE_ALL_INFORMATION)) {
-                    PFILE_ALL_INFORMATION pAll = (PFILE_ALL_INFORMATION)FileInformation;
-                    pAll->BasicInformation.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
-                    if (pAll->BasicInformation.FileAttributes == 0) pAll->BasicInformation.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-                }
-            }
-        }
 
         // [新增] File ID 混淆逻辑
         PLARGE_INTEGER pFileId = NULL;
