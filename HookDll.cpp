@@ -11,8 +11,6 @@
 #include <vector>
 #include <algorithm>
 #include <stdio.h>
-#include "MinHook.h"
-#include "IpcCommon.h"
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -26,6 +24,8 @@
 #include <shlobj.h>
 #include <knownfolders.h>
 #include <objbase.h>
+#include "MinHook.h"
+#include "IpcCommon.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -2040,6 +2040,76 @@ std::wstring GetReparseTarget(const std::wstring& path) {
     return target;
 }
 
+// [新增] 剥离 .NET 程序的 _Url_ 哈希和版本号
+void StripDotNetConfigHash(std::wstring& path) {
+    if (path.empty()) return;
+
+    // 转换为小写进行查找 忽略大小写差异
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    // 检查是否在 AppData\Local 目录下
+    size_t localPos = lowerPath.find(L"appdata\\local\\");
+    if (localPos == std::wstring::npos) return;
+
+    // 查找 _url_ 特征
+    size_t urlPos = lowerPath.find(L"_url_", localPos);
+    if (urlPos == std::wstring::npos) return;
+
+    size_t hashStartPos = urlPos + 5; // L"_url_" 长度为 5
+
+    // 找到哈希结束的位置 (下一个斜杠或字符串末尾)
+    size_t hashEndPos = path.find(L'\\', hashStartPos);
+    bool hasSlash1 = (hashEndPos != std::wstring::npos);
+    if (!hasSlash1) {
+        hashEndPos = path.length();
+    }
+
+    // 1. [严格] 检查哈希长度是否为 32
+    if (hashEndPos - hashStartPos != 32) return;
+
+    // 2. [严格] 检查哈希是否仅包含字母和数字 (使用 iswalnum 更简洁)
+    for (size_t i = hashStartPos; i < hashEndPos; ++i) {
+        if (!iswalnum(path[i])) {
+            return; // 包含无效字符
+        }
+    }
+
+    // 如果路径在哈希后就结束了 直接擦除哈希部分
+    if (!hasSlash1) {
+        path.erase(urlPos);
+        return;
+    }
+
+    // 哈希验证通过 继续查找版本号目录
+    size_t versionStartPos = hashEndPos + 1;
+    size_t versionEndPos = path.find(L'\\', versionStartPos);
+    if (versionEndPos == std::wstring::npos) {
+        versionEndPos = path.length();
+    }
+
+    // 验证后续目录是否为版本号 (仅包含数字和点)
+    bool isVersion = (versionEndPos > versionStartPos);
+    if (isVersion) {
+        for (size_t i = versionStartPos; i < versionEndPos; ++i) {
+            wchar_t c = path[i];
+            if (c != L'.' && (c < L'0' || c > L'9')) {
+                isVersion = false;
+                break;
+            }
+        }
+    }
+
+    // 根据是否存在版本号执行不同的擦除逻辑
+    if (isVersion) {
+        // 存在版本号：删除 _Url_ 到版本号目录结束的部分
+        path.erase(urlPos, versionEndPos - urlPos);
+    } else {
+        // 不存在版本号：仅删除 _Url_ 到哈希结束的部分
+        path.erase(urlPos, hashEndPos - urlPos);
+    }
+}
+
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
 // 必须放在 NtPathToDosPath 之后 Detour_NtCreateFile 之前
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
@@ -2088,6 +2158,9 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         if (suffix.empty()) suffix = component;
         else suffix = component + L"\\" + suffix;
     }
+
+    // [新增] 剥离 .NET 程序的 _Url_ 哈希和版本号
+    StripDotNetConfigHash(currentPath);
 
     // 3. 转回 NT 路径
     // 如果解析出了 Z:\aaa\1.txt 这里返回 \??\Z:\aaa\1.txt
@@ -11258,6 +11331,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
             // 下面这些通常只在 hookfile 启用时才需要 但为了保险起见也可以挂钩
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
