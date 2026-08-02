@@ -4203,6 +4203,16 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                 }
             }
 
+            // [新增] 1.5 自动创建符号链接的父键 (如果不存在)
+            size_t lastSlash = arg.subKey.find_last_of(L'\\');
+            if (lastSlash != std::wstring::npos) {
+                std::wstring parentSubKey = arg.subKey.substr(0, lastSlash);
+                HKEY hParentKey;
+                if (RegCreateKeyExW(arg.hRootKey, parentSubKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hParentKey, NULL) == ERROR_SUCCESS) {
+                    RegCloseKey(hParentKey);
+                }
+            }
+
             // 2. 将已存在的注册表项重命名为 _Backup
             HKEY hTemp;
             if (RegOpenKeyExW(arg.hRootKey, arg.subKey.c_str(), 0, KEY_READ, &hTemp) == ERROR_SUCCESS) {
