@@ -2054,48 +2054,59 @@ void StripDotNetConfigHash(std::wstring& path) {
 
     // 查找 _url_ 特征
     size_t urlPos = lowerPath.find(L"_url_", localPos);
-    if (urlPos != std::wstring::npos) {
-        size_t hashStartPos = urlPos + 5; // length of "_url_"
+    if (urlPos == std::wstring::npos) return;
 
-        // 找到哈希结束的位置 (下一个斜杠)
-        size_t hashEndPos = path.find(L'\\', hashStartPos);
-        if (hashEndPos == std::wstring::npos) return; // 格式不完整
+    size_t hashStartPos = urlPos + 5; // L"_url_" 长度为 5
 
-        // 1. [严格] 检查哈希长度是否为 32
-        if (hashEndPos - hashStartPos != 32) {
-            return;
+    // 找到哈希结束的位置 (下一个斜杠或字符串末尾)
+    size_t hashEndPos = path.find(L'\\', hashStartPos);
+    bool hasSlash1 = (hashEndPos != std::wstring::npos);
+    if (!hasSlash1) {
+        hashEndPos = path.length();
+    }
+
+    // 1. [严格] 检查哈希长度是否为 32
+    if (hashEndPos - hashStartPos != 32) return;
+
+    // 2. [严格] 检查哈希是否仅包含字母和数字 (使用 iswalnum 更简洁)
+    for (size_t i = hashStartPos; i < hashEndPos; ++i) {
+        if (!iswalnum(path[i])) {
+            return; // 包含无效字符
         }
+    }
 
-        // 2. [严格] 检查哈希是否仅包含字母和数字
-        for (size_t i = hashStartPos; i < hashEndPos; ++i) {
-            if (!iswalnum(path[i])) {
-                return; // 包含无效字符
+    // 如果路径在哈希后就结束了 直接擦除哈希部分
+    if (!hasSlash1) {
+        path.erase(urlPos);
+        return;
+    }
+
+    // 哈希验证通过 继续查找版本号目录
+    size_t versionStartPos = hashEndPos + 1;
+    size_t versionEndPos = path.find(L'\\', versionStartPos);
+    if (versionEndPos == std::wstring::npos) {
+        versionEndPos = path.length();
+    }
+
+    // 验证后续目录是否为版本号 (仅包含数字和点)
+    bool isVersion = (versionEndPos > versionStartPos);
+    if (isVersion) {
+        for (size_t i = versionStartPos; i < versionEndPos; ++i) {
+            wchar_t c = path[i];
+            if (c != L'.' && (c < L'0' || c > L'9')) {
+                isVersion = false;
+                break;
             }
         }
+    }
 
-        // 哈希验证通过 继续查找版本号目录
-        size_t versionStartPos = hashEndPos + 1;
-        size_t versionEndPos = path.find(L'\\', versionStartPos);
-        size_t endOfRemovalPos = (versionEndPos != std::wstring::npos) ? versionEndPos : path.length();
-
-        // 验证版本号目录是否有效 (可选但推荐)
-        bool isVersion = true;
-        if (endOfRemovalPos > versionStartPos) {
-            for (size_t i = versionStartPos; i < endOfRemovalPos; ++i) {
-                wchar_t c = path[i];
-                if (c != L'.' && (c < L'0' || c > L'9')) {
-                    isVersion = false;
-                    break;
-                }
-            }
-        } else {
-            isVersion = false; // 版本号目录为空
-        }
-
-        if (isVersion) {
-            // 删除从 _Url_ 到版本号目录结束的部分
-            path.erase(urlPos, endOfRemovalPos - urlPos);
-        }
+    // 根据是否存在版本号执行不同的擦除逻辑
+    if (isVersion) {
+        // 存在版本号：删除 _Url_ 到版本号目录结束的部分
+        path.erase(urlPos, versionEndPos - urlPos);
+    } else {
+        // 不存在版本号：仅删除 _Url_ 到哈希结束的部分
+        path.erase(urlPos, hashEndPos - urlPos);
     }
 }
 
