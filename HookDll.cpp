@@ -2040,6 +2040,56 @@ std::wstring GetReparseTarget(const std::wstring& path) {
     return target;
 }
 
+// [新增] 剥离 .NET 程序的 _Url_ 哈希和版本号
+void StripDotNetConfigHash(std::wstring& path) {
+    if (path.empty()) return;
+
+    // 转换为小写进行查找，忽略大小写差异
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
+
+    // 检查是否在 AppData\Local 目录下
+    size_t localPos = lowerPath.find(L"appdata\\local\\");
+    if (localPos == std::wstring::npos) return;
+
+    // 查找 _url_ 特征
+    size_t urlPos = lowerPath.find(L"_url_", localPos);
+    if (urlPos != std::wstring::npos) {
+        // 找到 _Url_ 后的第一个斜杠 (哈希结束的位置)
+        size_t slash1 = path.find(L'\\', urlPos);
+        if (slash1 != std::wstring::npos) {
+            // 找到版本号后的斜杠
+            size_t slash2 = path.find(L'\\', slash1 + 1);
+            size_t endPos = (slash2 != std::wstring::npos) ? slash2 : path.length();
+
+            // 验证 slash1+1 到 endPos 之间是否为纯版本号 (仅包含数字和点)
+            bool isVersion = true;
+            if (endPos > slash1 + 1) {
+                for (size_t i = slash1 + 1; i < endPos; ++i) {
+                    wchar_t c = path[i];
+                    if (c != L'.' && (c < L'0' || c > L'9')) {
+                        isVersion = false;
+                        break;
+                    }
+                }
+            } else {
+                isVersion = false;
+            }
+
+            if (isVersion) {
+                // 删除 _Url_hash\version 部分
+                path.erase(urlPos, endPos - urlPos);
+            } else {
+                // 如果后面不是版本号，仅删除 _Url_hash 部分
+                path.erase(urlPos, slash1 - urlPos);
+            }
+        } else {
+            // 没有斜杠，说明路径刚好到 _Url_hash 结束
+            path.erase(urlPos);
+        }
+    }
+}
+
 // [新增] 路径规范化：解析短文件名、符号链接、Junction
 // 必须放在 NtPathToDosPath 之后 Detour_NtCreateFile 之前
 std::wstring NormalizeNtPath(const std::wstring& ntPath) {
@@ -2088,6 +2138,9 @@ std::wstring NormalizeNtPath(const std::wstring& ntPath) {
         if (suffix.empty()) suffix = component;
         else suffix = component + L"\\" + suffix;
     }
+
+    // [新增] 剥离 .NET 程序的 _Url_ 哈希和版本号
+    StripDotNetConfigHash(currentPath);
 
     // 3. 转回 NT 路径
     // 如果解析出了 Z:\aaa\1.txt 这里返回 \??\Z:\aaa\1.txt
