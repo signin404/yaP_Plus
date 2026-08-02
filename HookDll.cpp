@@ -2044,7 +2044,7 @@ std::wstring GetReparseTarget(const std::wstring& path) {
 void StripDotNetConfigHash(std::wstring& path) {
     if (path.empty()) return;
 
-    // 转换为小写进行查找，忽略大小写差异
+    // 转换为小写进行查找 忽略大小写差异
     std::wstring lowerPath = path;
     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), towlower);
 
@@ -2055,37 +2055,46 @@ void StripDotNetConfigHash(std::wstring& path) {
     // 查找 _url_ 特征
     size_t urlPos = lowerPath.find(L"_url_", localPos);
     if (urlPos != std::wstring::npos) {
-        // 找到 _Url_ 后的第一个斜杠 (哈希结束的位置)
-        size_t slash1 = path.find(L'\\', urlPos);
-        if (slash1 != std::wstring::npos) {
-            // 找到版本号后的斜杠
-            size_t slash2 = path.find(L'\\', slash1 + 1);
-            size_t endPos = (slash2 != std::wstring::npos) ? slash2 : path.length();
+        size_t hashStartPos = urlPos + 5; // length of "_url_"
 
-            // 验证 slash1+1 到 endPos 之间是否为纯版本号 (仅包含数字和点)
-            bool isVersion = true;
-            if (endPos > slash1 + 1) {
-                for (size_t i = slash1 + 1; i < endPos; ++i) {
-                    wchar_t c = path[i];
-                    if (c != L'.' && (c < L'0' || c > L'9')) {
-                        isVersion = false;
-                        break;
-                    }
-                }
-            } else {
-                isVersion = false;
+        // 找到哈希结束的位置 (下一个斜杠)
+        size_t hashEndPos = path.find(L'\\', hashStartPos);
+        if (hashEndPos == std::wstring::npos) return; // 格式不完整
+
+        // 1. [严格] 检查哈希长度是否为 32
+        if (hashEndPos - hashStartPos != 32) {
+            return;
+        }
+
+        // 2. [严格] 检查哈希是否仅包含字母和数字
+        for (size_t i = hashStartPos; i < hashEndPos; ++i) {
+            if (!iswalnum(path[i])) {
+                return; // 包含无效字符
             }
+        }
 
-            if (isVersion) {
-                // 删除 _Url_hash\version 部分
-                path.erase(urlPos, endPos - urlPos);
-            } else {
-                // 如果后面不是版本号，仅删除 _Url_hash 部分
-                path.erase(urlPos, slash1 - urlPos);
+        // 哈希验证通过 继续查找版本号目录
+        size_t versionStartPos = hashEndPos + 1;
+        size_t versionEndPos = path.find(L'\\', versionStartPos);
+        size_t endOfRemovalPos = (versionEndPos != std::wstring::npos) ? versionEndPos : path.length();
+
+        // 验证版本号目录是否有效 (可选但推荐)
+        bool isVersion = true;
+        if (endOfRemovalPos > versionStartPos) {
+            for (size_t i = versionStartPos; i < endOfRemovalPos; ++i) {
+                wchar_t c = path[i];
+                if (c != L'.' && (c < L'0' || c > L'9')) {
+                    isVersion = false;
+                    break;
+                }
             }
         } else {
-            // 没有斜杠，说明路径刚好到 _Url_hash 结束
-            path.erase(urlPos);
+            isVersion = false; // 版本号目录为空
+        }
+
+        if (isVersion) {
+            // 删除从 _Url_ 到版本号目录结束的部分
+            path.erase(urlPos, endOfRemovalPos - urlPos);
         }
     }
 }
@@ -11311,6 +11320,7 @@ DWORD WINAPI InitHookThread(LPVOID) {
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryAttributesFile"), &Detour_NtQueryAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryAttributesFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryFullAttributesFile"), &Detour_NtQueryFullAttributesFile, reinterpret_cast<LPVOID*>(&fpNtQueryFullAttributesFile));
             // 下面这些通常只在 hookfile 启用时才需要 但为了保险起见也可以挂钩
+            MH_CreateHook(GetProcAddress(hNtdll, "NtQueryObject"), &Detour_NtQueryObject, reinterpret_cast<LPVOID*>(&fpNtQueryObject));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryInformationFile"), &Detour_NtQueryInformationFile, reinterpret_cast<LPVOID*>(&fpNtQueryInformationFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtQueryDirectoryFile"), &Detour_NtQueryDirectoryFile, reinterpret_cast<LPVOID*>(&fpNtQueryDirectoryFile));
             MH_CreateHook(GetProcAddress(hNtdll, "NtSetInformationFile"), &Detour_NtSetInformationFile, reinterpret_cast<LPVOID*>(&fpNtSetInformationFile));
