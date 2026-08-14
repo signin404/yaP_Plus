@@ -47,6 +47,7 @@
 - [x] 加载临时字体
 - [x] 隐藏控制台程序窗口
 - [x] 检测前台并挂起后台
+- [x] 设置系统保留CPU集
 - [x] 文件写入格式编码检测
 - [x] 异常退出解决方案
 - [x] 硬链接完整目录遍历
@@ -121,6 +122,7 @@
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
+    *   [PortableLauncher](https://github.com/NixaVulpi/PortableLauncher)
     *   [Mini-Launcher](https://github.com/xan105/Mini-Launcher)
 
 ### 虚拟化

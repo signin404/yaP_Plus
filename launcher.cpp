@@ -57,6 +57,7 @@ typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *pfnRtlCreateUserThread)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
+typedef NTSTATUS (NTAPI *pfnNtSetSystemInformation)(INT SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength);
 
 // [修改] 确保全局变量已声明
 pfnNtDeleteKey g_NtDeleteKey = nullptr;
@@ -64,6 +65,7 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 pfnNtQueryInformationProcess g_NtQueryInformationProcess = nullptr;
 pfnRtlCreateUserThread g_RtlCreateUserThread = nullptr;
+pfnNtSetSystemInformation g_NtSetSystemInformation = nullptr;
 
 std::wstring g_originalPath;
 std::wstring g_LauncherDir;
@@ -5446,6 +5448,10 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     LauncherThreadData* data = static_cast<LauncherThreadData*>(lpParam);
     if (!data) return 1;
 
+    // [新增] 用于保存系统保留 CPU 集状态
+    bool hasReservedCpuSets = false;
+    ULONG64 originalAllowedCpuMask = 0;
+
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     STARTUPINFOW si;
@@ -5710,6 +5716,54 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             }
         }
 
+        // [新增] 设置系统保留 CPU 集/修改 application 进程的亲和性
+        std::wstring reservedCpuSetsVal = GetValueFromIniContent(data->iniContent, L"General", L"reservedcpusets");
+        if (!reservedCpuSetsVal.empty() && g_NtSetSystemInformation) {
+            SYSTEM_INFO sysInfo;
+            GetSystemInfo(&sysInfo);
+            int processorCount = sysInfo.dwNumberOfProcessors;
+            if (processorCount > 64) processorCount = 64;
+
+            ULONG64 systemMask = (processorCount >= 64) ? ~0ULL : (1ULL << processorCount) - 1;
+            ULONG64 reservedMask = 0;
+
+            if (reservedCpuSetsVal != L"-1") {
+                auto parts = split_string(reservedCpuSetsVal, L",");
+                for (const auto& part : parts) {
+                    std::wstring trimmed = trim(part);
+                    if (trimmed.empty()) continue;
+
+                    size_t dashPos = trimmed.find(L'-');
+                    if (dashPos != std::wstring::npos) {
+                        int start = _wtoi(trimmed.substr(0, dashPos).c_str());
+                        int end = _wtoi(trimmed.substr(dashPos + 1).c_str());
+                        if (start > end) std::swap(start, end);
+                        for (int k = start; k <= end; ++k) {
+                            if (k < processorCount && k < 64) {
+                                reservedMask |= (1ULL << k);
+                            }
+                        }
+                    } else {
+                        int v = _wtoi(trimmed.c_str());
+                        if (v < processorCount && v < 64) {
+                            reservedMask |= (1ULL << v);
+                        }
+                    }
+                }
+            }
+
+            if (reservedMask != 0) {
+                ULONG64 allowedMask = systemMask & (~reservedMask);
+                // 设置系统保留 CPU 集
+                g_NtSetSystemInformation(168, &allowedMask, sizeof(allowedMask));
+                hasReservedCpuSets = true;
+                originalAllowedCpuMask = systemMask;
+
+                // 修改 application 进程的亲和性
+                SetProcessAffinityMask(pi.hProcess, (DWORD_PTR)reservedMask);
+            }
+        }
+
         ResumeThread(pi.hThread);
 
         // --- 7. 等待逻辑 (WaitProcess) ---
@@ -5895,6 +5949,11 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     // 传入 iniContent 以支持智能 Path 变量清理
     PerformFullCleanup(data->afterOps, data->shutdownOps, data->variables, finalTrustedPids, data->launcherPid, data->iniContent);
 
+    // [新增] 恢复系统保留 CPU 集
+    if (hasReservedCpuSets && g_NtSetSystemInformation) {
+        g_NtSetSystemInformation(168, &originalAllowedCpuMask, sizeof(originalAllowedCpuMask));
+    }
+
     // [新增] 卸载注册表 Hive
     if (!data->regMountName.empty()) {
         // 尝试卸载 Hive
@@ -5985,6 +6044,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         // [新增] 初始化这两个关键函数
         g_NtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
         g_RtlCreateUserThread = (pfnRtlCreateUserThread)GetProcAddress(hNtdll, "RtlCreateUserThread");
+        g_NtSetSystemInformation = (pfnNtSetSystemInformation)GetProcAddress(hNtdll, "NtSetSystemInformation");
     }
 
     // <-- [新增] 在程序开始时获取并存储原始的Path环境变量
@@ -6640,11 +6700,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                              !hookLocaleVal.empty() || !hookFontVal.empty() ||
                              !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);
 
-            if (!needHook) {
+            // [修改] 获取 ReservedCpuSets 即使不需要 Hook 也必须使用 CreateProcess 挂起启动
+            std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"reservedcpusets");
+
+            if (!needHook && reservedCpuSetsVal.empty()) {
                 LaunchApplication(iniContent, variables);
             }
             else {
-                // --- 需要 Hook：通过 IPC 请求第一个实例进行注入 ---
+                // --- 需要 Hook 或设置亲和性 ---
 
                 // 1. 准备启动参数
                 std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
@@ -6669,19 +6732,58 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 // 3. 挂起启动
                 if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, finalWorkDir.c_str(), &si, &pi)) {
 
-                    // 4. 连接到第一个实例的 IPC 管道
-                    bool injected = false;
+                    // 4. 连接到第一个实例的 IPC 管道 (仅当需要 Hook 时)
+                    if (needHook) {
+                        bool injected = false;
 
-                    // 等待管道可用 (最多等待 1 秒)
-                    if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
-                        IpcMessage msg;
-                        msg.targetPid = pi.dwProcessId;
-                        IpcResponse resp;
-                        DWORD bytesRead;
+                        // 等待管道可用 (最多等待 1 秒)
+                        if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
+                            IpcMessage msg;
+                            msg.targetPid = pi.dwProcessId;
+                            IpcResponse resp;
+                            DWORD bytesRead;
 
-                        // 发送注入请求
-                        if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
-                            if (resp.success) injected = true;
+                            // 发送注入请求
+                            if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
+                                if (resp.success) injected = true;
+                            }
+                        }
+                    }
+
+                    // [新增] 为多实例的 application 进程设置亲和性
+                    if (!reservedCpuSetsVal.empty()) {
+                        SYSTEM_INFO sysInfo;
+                        GetSystemInfo(&sysInfo);
+                        int processorCount = sysInfo.dwNumberOfProcessors;
+                        if (processorCount > 64) processorCount = 64;
+
+                        ULONG64 reservedMask = 0;
+                        if (reservedCpuSetsVal != L"-1") {
+                            auto parts = split_string(reservedCpuSetsVal, L",");
+                            for (const auto& part : parts) {
+                                std::wstring trimmed = trim(part);
+                                if (trimmed.empty()) continue;
+
+                                size_t dashPos = trimmed.find(L'-');
+                                if (dashPos != std::wstring::npos) {
+                                    int start = _wtoi(trimmed.substr(0, dashPos).c_str());
+                                    int end = _wtoi(trimmed.substr(dashPos + 1).c_str());
+                                    if (start > end) std::swap(start, end);
+                                    for (int k = start; k <= end; ++k) {
+                                        if (k < processorCount && k < 64) {
+                                            reservedMask |= (1ULL << k);
+                                        }
+                                    }
+                                } else {
+                                    int v = _wtoi(trimmed.c_str());
+                                    if (v < processorCount && v < 64) {
+                                        reservedMask |= (1ULL << v);
+                                    }
+                                }
+                            }
+                        }
+                        if (reservedMask != 0) {
+                            SetProcessAffinityMask(pi.hProcess, (DWORD_PTR)reservedMask);
                         }
                     }
 
