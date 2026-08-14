@@ -57,6 +57,7 @@ typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
 typedef LONG (NTAPI *pfnNtResumeProcess)(IN HANDLE ProcessHandle);
 typedef NTSTATUS (NTAPI *pfnNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 typedef NTSTATUS (NTAPI *pfnRtlCreateUserThread)(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, SIZE_T, SIZE_T, PVOID, PVOID, PHANDLE, PVOID);
+typedef NTSTATUS (NTAPI *pfnNtSetSystemInformation)(INT SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength);
 
 // [修改] 确保全局变量已声明
 pfnNtDeleteKey g_NtDeleteKey = nullptr;
@@ -64,6 +65,7 @@ pfnNtSuspendProcess g_NtSuspendProcess = nullptr;
 pfnNtResumeProcess g_NtResumeProcess = nullptr;
 pfnNtQueryInformationProcess g_NtQueryInformationProcess = nullptr;
 pfnRtlCreateUserThread g_RtlCreateUserThread = nullptr;
+pfnNtSetSystemInformation g_NtSetSystemInformation = nullptr;
 
 std::wstring g_originalPath;
 std::wstring g_LauncherDir;
@@ -5985,6 +5987,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         // [新增] 初始化这两个关键函数
         g_NtQueryInformationProcess = (pfnNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
         g_RtlCreateUserThread = (pfnRtlCreateUserThread)GetProcAddress(hNtdll, "RtlCreateUserThread");
+        g_NtSetSystemInformation = (pfnNtSetSystemInformation)GetProcAddress(hNtdll, "NtSetSystemInformation");
     }
 
     // <-- [新增] 在程序开始时获取并存储原始的Path环境变量
@@ -6447,6 +6450,52 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
         }
 
+        // [新增] 设置系统保留 CPU 集
+        std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"ReservedCpuSets");
+        bool hasReservedCpuSets = false;
+        ULONG64 originalAllowedCpuMask = 0;
+        
+        if (!reservedCpuSetsVal.empty() && g_NtSetSystemInformation) {
+            SYSTEM_INFO sysInfo;
+            GetSystemInfo(&sysInfo);
+            int processorCount = sysInfo.dwNumberOfProcessors;
+            if (processorCount > 64) processorCount = 64;
+            
+            ULONG64 systemMask = (processorCount >= 64) ? ~0ULL : (1ULL << processorCount) - 1;
+            ULONG64 reservedMask = 0;
+            
+            if (reservedCpuSetsVal != L"-1") {
+                auto parts = split_string(reservedCpuSetsVal, L",");
+                for (const auto& part : parts) {
+                    std::wstring trimmed = trim(part);
+                    if (trimmed.empty()) continue;
+                    
+                    size_t dashPos = trimmed.find(L'-');
+                    if (dashPos != std::wstring::npos) {
+                        int start = _wtoi(trimmed.substr(0, dashPos).c_str());
+                        int end = _wtoi(trimmed.substr(dashPos + 1).c_str());
+                        if (start > end) std::swap(start, end);
+                        for (int k = start; k <= end; ++k) {
+                            if (k < processorCount && k < 64) {
+                                reservedMask |= (1ULL << k);
+                            }
+                        }
+                    } else {
+                        int v = _wtoi(trimmed.c_str());
+                        if (v < processorCount && v < 64) {
+                            reservedMask |= (1ULL << v);
+                        }
+                    }
+                }
+            }
+            
+            ULONG64 allowedMask = systemMask & (~reservedMask);
+            // 168 对应 SystemReservedCpuSetsInformation
+            g_NtSetSystemInformation(168, &allowedMask, sizeof(allowedMask));
+            hasReservedCpuSets = true;
+            originalAllowedCpuMask = systemMask;
+        }
+
         HANDLE hWorkerThread = CreateThread(NULL, 0, LauncherWorkerThread, &threadData, 0, NULL);
 
         if (hWorkerThread) {
@@ -6466,6 +6515,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 }
             }
             CloseHandle(hWorkerThread);
+        }
+
+        // [新增] 恢复系统保留 CPU 集
+        if (hasReservedCpuSets && g_NtSetSystemInformation) {
+            g_NtSetSystemInformation(168, &originalAllowedCpuMask, sizeof(originalAllowedCpuMask));
         }
 
         UnloadTemporaryFonts();
