@@ -5717,7 +5717,7 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
         }
 
         // [新增] 设置系统保留 CPU 集/修改 application 进程的亲和性
-        std::wstring reservedCpuSetsVal = GetValueFromIniContent(data->iniContent, L"General", L"ReservedCpuSets");
+        std::wstring reservedCpuSetsVal = GetValueFromIniContent(data->iniContent, L"General", L"reservedcpusets");
         if (!reservedCpuSetsVal.empty() && g_NtSetSystemInformation) {
             SYSTEM_INFO sysInfo;
             GetSystemInfo(&sysInfo);
@@ -6701,7 +6701,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                              !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);
 
             // [修改] 获取 ReservedCpuSets 即使不需要 Hook 也必须使用 CreateProcess 挂起启动
-            std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"ReservedCpuSets");
+            std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"reservedcpusets");
 
             if (!needHook && reservedCpuSetsVal.empty()) {
                 LaunchApplication(iniContent, variables);

@@ -47,6 +47,7 @@ Just copy and paste to create portable software.
 - [x] Load temporary fonts
 - [x] Hide console program window
 - [x] Detect foreground and suspend background processes
+- [x] Set system reserved CPU set
 - [x] File write format encoding detection
 - [x] Exception exit solutions
 - [x] Full directory traversal with hard links
@@ -121,6 +122,7 @@ Just copy and paste to create portable software.
     *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
+    *   [PortableLauncher](https://github.com/NixaVulpi/PortableLauncher)
     *   [Mini-Launcher](https://github.com/xan105/Mini-Launcher)
 
 ### Virtualization
