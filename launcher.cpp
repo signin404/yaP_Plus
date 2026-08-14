@@ -6700,11 +6700,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                              !hookLocaleVal.empty() || !hookFontVal.empty() ||
                              !hookTimeVal.empty() || !hookRegVal.empty() || hasThirdPartyDlls);
 
-            if (!needHook) {
+            // [修改] 获取 ReservedCpuSets 即使不需要 Hook 也必须使用 CreateProcess 挂起启动
+            std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"ReservedCpuSets");
+
+            if (!needHook && reservedCpuSetsVal.empty()) {
                 LaunchApplication(iniContent, variables);
             }
             else {
-                // --- 需要 Hook：通过 IPC 请求第一个实例进行注入 ---
+                // --- 需要 Hook 或设置亲和性 ---
 
                 // 1. 准备启动参数
                 std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
@@ -6729,59 +6732,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 // 3. 挂起启动
                 if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, finalWorkDir.c_str(), &si, &pi)) {
 
-                    // 4. 连接到第一个实例的 IPC 管道
-                    bool injected = false;
+                    // 4. 连接到第一个实例的 IPC 管道 (仅当需要 Hook 时)
+                    if (needHook) {
+                        bool injected = false;
 
-                    // 等待管道可用 (最多等待 1 秒)
-                    if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
-                        IpcMessage msg;
-                        msg.targetPid = pi.dwProcessId;
-                        IpcResponse resp;
-                        DWORD bytesRead;
+                        // 等待管道可用 (最多等待 1 秒)
+                        if (WaitNamedPipeW(sharedPipeName.c_str(), 1000)) {
+                            IpcMessage msg;
+                            msg.targetPid = pi.dwProcessId;
+                            IpcResponse resp;
+                            DWORD bytesRead;
 
-                        // 发送注入请求
-                        if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
-                            if (resp.success) injected = true;
-                        }
-                    }
-
-                // [新增] 为多实例的 application 进程设置亲和性
-                std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"ReservedCpuSets");
-                if (!reservedCpuSetsVal.empty()) {
-                    SYSTEM_INFO sysInfo;
-                    GetSystemInfo(&sysInfo);
-                    int processorCount = sysInfo.dwNumberOfProcessors;
-                    if (processorCount > 64) processorCount = 64;
-
-                    ULONG64 reservedMask = 0;
-                    if (reservedCpuSetsVal != L"-1") {
-                        auto parts = split_string(reservedCpuSetsVal, L",");
-                        for (const auto& part : parts) {
-                            std::wstring trimmed = trim(part);
-                            if (trimmed.empty()) continue;
-
-                            size_t dashPos = trimmed.find(L'-');
-                            if (dashPos != std::wstring::npos) {
-                                int start = _wtoi(trimmed.substr(0, dashPos).c_str());
-                                int end = _wtoi(trimmed.substr(dashPos + 1).c_str());
-                                if (start > end) std::swap(start, end);
-                                for (int k = start; k <= end; ++k) {
-                                    if (k < processorCount && k < 64) {
-                                        reservedMask |= (1ULL << k);
-                                    }
-                                }
-                            } else {
-                                int v = _wtoi(trimmed.c_str());
-                                if (v < processorCount && v < 64) {
-                                    reservedMask |= (1ULL << v);
-                                }
+                            // 发送注入请求
+                            if (CallNamedPipeW(sharedPipeName.c_str(), &msg, sizeof(msg), &resp, sizeof(resp), &bytesRead, 5000)) {
+                                if (resp.success) injected = true;
                             }
                         }
                     }
-                    if (reservedMask != 0) {
-                        SetProcessAffinityMask(pi.hProcess, (DWORD_PTR)reservedMask);
+
+                    // [新增] 为多实例的 application 进程设置亲和性
+                    if (!reservedCpuSetsVal.empty()) {
+                        SYSTEM_INFO sysInfo;
+                        GetSystemInfo(&sysInfo);
+                        int processorCount = sysInfo.dwNumberOfProcessors;
+                        if (processorCount > 64) processorCount = 64;
+
+                        ULONG64 reservedMask = 0;
+                        if (reservedCpuSetsVal != L"-1") {
+                            auto parts = split_string(reservedCpuSetsVal, L",");
+                            for (const auto& part : parts) {
+                                std::wstring trimmed = trim(part);
+                                if (trimmed.empty()) continue;
+
+                                size_t dashPos = trimmed.find(L'-');
+                                if (dashPos != std::wstring::npos) {
+                                    int start = _wtoi(trimmed.substr(0, dashPos).c_str());
+                                    int end = _wtoi(trimmed.substr(dashPos + 1).c_str());
+                                    if (start > end) std::swap(start, end);
+                                    for (int k = start; k <= end; ++k) {
+                                        if (k < processorCount && k < 64) {
+                                            reservedMask |= (1ULL << k);
+                                        }
+                                    }
+                                } else {
+                                    int v = _wtoi(trimmed.c_str());
+                                    if (v < processorCount && v < 64) {
+                                        reservedMask |= (1ULL << v);
+                                    }
+                                }
+                            }
+                        }
+                        if (reservedMask != 0) {
+                            SetProcessAffinityMask(pi.hProcess, (DWORD_PTR)reservedMask);
+                        }
                     }
-                }
 
                     // 5. 恢复进程
                     ResumeThread(pi.hThread);
