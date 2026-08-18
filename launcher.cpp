@@ -3437,7 +3437,7 @@ void UnloadTemporaryFonts() {
 // --- [新增] 注册表 Hive 管理辅助函数 ---
 // 计算 Hive 挂载名称 (基于启动器名称)
 std::wstring GetHiveMountName(const std::wstring& launcherName) {
-    return L"YapHookReg_" + launcherName;
+    return L"YapRegHive_" + launcherName;
 }
 
 // 确保 Hive 文件存在且有效 (如果不存在则创建并初始化)
@@ -4864,7 +4864,7 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     if (!l_op.traversalMode.empty()) {
                         l_op.isDirectory = true;
                     } else {
-                        // [修改] 如果是 junction，则强制为目录
+                        // [修改] 如果是 junction 则强制为目录
                         l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\' || l_op.isJunction);
                     }
 
@@ -6060,13 +6060,13 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             // 如果 retry == 10 依然失败 循环将自然结束 放弃卸载并继续执行后续操作
         }
 
-        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)
+        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapRegHive.dat 本身)
         if (!data->hivePath.empty()) {
             wchar_t hiveDir[MAX_PATH];
             wcscpy_s(hiveDir, MAX_PATH, data->hivePath.c_str());
             PathRemoveFileSpecW(hiveDir);
-            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat.*");
-            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat{*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapRegHive.dat.*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapRegHive.dat{*");
         }
     }
 
@@ -6457,9 +6457,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
 
-            hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+            hivePath = variables[L"YAPROOT"] + L"\\YapRegHive.dat";
             if (!finalHookPath.empty()) {
-                 hivePath = finalHookPath + L"\\YapHookReg.dat";
+                 hivePath = finalHookPath + L"\\YapRegHive.dat";
             }
 
             regMountName = GetHiveMountName(launcherBaseName);
