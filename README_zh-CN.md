@@ -42,6 +42,7 @@
 - [x] 等待进程
 - [x] 定时备份
 - [x] 创建硬链接
+- [x] 创建目录链接
 - [x] 创建注册表符号链接
 - [x] 创建防火墙规则
 - [x] 加载临时字体
@@ -119,7 +120,7 @@
 *   **使用此方案的软件:**
     *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
     *   [PortableApps Compiler & Management](https://github.com/daemondevin/pac-man)
-    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
+    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://github.com/sl2365/X-Launcher64)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
     *   [PortableLauncher](https://github.com/NixaVulpi/PortableLauncher)

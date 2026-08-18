@@ -42,6 +42,7 @@ Just copy and paste to create portable software.
 - [x] Wait for process
 - [x] Scheduled backup
 - [x] Create hard links
+- [x] Create directory junctions
 - [x] Create registry symbolic link
 - [x] Create firewall rules
 - [x] Load temporary fonts
@@ -119,7 +120,7 @@ Just copy and paste to create portable software.
 *   **Software using this solution:**
     *   [PortableApps.com Launcher](https://portableapps.com/apps/development/portableapps.com_launcher)
     *   [PortableApps Compiler & Management](https://github.com/daemondevin/pac-man)
-    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://www.portablefreeware.com/index.php?id=3134)
+    *   [X-Launcher](https://www.winpenpack.com/en/download.php?view.15) | [x64](https://github.com/sl2365/X-Launcher64)
     *   [AutoRun LWMenu](https://github.com/lwcorp/lwmenu)
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
     *   [PortableLauncher](https://github.com/NixaVulpi/PortableLauncher)
