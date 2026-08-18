@@ -27,6 +27,7 @@
 #include <codecvt>
 #include <regex>
 #include <functional>
+#include <winioctl.h>
 #include <wincrypt.h>
 #include "IpcCommon.h"
 
@@ -51,6 +52,8 @@
 #define REG_OPTION_OPEN_LINK (0x00000008L)
 #endif
 
+#define YAP_REPARSE_DATA_BUFFER_HEADER_SIZE  FIELD_OFFSET(YAP_REPARSE_DATA_BUFFER, GenericReparseBuffer)
+
 // --- Function pointer types for NTDLL functions ---
 typedef LONG (NTAPI *pfnNtDeleteKey)(IN HANDLE KeyHandle);
 typedef LONG (NTAPI *pfnNtSuspendProcess)(IN HANDLE ProcessHandle);
@@ -72,6 +75,77 @@ std::wstring g_LauncherDir;
 std::vector<std::wstring> g_TemporaryFonts;
 
 // --- Data Structures ---
+
+// [新增] 定义用于创建目录链接点的结构体
+typedef struct _YAP_REPARSE_DATA_BUFFER {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;
+            WCHAR  PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPointReparseBuffer;
+        struct {
+            UCHAR  DataBuffer[1];
+        } GenericReparseBuffer;
+    };
+} YAP_REPARSE_DATA_BUFFER, *PYAP_REPARSE_DATA_BUFFER;
+
+// [新增] 创建目录链接点 (Junction) 的函数
+bool CreateJunction(const std::wstring& linkDir, const std::wstring& targetDir) {
+    wchar_t fullTarget[MAX_PATH];
+    if (!GetFullPathNameW(targetDir.c_str(), MAX_PATH, fullTarget, NULL)) {
+        return false;
+    }
+
+    std::wstring ntTarget = L"\\??\\" + std::wstring(fullTarget);
+
+    if (!CreateDirectoryW(linkDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+
+    HANDLE hDir = CreateFileW(linkDir.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (hDir == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    size_t targetLen = ntTarget.length() * sizeof(wchar_t);
+    size_t printLen = wcslen(fullTarget) * sizeof(wchar_t);
+    size_t bufferSize = YAP_REPARSE_DATA_BUFFER_HEADER_SIZE + 8 + targetLen + 2 + printLen + 2;
+
+    std::vector<BYTE> buffer(bufferSize, 0);
+    PYAP_REPARSE_DATA_BUFFER pReparse = (PYAP_REPARSE_DATA_BUFFER)buffer.data();
+
+    pReparse->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+    pReparse->ReparseDataLength = (USHORT)(bufferSize - YAP_REPARSE_DATA_BUFFER_HEADER_SIZE);
+    pReparse->Reserved = 0;
+
+    pReparse->MountPointReparseBuffer.SubstituteNameOffset = 0;
+    pReparse->MountPointReparseBuffer.SubstituteNameLength = (USHORT)targetLen;
+    pReparse->MountPointReparseBuffer.PrintNameOffset = (USHORT)(targetLen + 2);
+    pReparse->MountPointReparseBuffer.PrintNameLength = (USHORT)printLen;
+
+    memcpy(pReparse->MountPointReparseBuffer.PathBuffer, ntTarget.c_str(), targetLen);
+    memcpy((BYTE*)pReparse->MountPointReparseBuffer.PathBuffer + targetLen + 2, fullTarget, printLen);
+
+    DWORD bytesReturned;
+    bool result = DeviceIoControl(hDir, FSCTL_SET_REPARSE_POINT, pReparse, (DWORD)bufferSize, NULL, 0, &bytesReturned, NULL);
+
+    CloseHandle(hDir);
+    return result;
+}
 
 // Operations with startup and shutdown/cleanup logic
 struct FileOp {
@@ -110,6 +184,7 @@ struct LinkOp {
     std::wstring backupPath;
     bool isDirectory;
     bool isHardlink;
+    bool isJunction = false;
     bool backupCreated = false;
     std::vector<std::pair<std::wstring, std::wstring>> createdLinks;
     std::vector<std::pair<std::wstring, std::wstring>> backedUpPaths;
@@ -3362,7 +3437,7 @@ void UnloadTemporaryFonts() {
 // --- [新增] 注册表 Hive 管理辅助函数 ---
 // 计算 Hive 挂载名称 (基于启动器名称)
 std::wstring GetHiveMountName(const std::wstring& launcherName) {
-    return L"YapHookReg_" + launcherName;
+    return L"YapRegHive_" + launcherName;
 }
 
 // 确保 Hive 文件存在且有效 (如果不存在则创建并初始化)
@@ -4138,6 +4213,7 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         else if (_wcsicmp(arg.traversalMode.c_str(), L"file") == 0) shouldLink = !isItemDirectory;
 
                         if (arg.isHardlink && isItemDirectory) shouldLink = false;
+                        if (arg.isJunction && !isItemDirectory) shouldLink = false; // [新增] 目录链接点仅适用于目录
 
                         if (shouldLink) {
                             std::wstring srcFullPath = arg.targetPath + L"\\" + itemName;
@@ -4150,6 +4226,11 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                             }
                             if (arg.isHardlink) {
                                 if (CreateHardLinkW(destFullPath.c_str(), srcFullPath.c_str(), NULL)) {
+                                    arg.createdLinks.push_back({destFullPath, L""});
+                                }
+                            } else if (arg.isJunction) {
+                                // [新增] 创建目录链接点
+                                if (CreateJunction(destFullPath, srcFullPath)) {
                                     arg.createdLinks.push_back({destFullPath, L""});
                                 }
                             } else {
@@ -4185,6 +4266,9 @@ void PerformStartupOperation(StartupShutdownOperationData& opData) {
                         } else {
                             CreateHardLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), NULL);
                         }
+                    } else if (arg.isJunction) {
+                        // [新增] 创建目录链接点
+                        CreateJunction(arg.linkPath, arg.targetPath);
                     } else {
                         DWORD flags = arg.isDirectory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
                         CreateSymbolicLinkW(arg.linkPath.c_str(), arg.targetPath.c_str(), flags);
@@ -4765,9 +4849,11 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
             BeforeOperation beforeOp;
             bool op_created = false;
 
-            if (_wcsicmp(key.c_str(), L"hardlink") == 0 || _wcsicmp(key.c_str(), L"symlink") == 0) {
+            // [修改] 增加对 junction 的支持
+            if (_wcsicmp(key.c_str(), L"hardlink") == 0 || _wcsicmp(key.c_str(), L"symlink") == 0 || _wcsicmp(key.c_str(), L"junction") == 0) {
                 LinkOp l_op;
                 l_op.isHardlink = (_wcsicmp(key.c_str(), L"hardlink") == 0);
+                l_op.isJunction = (_wcsicmp(key.c_str(), L"junction") == 0);
                 auto parts = split_string(value, delimiter);
                 if (parts.size() >= 2) {
                     l_op.linkPath = ResolveToAbsolutePath(ExpandVariables(parts[0], variables), variables);
@@ -4778,7 +4864,8 @@ void ParseIniSections(const std::wstring& iniContent, std::map<std::wstring, std
                     if (!l_op.traversalMode.empty()) {
                         l_op.isDirectory = true;
                     } else {
-                        l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\');
+                        // [修改] 如果是 junction 则强制为目录
+                        l_op.isDirectory = (parts[0].back() == L'\\' || parts[1].back() == L'\\' || l_op.isJunction);
                     }
 
                     if (l_op.isDirectory) {
@@ -5973,13 +6060,13 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
             // 如果 retry == 10 依然失败 循环将自然结束 放弃卸载并继续执行后续操作
         }
 
-        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapHookReg.dat 本身)
+        // [新增] 卸载后使用通配符删除日志文件 (避免误删 YapRegHive.dat 本身)
         if (!data->hivePath.empty()) {
             wchar_t hiveDir[MAX_PATH];
             wcscpy_s(hiveDir, MAX_PATH, data->hivePath.c_str());
             PathRemoveFileSpecW(hiveDir);
-            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat.*");
-            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapHookReg.dat{*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapRegHive.dat.*");
+            ActionHelpers::DeleteFilesByPatternSafe(hiveDir, L"YapRegHive.dat{*");
         }
     }
 
@@ -6370,9 +6457,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring hookPathRaw = GetValueFromIniContent(iniContent, L"Hook", L"hookpath");
             std::wstring finalHookPath = ResolveToAbsolutePath(ExpandVariables(hookPathRaw, variables), variables);
 
-            hivePath = variables[L"YAPROOT"] + L"\\YapHookReg.dat";
+            hivePath = variables[L"YAPROOT"] + L"\\YapRegHive.dat";
             if (!finalHookPath.empty()) {
-                 hivePath = finalHookPath + L"\\YapHookReg.dat";
+                 hivePath = finalHookPath + L"\\YapRegHive.dat";
             }
 
             regMountName = GetHiveMountName(launcherBaseName);
