@@ -41,8 +41,7 @@ Just copy and paste to create portable software.
 - [x] Unicode support
 - [x] Wait for process
 - [x] Scheduled backup
-- [x] Create hard links
-- [x] Create directory junctions
+- [x] Create hard links/junction
 - [x] Create registry symbolic link
 - [x] Create firewall rules
 - [x] Load temporary fonts
@@ -52,7 +51,7 @@ Just copy and paste to create portable software.
 - [x] File write format encoding detection
 - [x] Exception exit solutions
 - [x] Full directory traversal with hard links
-- [x] Hard/Symbolic Link Single-Level Directory Traversal
+- [x] Hard/Symbolic/Junction Link Single-Level Directory Traversal
 - [x] Check the parent process or path and terminate the process
 - [x] Traverse subdirectories and delete files/directories
 - [x] (Experimental) Hook Redirect File Operations
