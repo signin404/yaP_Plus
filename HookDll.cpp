@@ -2672,7 +2672,7 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
             relPath.erase(colonPos, 1);
         }
 
-        targetPath += L"\\";
+        targetPath += L"\\Disk\\";
         targetPath += relPath;
         return true;
     }
@@ -2690,14 +2690,14 @@ bool ShouldRedirect(const std::wstring& fullNtPath, std::wstring& targetPath) {
     }
 
     // --- Mode 2 & Mode 1(系统盘部分): 默认绝对路径映射 ---
-    // 映射为 Sandbox\DriveLetter\Path
+    // 映射为 Sandbox\Disk\DriveLetter\Path
     std::wstring relPath = fullNtPath.substr(4);
     std::replace(relPath.begin(), relPath.end(), L'/', L'\\');
     size_t colonPos = relPath.find(L':');
     if (colonPos != std::wstring::npos) {
         relPath.erase(colonPos, 1);
     }
-    targetPath += L"\\";
+    targetPath += L"\\Disk\\";
     targetPath += relPath;
     return true;
 }
