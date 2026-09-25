@@ -414,6 +414,7 @@ struct LauncherThreadData {
     std::wstring pipeName;
     std::wstring regMountName; // [新增] 传递挂载名称用于卸载
     std::wstring hivePath;     // [新增] 传递文件路径用于清理日志
+    bool hideApp = false;      // [新增] 是否隐藏主程序窗口
 };
 
 // --- 提取嵌入资源的辅助函数 ---
@@ -5156,12 +5157,19 @@ void PerformFullCleanup(
 
 // --- Main Application Logic ---
 void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
-    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
-    if (appPathRaw.empty()) return;
+    // [修改] 支持解析 application=xxx :: hide
+    std::wstring appValueRaw = GetValueFromIniContent(iniContent, L"General", L"application");
+    auto appParts = split_string(appValueRaw, L" :: ");
+    if (appParts.empty() || appParts[0].empty()) return;
+
+    std::wstring appPathRaw = ExpandVariables(appParts[0], variables);
+    bool hideApp = (appParts.size() > 1 && _wcsicmp(appParts[1].c_str(), L"hide") == 0);
 
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
-    ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, false);
+
+    // [修改] 将 hideApp 传递给 ExecuteProcess 的最后一个参数
+    ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, hideApp);
 }
 
 // --- [新增] 在此处添加 PerformFullCleanup 的前向声明 ---
@@ -5546,6 +5554,12 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
+
+    // [新增] 如果配置了 hide 则隐藏窗口
+    if (data->hideApp) {
+        si.dwFlags |= STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+    }
 
     // --- 1. 准备启动参数 ---
     std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
@@ -6214,7 +6228,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
-    std::wstring appPathRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"application"), variables);
+    // [修改] 解析 application 及其 hide 标志
+    std::wstring appValueRaw = GetValueFromIniContent(iniContent, L"General", L"application");
+    auto appParts = split_string(appValueRaw, L" :: ");
+    std::wstring appPathRaw = appParts.empty() ? L"" : ExpandVariables(appParts[0], variables);
+    bool hideApp = (appParts.size() > 1 && _wcsicmp(appParts[1].c_str(), L"hide") == 0);
 
     wchar_t launcherBaseName[MAX_PATH];
     wcscpy_s(launcherBaseName, PathFindFileNameW(launcherFullPath));
@@ -6548,6 +6566,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         threadData.pipeName = sharedPipeName;
         threadData.regMountName = regMountName;
         threadData.hivePath = hivePath;
+        threadData.hideApp = hideApp;
 
         std::wstring foregroundAppName = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"foreground"), variables);
         if (!foregroundAppName.empty()) {
@@ -6815,6 +6834,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
                 STARTUPINFOW si = { sizeof(si) };
                 PROCESS_INFORMATION pi = { 0 };
+
+                // [新增] 如果配置了 hide 则隐藏窗口
+                if (hideApp) {
+                    si.dwFlags |= STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_HIDE;
+                }
 
                 // 3. 挂起启动
                 if (CreateProcessW(NULL, commandLineBuffer, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, finalWorkDir.c_str(), &si, &pi)) {
