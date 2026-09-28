@@ -412,6 +412,7 @@ struct LauncherThreadData {
     std::atomic<bool>* isBackupWorking = nullptr;
 	DWORD launcherPid;
     std::wstring pipeName;
+    std::wstring overrideCmdLine; // [新增] 传递覆盖的命令行
     std::wstring regMountName; // [新增] 传递挂载名称用于卸载
     std::wstring hivePath;     // [新增] 传递文件路径用于清理日志
     bool hideApp = false;      // [新增] 是否隐藏主程序窗口
@@ -5156,7 +5157,7 @@ void PerformFullCleanup(
 
 
 // --- Main Application Logic ---
-void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables) {
+void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, std::wstring>& variables, const std::wstring& overrideCmdLine) {
     // [修改] 支持解析 application=xxx :: hide
     std::wstring appValueRaw = GetValueFromIniContent(iniContent, L"General", L"application");
     auto appParts = split_string(appValueRaw, L" :: ");
@@ -5166,7 +5167,10 @@ void LaunchApplication(const std::wstring& iniContent, std::map<std::wstring, st
     bool hideApp = (appParts.size() > 1 && _wcsicmp(appParts[1].c_str(), L"hide") == 0);
 
     std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
-    std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
+
+    // [修改] 优先使用外部传入的命令行
+    std::wstring commandLineRaw = overrideCmdLine.empty() ? GetValueFromIniContent(iniContent, L"General", L"commandline") : overrideCmdLine;
+    std::wstring commandLine = ExpandVariables(commandLineRaw, variables);
 
     // [修改] 将 hideApp 传递给 ExecuteProcess 的最后一个参数
     ExecuteProcess(ResolveToAbsolutePath(appPathRaw, variables), commandLine, ResolveToAbsolutePath(workDirRaw, variables), false, hideApp);
@@ -5562,7 +5566,9 @@ DWORD WINAPI LauncherWorkerThread(LPVOID lpParam) {
     }
 
     // --- 1. 准备启动参数 ---
-    std::wstring commandLine = ExpandVariables(GetValueFromIniContent(data->iniContent, L"General", L"commandline"), data->variables);
+    // [修改] 优先使用外部传入的命令行
+    std::wstring commandLineRaw = data->overrideCmdLine.empty() ? GetValueFromIniContent(data->iniContent, L"General", L"commandline") : data->overrideCmdLine;
+    std::wstring commandLine = ExpandVariables(commandLineRaw, data->variables);
     std::wstring fullCommandLine = L"\"" + data->absoluteAppPath + L"\" " + commandLine;
     wchar_t commandLineBuffer[4096];
     wcscpy_s(commandLineBuffer, fullCommandLine.c_str());
@@ -6131,6 +6137,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     EnableAllPrivileges();
 	DWORD launcherPid = GetCurrentProcessId();
 
+    // [新增] 提取启动器自身的命令行参数 (如果有的话)
+    std::wstring overrideCmdLine = pCmdLine ? trim(pCmdLine) : L"";
+
     // [新增] 获取启动器目录
     wchar_t pathBuffer[MAX_PATH];
     GetModuleFileNameW(NULL, pathBuffer, MAX_PATH);
@@ -6564,6 +6573,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         threadData.isBackupWorking = &isBackupWorking;
 		threadData.launcherPid = launcherPid;
         threadData.pipeName = sharedPipeName;
+        threadData.overrideCmdLine = overrideCmdLine;
         threadData.regMountName = regMountName;
         threadData.hivePath = hivePath;
         threadData.hideApp = hideApp;
@@ -6810,14 +6820,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             std::wstring reservedCpuSetsVal = GetValueFromIniContent(iniContent, L"General", L"reservedcpusets");
 
             if (!needHook && reservedCpuSetsVal.empty()) {
-                LaunchApplication(iniContent, variables);
+                LaunchApplication(iniContent, variables, overrideCmdLine); // [修改] 传递 overrideCmdLine
             }
             else {
                 // --- 需要 Hook 或设置亲和性 ---
 
                 // 1. 准备启动参数
                 std::wstring absoluteAppPath = ResolveToAbsolutePath(appPathRaw, variables);
-                std::wstring commandLine = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"commandline"), variables);
+
+                // [修改] 优先使用外部传入的命令行
+                std::wstring commandLineRaw = overrideCmdLine.empty() ? GetValueFromIniContent(iniContent, L"General", L"commandline") : overrideCmdLine;
+                std::wstring commandLine = ExpandVariables(commandLineRaw, variables);
+
                 std::wstring workDirRaw = ExpandVariables(GetValueFromIniContent(iniContent, L"General", L"workdir"), variables);
                 std::wstring finalWorkDir = ResolveToAbsolutePath(workDirRaw, variables);
 
