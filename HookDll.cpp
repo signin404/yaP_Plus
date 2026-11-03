@@ -9716,6 +9716,62 @@ BOOL CreateProcessInternal(
     // 但为了处理 Feature Flags 我们主要关注显式传入的 cmdLineW
     if (!cmdLineW.empty()) {
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
+
+        // ========== 命令行路径重定向 ==========
+        // 遍历命令行参数 将包含真实盘符的绝对路径重定向为沙盒路径
+        std::wstring rebuiltCommandLine;
+        rebuiltCommandLine.reserve(cmdLineW.size() + 256);
+
+        size_t copiedUpTo = 0;
+        size_t index = 0;
+
+        while ((index + 2) < cmdLineW.size()) {
+            const bool startsArgument =
+                (0 == index) || (L'"' == cmdLineW[index - 1]) || (L'=' == cmdLineW[index - 1]) ||
+                (L' ' == cmdLineW[index - 1]);
+
+            // 匹配诸如 C:\ 形式的绝对路径开头
+            if (startsArgument && iswalpha(cmdLineW[index]) &&
+                L':' == cmdLineW[index + 1] && L'\\' == cmdLineW[index + 2]) {
+                
+                // [优化] 引号内的路径带空格的情况
+                bool inQuote = (index > 0 && cmdLineW[index - 1] == L'"');
+                size_t pathEnd = index;
+                
+                while (pathEnd < cmdLineW.size()) {
+                    if (inQuote) {
+                        if (cmdLineW[pathEnd] == L'"') break;
+                    } else {
+                        if (cmdLineW[pathEnd] == L'"' || cmdLineW[pathEnd] == L' ') break;
+                    }
+                    ++pathEnd;
+                }
+
+                std::wstring path = cmdLineW.substr(index, pathEnd - index);
+                std::wstring ntPath = L"\\??\\" + path;
+                std::wstring targetNtPath;
+
+                // 如果位于重定向范围 则改写为沙盒 DOS 路径
+                if (ShouldRedirect(ntPath, targetNtPath)) {
+                    std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+                    
+                    rebuiltCommandLine.append(cmdLineW.substr(copiedUpTo, index - copiedUpTo));
+                    rebuiltCommandLine.append(targetDosPath);
+                    copiedUpTo = pathEnd;
+
+                    DebugLog(L"CreateProcess: Redirected CmdLine path from \"%s\" to \"%s\"", path.c_str(), targetDosPath.c_str());
+                }
+
+                index = pathEnd;
+            } else {
+                ++index;
+            }
+        }
+
+        if (copiedUpTo > 0) {
+            rebuiltCommandLine.append(cmdLineW.substr(copiedUpTo));
+            cmdLineW = std::move(rebuiltCommandLine);
+        }
     }
 
     //[新增] 批处理文件 (.bat / .cmd) 识别逻辑
