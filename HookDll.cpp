@@ -11355,6 +11355,35 @@ DWORD WINAPI InitHookThread(LPVOID) {
 
     InitSpoofing();
 
+    // ========== [新增] 覆盖当前进程环境变量 ==========
+    // 确保子进程（如 WeChatAppEx/Chromium）在创建沙盒策略时读取到正确的沙盒路径
+    // 必须在读取完原始环境变量（g_UserProfileNt 等）之后调用
+    if (g_SandboxRoot[0] != L'\0') {
+        std::wstring sandbox = g_SandboxRoot;
+        std::wstring userProfile = sandbox + L"\\Users\\Current";
+        std::wstring appData = userProfile + L"\\AppData\\Roaming";
+        std::wstring localAppData = userProfile + L"\\AppData\\Local";
+        std::wstring programData = sandbox + L"\\Users\\All";
+        std::wstring publicDir = sandbox + L"\\Users\\Public";
+
+        SetEnvironmentVariableW(L"USERPROFILE", userProfile.c_str());
+        SetEnvironmentVariableW(L"APPDATA", appData.c_str());
+        SetEnvironmentVariableW(L"LOCALAPPDATA", localAppData.c_str());
+        SetEnvironmentVariableW(L"PROGRAMDATA", programData.c_str());
+        SetEnvironmentVariableW(L"ALLUSERSPROFILE", programData.c_str());
+        SetEnvironmentVariableW(L"PUBLIC", publicDir.c_str());
+        SetEnvironmentVariableW(L"USERNAME", L"Current");
+
+        if (userProfile.length() >= 2 && userProfile[1] == L':') {
+            std::wstring drive = userProfile.substr(0, 2);
+            std::wstring path = userProfile.substr(2);
+            SetEnvironmentVariableW(L"HOMEDRIVE", drive.c_str());
+            SetEnvironmentVariableW(L"HOMEPATH", path.c_str());
+        }
+
+        DebugLog(L"Init: Replaced Environment Variables with Sandbox Paths.");
+    }
+
     DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
 
     // 7. 初始化 MinHook
