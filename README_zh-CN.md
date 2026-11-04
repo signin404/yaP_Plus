@@ -103,6 +103,7 @@
     *   [Reg-To-File-Tune](https://github.com/ike9000e/Reg-To-File-Tune)
     *   [fakereg](https://github.com/luojunyuan/fakereg)
     *   [WFRR](https://github.com/peitaosu/WFRR)
+    *   [DoNotInstaller](https://github.com/Imaha486/DoNotInstaller)
 
 ### 启动器
 
@@ -124,6 +125,8 @@
     *   [PortableXE](https://github.com/LMLK-seal/PortableXE)
     *   [PortableLauncher](https://github.com/NixaVulpi/PortableLauncher)
     *   [Mini-Launcher](https://github.com/xan105/Mini-Launcher)
+    *   [MIIIME Hybrid Launcher](https://github.com/miiimeworks/MHL)
+    *   [great! another Portabilizer](https://github.com/Hanatarou/gaP)
 
 ### 虚拟化
 
