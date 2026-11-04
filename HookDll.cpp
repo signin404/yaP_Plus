@@ -9723,7 +9723,20 @@ BOOL CreateProcessInternal(
         rebuiltCommandLine.reserve(cmdLineW.size() + 256);
 
         size_t copiedUpTo = 0;
+
+        // [修复] 查找第一个参数(可执行文件路径)的结束位置 跳过它防止被重复或错误替换
         size_t index = 0;
+        while (index < cmdLineW.size() && cmdLineW[index] == L' ') index++;
+        if (index < cmdLineW.size()) {
+            if (cmdLineW[index] == L'"') {
+                index = cmdLineW.find(L'"', index + 1);
+                if (index != std::wstring::npos) index++;
+                else index = cmdLineW.size();
+            } else {
+                index = cmdLineW.find(L' ', index);
+                if (index == std::wstring::npos) index = cmdLineW.size();
+            }
+        }
 
         while ((index + 2) < cmdLineW.size()) {
             const bool startsArgument =
