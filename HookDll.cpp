@@ -980,15 +980,28 @@ namespace CmdUtils {
     // 辅助：给参数加引号（如果包含空格）
     std::wstring QuoteArg(const std::wstring& arg) {
         if (arg.empty()) return L"\"\"";
-        if (arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
 
-        std::wstring quoted;
+        size_t space_pos = arg.find_first_of(L" \t\"");
+        if (space_pos == std::wstring::npos) return arg;
+
+        std::wstring prefix;
+        std::wstring to_quote = arg;
+
+        // [修复] 如果参数包含等号 且空格在等号后面 则只对等号后面的部分加引号
+        // 这样可以把 -test=A B 正确地还原为 -test="A B" 而不是 "-test=A B"
+        size_t eq_pos = arg.find(L'=');
+        if (eq_pos != std::wstring::npos && eq_pos < space_pos) {
+            prefix = arg.substr(0, eq_pos + 1); // 包含等号
+            to_quote = arg.substr(eq_pos + 1);
+        }
+
+        std::wstring quoted = prefix;
         quoted.push_back(L'"');
-        for (auto it = arg.begin(); it != arg.end(); ++it) {
+        for (auto it = to_quote.begin(); it != to_quote.end(); ++it) {
             if (*it == L'"') {
                 int backslash_count = 0;
                 auto back_it = it;
-                while (back_it != arg.begin() && *(--back_it) == L'\\') {
+                while (back_it != to_quote.begin() && *(--back_it) == L'\\') {
                     backslash_count++;
                 }
                 quoted.append(backslash_count, L'\\');
@@ -9723,7 +9736,20 @@ BOOL CreateProcessInternal(
         rebuiltCommandLine.reserve(cmdLineW.size() + 256);
 
         size_t copiedUpTo = 0;
+
+        // [修复] 查找第一个参数(可执行文件路径)的结束位置 跳过它防止被重复或错误替换
         size_t index = 0;
+        while (index < cmdLineW.size() && cmdLineW[index] == L' ') index++;
+        if (index < cmdLineW.size()) {
+            if (cmdLineW[index] == L'"') {
+                index = cmdLineW.find(L'"', index + 1);
+                if (index != std::wstring::npos) index++;
+                else index = cmdLineW.size();
+            } else {
+                index = cmdLineW.find(L' ', index);
+                if (index == std::wstring::npos) index = cmdLineW.size();
+            }
+        }
 
         while ((index + 2) < cmdLineW.size()) {
             const bool startsArgument =
