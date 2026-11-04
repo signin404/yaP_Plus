@@ -9716,6 +9716,62 @@ BOOL CreateProcessInternal(
     // 但为了处理 Feature Flags 我们主要关注显式传入的 cmdLineW
     if (!cmdLineW.empty()) {
         cmdLineW = CmdUtils::ProcessAndReassemble(cmdLineW, extraArgs);
+
+        // ========== 命令行路径重定向 ==========
+        // 遍历命令行参数 将包含真实盘符的绝对路径重定向为沙盒路径
+        std::wstring rebuiltCommandLine;
+        rebuiltCommandLine.reserve(cmdLineW.size() + 256);
+
+        size_t copiedUpTo = 0;
+        size_t index = 0;
+
+        while ((index + 2) < cmdLineW.size()) {
+            const bool startsArgument =
+                (0 == index) || (L'"' == cmdLineW[index - 1]) || (L'=' == cmdLineW[index - 1]) ||
+                (L' ' == cmdLineW[index - 1]);
+
+            // 匹配诸如 C:\ 形式的绝对路径开头
+            if (startsArgument && iswalpha(cmdLineW[index]) &&
+                L':' == cmdLineW[index + 1] && L'\\' == cmdLineW[index + 2]) {
+
+                // [优化] 引号内的路径带空格的情况
+                bool inQuote = (index > 0 && cmdLineW[index - 1] == L'"');
+                size_t pathEnd = index;
+
+                while (pathEnd < cmdLineW.size()) {
+                    if (inQuote) {
+                        if (cmdLineW[pathEnd] == L'"') break;
+                    } else {
+                        if (cmdLineW[pathEnd] == L'"' || cmdLineW[pathEnd] == L' ') break;
+                    }
+                    ++pathEnd;
+                }
+
+                std::wstring path = cmdLineW.substr(index, pathEnd - index);
+                std::wstring ntPath = L"\\??\\" + path;
+                std::wstring targetNtPath;
+
+                // 如果位于重定向范围 则改写为沙盒 DOS 路径
+                if (ShouldRedirect(ntPath, targetNtPath)) {
+                    std::wstring targetDosPath = NtPathToDosPath(targetNtPath);
+
+                    rebuiltCommandLine.append(cmdLineW.substr(copiedUpTo, index - copiedUpTo));
+                    rebuiltCommandLine.append(targetDosPath);
+                    copiedUpTo = pathEnd;
+
+                    DebugLog(L"CreateProcess: Redirected CmdLine path from \"%s\" to \"%s\"", path.c_str(), targetDosPath.c_str());
+                }
+
+                index = pathEnd;
+            } else {
+                ++index;
+            }
+        }
+
+        if (copiedUpTo > 0) {
+            rebuiltCommandLine.append(cmdLineW.substr(copiedUpTo));
+            cmdLineW = std::move(rebuiltCommandLine);
+        }
     }
 
     //[新增] 批处理文件 (.bat / .cmd) 识别逻辑
@@ -10057,20 +10113,24 @@ BOOL WINAPI Detour_UpdateProcThreadAttribute(
     PSIZE_T lpReturnSize)
 {
     // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 的值为 0x20007
-    // 这个属性用于设置进程创建时的安全缓解策略
     if (Attribute == PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY && cbSize >= sizeof(DWORD64)) {
-
         DWORD64* policy = (DWORD64*)lpValue;
 
-        // 关键操作: 移除“阻止加载非微软签名的二进制文件”的策略
-        // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON (1ui64 << 44)
-        // 我们通过位运算将其对应的标志位清零
+        // 1. 移除“阻止加载非微软签名的二进制文件”的策略 (CIG)
         *policy &= ~(0x00000001ui64 << 44);
 
-        DebugLog(L"MitigationPolicy: Removed BLOCK_NON_MICROSOFT_BINARIES flag.");
+        // 2. [新增] 移除“禁止动态代码”策略 (ACG)
+        // WeChatAppEx 基于 Chromium 会启用 ACG 导致 MinHook 无法分配可执行内存而 Hook 失败
+        *policy &= ~(0x00000001ui64 << 36); // PROHIBIT_DYNAMIC_CODE_ALWAYS_ON
+        *policy &= ~(0x00000001ui64 << 39); // PROHIBIT_DYNAMIC_CODE_ALWAYS_ON_ROUTED
+
+        // 3. [新增] 移除“禁用扩展点”策略
+        // 防止子进程屏蔽注入动作
+        *policy &= ~(0x00000001ui64 << 32); // EXTENSION_POINT_DISABLE_ALWAYS_ON
+
+        DebugLog(L"MitigationPolicy: Removed CIG/ACG/Extension flags to allow hooking.");
     }
 
-    // 调用原始的 UpdateProcThreadAttribute 函数
     return fpUpdateProcThreadAttribute(lpAttributeList, dwFlags, Attribute, lpValue, cbSize, lpPreviousValue, lpReturnSize);
 }
 
@@ -10079,15 +10139,13 @@ BOOL WINAPI Detour_SetProcessMitigationPolicy(
     PVOID lpBuffer,
     SIZE_T dwLength)
 {
-    // ProcessDynamicCodePolicy 的值为 8
-    // 此策略一旦启用 会禁止进程创建动态代码或修改现有可执行代码 这会导致Hook失败
-    if (MitigationPolicy == ProcessDynamicCodePolicy) {
-        DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(ProcessDynamicCodePolicy).");
-        // 直接返回 TRUE 假装成功设置 但不调用原始函数 从而阻止该策略生效
+    // ProcessDynamicCodePolicy = 8, ProcessSignaturePolicy = 10
+    // 此策略一旦启用 会禁止进程创建动态代码或阻止注入 导致子进程 Hook 失败
+    if (MitigationPolicy == ProcessDynamicCodePolicy || MitigationPolicy == ProcessSignaturePolicy) {
+        DebugLog(L"MitigationPolicy: Blocked SetProcessMitigationPolicy(%d).", MitigationPolicy);
         return TRUE;
     }
 
-    // 对于其他策略 正常调用原始函数
     return fpSetProcessMitigationPolicy(MitigationPolicy, lpBuffer, dwLength);
 }
 
@@ -11296,6 +11354,35 @@ DWORD WINAPI InitHookThread(LPVOID) {
     }
 
     InitSpoofing();
+
+    // ========== [新增] 覆盖当前进程环境变量 ==========
+    // 确保子进程（如 WeChatAppEx/Chromium）在创建沙盒策略时读取到正确的沙盒路径
+    // 必须在读取完原始环境变量（g_UserProfileNt 等）之后调用
+    if (g_SandboxRoot[0] != L'\0') {
+        std::wstring sandbox = g_SandboxRoot;
+        std::wstring userProfile = sandbox + L"\\Users\\Current";
+        std::wstring appData = userProfile + L"\\AppData\\Roaming";
+        std::wstring localAppData = userProfile + L"\\AppData\\Local";
+        std::wstring programData = sandbox + L"\\Users\\All";
+        std::wstring publicDir = sandbox + L"\\Users\\Public";
+
+        SetEnvironmentVariableW(L"USERPROFILE", userProfile.c_str());
+        SetEnvironmentVariableW(L"APPDATA", appData.c_str());
+        SetEnvironmentVariableW(L"LOCALAPPDATA", localAppData.c_str());
+        SetEnvironmentVariableW(L"PROGRAMDATA", programData.c_str());
+        SetEnvironmentVariableW(L"ALLUSERSPROFILE", programData.c_str());
+        SetEnvironmentVariableW(L"PUBLIC", publicDir.c_str());
+        SetEnvironmentVariableW(L"USERNAME", L"Current");
+
+        if (userProfile.length() >= 2 && userProfile[1] == L':') {
+            std::wstring drive = userProfile.substr(0, 2);
+            std::wstring path = userProfile.substr(2);
+            SetEnvironmentVariableW(L"HOMEDRIVE", drive.c_str());
+            SetEnvironmentVariableW(L"HOMEPATH", path.c_str());
+        }
+
+        DebugLog(L"Init: Replaced Environment Variables with Sandbox Paths.");
+    }
 
     DebugLog(L"Hook Initialized. Mode: %d, Root: %s", g_HookMode, g_SandboxRoot);
 
