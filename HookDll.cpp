@@ -11384,7 +11384,8 @@ DWORD WINAPI InitHookThread(LPVOID) {
     // ========== [新增] 覆盖当前进程环境变量 ==========
     // 确保子进程（如 WeChatAppEx/Chromium）在创建沙盒策略时读取到正确的沙盒路径
     // 必须在读取完原始环境变量（g_UserProfileNt 等）之后调用
-    if (g_SandboxRoot[0] != L'\0') {
+    // 仅在文件系统重定向启用时（hookfile=1-4）执行 避免在纯网络/注册表拦截模式下误改环境变量
+    if ((g_HookMode >= 1 && g_HookMode <= 4) && g_SandboxRoot[0] != L'\0') {
         std::wstring sandbox = g_SandboxRoot;
         std::wstring userProfile = sandbox + L"\\Users\\Current";
         std::wstring appData = userProfile + L"\\AppData\\Roaming";
